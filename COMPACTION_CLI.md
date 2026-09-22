@@ -20,7 +20,7 @@ rencrow-compaction select --input input.json --bundle candidate.json --output se
 
 prepareは、①整理案、②別要求での意味検証、③整理後の作業要約、④要約検証を行う。
 モデルは対象IDと意味判断だけを返す。hashとbyte参照はCLIが固定snapshotから生成し、未知IDを拒否する。意味reviewは実際に送ったplanへ、要約reviewは送った要約へCLIがhashを結び付ける。モデルにhashの計算・転記をさせない。
-CLIの整理操作は現在record全体単位。現行指示と撤回対象が同居するrecordは保持する。基礎ライブラリの部分範囲機能は自動公開していない。
+CLIの整理案は任意の`source_text`でrecord内の削減対象原文を指定できる。省略時はrecord全体。原文に一意に一致するUTF-8範囲をCLIが確定し、空文字、不一致、重複一致（重なる一致も含む）は拒否する。混在recordは有効部分を残す。保護範囲・根拠の保持検査は意味review前にも実行する。reviewへは実際に選択した原文を渡し、モデルにbyte範囲を計算させない。
 各要求のresponse ID、usage、壁時計秒、output tok/secをstderrへJSONで表示し、成功candidateにも含める。
 reasoningをoutputへ二重加算せず、cacheはusageの元の区分を保持する。4要求の費用を含むため、削減効果は別途比較が必要。
 失敗時も完了済み要求のusageはstderrに残る。`--trace-dir <未作成directory>`を指定すると、各段階のモデル応答原文を非上書きで保存し、不正JSONを診断できる。Unixではdirectoryを0700、ファイルを0600で作成する。応答には入力由来の機微情報を含み得るため、Gitに追加せず専用の非公開領域を用いる。
@@ -47,9 +47,10 @@ reasoningをoutputへ二重加算せず、cacheはusageの元の区分を保持�
 rencrow-compaction capture --rollout frozen-rollout.jsonl --output legacy-input.json
 ```
 
-旧ログのassistant text messageは`work`として要約対象にする。その他のresponse_itemは`unknown`として、元のpayloadをopaqueに保存する。
+旧ログのassistant text messageは`work`として要約対象にする。その他のresponse_itemは`unknown`として、metadataを含む元の行をopaqueに保存する。assistant textでもmetadataがあれば元の行を保護する。
 `role=user`や文字列markerから人間を推測しない。従ってこの取込みだけでは本人指示の自動削減はできない。
 原本は変更しない。不完全なJSONL行はエラーとし、欠落を黙って無視しない。
+このcaptureは直線的なresponse履歴の取込みであり、live checkpointの復元ではない。圧縮済み・巻き戻し・retained context・agent通信等の再構築が必要な項目は明示的に拒否し、ownerで復元したsnapshotを要求する。表示用eventやsession/turn metadata、usageはモデルのresponse履歴へ追加しない。
 
 ## 最後の選択と保護
 
@@ -68,7 +69,7 @@ stdoutは`ready`、失敗はstderrの`rejected`とexit 2。`ready`は意味的�
 ## この環境の配置と確認
 
 2026-09-22、Ubuntuで`~/.local/bin/rencrow-compaction`へ独立binaryを配置し、`--help`の4subcommandを確認した。
-SHA-256: `ae3d3b2a38f545483fe0b59cff61c440d1de2bafe34066230f1847093a18478c`。
+SHA-256: `cc395d2329352553c18c8f595dd2b1ff9cf81976736538bdb5c575c309c5d6cc`。
 稼働中の`rencrow-switch-core`は変更していない（SHA-256 `04159684a80c3751fa0903b81a04fa3d9b4b20550a4b86e927bf73b5b0e53c1d`を確認）。
 CLI配置の取消しはこの独立binaryを除くことで行える。候補ファイルの削除は元sessionの復旧操作にはならず、元sessionは本経路で更新していない。
 試験結果・観測した不具合と修正・未完了境界は[仕様の実装記録](COMPACTION_SPEC.md)を参照。

@@ -1,6 +1,6 @@
 # RenCrow Switch Core Compaction仕様 v0.2
 
-2026-09-22。状態: **実装中。純粋な選別・検証処理を追加。稼働Compactionへの接続・配備は未完了**。
+2026-09-22。状態: **実装中。別ラインCLIで部分選別・Qwen要約・最終候補を検証済み。稼働Compactionへの接続・配備は未完了**。
 本書はFork内部のCompaction契約の正本。横断的な削減規則・受入は
 [catalog仕様](../docs/codex-context-management.md)、改変・上流追従は[FORK_RULES.md](FORK_RULES.md)が所有する。
 単独checkoutでcatalog参照がない場合も、本書の保護条件は適用する。横断仕様変更時はowner側と照合する。
@@ -270,7 +270,7 @@ hostが作る`SourceFragment`のkind/scope/保護範囲はモデルから受け�
 独立binary `rencrow-compaction`の`capture / inspect / prepare / select`から使う。[CLI入力・運用契約](COMPACTION_CLI.md)を参照。
 prepareは正規Gatewayのworker/highで整理→検証→要約→検証を行い、selectは入力hashを再照合して分離したデータを出す。
 モデルの提案schemaは対象IDと意味判断のみ。CLIが固定snapshotからhash/byte参照を確定し、基礎ライブラリのCompactionPlanへ変換する。未知IDは拒否する。review hashも要求対象からCLIが生成する。
-CLIはrecord全体の操作だけを提供し、現行指示を含む混在recordは保持する。部分範囲/merge/referenceの自動整理は未接続。
+CLIは`source_text`の一意な原文一致から部分範囲も確定する。混在recordの有効部分は保持する。merge/referenceの自動整理は未接続。
 既存Compaction、通常turn、session DB、稼働launcher/profileは変更していない。
 
 旧rollout取込みはassistant textをwork、その他のresponse_itemをunknown＋opaqueとして保全する。本人入力受付からの自動証拠付与は未接続。
@@ -322,5 +322,36 @@ CLIはrecord全体の操作だけを提供し、現行指示を含む混在recor
 
 #### 現在の未完了境界
 
-別ラインの候補生成と最終データ組立まで実装・fixture確認済み。人間本人の入力受付との自動接続、混在recordの部分整理、merge/reference、稼働Compactionの保存境界、resume、remote、実作業の継続と総token比較は未完了。
+別ラインの候補生成と最終データ組立まで実装・fixture確認済み。人間本人の入力受付との自動接続、merge/reference、稼働Compactionの保存境界、resume、remote、実作業の継続と総token比較は未完了。
 通常Compactionや配備済みFork binaryへ本候補経路を接続しておらず、仕様全体完了とは扱わない。
+
+
+### 部分削減とcapture保全の追加修正（2026-09-22）
+
+CLIの`source_text`指定により、同じ本人投稿に有効指示・撤回済み指示・完了依頼・引用が混在する場合も、原文の部分範囲を選択できる。
+LLMは対象文を原文のまま提案し、CLIが唯一の一致箇所からUTF-8 byte参照を生成する。空・不一致・複数一致（重複する一致も含む）は拒否する。
+既存snapshotの保護・根拠・scope検査を意味review前に行い、検証不能な案にreview要求を追加しない。reviewには選択した原文も添える。
+
+CLI 8件pass（skip 0）、build、format、diff check成功。history実装は変更しておらず、既存46件の証拠を再利用する。
+証拠: Git外`target/fork-bootstrap/mixed-{cli-tests,build,format}.log`、`mixed-trial/{input,bundle,selected,acceptance}.json`と`trace/`。
+合成fixtureを同じworker/highで実行し、混在投稿294→135 UTF-8 bytes。有効な認証/policy制約と引用を保護し、撤回文と完了依頼だけを除去した。
+訂正文・unknown原文・入力ファイルSHA-256も不変。生成要約を独立に確認し、過去の作業メモの全体テスト方針を現行命令へ戻していないことを確認した。
+4要求はinput 3,276 + output 9,635 = 12,911 tokens、162.890秒。各段階のoutput tok/壁時計秒は59.40、57.85、63.37、56.41。
+response ID: `chatcmpl-1790079519914`、`chatcmpl-1790079568494`、`chatcmpl-1790079584434`、`chatcmpl-1790079593880`。
+前回とは入力が異なるため、所要時間やtoken数の単純比較で改善/悪化を断定しない。部分削減の正しさを確認したもので、総費用削減の受入は未完了。
+
+#### Capture Failure Knowledge
+
+- **Failure / Problem**: 旧captureはresponse payloadだけを扱い、隣接metadataを欠落させ、圧縮・巻き戻し等の復元境界も読み飛ばしていた。古い履歴を復活させる危険があった。
+- **Cause**: `codex-history/src/rollout_payload.rs`の`RolloutItemWire::ResponseItem`はpayloadとは別にmetadataを保存する。`core/src/session/rollout_reconstruction.rs`はCompacted/ThreadRolledBack等を解釈するが、CLIの単純なresponse_item走査にはその処理がなかった。
+- **Lesson / Invariant**: 本人由来の推測と履歴復元を混同しない。host metadataを欠落させず、未対応の履歴境界を無視しない。
+- **Enforcement**: captureを専用moduleへ分離し、unknownまたはmetadata付きresponseは元の行をopaque保護。圧縮、巻き戻し、retained context、agent通信、未知のrollout種類はownerでの再構築を要求して拒否する。
+- **Tests**: `preserves_sibling_metadata_and_never_promotes_user_role`、`rejects_replay_boundaries_instead_of_reviving_old_history`。通常線形取込みの保全と未対応境界の拒否を確認。
+
+#### 本人由来の未完了境界をコードで再確認
+
+`protocol/src/turn_input.rs::TurnInput::UserInput`はcontent/client_idを持つが、人間本人か代理投稿かを保証するフィールドはない。
+`protocol/src/protocol.rs::UserMessageEvent`のclient_idも本人認証の根拠ではない。
+`history/src/lib.rs::CodexHarnessMetadata`にはuser_input_orderとinherited_user_messageがあるが、前者は受付順、後者は継承の印であり、人間本人の証明ではない。
+`core/src/session/turn_input.rs`では代理由来のFunctionCallOutputにも受付順が付与される。従ってこれらだけでhumanへ自動昇格しない。
+入力受付側の由来付与、ownerの履歴復元との接続、checkpoint/resume、追加削減操作、通常Compaction適用と実運用費用比較は引き続き未完了。
