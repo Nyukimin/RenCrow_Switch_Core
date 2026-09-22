@@ -1,3 +1,18 @@
+<!-- Modified by RenCrow Switch Core on 2026-09-22: added unofficial-fork identification and maintenance rules. -->
+# RenCrow Switch Core
+
+Unofficial fork of [OpenAI Codex](https://github.com/openai/codex) maintained for RenCrow. Not affiliated with or endorsed by OpenAI.
+
+Purpose: improve compaction so obsolete instructions do not survive as active commands, while preserving current requirements and capabilities. **Compaction modifications are not implemented yet; this initial change establishes the fork and its maintenance rules.**
+
+- [Fork改変ルール・上流更新・検証・復旧](FORK_RULES.md)
+- [Contributor instructions](AGENTS.md)
+- [License](LICENSE) / [Attribution notices](NOTICE)
+
+No fork binary has been released or installed. The original README below describes **official OpenAI Codex**, including its installers, services and support links; those commands do not install this fork.
+
+---
+
 <p align="center"><strong>Codex CLI</strong> is a coding agent from OpenAI that runs locally on your computer.
 <p align="center">
   <img src="https://github.com/openai/codex/blob/main/.github/codex-cli-splash.png" alt="Codex CLI splash" width="80%" />

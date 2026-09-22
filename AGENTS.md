@@ -1,3 +1,8 @@
+<!-- Modified by RenCrow Switch Core on 2026-09-22: added the fork rules entrypoint; upstream instructions below are preserved. -->
+# Fork作業入口
+
+本repositoryを変更する前に[Fork改変ルール](FORK_RULES.md)を読む。共通のモデル役割・権限はここで再定義しない。以下は上流の実装規約として保持する。
+
 # Rust/codex-rs
 
 In the codex-rs folder where the rust code lives:
