@@ -325,7 +325,7 @@ fn malformed_references_reviews_and_snapshot_ids_fail_closed() {
             Err(PlanError::InvalidReview)
         );
     }
-    let mut fragments = snapshot.fragments.clone();
+    let mut fragments = snapshot.fragments;
     fragments.push(fragments[0].clone());
     assert!(matches!(
         CompactionSnapshot::capture("binding".into(), fragments),

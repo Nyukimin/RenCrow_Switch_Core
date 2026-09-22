@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-09-22: separate original-input intake.
 use super::*;
 use crate::app_event::ConnectorsSnapshot;
 use crate::bottom_pane::RestrictedInputMode;
@@ -1394,6 +1395,7 @@ async fn queued_restore_with_remote_images_keeps_local_placeholder_mapping() {
     let remote_image_urls = vec!["https://example.com/queued-remote.png".to_string()];
 
     chat.restore_user_message_to_composer(UserMessage {
+        intake: None,
         text: text.clone(),
         local_images: local_images.clone(),
         remote_image_urls: remote_image_urls.clone(),
@@ -1427,6 +1429,7 @@ async fn restored_message_preserves_existing_composer_draft_and_attachments() {
         .set_composer_pending_pastes(vec![(paste_placeholder.to_string(), "hello".to_string())]);
 
     chat.restore_user_message_to_composer(UserMessage {
+        intake: None,
         text: "[Image #1] retry prompt".to_string(),
         local_images: vec![LocalImageAttachment {
             placeholder: "[Image #1]".to_string(),
@@ -1470,6 +1473,7 @@ async fn interrupted_turn_restore_keeps_active_mode_for_resubmission() {
     chat.on_task_started();
     chat.input_queue.queued_user_messages.push_back(
         UserMessage {
+            intake: None,
             text: "Implement the plan.".to_string(),
             local_images: Vec::new(),
             remote_image_urls: Vec::new(),
@@ -1528,6 +1532,7 @@ async fn remap_placeholders_uses_attachment_labels() {
         },
     ];
     let message = UserMessage {
+        intake: None,
         text,
         text_elements: elements,
         local_images: attachments,
@@ -1594,6 +1599,7 @@ async fn remap_placeholders_uses_byte_ranges_when_placeholder_missing() {
         },
     ];
     let message = UserMessage {
+        intake: None,
         text,
         text_elements: elements,
         local_images: attachments,
@@ -2174,6 +2180,7 @@ async fn submit_user_message_ignores_inaccessible_app_mentions_from_bindings() {
     );
 
     chat.submit_user_message(UserMessage {
+        intake: None,
         text: "$arabica-uae".to_string(),
         local_images: Vec::new(),
         remote_image_urls: Vec::new(),
@@ -2323,6 +2330,7 @@ async fn task_mention_submission_and_transcript_preserve_the_visible_title() {
         chat.set_task_mentions_enabled(enabled);
         let title = "Review database migration";
         chat.submit_user_message(UserMessage {
+            intake: None,
             text: format!("Inspect @{title}"),
             local_images: Vec::new(),
             remote_image_urls: Vec::new(),

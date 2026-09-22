@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-09-22: separate original-input intake.
 //! Selection keys remain inside the overlay while drafts and backtrack previews are pending.
 
 use super::*;
@@ -107,6 +108,7 @@ async fn offline_selection_reserves_keys_and_preserves_draft_and_backtrack_state
     .unwrap();
     app.chat_widget
         .restore_user_message_to_composer(UserMessage {
+            intake: None,
             text: "draft prompt".to_owned(),
             local_images: Vec::new(),
             remote_image_urls: vec!["https://example.com/draft.png".to_owned()],

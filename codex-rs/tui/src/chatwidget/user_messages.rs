@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-09-22: separate original-input intake.
 //! User-message models and helpers for the chat widget.
 //!
 //! The app-server preserves user input as structured chunks, while chat history
@@ -30,6 +31,8 @@ use super::ChatWidget;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct UserMessage {
+    // RenCrow: only composer-originated input carries this, through queueing and image preparation.
+    pub(crate) intake: Option<codex_history::input_intake::OriginalInput>,
     pub(crate) text: String,
     pub(crate) local_images: Vec<LocalImageAttachment>,
     /// Remote image attachments represented as URLs (for example data URLs)
@@ -160,6 +163,7 @@ pub(crate) struct ThreadInputStateRestoreMode {
 impl From<String> for UserMessage {
     fn from(text: String) -> Self {
         Self {
+            intake: None,
             text,
             local_images: Vec::new(),
             remote_image_urls: Vec::new(),
@@ -173,6 +177,7 @@ impl From<String> for UserMessage {
 impl From<&str> for UserMessage {
     fn from(text: &str) -> Self {
         Self {
+            intake: None,
             text: text.to_string(),
             local_images: Vec::new(),
             remote_image_urls: Vec::new(),
@@ -211,6 +216,7 @@ pub(crate) fn create_initial_user_message(
             })
             .collect();
         Some(UserMessage {
+            intake: None,
             text,
             local_images,
             remote_image_urls: Vec::new(),
@@ -343,6 +349,7 @@ fn remap_placeholders_for_message_and_history_record(
     next_label: &mut usize,
 ) -> (UserMessage, UserMessageHistoryRecord) {
     let UserMessage {
+        intake,
         text,
         text_elements,
         local_images,
@@ -365,6 +372,7 @@ fn remap_placeholders_for_message_and_history_record(
 
     (
         UserMessage {
+            intake,
             text,
             local_images: remapped_images,
             remote_image_urls,
@@ -420,6 +428,7 @@ pub(super) fn merge_user_messages(messages: Vec<UserMessage>) -> UserMessage {
 
 fn merge_remapped_user_messages(messages: impl IntoIterator<Item = UserMessage>) -> UserMessage {
     let mut combined = UserMessage {
+        intake: None,
         text: String::new(),
         text_elements: Vec::new(),
         local_images: Vec::new(),
@@ -432,6 +441,7 @@ fn merge_remapped_user_messages(messages: impl IntoIterator<Item = UserMessage>)
             combined.text.push('\n');
         }
         let UserMessage {
+            intake: _,
             text,
             text_elements,
             local_images,

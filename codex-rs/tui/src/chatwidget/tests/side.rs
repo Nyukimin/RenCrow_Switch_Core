@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-09-22: separate original-input intake.
 use super::*;
 use pretty_assertions::assert_eq;
 use ratatui::Terminal;
@@ -327,7 +328,7 @@ async fn slash_side_requests_forked_side_question_while_task_running() {
             user_message: Some(user_message),
         }) if emitted_parent_thread_id == parent_thread_id
             && user_message
-                == UserMessage {
+                == UserMessage { intake: None,
                     text: "explore the codebase".to_string(),
                     local_images: Vec::new(),
                     remote_image_urls: Vec::new(),
@@ -375,7 +376,7 @@ async fn slash_btw_requests_forked_side_question_while_task_running() {
             user_message: Some(user_message),
         }) if emitted_parent_thread_id == parent_thread_id
             && user_message
-                == UserMessage {
+                == UserMessage { intake: None,
                     text: "explore the codebase".to_string(),
                     local_images: Vec::new(),
                     remote_image_urls: Vec::new(),

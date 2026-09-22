@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-09-22: preserve input-channel provenance flags.
 use clap::Args;
 use clap::CommandFactory;
 use clap::Parser;
@@ -2653,6 +2654,7 @@ fn merge_interactive_cli_flags(interactive: &mut TuiCli, subcommand_cli: TuiCli)
         approval_policy,
         web_search,
         no_alt_screen,
+        rencrow_input_author,
         no_daemon,
         prompt,
         mut config_overrides,
@@ -2674,6 +2676,9 @@ fn merge_interactive_cli_flags(interactive: &mut TuiCli, subcommand_cli: TuiCli)
         interactive.web_search = true;
     }
     interactive.no_alt_screen |= no_alt_screen;
+    if rencrow_input_author.is_some() {
+        interactive.rencrow_input_author = rencrow_input_author;
+    }
     interactive.no_daemon |= no_daemon;
     if strict_config {
         interactive.strict_config = true;
@@ -3881,6 +3886,37 @@ mod tests {
             ] {
                 assert!(finalize(&args).no_daemon);
             }
+        }
+    }
+
+    #[test]
+    fn resume_and_fork_preserve_declared_input_author() {
+        for (command, finalize) in [
+            ("resume", finalize_resume_from_args as fn(&[&str]) -> TuiCli),
+            ("fork", finalize_fork_from_args as fn(&[&str]) -> TuiCli),
+        ] {
+            for args in [
+                vec!["codex", command, "--rencrow-input-author", "human"],
+                vec!["codex", "--rencrow-input-author", "human", command],
+            ] {
+                assert_eq!(
+                    finalize(&args).rencrow_input_author.as_deref(),
+                    Some("human")
+                );
+            }
+            assert_eq!(
+                finalize(&[
+                    "codex",
+                    "--rencrow-input-author",
+                    "human",
+                    command,
+                    "--rencrow-input-author",
+                    "automation"
+                ])
+                .rencrow_input_author
+                .as_deref(),
+                Some("automation")
+            );
         }
     }
 

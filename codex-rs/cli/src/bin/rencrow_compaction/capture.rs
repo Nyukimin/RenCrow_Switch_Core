@@ -12,6 +12,8 @@ use serde_json::Value;
 
 pub(super) fn capture(data: &[u8]) -> Result<CandidateInput> {
     let mut records = Vec::new();
+    let mut initial_world_state = false;
+    let mut completed_turn = false;
     for (index, line) in data.split(|b| *b == b'\n').enumerate() {
         if line.is_empty() {
             continue;
@@ -20,10 +22,35 @@ pub(super) fn capture(data: &[u8]) -> Result<CandidateInput> {
             serde_json::from_slice(line).context("incomplete or invalid rollout line")?;
         match value["type"].as_str() {
             Some("response_item") => {}
+            Some("world_state") => {
+                ensure!(
+                    !initial_world_state
+                        && !completed_turn
+                        && value["payload"]["full"] == true
+                        && value["payload"]["state"].is_object(),
+                    "unsupported rollout replay: world-state updates require owner reconstruction"
+                );
+                initial_world_state = true;
+                records.push(CandidateRecord {
+                    id: format!("line-{index}"),
+                    origin: Origin::Unknown,
+                    intake_ref: None,
+                    scope: "legacy".into(),
+                    role: "unknown".into(),
+                    text: serde_json::to_string(&value["payload"])?,
+                    protected: vec![],
+                    execution_evidence: false,
+                    opaque: Some(value),
+                });
+                continue;
+            }
             Some(
                 "session_meta" | "turn_context" | "token_usage_record" | "security_risk_score",
             ) => continue,
-            Some("event_msg") if value["payload"]["type"] != "thread_rolled_back" => continue,
+            Some("event_msg") if value["payload"]["type"] != "thread_rolled_back" => {
+                completed_turn |= value["payload"]["type"] == "task_complete";
+                continue;
+            }
             _ => bail!(
                 "unsupported rollout replay item at line {}; use an owner-reconstructed snapshot",
                 index + 1
@@ -100,6 +127,26 @@ mod tests {
         assert_eq!(result.records[1].origin, Origin::Work);
         assert_eq!(result.records[1].opaque, Some(items[1].clone()));
         assert!(result.records[2].opaque.is_none());
+    }
+
+    #[test]
+    fn retains_initial_world_state_but_rejects_updates_without_replay() {
+        let state = json!({"type":"world_state","payload":{"full":true,"state":{"permissions":"protected context"}}});
+        let result = capture(state.to_string().as_bytes()).unwrap();
+        assert_eq!(result.records[0].opaque, Some(state.clone()));
+        assert_eq!(result.records[0].origin, Origin::Unknown);
+        assert!(capture(format!("{state}\n{state}").as_bytes()).is_err());
+        assert!(
+            capture(
+                format!(
+                    "{}\n{state}",
+                    json!({"type":"event_msg","payload":{"type":"task_complete"}})
+                )
+                .as_bytes()
+            )
+            .is_err()
+        );
+        assert!(capture(br#"{"type":"world_state","payload":{"full":false,"state":{}}}"#).is_err());
     }
 
     #[test]

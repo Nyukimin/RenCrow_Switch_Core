@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-09-22: separate original-input intake.
 //! Input queue restore and thread-input snapshot behavior for `ChatWidget`.
 
 use std::collections::HashSet;
@@ -24,6 +25,7 @@ impl ChatWidget {
         let existing_draft = self.bottom_pane.composer_draft_snapshot();
         let existing_cursor = existing_draft.cursor;
         let existing_message = UserMessage {
+            intake: None,
             text: existing_draft.text,
             text_elements: existing_draft.text_elements,
             local_images: existing_draft.local_images,
@@ -34,6 +36,7 @@ impl ChatWidget {
             !self.bottom_pane.composer_is_empty() || !existing_draft.pending_pastes.is_empty();
 
         let startup_message = UserMessage {
+            intake: None,
             text: draft.text,
             text_elements: draft.text_elements,
             local_images: draft.local_images,
@@ -401,6 +404,7 @@ impl ChatWidget {
         let composer = self.bottom_pane.composer_draft_snapshot();
         let composer_pending_pastes = composer.pending_pastes;
         let existing_message = UserMessage {
+            intake: None,
             text: composer.text,
             text_elements: composer.text_elements,
             local_images: composer.local_images,
@@ -485,6 +489,7 @@ impl ChatWidget {
         let draft = self.bottom_pane.composer_draft_snapshot();
         let pending_pastes = draft.pending_pastes;
         let draft_message = UserMessage {
+            intake: None,
             text: draft.text,
             text_elements: draft.text_elements,
             local_images: draft.local_images,
@@ -529,6 +534,7 @@ impl ChatWidget {
         pending_pastes: Vec<(String, String)>,
     ) -> ThreadComposerState {
         let UserMessage {
+            intake: _,
             text,
             local_images,
             remote_image_urls,

@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-09-22: separate original-input intake.
 use super::*;
 use pretty_assertions::assert_eq;
 
@@ -1287,6 +1288,7 @@ async fn submit_user_message_emits_structured_plugin_mentions_from_bindings() {
         }]));
 
     chat.submit_user_message(UserMessage {
+        intake: None,
         text: "$sample".to_string(),
         local_images: Vec::new(),
         remote_image_urls: Vec::new(),

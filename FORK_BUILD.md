@@ -43,3 +43,21 @@ bootstrap、binary、会話・認証情報はcommitしない。
 
 本基点には公式0.155.1より新しいSQLite migrationが含まれる。旧版のmissing migration許容だけでは
 完全なrollback保証にならないため、backupと実resume確認を省略しない。
+
+
+## 別系統の入力記録を試験する場合
+
+`codex-cli`の`codex`と`rencrow-compaction`を同じrevisionからbuildする。
+TUIの`--rencrow-input-author human|automation`は、送信本文・添付の別記録だけを有効にする。
+通常Compactionの切替フラグではない。利用と制限はCOMPACTION_CLI.mdを参照。
+稼働中の旧binaryはこのフラグに対応しない。既存writerの差替えや再起動を伴わない試験は、
+新binary・独立CODEX_HOME・独立sessionを使用し、同じ既存Gateway/model契約を維持する。
+
+試験済みの未梱包dev-small binaryには`--no-daemon`が必要。起動例:
+
+```sh
+CODEX_HOME=/private/isolated-home ./target/fork-build/dev-small/codex --no-daemon --rencrow-input-author human
+```
+
+既存TUI回帰をこのホストで確認する際は、短い一時path、私有umask、通常の端末色設定を用いる。
+Git 2.34.1では上流worktreeの`list -z`に対応できず、関連検査は未受入。今回の機能のためにGitや製品の検査を弱めない。

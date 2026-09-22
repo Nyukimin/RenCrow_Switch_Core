@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-09-22: separate original-input intake.
 //! Slash-command dispatch and local-recall handoff for `ChatWidget`.
 //!
 //! `ChatComposer` parses slash input and stages recognized command text for local
@@ -733,6 +734,7 @@ impl ChatWidget {
             mention_bindings = self.bottom_pane.take_recent_submission_mention_bindings();
         }
         UserMessage {
+            intake: None,
             text: args,
             local_images,
             remote_image_urls,
@@ -975,6 +977,7 @@ impl ChatWidget {
                             .collect();
                         self.queue_user_message_with_options(
                             UserMessage {
+                                intake: None,
                                 text: format!("{GOAL_PREFIX}{}", draft.objective),
                                 local_images: draft.local_images,
                                 remote_image_urls: draft.remote_image_urls,
@@ -1059,6 +1062,7 @@ impl ChatWidget {
             ..
         } = queued_message;
         let UserMessage {
+            intake,
             text,
             local_images,
             remote_image_urls,
@@ -1067,6 +1071,7 @@ impl ChatWidget {
         } = user_message;
         let Some((name, rest, rest_offset)) = parse_slash_name(&text) else {
             self.submit_user_message(UserMessage {
+                intake,
                 text,
                 local_images,
                 remote_image_urls,
@@ -1078,6 +1083,7 @@ impl ChatWidget {
 
         if name.contains('/') {
             self.submit_user_message(UserMessage {
+                intake,
                 text,
                 local_images,
                 remote_image_urls,
@@ -1115,6 +1121,7 @@ impl ChatWidget {
 
         if !command.supports_inline_args() {
             self.submit_user_message(UserMessage {
+                intake,
                 text,
                 local_images,
                 remote_image_urls,
@@ -1125,6 +1132,7 @@ impl ChatWidget {
         }
         let SlashCommandItem::Builtin(cmd) = command else {
             self.submit_user_message(UserMessage {
+                intake,
                 text,
                 local_images,
                 remote_image_urls,

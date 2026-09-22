@@ -39,7 +39,7 @@ reasoningをoutputへ二重加算せず、cacheはusageの元の区分を保持�
 - `unknown`と`opaque`を持つ本人入力の本文は全体保護する。由来や添付が不明なまま容量だけを理由に削除しない。
 - `host`を含む入力は現行`current_context`が必須。古いhost本文を本人入力として再保持しない。保護指定/opaqueがあれば別途残す。
 
-入力受付から本人の由来を自動記録するadapterは未接続。`human`指定をLLMに生成させて自動由来確認の代替にしない。
+入力受付の別記録は、下記の明示された入力元を持つTUI投稿に対応する。`human`指定をLLMに推測させて由来確認の代替にしない。
 
 旧rolloutの安全な取込み:
 
@@ -50,7 +50,7 @@ rencrow-compaction capture --rollout frozen-rollout.jsonl --output legacy-input.
 旧ログのassistant text messageは`work`として要約対象にする。その他のresponse_itemは`unknown`として、metadataを含む元の行をopaqueに保存する。assistant textでもmetadataがあれば元の行を保護する。
 `role=user`や文字列markerから人間を推測しない。従ってこの取込みだけでは本人指示の自動削減はできない。
 原本は変更しない。不完全なJSONL行はエラーとし、欠落を黙って無視しない。
-このcaptureは直線的なresponse履歴の取込みであり、live checkpointの復元ではない。圧縮済み・巻き戻し・retained context・agent通信等の再構築が必要な項目は明示的に拒否し、ownerで復元したsnapshotを要求する。表示用eventやsession/turn metadata、usageはモデルのresponse履歴へ追加しない。
+このcaptureは直線的なresponse履歴の取込みであり、live checkpointの復元ではない。初回の完全なworld_stateはopaque保護し、差分更新・再設定は拒否する。圧縮済み・巻き戻し・retained context・agent通信等の再構築が必要な項目は明示的に拒否し、ownerで復元したsnapshotを要求する。表示用eventやsession/turn metadata、usageはモデルのresponse履歴へ追加しない。
 
 ## 最後の選択と保護
 
@@ -63,14 +63,54 @@ selectは元入力hash、整理案とreviewの対応、要約view hash・review�
 Unixではtempfileのprivate modeを引き継ぐ。Windowsでは配置先のACLを適切に設定する。
 stdoutは`ready`、失敗はstderrの`rejected`とexit 2。`ready`は意味的完全性や稼働配備の証明ではない。
 
-未実装: intake由来の自動取得、merge/reference等の追加削減操作、通常Compactionの最終接続、checkpointの原子的確定・resume、remote経路、実作業による総token比較。
+未実装: 圧縮・巻き戻し済み履歴のintake照合、merge/reference等の追加削減操作、通常Compactionの最終接続、checkpointの原子的確定・resume、remote経路、実作業による総token比較。
 
 
 ## この環境の配置と確認
 
 2026-09-22、Ubuntuで`~/.local/bin/rencrow-compaction`へ独立binaryを配置し、`--help`の4subcommandを確認した。
-SHA-256: `cc395d2329352553c18c8f595dd2b1ff9cf81976736538bdb5c575c309c5d6cc`。
+SHA-256: `b9fee2400128deec357c6648ef0047f772c8d112403b039ec618eccb3457ae77`。
 稼働中の`rencrow-switch-core`は変更していない（SHA-256 `04159684a80c3751fa0903b81a04fa3d9b4b20550a4b86e927bf73b5b0e53c1d`を確認）。
 CLI配置の取消しはこの独立binaryを除くことで行える。候補ファイルの削除は元sessionの復旧操作にはならず、元sessionは本経路で更新していない。
 試験結果・観測した不具合と修正・未完了境界は[仕様の実装記録](COMPACTION_SPEC.md)を参照。
 Windows/macOSの実機動作は未確認。通常Compactionへの切替は未実施。
+
+
+## 送信本文・添付の別記録（2026-09-22）
+
+新しいForkのTUIを起動するときに入力元を一度指定する。
+
+```sh
+rencrow-switch-core --no-daemon --rencrow-input-author human
+# 自動操作の端末では automation を指定する。
+rencrow-switch-core --no-daemon --rencrow-input-author automation
+```
+
+`--no-daemon`は未梱包の開発binaryを単独起動する上流のオプション。Gatewayの迂回や権限変更は行わない。
+この指定は操作者による入力経路の申告であり、物理的に人間がキーを押した証明ではない。
+未指定は記録しない。LLM、role=user、client_id、受付順から本人性を推定しない。
+起動引数のprompt、内部生成メッセージ、由来を保てない結合・本文変換は本人枠へ昇格しない。
+本機能は新binaryが必要であり、既に起動中の旧binaryには有効にならない。
+
+TUIの送信操作で得た本文と画像添付（ローカルpath/placeholder、remote URL）を、
+IDE等のhost情報追加前に取得する。送信時にthread/client IDと送信本文hashを付け、
+`$CODEX_HOME/rencrow/input-intake/<thread-id>/<client-id>.json`へ私有・非上書きで保存する。
+受付記録は最大1 MiB。保存失敗は画面に表示し、通常送信は継続するが本人性の証拠にはしない。
+原ログと添付実体を変更・削除しない。添付実体のコピー・バックアップ機能ではない。
+
+`capture`はsessions/archived_sessions配下のrolloutから同じCODEX_HOMEの受付記録を自動取得する。
+別配置の場合のみ、操作者が管理する記録のdirectoryを明示する。
+
+```sh
+rencrow-compaction capture --rollout frozen-rollout.jsonl \
+  --intake-dir /trusted/codex-home/rencrow/input-intake --output input.json
+```
+
+受理済み`item_completed/UserMessage`（旧形式では`user_message`）とthread/client ID・本文hashを照合し、対応するモデル履歴に元本文が一意に存在することを確認する。
+本文と添付参照を入力枠へ移し、残るhost情報・画像構造・metadataを保護枠へ残す。
+派生候補の元メッセージから移した本文だけを除き、本文の二重保持を避ける。原rolloutは不変。
+`automation`はwork、記録なし・未受理・継承入力はunknownのまま。不一致・破損は出力せず拒否する。
+添付付き入力は現在のopaque保護に従って本文も全体保護するため、添付付き投稿の部分削減は未対応。
+添付内容や引用文をユーザー命令として扱う権限は付与しない。
+受付記録は信頼するローカル操作者の管理領域を前提とし、モデルや外部文書が提供した任意JSONを本人証明として受け付けない。
+通常Compactionへの切替、live checkpoint、履歴復元、既存sessionの再構築はこの機能に含めない。

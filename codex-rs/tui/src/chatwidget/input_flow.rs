@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-09-22: separate original-input intake.
 //! User input submission, queue draining, and draft restore flow for `ChatWidget`.
 //!
 //! The queue data itself lives in `input_queue`; this module owns the app-level
@@ -398,6 +399,7 @@ impl ChatWidget {
         self.set_collaboration_mask_from_user_action(collaboration_mode);
         let should_queue = self.is_plan_streaming_in_tui();
         let user_message = UserMessage {
+            intake: None,
             text,
             local_images: Vec::new(),
             remote_image_urls: Vec::new(),

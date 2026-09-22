@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-09-22: separate original-input intake.
 //! App-level orchestration tests for the TUI.
 
 #[path = "tests/daybreak_tests.rs"]
@@ -7508,6 +7509,7 @@ async fn backtrack_selection_preserves_selected_prompt_and_requests_branch() {
         thread_id: base_id,
         nth_user_message: 1,
         prompt: crate::chatwidget::UserMessage {
+            intake: None,
             text: edited_text,
             local_images: vec![crate::bottom_pane::LocalImageAttachment {
                 placeholder: placeholder.to_string(),
@@ -8267,6 +8269,7 @@ async fn prompt_edit_reverts_earlier_and_first_visible_prompts_in_place() -> Res
             .is_some()
     );
     let prompt = crate::chatwidget::UserMessage {
+        intake: None,
         text: "selected prompt [Image #1]".to_string(),
         local_images: vec![crate::bottom_pane::LocalImageAttachment {
             placeholder: "[Image #1]".to_string(),

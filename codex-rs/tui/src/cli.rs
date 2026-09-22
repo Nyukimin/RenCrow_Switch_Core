@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-09-22: separate original-input intake.
 use clap::Args;
 use clap::FromArgMatches;
 use clap::Parser;
@@ -9,6 +10,10 @@ use codex_utils_cli::SharedCliOptions;
 #[derive(Parser, Clone, Debug)]
 #[command(version)]
 pub struct Cli {
+    /// Declare the operator of this input channel; omitted inputs retain unknown provenance.
+    #[arg(long, value_parser = ["human", "automation"])]
+    pub rencrow_input_author: Option<String>,
+
     /// Internal: launching CLI that handles daemon updates after the TUI exits.
     #[clap(skip)]
     pub daemon_cli_executable: Option<AbsolutePathBuf>,

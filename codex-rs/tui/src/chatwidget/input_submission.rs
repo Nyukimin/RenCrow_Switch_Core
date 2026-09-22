@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-09-22: separate original-input intake.
 //! User-message and shell-prompt submission behavior for `ChatWidget`.
 
 use super::*;
@@ -25,7 +26,9 @@ impl ChatWidget {
             .bottom_pane
             .take_recent_submission_images_with_placeholders();
         let remote_image_urls = self.take_remote_image_urls();
+        let intake = crate::input_intake::original(&text, &local_images, &remote_image_urls);
         UserMessage {
+            intake,
             text,
             local_images,
             remote_image_urls,
@@ -201,6 +204,7 @@ impl ChatWidget {
             && !self.current_model_supports_images()
         {
             let UserMessage {
+                intake: _,
                 text,
                 text_elements,
                 local_images,
@@ -217,6 +221,7 @@ impl ChatWidget {
             return (false, None);
         }
         let UserMessage {
+            intake,
             text,
             local_images,
             remote_image_urls,
@@ -254,6 +259,7 @@ impl ChatWidget {
         } else if self.snapshot_local_images && !local_images.is_empty() {
             self.prepare_image_submission(
                 UserMessage {
+                    intake,
                     text,
                     local_images,
                     remote_image_urls,
@@ -400,6 +406,7 @@ impl ChatWidget {
             );
             self.restore_user_message_to_composer(user_message_for_restore(
                 UserMessage {
+                    intake,
                     text,
                     local_images,
                     remote_image_urls,
@@ -425,9 +432,21 @@ impl ChatWidget {
             .then(|| Self::user_message_display_from_inputs(&items));
         let client_user_message_id = uuid::Uuid::new_v4().to_string();
         crate::startup_recovery::bind_submission(&text, &client_user_message_id);
+        if let (Some(original), Some(thread_id)) = (intake.as_ref(), self.thread_id)
+            && let Err(error) = crate::input_intake::record(
+                self.config.codex_home.as_path(),
+                &thread_id.to_string(),
+                &client_user_message_id,
+                original,
+                &items,
+            )
+        {
+            self.add_error_message(format!("Input provenance was not recorded: {error}"));
+        }
         let pending_steer = (!render_in_history).then(|| PendingSteer {
             client_id: client_user_message_id.clone(),
             user_message: UserMessage {
+                intake: intake.clone(),
                 text: text.clone(),
                 local_images: local_images.clone(),
                 remote_image_urls: remote_image_urls.clone(),
@@ -455,6 +474,7 @@ impl ChatWidget {
             /*personality*/ None,
         );
         let submitted_message = UserMessage {
+            intake,
             text,
             local_images,
             remote_image_urls,
@@ -574,6 +594,7 @@ impl ChatWidget {
     ) {
         // Preserve the user's composed payload so they can retry after changing models.
         self.restore_user_message_to_composer(UserMessage {
+            intake: None,
             text,
             text_elements,
             local_images,

@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-09-22: separate original-input intake.
 //! Backtracking and detailed transcript event routing.
 //!
 //! This file owns backtrack mode (Esc/Enter navigation in the transcript overlay) and also
@@ -467,6 +468,7 @@ impl App {
             thread_id: base_id,
             nth_user_message,
             prompt: UserMessage {
+                intake: None,
                 text: selected.message.clone(),
                 local_images,
                 remote_image_urls: selected.remote_image_urls.clone(),
@@ -744,6 +746,7 @@ mod tests {
 
     fn prompt(text: &str) -> UserMessage {
         UserMessage {
+            intake: None,
             text: text.to_string(),
             local_images: Vec::new(),
             remote_image_urls: Vec::new(),

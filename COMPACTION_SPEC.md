@@ -273,7 +273,7 @@ prepareは正規Gatewayのworker/highで整理→検証→要約→検証を行�
 CLIは`source_text`の一意な原文一致から部分範囲も確定する。混在recordの有効部分は保持する。merge/referenceの自動整理は未接続。
 既存Compaction、通常turn、session DB、稼働launcher/profileは変更していない。
 
-旧rollout取込みはassistant textをwork、その他のresponse_itemをunknown＋opaqueとして保全する。本人入力受付からの自動証拠付与は未接続。
+旧rollout取込みはassistant textをwork、その他のresponse_itemをunknown＋opaqueとして保全する。TUI受付の別記録と受理照合を追加した。適用範囲は末尾の「送信入力の別系統と受理照合」を参照。
 明示的なintake参照を持つhost作成snapshotを処理できることと、過去ログから人間本人を自動認定できることを区別する。
 追加のmerge/reference操作、通常Compactionへの適用、checkpoint保存/replay、remote対応は引き続き未実装。
 
@@ -322,7 +322,7 @@ CLIは`source_text`の一意な原文一致から部分範囲も確定する。�
 
 #### 現在の未完了境界
 
-別ラインの候補生成と最終データ組立まで実装・fixture確認済み。人間本人の入力受付との自動接続、merge/reference、稼働Compactionの保存境界、resume、remote、実作業の継続と総token比較は未完了。
+別ラインの候補生成と最終データ組立まで実装・fixture確認済み。入力受付との接続は末尾の追加記録を参照。merge/reference、稼働Compactionの保存境界、resume、remote、実作業の継続と総token比較は未完了。
 通常Compactionや配備済みFork binaryへ本候補経路を接続しておらず、仕様全体完了とは扱わない。
 
 
@@ -354,4 +354,46 @@ response ID: `chatcmpl-1790079519914`、`chatcmpl-1790079568494`、`chatcmpl-179
 `protocol/src/protocol.rs::UserMessageEvent`のclient_idも本人認証の根拠ではない。
 `history/src/lib.rs::CodexHarnessMetadata`にはuser_input_orderとinherited_user_messageがあるが、前者は受付順、後者は継承の印であり、人間本人の証明ではない。
 `core/src/session/turn_input.rs`では代理由来のFunctionCallOutputにも受付順が付与される。従ってこれらだけでhumanへ自動昇格しない。
-入力受付側の由来付与、ownerの履歴復元との接続、checkpoint/resume、追加削減操作、通常Compaction適用と実運用費用比較は引き続き未完了。
+入力受付側の由来付与は以下の追加範囲で扱う。ownerの履歴復元との接続、checkpoint/resume、追加削減操作、通常Compaction適用と実運用費用比較は引き続き未完了。
+
+
+### 送信入力の別系統と受理照合（2026-09-22）
+
+以前の「本人由来自動取得は未接続」は旧実装の状態。現在の追加範囲はTUI入力受付から独立captureまで。
+責務は次のように分離する。
+
+- CLI: TUI composerで元本文・添付参照を取得し、送信時のthread/client IDと本文hashを私有ファイルへ固定する。
+- Boundary: 起動時の操作者申告human/automation（未指定はunknown）を保持し、受理ログと照合する。本人性の意味推測や物理操作者の検出は行わない。
+- CLI: 一致した本文・添付を別枠へ移す。派生候補から同じ本文のコピーだけを除去し、host情報・prepared画像・metadata・原ログを保持する。
+- LLM: この取得・照合には利用しない。後段の撤回/完了の意味判断と要約だけが既存LLM処理を利用する。
+
+ownerはForkの`history::input_intake`（記録契約）、TUIの`input_intake`（受付）、独立CLIの`intake`（受理照合）。
+新protocolや通常Compactionの経路は追加しない。詳細な利用方法・失敗挙動・未対応境界はCOMPACTION_CLI.mdの送信本文・添付の節を正本とする。
+記録先の不存在は由来不明、記録破損や受理不一致はcapture拒否とする。保存失敗で通常送信を偽装成功させず、由来記録の失敗を表示する。
+
+受入条件: 本文/添付の抽出、host情報との分離、原本不変、重複本文なし、未受理/automation/継承の誤昇格なし、ID/hash不一致拒否、非上書き保存、既存TUI送信の回帰。
+検証記録は以下を参照。通常Compaction接続、圧縮/rollback済み履歴、resume、実運用の総token比較は未完了のまま。
+
+
+実送信で判明した接続差異: 現行Forkは`item_completed`の`UserMessageItem`を保存し、旧`user_message` eventは必ずしも残さない。
+受理本文の再現はprotocol ownerの`UserMessageItem::message()`を利用し、独自の連結規則を増やさない。
+また初回送信にも完全なworld_stateが存在する。初回の完全snapshotをopaque保護する取込みを追加し、
+差分・二回目のsnapshot・完了turn後のsnapshotは復元未対応として拒否する。
+再現test: `binds_persisted_user_item_completion_without_a_legacy_event`、`retains_initial_world_state_but_rejects_updates_without_replay`。
+
+
+#### 入力別記録の検証結果
+
+- history 47件を含む関連lib/CLI/TUI検査は5,486件実行、初回5,467成功・17失敗・2timeout（4skip）。新規の受付保存と照合検査は成功。
+- 短い私有一時path、通常の端末設定で失敗19件だけを再検査し10件成功。`umask 0002`でRustの一時dirが0775になることを確認し、検査processだけ`umask 0077`にしてIDE接続7件成功。権限検査・timeout閾値・製品コードは緩和していない。
+- 残る既存失敗はworktree 2件（ホストGit 2.34.1が`git worktree list -z`未対応）とKitty画像1件。後者はpathのBase64にも禁止判定語`cG5n`が現れることを再現した。上流テスト全成功・TUI release受入とは扱わない。
+- 現行受理形式・初回world_state対応後の独立CLI検査は13/13成功。resume/forkの入力元フラグ継承は1/1成功。`just fmt`、`just fix`、dev-small両binary build、diff check成功。静的検査には既存の`expect("validated source")`警告が1件残る。
+- 新TUIを独立CODEX_HOMEで`--no-daemon --rencrow-input-author human`として起動し、本文120 UTF-8 bytesとPNG画像1件を送信。同じGatewayのworker/highから「受付確認」を受信した。これは監督の自動操作による合成試験であり、物理的な本人確認ではない。
+- 終了後、同じ実rolloutを新CLIが自動探索した受付記録と照合。human 1件・添付1件を抽出し、残余のunknownに元本文の二重コピーなし。prepared画像は同一、原ログSHA-256不変、受付file 0600／directory 0700を実確認。
+- 応答`chatcmpl-1790084206042`はinput 7,135、output 19、total 7,154 tokens、turn 10.863秒、初tokenまで10.757秒。入力取得・照合自身のLLM呼出しは0。Compactionの節約率や生成速度比較の証拠にはしない。
+
+証跡はGit外の`target/fork-bootstrap/intake-{tests,retry-tests,private-ipc-tests,resume-tests,final-cli-tests,build,final-cli-build,clippy,complete-format}.log`と、
+`intake-trial/{acceptance,input,installation,usage}.json`、同directoryの独立homeに保存。fixture原文・添付・runtime log・binaryはcommitしない。
+独立`rencrow-compaction`を更新し旧binaryを同試験directoryへ退避した。稼働TUIは従来SHA-256 `04159684a80c3751fa0903b81a04fa3d9b4b20550a4b86e927bf73b5b0e53c1d`のまま。
+新TUI試験版のSHA-256は`18d2d5522c68e9a620613f725613de78e13d0287bf3c1019d33ac4a40b7abdaf`。
+今回の入力別記録の受入と、未完了の通常Compaction接続・checkpoint/resume・履歴復元・総費用比較を区別する。
