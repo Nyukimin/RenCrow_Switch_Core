@@ -6,9 +6,11 @@
 
 - Fork: `Nyukimin/RenCrow_Switch_Core`。上流: `openai/codex`。
 - 作成時の上流基点: `94174e44cbc54cece45f6052328ca0c2cd7a8a2a`（`main`）。これは開発基点であり、安定版・動作検証済み版の宣言ではない。
-- 現在の独自差分は本ルールとREADME／AGENTSの入口だけ。Compaction改修・製品build・配備は未実施。
+- 独自差分はFork運用文書と入口、および履歴ownerのCompaction整理案検証・選別処理。稼働Compactionへの接続は未実施。2026-09-22にLinuxの`dev-small` buildを`rencrow-switch-core`としてローカル配備し、Codex-switchから既存Qwen sessionをresumeした。公開release・三OS受入完了ではない。[build・切替手順](FORK_BUILD.md)を参照。
 - このrepositoryはCodexクライアント本体の派生実装を所有する。既存Codex-switchのlauncher、Gateway、Backend、RenCrowのIdentity移行とは所有範囲を分ける。
 - RenCrow共通作業ルールを受領している環境ではそれを継承し、本文・モデル役割を複製しない。上流由来の実装規約は[AGENTS.md](AGENTS.md)、build入口は[docs/install.md](docs/install.md)を参照する。
+
+RenCrowの標準実行基盤は本Forkとする。Compaction内部契約の正本は[COMPACTION_SPEC.md](COMPACTION_SPEC.md)。公式Codexは上流・比較・明示的復旧の対象として維持する。
 
 ## 改変原則
 

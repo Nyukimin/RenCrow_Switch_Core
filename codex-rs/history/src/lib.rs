@@ -1,5 +1,9 @@
 //! Model-history and persisted-rollout domain types.
 
+// RenCrow fork: derived-context validation, not rollout mutation.
+pub mod compaction_candidate;
+pub mod compaction_plan;
+
 mod compaction_checkpoint;
 pub use compaction_checkpoint::CompactionCheckpoint;
 

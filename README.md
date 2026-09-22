@@ -3,13 +3,16 @@
 
 Unofficial fork of [OpenAI Codex](https://github.com/openai/codex) maintained for RenCrow. Not affiliated with or endorsed by OpenAI.
 
-Purpose: improve compaction so obsolete instructions do not survive as active commands, while preserving current requirements and capabilities. **Compaction modifications are not implemented yet; this initial change establishes the fork and its maintenance rules.**
+Purpose: improve compaction so obsolete instructions do not survive as active commands, while preserving current requirements and capabilities. **Compaction work is in progress: a separate candidate CLI implements instruction selection, Qwen summarization and final data assembly; automatic human-input provenance and live runtime integration are pending.**
 
 - [Fork改変ルール・上流更新・検証・復旧](FORK_RULES.md)
+- [Compaction specification and implementation status](COMPACTION_SPEC.md)
+- [Separate compaction candidate CLI](COMPACTION_CLI.md)
+- [Local build and Codex-switch integration](FORK_BUILD.md)
 - [Contributor instructions](AGENTS.md)
 - [License](LICENSE) / [Attribution notices](NOTICE)
 
-No fork binary has been released or installed. The original README below describes **official OpenAI Codex**, including its installers, services and support links; those commands do not install this fork.
+A Linux `dev-small` build has been installed locally as `rencrow-switch-core` for a Codex-switch trial. No public fork binary release is available. The original README below describes **official OpenAI Codex**, including its installers, services and support links; those commands do not install this fork.
 
 ---
 

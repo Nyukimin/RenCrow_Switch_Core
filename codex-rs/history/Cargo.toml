@@ -17,6 +17,8 @@ codex-protocol = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+# RenCrow fork: bind derived compaction plans to immutable source snapshots.
+sha2 = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }

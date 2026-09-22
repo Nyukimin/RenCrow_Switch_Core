@@ -14,6 +14,10 @@ path = "src/main.rs"
 name = "logs_client"
 path = "src/bin/logs_client.rs"
 
+[[bin]]
+name = "rencrow-compaction"
+path = "src/bin/rencrow_compaction.rs"
+
 [lib]
 name = "codex_cli"
 path = "src/lib.rs"
