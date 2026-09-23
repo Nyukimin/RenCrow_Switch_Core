@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-09-22: expose owner checkpoint validation at the rollout boundary.
 //! Rollout persistence and discovery for Codex session files.
 
 use std::sync::LazyLock;
@@ -8,6 +9,7 @@ use serde_json::Value;
 
 pub(crate) mod compression;
 pub(crate) mod config;
+pub mod evidence;
 pub(crate) mod list;
 mod maintenance;
 pub(crate) mod metadata;
@@ -35,6 +37,7 @@ pub use codex_history::RetainedContextEvent;
 pub use codex_history::RetainedInputSource;
 pub use codex_history::RolloutItem;
 pub use codex_history::RolloutLine;
+pub use codex_history::compaction_transaction;
 pub(crate) use codex_protocol::protocol;
 
 /// Decodes a persisted rollout record without Serde's flattened-envelope buffering.
@@ -112,6 +115,22 @@ pub async fn materialize_rollout_for_reference(
 pub use config::Config;
 pub use config::RolloutConfig;
 pub use config::RolloutConfigView;
+pub use evidence::ArchiveEvidence;
+pub use evidence::IndexedObservationRef;
+pub use evidence::InventoryQuery;
+pub use evidence::MAX_ARCHIVE_EVIDENCE_BYTES;
+pub use evidence::ObservationIndex;
+pub use evidence::ObservationInventoryEntry;
+pub use evidence::ObservationInventoryPage;
+pub use evidence::ObservationPart;
+pub use evidence::ObservationRange;
+pub use evidence::PreparedCompactionReferenceKind;
+pub use evidence::PreparedCompactionSourcePair;
+pub use evidence::PreparedCompactionSources;
+pub use evidence::inventory_compaction_from_items;
+pub use evidence::prepare_compaction_sources;
+pub use evidence::resolve_archive_evidence;
+pub use evidence::resolve_archive_evidence_from_items;
 pub use list::Cursor;
 pub use list::SortDirection;
 pub use list::ThreadItem;

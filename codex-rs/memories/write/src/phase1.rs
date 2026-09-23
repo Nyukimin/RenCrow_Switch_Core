@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-09-22: keep transaction markers out of model input.
 use crate::build_stage_one_input_message;
 use crate::metrics::MEMORY_PHASE_ONE_E2E_MS;
 use crate::metrics::MEMORY_PHASE_ONE_JOBS;
@@ -412,6 +413,7 @@ mod job {
                 | RolloutItem::RealtimeItem(_)
                 | RolloutItem::WorldState(_)
                 | RolloutItem::RetainedContext(_)
+                | RolloutItem::RenCrowCompactionCommit { .. }
                 | RolloutItem::SecurityRiskScore(_)
                 | RolloutItem::EventMsg(_) => None,
             })

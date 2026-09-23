@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-09-22: retain the previous checkpoint until transaction validation.
 use crate::ResponseItemEnvelope;
 use crate::RolloutItem;
 use codex_protocol::items::TurnItem;
@@ -80,6 +81,11 @@ impl ModelContextScan {
     }
 
     fn observe(&mut self, item: &RolloutItem) -> ModelContextScanProgress {
+        if codex_history::compaction_transaction::is_prepared_checkpoint(item) {
+            // Validation needs the commit marker plus the previous valid history
+            // when a write was interrupted. Core filters before startup consumers.
+            self.must_scan_to_start = true;
+        }
         if self.must_scan_to_start {
             return ModelContextScanProgress::Continue;
         }
@@ -162,6 +168,7 @@ impl ModelContextScan {
             | RolloutItem::RealtimeItem(_)
             | RolloutItem::RetainedContext(_)
             | RolloutItem::SecurityRiskScore(_)
+            | RolloutItem::RenCrowCompactionCommit { .. }
             | RolloutItem::TokenUsageRecord(_) => {}
         }
 

@@ -61,3 +61,29 @@ CODEX_HOME=/private/isolated-home ./target/fork-build/dev-small/codex --no-daemo
 
 既存TUI回帰をこのホストで確認する際は、短い一時path、私有umask、通常の端末色設定を用いる。
 Git 2.34.1では上流worktreeの`list -z`に対応できず、関連検査は未受入。今回の機能のためにGitや製品の検査を弱めない。
+
+## 新方式の通常Compaction
+
+新方式対応binaryをbuild後、対象CODEX_HOMEの有効な設定に次を設定する。
+launcherによるprofile再生成後も維持する運用設定は`CODEX_HOME/config.toml`のtop levelに置く。
+独立試験ではprofile v2の`<profile>.config.toml`のtop levelにも設定できる。
+
+```toml
+rencrow_compaction = true
+```
+
+`/compact`とlocalの自動Compactionが同じ検証済みpipelineを利用する。
+要約生成は1要求で、モデルにWork ID全件の転記を求めない。host-bound `summary_hash`、coverage、invalidation検査と保存barrier成功後だけ通常履歴へ採用する。人間由来入力がある場合のplan提案・意味reviewは維持する。summary reviewは自動実行せず、bundleには`summary_review: null`を未実施receiptとして保存する。
+remote V2 / TokenBudgetとの併用は拒否し、旧方式へ暗黙fallbackしない。
+`--rencrow-input-author human`は利用者による直接投稿の受付を申告する設定。
+Astra等による代理操作は`automation`を指定する。未指定・旧記録・照合不一致を本人入力と推定しない。
+
+各段階の表示は出力token数 / request全体のwall秒（prefill・待ち時間込み）であり、
+Backendの純粋なdecode速度ではない。実行したplan提案・plan review・要約要求のusageはcheckpointに残り、summary reviewが通過したと偽装しない。
+
+保存結果が不確定になったruntimeは次の通常turnを拒否する。再起動時はownerのappend-only
+replayがhash一致の完了印まで確認できる最後のcheckpointを利用する。不完全な新checkpointは読み取りviewで除外する。電源断・書込み失敗時に複数JSON行が
+filesystem transactionになるとは主張しない。原ログやDBを手動で切り詰めない。
+
+配備前に隔離sessionで現在要求の維持、撤回部分の非復活、通常toolの利用、
+再起動と2回目のCompactionを確認する。共有sessionのwriterを二重に起動しない。

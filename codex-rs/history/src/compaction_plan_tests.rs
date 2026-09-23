@@ -104,6 +104,69 @@ fn unreviewed_deletion_keeps_original() {
 }
 
 #[test]
+fn unaccepted_legacy_operation_still_receives_structural_validation() {
+    let snapshot = snapshot();
+    let plan = plan(
+        &snapshot,
+        Operation::DropSuperseded {
+            source: source(&snapshot, "old"),
+            correction: source(&snapshot, "receipt"),
+        },
+    );
+    let review = SemanticReview {
+        plan_hash: plan.hash().unwrap(),
+        accepted_operations: vec![],
+    };
+
+    assert_eq!(
+        snapshot.apply(&plan, &review),
+        Err(PlanError::InvalidEvidence)
+    );
+}
+
+#[test]
+fn unaccepted_legacy_witness_is_not_checked_against_accepted_removals() {
+    let snapshot = CompactionSnapshot::capture(
+        "binding".into(),
+        vec![
+            fragment("old", SourceKind::UserInstruction, "Old instruction."),
+            fragment(
+                "current",
+                SourceKind::UserInstruction,
+                "Current instruction.",
+            ),
+            fragment("later", SourceKind::UserInstruction, "Later instruction."),
+        ],
+    )
+    .unwrap();
+    let proposal = CompactionPlan {
+        schema_version: 1,
+        snapshot_hash: snapshot.hash().into(),
+        operations: vec![
+            Operation::DropSuperseded {
+                source: source(&snapshot, "old"),
+                correction: source(&snapshot, "current"),
+            },
+            Operation::DropSuperseded {
+                source: source(&snapshot, "current"),
+                correction: source(&snapshot, "later"),
+            },
+        ],
+    };
+    let review = SemanticReview {
+        plan_hash: proposal.hash().unwrap(),
+        accepted_operations: vec![1],
+    };
+
+    let view = snapshot.apply(&proposal, &review).unwrap();
+
+    assert_eq!(view.retained[0].text, "Old instruction.");
+    assert_eq!(view.retained[1].text, "");
+    assert_eq!(view.applied_operations, vec![1]);
+    assert_eq!(view.unresolved_operations, vec![0]);
+}
+
+#[test]
 fn completed_result_is_not_rewritten_as_user_testimony() {
     let snapshot = snapshot();
     let original = source(&snapshot, "old");

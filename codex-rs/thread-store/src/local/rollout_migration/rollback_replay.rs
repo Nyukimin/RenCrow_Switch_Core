@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-09-22: handle durable compaction markers.
 //! Mirrors the part of legacy cold resume that chooses the model-history checkpoint.
 //!
 //! Legacy rollback has two jobs. The forward history reducer decides which turns remain visible,
@@ -78,6 +79,7 @@ impl ModelReplayPlanner {
             | RolloutItem::RealtimeItem(_)
             | RolloutItem::TokenUsageRecord(_)
             | RolloutItem::RetainedContext(_)
+            | RolloutItem::RenCrowCompactionCommit { .. }
             | RolloutItem::SecurityRiskScore(_)
             | RolloutItem::WorldState(_) => return,
         };

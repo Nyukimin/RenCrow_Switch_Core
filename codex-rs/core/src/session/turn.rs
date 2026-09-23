@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-09-22: validated compaction dispatch.
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::marker::PhantomData;
@@ -168,6 +169,7 @@ pub(crate) async fn run_turn(
     prewarmed_client_session: Option<ModelClientSession>,
     cancellation_token: CancellationToken,
 ) -> CodexResult<Option<String>> {
+    sess.check_rencrow_checkpoint().await?;
     if crate::guardian::is_basic_session_source(&turn_context.session_source) {
         crate::guardian::check_pending_guardian_input(&sess, &turn_context).await?;
     }
@@ -1451,6 +1453,15 @@ async fn run_auto_compact(
 ) -> CodexResult<()> {
     let turn_context = &step_context.turn;
     let _profile_guard = turn_context.turn_timing_state.begin_compaction();
+    if turn_context.config.rencrow_compaction
+        && (turn_context.config.features.enabled(Feature::TokenBudget)
+            || !matches!(
+                turn_context.provider.capabilities().remote_compaction,
+                RemoteCompactionSupport::Unsupported
+            ))
+    {
+        return Err(codex_protocol::error::CodexErr::Stream("RenCrow compaction requires local Responses without TokenBudget; no legacy fallback was applied".into()));
+    }
     if turn_context.config.features.enabled(Feature::TokenBudget) {
         // Compaction is the reset request, so force a new context window
         // instead of consuming a pending `new_context` tool request.

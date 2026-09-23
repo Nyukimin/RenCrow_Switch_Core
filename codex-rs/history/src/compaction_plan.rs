@@ -1,9 +1,9 @@
 // Modified by RenCrow Switch Core, 2026-09-22.
 //! Pure validation for derived compaction views. This module never edits a rollout.
 //!
-//! The host supplies provenance and protected ranges. Models propose operations;
-//! a separate semantic review must agree on the exact plan before application.
-//! Structural validation is not proof that a semantic judgment is correct.
+//! The host supplies provenance and protected ranges. Models propose operations. The legacy
+//! reviewed path requires separate semantic agreement before application; V2 reuses the same
+//! structural checks directly without a review receipt. Neither path proves semantic correctness.
 
 use serde::Deserialize;
 use serde::Serialize;
@@ -125,7 +125,8 @@ pub struct RetainedFragment {
     pub text: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DerivedResult {
     pub source: SourceRef,
     pub evidence: SourceRef,
@@ -138,6 +139,18 @@ pub struct CompactionView {
     pub snapshot_hash: String,
     pub plan_hash: String,
     pub retained: Vec<RetainedFragment>,
+    pub results: Vec<DerivedResult>,
+    pub applied_operations: Vec<usize>,
+    pub unresolved_operations: Vec<usize>,
+}
+
+/// Structurally validated operation effects shared by legacy review and V2 selection paths.
+/// The caller decides whether semantic review is required; this type records no review receipt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ValidatedPlanStructure {
+    pub plan_hash: String,
+    pub removed: Vec<SourceRef>,
+    pub witnesses: Vec<SourceRef>,
     pub results: Vec<DerivedResult>,
     pub applied_operations: Vec<usize>,
     pub unresolved_operations: Vec<usize>,
@@ -222,30 +235,28 @@ impl CompactionSnapshot {
         Ok((index, fragment))
     }
 
-    pub fn apply(
-        &self,
-        plan: &CompactionPlan,
-        review: &SemanticReview,
-    ) -> Result<CompactionView, PlanError> {
+    pub(crate) fn validate_plan_header(&self, plan: &CompactionPlan) -> Result<String, PlanError> {
         if plan.schema_version != 1 {
             return Err(PlanError::InvalidSchema);
         }
         if self.hash != plan.snapshot_hash {
             return Err(PlanError::StaleSnapshot);
         }
-        let plan_hash = plan.hash()?;
-        if review.plan_hash != plan_hash {
-            return Err(PlanError::StaleReview);
-        }
-        let accepted: BTreeSet<_> = review.accepted_operations.iter().copied().collect();
-        if accepted.len() != review.accepted_operations.len()
-            || accepted.iter().any(|i| *i >= plan.operations.len())
-        {
-            return Err(PlanError::InvalidReview);
-        }
-        let mut sources: Vec<&SourceRef> = Vec::new();
-        let mut removed: Vec<&SourceRef> = Vec::new();
-        let mut witnesses: Vec<&SourceRef> = Vec::new();
+        plan.hash()
+    }
+
+    /// Validate every proposed operation, including unaccepted legacy operations. Cross-check
+    /// witnesses against removals only for operations the caller will apply, matching legacy
+    /// review semantics while allowing V2 to apply all structurally valid proposals directly.
+    pub(crate) fn validate_plan_structure(
+        &self,
+        plan: &CompactionPlan,
+        accepted: &BTreeSet<usize>,
+        plan_hash: String,
+    ) -> Result<ValidatedPlanStructure, PlanError> {
+        let mut sources: Vec<SourceRef> = Vec::new();
+        let mut removed: Vec<SourceRef> = Vec::new();
+        let mut witnesses: Vec<SourceRef> = Vec::new();
         let mut results = Vec::new();
         let mut applied = Vec::new();
         let mut unresolved = Vec::new();
@@ -258,7 +269,7 @@ impl CompactionSnapshot {
             {
                 return Err(PlanError::OverlappingOperations);
             }
-            sources.push(source);
+            sources.push(source.clone());
             if matches!(operation, Operation::Keep { .. }) {
                 continue;
             }
@@ -303,8 +314,8 @@ impl CompactionSnapshot {
                 unresolved.push(i);
                 continue;
             }
-            removed.push(source);
-            witnesses.push(evidence);
+            removed.push(source.clone());
+            witnesses.push(evidence.clone());
             applied.push(i);
             if let Operation::ReplaceCompleted {
                 evidence, result, ..
@@ -324,12 +335,39 @@ impl CompactionSnapshot {
         }) {
             return Err(PlanError::RemovedEvidence);
         }
+        Ok(ValidatedPlanStructure {
+            plan_hash,
+            removed,
+            witnesses,
+            results,
+            applied_operations: applied,
+            unresolved_operations: unresolved,
+        })
+    }
+
+    pub fn apply(
+        &self,
+        plan: &CompactionPlan,
+        review: &SemanticReview,
+    ) -> Result<CompactionView, PlanError> {
+        let plan_hash = self.validate_plan_header(plan)?;
+        if review.plan_hash != plan_hash {
+            return Err(PlanError::StaleReview);
+        }
+        let accepted: BTreeSet<_> = review.accepted_operations.iter().copied().collect();
+        if accepted.len() != review.accepted_operations.len()
+            || accepted.iter().any(|i| *i >= plan.operations.len())
+        {
+            return Err(PlanError::InvalidReview);
+        }
+        let structure = self.validate_plan_structure(plan, &accepted, plan_hash)?;
         let retained = self
             .fragments
             .iter()
             .map(|fragment| {
                 let mut text = fragment.text.clone();
-                let mut ranges: Vec<_> = removed
+                let mut ranges: Vec<_> = structure
+                    .removed
                     .iter()
                     .filter(|r| r.id == fragment.id)
                     .map(|r| &r.range)
@@ -347,11 +385,11 @@ impl CompactionSnapshot {
             .collect();
         Ok(CompactionView {
             snapshot_hash: self.hash.clone(),
-            plan_hash,
+            plan_hash: structure.plan_hash,
             retained,
-            results,
-            applied_operations: applied,
-            unresolved_operations: unresolved,
+            results: structure.results,
+            applied_operations: structure.applied_operations,
+            unresolved_operations: structure.unresolved_operations,
         })
     }
 }

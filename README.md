@@ -3,7 +3,7 @@
 
 Unofficial fork of [OpenAI Codex](https://github.com/openai/codex) maintained for RenCrow. Not affiliated with or endorsed by OpenAI.
 
-Purpose: improve compaction so obsolete instructions do not survive as active commands, while preserving current requirements and capabilities. **Compaction work is in progress: a separate candidate CLI implements instruction selection, Qwen summarization and final data assembly; automatic human-input provenance and live runtime integration are pending.**
+Purpose: improve compaction so obsolete instructions do not survive as active commands, while preserving current requirements and capabilities. **Compaction work is in progress: accepted composer input has separate provenance, and `rencrow_compaction = true` connects the shared selection/review/summary pipeline to local Responses compaction. Runtime validation and deployment results are tracked in COMPACTION_SPEC.md; source availability alone is not a release acceptance.**
 
 - [Fork改変ルール・上流更新・検証・復旧](FORK_RULES.md)
 - [Compaction specification and implementation status](COMPACTION_SPEC.md)

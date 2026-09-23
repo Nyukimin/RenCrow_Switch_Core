@@ -2,9 +2,35 @@
 //! Model-history and persisted-rollout domain types.
 
 // RenCrow fork: derived-context validation, not rollout mutation.
+pub mod archive_reference;
 pub mod compaction_candidate;
+pub mod compaction_checkpoint_metadata;
+pub mod compaction_pipeline;
+pub mod compaction_preprocess;
+pub mod compaction_selection;
+pub use archive_reference::ArchiveReference;
+pub use archive_reference::ArchiveTerminalStatus;
+pub use archive_reference::ObservationReference;
+pub use compaction_checkpoint_metadata::CheckpointResponseStage;
+pub use compaction_checkpoint_metadata::CompactionModelResponseReceipt;
+pub use compaction_checkpoint_metadata::CompactionSelectionMode;
+pub use compaction_checkpoint_metadata::RenCrowCompactionMetadataV2;
+pub use compaction_preprocess::InstructionObservationLink;
+pub use compaction_preprocess::InstructionPruning;
+pub use compaction_preprocess::collect_instruction_candidates;
+pub use compaction_preprocess::instruction_presentation_hash;
+pub use compaction_preprocess::prune_known_obsolete;
 pub mod compaction_plan;
+pub mod compaction_transaction;
 pub mod input_intake;
+pub mod observation_projection;
+pub use observation_projection::ObservationCoverage;
+pub use observation_projection::ObservationPartCoverage;
+pub use observation_projection::ObservationPartExcerpt;
+pub use observation_projection::ObservationProjection;
+pub use observation_projection::ObservationSummaryExcerpt;
+pub use observation_projection::project_existing_observation;
+pub use observation_projection::project_observation;
 
 mod compaction_checkpoint;
 pub use compaction_checkpoint::CompactionCheckpoint;
@@ -57,6 +83,18 @@ pub struct ResponseItemEnvelope {
 ///
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
 pub struct CodexHarnessMetadata {
+    /// Host proof that a text-only terminal output was replaced by a rollout reference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rencrow_archive_reference: Option<archive_reference::ArchiveReference>,
+
+    /// RenCrow accepted original-input reference; never sent as model instructions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rencrow_input: Option<serde_json::Value>,
+
+    /// Validated compaction provenance persisted with its summary checkpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rencrow_compaction: Option<serde_json::Value>,
+
     /// Whether a developer message was supplied by an app-server client.
     #[serde(default)]
     pub client_authored: bool,
@@ -170,6 +208,10 @@ pub enum RolloutItem {
         trigger_turn: bool,
     },
     Compacted(CompactedItem),
+    /// Durable marker following a prepared RenCrow compaction checkpoint.
+    RenCrowCompactionCommit {
+        checkpoint_hash: String,
+    },
     TurnContext(TurnContextItem),
     TokenUsageRecord(TokenUsageRecord),
     WorldState(WorldStateItem),
@@ -548,6 +590,7 @@ fn multi_agent_version_from_items(
             | RolloutItem::InterAgentCommunication(_)
             | RolloutItem::InterAgentCommunicationMetadata { .. }
             | RolloutItem::Compacted(_)
+            | RolloutItem::RenCrowCompactionCommit { .. }
             | RolloutItem::TokenUsageRecord(_)
             | RolloutItem::WorldState(_)
             | RolloutItem::RetainedContext(_)

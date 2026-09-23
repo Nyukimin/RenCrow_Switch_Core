@@ -101,6 +101,7 @@ pub(super) fn capture(data: &[u8]) -> Result<CandidateInput> {
         binding: digest(&data).map_err(anyhow::Error::msg)?,
         records,
         current_context: vec![],
+        prior_invalidations: vec![],
     })
 }
 

@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-09-22: validated compaction dispatch.
 use std::sync::Arc;
 
 use super::SessionTask;
@@ -33,6 +34,15 @@ impl SessionTask for CompactTask {
         _cancellation_token: CancellationToken,
     ) -> SessionTaskResult {
         let _profile_guard = ctx.turn_timing_state.begin_compaction();
+        if ctx.config.rencrow_compaction
+            && (ctx.config.features.enabled(Feature::TokenBudget)
+                || !matches!(
+                    ctx.provider.capabilities().remote_compaction,
+                    RemoteCompactionSupport::Unsupported
+                ))
+        {
+            return Err(codex_protocol::error::CodexErr::Stream("RenCrow compaction requires local Responses without TokenBudget; no legacy fallback was applied".into()));
+        }
         if ctx.config.features.enabled(Feature::TokenBudget) {
             crate::compact_token_budget::run_manual_compact_task(session, ctx).await?;
             return Ok(None);

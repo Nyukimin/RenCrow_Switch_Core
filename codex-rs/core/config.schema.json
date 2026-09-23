@@ -7399,6 +7399,10 @@
       "default": null,
       "description": "Experimental / do not use. Realtime websocket session selection. `version` controls v1/v2 and `type` controls conversational/transcription."
     },
+    "rencrow_compaction": {
+      "description": "Use the RenCrow validated local compaction pipeline.",
+      "type": "boolean"
+    },
     "responses_api_metadata": {
       "additionalProperties": {
         "type": "string"

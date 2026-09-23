@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-09-22: opt-in validated compaction.
 //! Schema-heavy configuration TOML types used by Codex.
 
 use std::collections::BTreeMap;
@@ -271,6 +272,9 @@ pub struct ConfigToml {
 
     /// Compact prompt used for history compaction.
     pub compact_prompt: Option<String>,
+
+    /// Use the RenCrow validated local compaction pipeline.
+    pub rencrow_compaction: Option<bool>,
 
     /// When set, restricts ChatGPT login to one or more workspace identifiers.
     #[serde(default)]

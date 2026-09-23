@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-09-22: handle durable compaction markers.
 #[path = "notification_tests.rs"]
 mod notification_tests;
 
@@ -310,6 +311,12 @@ impl StepContext {
 }
 
 mod guardian_tests;
+
+#[path = "compaction_usage_tests.rs"]
+mod compaction_usage_tests;
+
+#[path = "v2_f07d_tests.rs"]
+mod v2_f07d_tests;
 
 fn user_message(text: &str) -> ResponseItem {
     ResponseItem::Message {
@@ -3714,6 +3721,7 @@ async fn start_new_context_window_persists_checkpoint_state() {
         | RolloutItem::TurnContext(_)
         | RolloutItem::WorldState(_)
         | RolloutItem::RetainedContext(_)
+        | RolloutItem::RenCrowCompactionCommit { .. }
         | RolloutItem::SecurityRiskScore(_)
         | RolloutItem::TokenUsageRecord(_)
         | RolloutItem::RealtimeItem(_)
@@ -3809,6 +3817,7 @@ async fn record_initial_history_assigns_and_persists_id_for_forked_response_item
         | RolloutItem::TurnContext(_)
         | RolloutItem::WorldState(_)
         | RolloutItem::RetainedContext(_)
+        | RolloutItem::RenCrowCompactionCommit { .. }
         | RolloutItem::SecurityRiskScore(_)
         | RolloutItem::TokenUsageRecord(_)
         | RolloutItem::RealtimeItem(_)

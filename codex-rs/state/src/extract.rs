@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-09-22: model-invisible compaction commit marker.
 use crate::model::ThreadMetadata;
 use codex_history::RolloutItem;
 use codex_protocol::items::TurnItem;
@@ -24,7 +25,7 @@ pub fn apply_rollout_item(
         RolloutItem::ResponseItem(item) => apply_response_item(metadata, &item.item),
         RolloutItem::InterAgentCommunication(_)
         | RolloutItem::InterAgentCommunicationMetadata { .. } => {}
-        RolloutItem::Compacted(_) => {}
+        RolloutItem::Compacted(_) | RolloutItem::RenCrowCompactionCommit { .. } => {}
         RolloutItem::WorldState(_) => {}
         RolloutItem::RetainedContext(_) | RolloutItem::SecurityRiskScore(_) => {}
         RolloutItem::RealtimeItem(_) => {}
@@ -54,6 +55,7 @@ pub fn rollout_item_affects_thread_metadata(item: &RolloutItem) -> bool {
         | RolloutItem::ResponseItem(_)
         | RolloutItem::InterAgentCommunication(_)
         | RolloutItem::InterAgentCommunicationMetadata { .. }
+        | RolloutItem::RenCrowCompactionCommit { .. }
         | RolloutItem::Compacted(_)
         | RolloutItem::RealtimeItem(_)
         | RolloutItem::RetainedContext(_)

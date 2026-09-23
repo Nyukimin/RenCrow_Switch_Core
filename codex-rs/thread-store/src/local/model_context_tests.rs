@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-09-22: validate checkpoints before startup metadata consumers.
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
@@ -26,6 +27,7 @@ use codex_rollout::CompactedItem;
 use codex_rollout::RolloutItem;
 use codex_rollout::RolloutLine;
 use pretty_assertions::assert_eq;
+use serde_json::json;
 use tempfile::TempDir;
 use uuid::Uuid;
 
@@ -81,6 +83,162 @@ async fn loads_latest_checkpoint_with_required_turn_metadata() {
     assert!(context.items.iter().any(|item| {
         matches!(item, RolloutItem::TurnContext(context) if context.turn_id.as_deref() == Some("turn-2"))
     }));
+}
+
+#[tokio::test]
+async fn model_context_normalizes_complete_and_truncated_transactions() {
+    let transaction_hash =
+        codex_rollout::compaction_transaction::transaction_hash(&[prepared_compacted(0)])
+            .expect("hash prepared checkpoint");
+
+    for (history_mode, committed) in [
+        (ThreadHistoryMode::Paginated, true),
+        (ThreadHistoryMode::Legacy, true),
+        (ThreadHistoryMode::Paginated, false),
+    ] {
+        let home = TempDir::new().expect("temp dir");
+        let uuid = Uuid::from_u128(if committed { 1010 } else { 1011 });
+        let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
+        let path = write_session_file_with_history_mode(
+            home.path(),
+            if committed {
+                "2025-01-03T13-00-09"
+            } else {
+                "2025-01-03T13-00-10"
+            },
+            uuid,
+            history_mode,
+        )
+        .expect("write session file");
+        append_items(
+            &path,
+            [
+                user_message("before transaction"),
+                prepared_compacted(0),
+                if committed {
+                    RolloutItem::RenCrowCompactionCommit {
+                        checkpoint_hash: transaction_hash.clone(),
+                    }
+                } else {
+                    user_message("unrelated tail")
+                },
+                user_message("after transaction"),
+            ],
+        );
+        let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+        let context = store
+            .load_latest_model_context(LoadThreadHistoryParams {
+                thread_id,
+                include_archived: false,
+            })
+            .await
+            .expect("load model context");
+
+        assert!(
+            !context
+                .items
+                .iter()
+                .any(|item| { matches!(item, RolloutItem::RenCrowCompactionCommit { .. }) })
+        );
+        if committed {
+            let checkpoint = context
+                .items
+                .iter()
+                .find(|item| {
+                    matches!(item, RolloutItem::Compacted(compacted) if compacted.message == "prepared")
+                })
+                .expect("committed checkpoint");
+            let value = serde_json::to_value(checkpoint).expect("serialize checkpoint");
+            let metadata =
+                &value["payload"]["replacement_history_metadata"][0]["rencrow_compaction"];
+            assert_eq!(
+                metadata["committed_transaction_hash"],
+                json!(transaction_hash)
+            );
+            assert!(metadata.get("transaction_following_items").is_none());
+        } else {
+            assert!(!context.items.iter().any(|item| {
+                matches!(item, RolloutItem::Compacted(compacted) if compacted.message == "prepared")
+            }));
+            assert!(context.items.iter().any(|item| {
+                matches!(item, RolloutItem::ResponseItem(envelope) if matches!(&envelope.item, ResponseItem::Message { content, .. } if content.iter().any(|content| matches!(content, ContentItem::InputText { text } if text == "unrelated tail"))))
+            }));
+        }
+    }
+}
+
+#[tokio::test]
+async fn fork_version_ignores_uncommitted_transaction_companion() {
+    let home = TempDir::new().expect("temp dir");
+    let uuid = Uuid::from_u128(/*v*/ 3010);
+    let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
+    let RolloutItem::TurnContext(mut committed_context) = turn_context(home.path(), "committed")
+    else {
+        unreachable!();
+    };
+    committed_context.multi_agent_version = Some(MultiAgentVersion::V2);
+    let RolloutItem::TurnContext(mut uncommitted_context) =
+        turn_context(home.path(), "uncommitted")
+    else {
+        unreachable!();
+    };
+    uncommitted_context.multi_agent_version = Some(MultiAgentVersion::V1);
+    let _path = write_paginated_rollout(
+        home.path(),
+        "2025-01-03T13-02-10",
+        uuid,
+        [
+            RolloutItem::TurnContext(committed_context),
+            prepared_compacted(1),
+            RolloutItem::TurnContext(uncommitted_context),
+        ],
+    );
+    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+    let lineage = store
+        .resolve_rollout_lineage(thread_id)
+        .await
+        .expect("resolve source lineage");
+
+    let context = load_for_fork(lineage, /*history_base*/ None)
+        .await
+        .expect("recover committed runtime version");
+    let RolloutItem::SessionMeta(session_meta) = &context[0] else {
+        panic!("expected session metadata");
+    };
+    assert_eq!(
+        session_meta.meta.multi_agent_version,
+        Some(MultiAgentVersion::V2)
+    );
+}
+
+#[tokio::test]
+async fn fork_version_keeps_commit_marker_with_long_newer_suffix() {
+    let home = TempDir::new().expect("temp dir");
+    let uuid = Uuid::from_u128(3011);
+    let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
+    let RolloutItem::TurnContext(mut context) = turn_context(home.path(), "committed") else {
+        unreachable!();
+    };
+    context.multi_agent_version = Some(MultiAgentVersion::V2);
+    let mut rows = vec![prepared_compacted(1), RolloutItem::TurnContext(context)];
+    let checkpoint_hash =
+        codex_rollout::compaction_transaction::transaction_hash(&rows).expect("checkpoint hash");
+    rows.push(RolloutItem::RenCrowCompactionCommit { checkpoint_hash });
+    for _ in 0..12 {
+        rows.push(user_message("newer suffix"));
+    }
+    let rows: [RolloutItem; 15] = rows.try_into().expect("fixed fixture size");
+    write_paginated_rollout(home.path(), "2025-01-03T13-02-11", uuid, rows);
+    let store = LocalThreadStore::new(test_config(home.path()), None);
+    let lineage = store
+        .resolve_rollout_lineage(thread_id)
+        .await
+        .expect("lineage");
+    let context = load_for_fork(lineage, None).await.expect("fork context");
+    let RolloutItem::SessionMeta(meta) = &context[0] else {
+        panic!("expected session metadata");
+    };
+    assert_eq!(meta.meta.multi_agent_version, Some(MultiAgentVersion::V2));
 }
 
 #[tokio::test]
@@ -892,4 +1050,24 @@ fn compacted(message: &str, replacement_history: Option<Vec<ResponseItem>>) -> R
         compaction_response_id: None,
         latest_token_usage_record: None,
     })
+}
+
+fn prepared_compacted(transaction_following_items: u64) -> RolloutItem {
+    let replacement = ResponseItem::Message {
+        id: None,
+        role: "assistant".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "replacement".to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let mut value = serde_json::to_value(compacted("prepared", Some(vec![replacement])))
+        .expect("serialize prepared checkpoint");
+    value["payload"]["replacement_history_metadata"] = json!([{
+        "rencrow_compaction": {
+            "transaction_following_items": transaction_following_items,
+        }
+    }]);
+    serde_json::from_value(value).expect("deserialize prepared checkpoint")
 }

@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-09-22: keep transaction markers presentation-invisible.
 //! Stateless projection from canonical paginated rollout records to thread-history changes.
 //!
 //! This module is only for the new paginated rollout format that persists canonical
@@ -89,6 +90,7 @@ pub fn project_rollout_line(line: &RolloutLine) -> ThreadHistoryChangeSet {
         | RolloutItem::WorldState(_)
         | RolloutItem::RealtimeItem(_)
         | RolloutItem::RetainedContext(_)
+        | RolloutItem::RenCrowCompactionCommit { .. }
         | RolloutItem::SecurityRiskScore(_)
         | RolloutItem::EventMsg(_) => ThreadHistoryChangeSet::default(),
     }

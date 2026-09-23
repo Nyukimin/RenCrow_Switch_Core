@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-09-22: share provider fixture with fork tests.
 use anyhow::Result;
 use anyhow::anyhow;
 use codex_core::TurnInputRequest;
@@ -281,7 +282,7 @@ with Path(r"{manual_post_log_path}").open("a", encoding="utf-8") as handle:
     fs::write(home.join("hooks.json"), hooks.to_string()).expect("write hooks.json");
 }
 
-fn non_openai_model_provider(server: &MockServer) -> ModelProviderInfo {
+pub(super) fn non_openai_model_provider(server: &MockServer) -> ModelProviderInfo {
     let mut provider =
         built_in_model_providers(/* openai_base_url */ /*openai_base_url*/ None)["openai"].clone();
     provider.name = "OpenAI (test)".into();

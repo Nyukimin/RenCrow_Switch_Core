@@ -1,6 +1,146 @@
-# RenCrow Switch Core Compaction仕様 v0.2
+# RenCrow Fork Compaction 新仕様案 第2版
 
-2026-09-22。状態: **実装中。別ラインCLIで部分選別・Qwen要約・最終候補を検証済み。稼働Compactionへの接続・配備は未完了**。
+## 第2版の実装契約（2026-09-23、利用者承認済み）
+
+利用者が関数順のTDD、可能な箇所のE2E、全関数の結合試験、実Qwen試験、修正後の共有配備とStep20監督を指示した。本節が現行の実装契約であり、以下の旧仕様・配備記録は既存証拠として保持する。未実装を配備済みと扱わない。
+
+上流基点94174e44cのlocal Compactionを利用し、個別関数本体を原則維持する。取りまとめ関数への呼出し・データ受渡しと要約入力契約の補足だけを基本とし、独立したruntime圧縮経路を増設しない。旧Fork経路は接続時に置換する。新DB・新ID体系・別の継続loopは作らない。通常応答取込みは変更せず、原本を保持してCompaction境界で派生Contextだけを整理する。
+
+|順序|追加関数|分類・契約|差込位置|
+|---|---|---|---|
+|1|prepare_compaction_sources|CLI。既存IDと保存原文の対応、完了/実行中/保護対象/要約済みを確認。曖昧なら保護|clone_history後|
+|2|prune_known_obsolete|CLI。対象ID・内容・範囲が一致する確定済み失効だけを整理。保存済み巨大応答は下記の抜粋投影契約に従う。原本と未提示状態を保持|要約入力構築前|
+|3|collect_instruction_candidates|CLI。意味判断が必要な指示と関連根拠を抽出。候補なしはLLM省略|機械整理後|
+|4|select_obsolete_instructions|LLM。撤回/訂正/完了の意味判断だけを行い、曖昧な指示や継続制約を残す|候補がある時のみ|
+|5|validate_and_apply_selection|Boundary/CLI。対象/根拠/範囲/保護対象を検証し作業コピーへ反映。意味の正しさの証明とはしない|for_prompt前|
+|6|filter_retained_instructions|CLI。同じ除外一覧をnative履歴へ一度適用し、要約入力と再投入userで共有する。再意味判断なし|⑤後・要約要求前に投影し、collect_annotated_user_messages / build_compacted_historyの前後で保持構造を照合・復元|
+|7|validate_compaction_candidate|Boundary/CLI。有効指示、保護構造、原文参照、owner推定Context量、新入力/取消しとの競合を検証。不正なら保存しない。実Qwen Token量は受入試験で別測定|初期Context再配置後、既存session-owned commit前|
+|8|read_observation(reference, range)|CLI。既存保存/取得を再利用して指定範囲だけ取得。取得不能は明示失敗、元tool再実行禁止|通常作業で必要時のみ|
+
+既存drain_to_completedによる要約、build_compacted_historyによる再構成、保存、再開、自動継続を利用する。要約には結果・判断・未解決事項・検証状態・根拠IDを残す。要約済み原文は通常の次回圧縮で展開しない。巨大な未要約原文も、以下の抜粋・未読範囲契約に従い全文の自動投入を避ける。原文の保存・索引化と、必要範囲を初めて読む費用は残る。通常の要約レビューLLMは追加しない。Cancel/Abort/Exit後に自動継続しない。
+
+元のuser保持Token予算によって有効指示が切断された場合も不合格とする。原文保存やIDの存在だけを意味保持の保証と扱わない。保存前の失敗で元Contextを破壊せず、同じ条件の無限再圧縮を防ぐ。未知由来を本人入力へ昇格せず、添付と実行中toolを保護する。
+
+工程完了トリガー、損益判定、独立Task State保存は本版の完了条件から分離する。全8責務についてRED→GREENを順番に確認し、親レビュー・独立検証後に結合、隔離実Qwen、共有配備、cold resumeを検証する。意味品質はCodex側で原文と照合する。性能は入力/出力Token、時間、圧縮後量、再取得回数で比較し、異なる要求の差を厳密な削減率としない。
+
+### 全工程再設計の受入条件（2026-09-24）
+
+利用者の「全てのステップを見直して、組み直して、不具合時は再度全工程を見直し、全部の実装を終わらせる」に基づく。①〜③の既存単体試験は局所的証拠であり、下記の全経路受入へ置き換えない。これまでの実装を無条件に継承しない。
+
+- ①【CLI / rollout owner】保存履歴を一度索引化し、既存call IDからcall・output・必要なterminal証拠へ対応させる。応答ごとの全履歴再走査、参照確認だけの本文コピー、同じ原文の重複検証を避ける。終了済みの通常テキストtool結果とカスタムtool結果を扱い、未完了process・添付・曖昧なIDは保護する。既存v1参照は互換読取し、新しいDB・ID体系を作らない。
+- ②【CLI / history owner】機械的に確定できる整理だけを派生履歴へ適用する。失効文字列を全Work本文から一括置換しない。過去の結果・引用・再指示を巻き込まない。要約済み参照から原文を再展開しない。未要約本文は今回の要約が成功するまで失わない。
+- ③【CLI / history owner】本人指示と由来・保護範囲を候補化する。同thread・後続順だけでtool本文を関連根拠へ追加せず、Human×toolのID組合せを生成しない。無関係な巨大tool結果の追加によって指示選別入力が増えないことを回帰条件とする。
+- ④【LLM / coreの既存model request】撤回・訂正は指示同士で判断する。完了判定は対応する実根拠がある場合だけ扱い、根拠不足・曖昧は保持する。候補なしは選別要求なし。選別のために作業履歴全文を再送しない。意味選別と要約以外の常設review LLMを増設しない。出力は一時保持し、モデル・effort・実phaseを維持する。
+- ⑤【Boundary / history owner】source・範囲・根拠・由来・保護・snapshotを検証し、単一の除外mapを作る。構造検証を意味保証・独立モデルreviewと偽らない。既存の意味review契約を利用する場合も、未実施reviewの証跡を捏造しない。
+- ⑥【CLI / coreの履歴構築境界】同じmapで要約入力と保持userを構築する。元のCodex関数を呼び出しつつ、有効指示の予算切断、添付脱落、summary prefixによる本人入力の誤除外を検出・防止する。要約済みtool本文は最終履歴へ再追加しない。
+- ⑦【Boundary / session owner】候補の構造・参照・有効指示・保護項目・Context量を検証し、既存の入力競合/取消し/永続化境界を通して保存する。原本は変更しない。失敗候補をlive会話へ書かず、同一条件の無限再圧縮をしない。通常要約は元のCodex経路へ接続し、旧Forkの別runtime経路を置換する。
+- ⑧【CLI / rollout owner】既存thread/call IDから原文の指定範囲を読み出す。範囲外・UTF-8境界・欠損・曖昧なIDを明示失敗にし、元toolを再実行しない。参照一覧の完全性はhostが持ち、全IDの転記をLLMへ要求しない。次回LLM入力には重要参照だけを残し、全inventoryを再投入しない。
+
+全工程の検査は、正常系、巨大な無関係tool出力、複数回圧縮、再指示、部分失敗、取消し、新入力競合、保存/再開、設定無効時の上流互換を含む。入力削減と出力保持と次回再投入を別々に測る。不具合発見時は①〜⑧と接続への影響を再点検し、必要な契約・実装・回帰を同じ修正単位で更新する。修正していない有効な試験は再利用し、全工程再点検を無条件の全試験反復とは扱わない。
+
+接続時の具体的な境界:
+
+- 参照の存在は意味要約済みの証明ではない。①は原文対応とI/Oの完了状態を確認し、意味要約済みかどうかは実際に採用したcheckpointが所有する。tool応答の返却は外部jobの成功・完了を意味しない。
+- 一般tool原文のpointerは既存thread ID・call ID・原文digestを使う。exec固有の旧v1参照は読取互換を維持し、一般toolへ架空のexit codeを付けない。新規採用は共通の索引・照合ownerへ集約する。
+- 保存前の鮮度確認だけでは、確認直後の新入力を防げない。Fork有効時は既存session ownerの入力gate・設定gate・durable checkpointを一度だけ通す。元の取りまとめ関数から呼び分け、独立したFork runtime loopや二重commitは残さない。無効時は上流の保存動作を維持する。
+- 元の履歴builderは個別関数本体を維持し、既存の可変Token予算引数を利用して保持対象を途中切断しない。完成候補全体が収まるかは別に検証し、保護情報を切断して成功にしない。
+
+巨大Observationの投影契約:
+
+- ②の作業コピーでは、保存原本との対応が確認できた巨大call/outputを、既存ID・tool名・原文長・CLIで生成した先頭/末尾・取得方法へ投影する。native call/outputの片側だけを壊さず、要約入力ではhost生成のObservation断片として渡す。通常turnのtool応答取込みは変更しない。
+- 抜粋は各part最大2,048 bytesとし、その範囲内なら全文、それ以上ならUTF-8境界へ内側に寄せた先頭・末尾を提示する。callのdigestは取得対象であるarguments/input原文テキスト、outputのdigestはoutput原文テキストをそれぞれ対象とする。native構造とmetadataの適格性は①の索引ownerが別に確認する。
+- 範囲は対象part（call/output）ごとのUTF-8境界上の半開byte rangeとする。checkpoint metadataには参照と提示範囲・未提示範囲・partial状態を結び付ける。output digestだけでcall引数の同一性まで保証したと扱わない。
+- 抜粋だけを提示したObservationは全文読取済み・意味要約済みではない。summaryにもpartial/未読を明示し、未読部分を含む根拠で本人指示を完了扱いしない。次回はこの状態を引き継ぎ、原文を自動展開しない。
+- hostの全参照inventoryをLLM入力へ再投入しない。重要な参照と保存先の取得方法を残す。必要な原文・参照一覧は同じrollout ownerから範囲を限定して取得し、新しい正本DB・ID体系を作らない。 重要参照の選択は同じ要約要求内で行う。要約本文では既存call IDを`observation:"call_id"`（値はJSON string）として記載でき、CLIがその表記をdecodeして今回の検証済みinventoryへ完全一致で解決する。新しいIDの発行ではない。重複表記は一つにし、不正な表記・未知/曖昧なIDは採用を拒否する。`important_refs`はこの明示表記で選ばれた参照だけとし、入力に出た全参照や過去の全important一覧を自動昇格しない。旧要約は一度だけ文脈に含めるが、保存metadataの全inventoryは提示しない。
+- 原文の本文・参照・partial状態は、候補の保存成功まで元履歴と保存原本で保全する。抜粋投影の採用だけで、その裏にある検証や外部処理の成功を宣言しない。
+
+旧`evidence`の全文返却にある1 MiB上限を、V2の原文参照作成へ流用しない。V2のexec参照は同じterminal検証を共有しつつ、本文全体のサイズでは除外せず、②で各part最大2,048 bytesへ投影する。旧全文取得の上限は維持し、V2参照を旧v1全文markerとして保存しない。
+
+### ①〜②の既存参照移行
+
+旧v1参照のselected outputは参照markerであり、参照digestが示す原文outputとは別である。markerを原文として新規投影へ渡さない。①は既存indexが検証済みのcanonical outputからbyte長だけを渡し、②は現在Contextに残るcall本文だけを最大2,048 bytesへ投影する。output本文は再取得・再提示せず、元digest・byte長と全未提示のcoverage（非空ならpresentedなし、unpresentedが全体、partial=true、excerptなし）で移行する。空本文は空の範囲集合とpartial=falseとする。過去の全文読取・意味要約を推定しない。
+
+既存V2 coverageは原文を展開せず、そのまま引き継ぐ。非提示outputを完了判定のlinkへ使わない。原文長のために履歴を再索引化したり、全本文をコピーしたりしない。新規観測の通常投影と、既存参照の移行を同じ参照・coverage owner内で明示的に区別する。
+
+### ③〜⑤の完了根拠候補
+
+撤回・訂正はHuman同士から選別する。tool出力の後続順や同thread、`execution_evidence`だけを関連付けの根拠にしない。coreは既存turn IDが明確で、当該turnのHumanがちょうど1件、①で検証したordinary terminal exec pairもちょうど1組の場合に限り、その組を完了判断の候補linkとして渡せる。call/outputとも各2,048 bytes以内の全文を提示でき、partial・保護対象・実行中ではないことを要する。複数組から任意に一つを選ばない。
+
+このlinkは成功や依頼完了の証明ではない。④が指示本文・call・output・terminal status/exit codeから意味を判断する。⑤は③に実際に提示したlinkと指示のID・fragment hashが一致し、削除範囲がそのlinkの指示範囲に完全に含まれ、evidence参照がlinkのoutput参照と完全一致する場合だけReplaceCompletedを構造的に許可する。混合指示の一部分だけを削除する場合も、提示した指示範囲を越えてはならない。候補linkがない場合は完了による削除を提案せず保持する。複数toolを要する依頼の完了を網羅的に自動判定する保証ではない。複数Human、turn不明、長文、曖昧な根拠で無理に削除しない。
+
+### ④〜⑤の提案束縛と提示範囲
+
+③は元snapshot hashに加え、適用済み除外refsと提示するhost linksを既存digestで束縛したpresentation hashを作る。同じ本文に見える別byte範囲も区別する。④は両hashをhostだけで保持し、LLMにはsourcesとcompletion linksを提示して意味選別のProposedPlanだけを生成させる。⑤は元snapshotと同じpruning/linksから再計算し、両方のhost束縛を照合する。LLMにhashの計算・転記を要求しない。候補なしは推論を呼ばず、未実施のSemanticReviewを作らない。既存review付き適用とV2の構造検証は共通の検証を使い、意味reviewの実施状態を混同しない。
+
+⑤はsourceとcorrectionの両方が、③で提示した元本文の範囲内にあることを確認する。提示範囲は元本文から②の適用済み除外範囲を引いた補集合として導出し、別の更新可能な正本を作らない。非提示範囲を跨ぐ参照、既知削除または今回削除と重なるwitnessは拒否する。V2の撤回・訂正提案はexactな`correction_text`を必須とし、元snapshotの一意な範囲へ束縛する。legacy経路の未指定時のwhole-record互換は維持する。`source_text`未指定によるwhole-record削除は、その全体が提示済みかつ未保護の場合だけ許可する。
+
+### ⑧の範囲取得と参照一覧
+
+既存`rencrow-compaction evidence --thread --call-id --sha256`の互換を保ち、範囲取得用に`--part call|output --start --end --part-sha256`を一組として追加する。既存sha256は常にoutput参照のdigestを意味する。指定partのdigestも独立して照合し、返却は指定範囲のみ（最大2,048 bytes）とする。空範囲、逆転、範囲外、UTF-8境界違反、欠損・曖昧なID・不一致は明示失敗し、全文返却やtool再実行へfallbackしない。
+
+重要参照以外を発見するため、同じownerの`inventory`で最新の永続commit済みV2 archive inventoryの参照metadataだけを最大32件ずつ取得できるようにする。既存transaction ownerで未commit候補を除外し、legacyの任意metadataをV2 inventoryへ昇格させない。これは保存済み原文を発見する履歴一覧であり、rollback後を含む現在の会話Context・有効指示・作業完了を表さない。現在Contextの再構築は既存Core replayが所有し、一覧用の別replayを増設しない。ページはcheckpointの内容digestに束縛し、途中で対象checkpointが変われば明示失敗する。原文は別途evidenceの範囲取得を使う。通常LLM入力へ全一覧を常設しない。
+
+既知call IDの参照metadataは同じ`inventory --call-id`で直接取得できるようにし、全ページ走査やLLMによるdigestの推測・再計算を必要にしない。0件・重複・不正coverageは明示失敗する。返すのはcheckpoint束縛とcall/outputのdigest・範囲等のmetadataだけで、本文は後続の範囲取得で読む。
+
+### ②〜⑥の共通除外map
+
+②は元snapshotを変更せず、hostが採用済みcheckpointから得た`SourceRef`（ID・fragment hash・byte range）を照合する。出力は適用できる除外範囲と、変更対象Humanの残存本文mapだけとし、全Work本文のコピーを作らない。同じ文字列でも別ID・変更済みfragment・再指示には適用しない。旧`prior_invalidations`文字列は互換読取用で、V2の削除や要約拒否の根拠にしない。
+
+③はこのmapを参照して候補を作り、⑤は新しい選別範囲を同じ元snapshotへ束縛して統合する。⑥は統合mapを元のnative itemへ適用する。先に書き換えたCandidateInputとの比較によって既適用削除が失われる構造にはしない。旧`CandidateInput.summary_input`の全Work文字列置換経路はV2から呼ばない。
+
+checkpoint越しの参照には既存ResponseItem IDを使う。位置由来の`item-{index}`を永続的な削除対象IDと扱わない。安定した既存IDがない項目は過去の除外を適用しない。巨大Observationの抜粋投影は同じ②の別の決定的処理であり、指示の意味選別や実行成功判定を行わない。
+
+### ⑥のnative入力保持
+
+⑤の除外mapを元envelopeの作業コピーへ一度適用し、同じ投影を要約入力と保持userへ用いる。複数text partの削除範囲は連結本文上の元byte座標から各partへ写像し、partの順・型・ID・phase・metadata・位置ごとのannotationを保持する。画像・音声等のopaque入力は全体を変更せず保持する。本人入力か実際の要約かはhost由来で判定し、SUMMARY_PREFIXで始まるという理由だけで本人入力を落とさない。
+
+通常の単一InputTextには既存collector/builderを再利用し、必要な保持量を満たす予算を渡して切断がないことを検証する。構造を平坦化するケースは元native投影へ戻す。`rencrow_input.selected_text`と既存の選別束縛をhost派生情報として更新し、元receipt由来と既存item IDを保つ。次回圧縮とcold resumeでも残存指示をHumanとして認識できることを検証する。旧replacementの先頭partへの文字列集約はV2から呼ばない。
+
+### ⑦の採用時window状態
+
+既存のdurable commit成功と再照合の後にだけ、新しいwindowを採用する。checkpointに保存したID・numberをそのまま使い、window内だけのnew-context要求、reminder、fallbackの既送出状態を初期化する。元の`restore`は再開用にID・numberを復元する処理であり、新windowへの切替えと同一視しない。新しいstate ownerの採用helperで既存`new_with_ids`と`restore`を組み合わせ、余分なUUID生成や保存前のadvanceを避ける。prefillは未設定に戻して既存の採用後再計数へ渡す。保存失敗・取消し・永続化不確実時に旧windowの状態を初期化しない。
+
+### 通常履歴の切詰めと原文照合
+
+通常のTool応答取込みは、保存原文を保持しながらlive履歴側だけを切り詰める。この差を原文改変と取り違えて巨大応答を参照化から除外しない。①は本文が完全一致する場合に加え、保存済み`history_truncation_token_limit`が存在し、metadataと本文以外のidentity・successが一致し、既存`codex-utils-output-truncation`の同じToken方針で算出した本文と選択側が完全一致する場合だけを受理する。保存budgetが不明な差は推測せず保護する。 `FunctionCall.encrypted_function_args`がSomeの場合は、空配列であっても実行由来へ影響する不透明なpayloadとしてcall/output pairを保護する。同一bytesであることだけを削除可能性の根拠にしない。これはCompaction候補判定で行い、既存の明示的な原文取得APIは変更しない。通常取込みと切詰めアルゴリズム本体は変更しない。rolloutから既存workspace内の切詰めownerを参照し、新しい外部packageやアルゴリズムを追加しない。
+
+Fresh pairの②への受渡しは保存原文の借用を用い、ハッシュ・byte長・抜粋範囲を原文に結びつける。原文全体のコピーや再索引化を行わず、抜粋だけをモデルへ提示する。Existing参照のoutput本文は展開せず、既存coverageまたは全未提示coverageを保持する。通常取込みで切り詰められたFunction/Custom応答から参照化・保存・範囲取得までを結合試験へ含める。
+
+### ⑦の補助要求とContext計数
+
+④と通常要約の実usage・課金・response receiptは記録する。補助要求の入力Token数を、未置換の会話量やBodyAfterPrefixの基準として残してはならない。失敗後のrecomputeだけでは、途中終了前に保存された補助TokenCountを再開時に判別できず、取消しで復元処理が実行されない場合もある。
+
+Session ownerで通常要求とCompaction補助要求を区別し、課金・budget・extension処理は同じ共有実装を通す。補助要求ではstate lock内で実usageの累積を更新しつつ、active last usageは現在の会話からの推定値にし、prefill値と由来（未設定・推定・server実測）を補助usageで更新しない。推定不能時も補助usageを代入せず直前のactive値を保つ。新window・新設定・新しい通常応答の計数を遅れて上書きしない。extensionへ渡す実応答usageと、保存する会話量は分ける。 同turn内の後続通常応答も識別するため、SessionStateに非永続のusage更新世代を一つだけ持つ。通常応答完了時はusage未提供でも世代を進め、補助要求開始時の世代・window IDs/number・開始turn・設定同一性を完了時に照合する。不一致時は最新のactive量/model window/prefillを保持し、実usage累積だけを加える。これは競合検知用の内部状態であり、新しい外部ID・DB・rollout markerではない。
+
+TokenCountを送る前にこの区別を完了し、誤った補助会話量をrolloutへ保存してから戻す方式を採らない。途中終了しても新しい永続markerや推測で通常/補助要求を分類する必要がないようにする。成功時は通常の採用処理が新windowの基準を設定する。失敗後のユーザー入力追記は現在履歴の推定に含め、abort等の早期return前の既存取りまとめ境界で処理する。
+
+本変更で既存のusage receipt・課金/budget処理を意図的に省略せず、budget errorもTokenCount送信後に返す既存動作を維持する。 callback待機中の取消し等で新しいTokenCount送信まで到達しない場合は、直前の安全なCountが残る。保証するのは補助入力由来の誤った会話量をlive/persisted stateへ露出させないことであり、中断された既存pipelineの通知完遂を新しく保証するものではない。協調取消しとprocess強制終了は区別する。既存taskの強制abortやprocess killを跨ぐ課金処理全体の原子性を新しく保証したり、別の背景課金task・永続marker・再実行loopを追加したりしない。取消し後のcheckpoint採用・自動継続は禁止する。
+
+### 推定量と記録済みusageの加算境界
+
+全履歴から計算した推定量へ、上流getterが通常のmodel usageに追加する直近Tool応答・後続Context・過去の暗号化reasoningを重ねて加算しない。SessionStateが非永続のusage由来（RecordedUsage / CurrentHistoryEstimate）を所有する。記録済みusageは元のgetterを利用し、全履歴推定の場合は既存owner推定器で現在履歴とbaseを一度だけ計数する。新しい数値cache・DB・rollout marker・独立したToken推定式は作らない。
+
+通常応答のusageがある場合はRecordedUsageへ戻し、usage未提供の場合は現在の由来を保つ。 既存のContextWindowExceeded通知に使う`set_token_usage_full`もRecordedUsageへ戻し、満杯のシグナルを全履歴推定で打ち消さない。補助要求の新しい推定はCurrentHistoryEstimateとし、競合時は直前の由来もactive値と共に維持する。補助要求のguardは由来の変化も照合する。Fork有効時の再計数は推定由来を同じstate lock内で設定し、無効時は元の記録usage経路を維持する。課金累計、実応答receipt、server実測prefillは別の既存責務として維持する。保存値だけでなく実際のget_total_token_usageとcontext_window_token_statusを、Tool call/output・後続summary・履歴追加のある入力で検証する。
+
+### 保存直後の終了とcold resume
+
+checkpointの永続化後、採用後TokenCountの保存前にprocessが終了しても、再開時に圧縮前のactive量を新windowへ持ち越さない。Fork有効時のResumed/Forked初期化で、元の履歴復元・TokenUsageInfo・実usage recordの復元を完了した後、既存recompute_token_usageを差し込む。Forkedでは継承履歴の保存・materializeも済ませてから、最後のflushより前に再計数を行い、コピーした古いTokenCountが新しいCountより後へ保存される順序を作らない。最初のpre-sampling Compaction判定より前に現在履歴のactive量を再計数する。復元済み累積usageと実課金recordを維持し、履歴から課金量を作らない。TokenCountが存在しない場合に実receiptから累積値を推測しない。無効時の上流経路は維持し、新しい永続markerやtransaction形式は追加しない。本境界の修正はTool pairを含む再開・Fork保存順・課金保持の単体と親独立検証で確認済み。元Compaction経路の結合と実Qwen cold resumeは未完了。
+
+### 元関数への例外と必要理由
+
+2026-09-23、利用者が「例外を認める。仕様には明記して」と承認した。続く全工程再構築の指示に基づき、前後処理だけでは防げない箇所を以下に限定する。下記は実装契約であり、検証完了・配備済みの宣言ではない。
+
+1. `drain_to_completed()`の出力ステージング。上流はPostTurn以外で`OutputItemDone`を逐次Contextへ書き込むため、Fork有効時は生成出力を一時保持し、成功応答として返す。実phaseは維持し、無効時は上流動作を維持する。この変更は単体・独立検証済みで、runtime接続は未完了。
+2. 同関数のusage完了処理に、Fork有効時の新Session helperへのdispatchを差し込む。元のobserved usage記録位置と実課金を維持し、補助usageを会話量として保存しない。別のstream/継続loopは作らない。 補助streamの`ServerReasoningIncluded`は通常会話のreasoning計数flagへ反映しない。これは接続由来の情報であり、後続の通常応答に属するactive計数を変更し得るため、Fork有効時だけ元setterを呼ばない。無効時は元動作を維持する。
+3. `Session::record_token_usage_info()`の既存処理をprivate共有実装へ機械的に切り出し、元signatureは通常usageとしてdelegateする。新helperは補助usageとして同じ処理へ入る。state lock内のactive量/prefill更新だけを区別し、課金/budget/extension処理を複製しない。単純な外側wrapperでは元関数のawait中の取消しで補助量が残るため、この分離が必要。2と3は全工程見直しで追加し、usage更新・request同一性・取消し・budget error・無効時互換を単体と独立試験で確認済み。V2全工程の結合と実Qwen受入・配備は未完了。
+
+4. `SessionState`のusage setter/getterに上記の由来を追加し、通常usageの追加計数と全履歴推定を区別する。 `Session::get_total_token_usage()`は同じstate lock内でownerのbase本文を借用して渡し、推定分岐でだけ既存推定器用のBaseInstructionsを構築する。通常/無効経路へ不要なbase全文コピーを加えず、非公開設定を公開しない。`Session::recompute_token_usage()`のstate書込み位置にFork有効時の由来dispatchを差し込む。全履歴推定を元のgetterへそのまま渡すとTool応答等が二重加算されるため、外側の後処理だけでは安全な値を公開できない。ContextManagerの元推定式・getter本体は変更しない。これは確認済み不具合への修正であり、実getter・usage由来・通常/満杯通知・再開を含む親独立検証20件が通過した。元経路の結合・実Qwen受入は未完了。
+
+呼出し元は一時出力を検証してから履歴置換・保存へ進む。部分stream失敗・不正要約・取消しで候補本文がlive Contextへ入らず、補助usageがlive/persisted会話量にならず、無効時の上流互換を維持することを回帰試験する。これ以外の元関数本体変更や保存形式変更への包括的な例外とはしない。
+
+## 旧仕様と配備記録
+
+2026-09-23。状態: **local Responsesの完了履歴削減をLinuxへ配備。手動圧縮・訂正後の再圧縮・cold resume・通常ツール復帰を実Qwenで確認。共有履歴388→37項目、原本135件取得、最終再開入力18,485 token。途中の未完了テスト成功誤記は不合格として記録し、要約指示と原本再確認後の再圧縮で是正を確認。長時間の自動圧縮、remote、三OS、一般的なQwen指示忠実性、Step20完了の保証ではない**。
 本書はFork内部のCompaction契約の正本。横断的な削減規則・受入は
 [catalog仕様](../docs/codex-context-management.md)、改変・上流追従は[FORK_RULES.md](FORK_RULES.md)が所有する。
 単独checkoutでcatalog参照がない場合も、本書の保護条件は適用する。横断仕様変更時はowner側と照合する。
@@ -25,13 +165,13 @@ Qwenで最初に検証するがモデル固有の削除規則にはしない。A
 既存システムに手を入れる範囲を最小化する。まず独立した処理経路で派生データを作り、最後にCompactionが利用するデータを選択する。
 「別ライン」は処理と成果物の分離を意味し、新しいGit branchや別の正本DBを作る指示ではない。
 
-- 開発中は既存の会話保存・通常要求・Compaction・checkpoint・稼働profileを変更しない。稼働Qwenを実験のために再起動しない。
+- 別ライン開発段階では既存の会話保存・通常要求・Compaction・checkpoint・稼働profileを変更しない。最終接続は2026-09-22の「compaction を新方式に差し替えてQwenで確認して」により明示された作業として実施する。必要な再起動は同一sessionの単独writerと原本保全を維持する。
 - 新経路は読み取り専用snapshotを入力とする。元の会話や進捗の正本を移さず、再生成可能な候補だけを出力する。
 - 新経路は本人入力の整理、作業履歴の整理と要約、最終候補の検証を一方向に実行する。同じ整理mapを共有し、二つの系統で別々に失効判定しない。
 - 既存の選別モジュールは新経路の部品として使う。既存history crateへの追加済みexport・依存を超えて、現行処理の挙動を先に書き換えない。
 - 既存データに本人入力の由来情報があれば再利用する。足りない場合も、既存保存形式の大規模変更を前提にせず、将来の入力受付境界で必要最小限の由来付与を設計する。
 - 最終接続時だけ、Compactionの入力選択境界と、保証上不可欠な保存・replay境界を変更する。hook・通常turn・Gatewayの各所へfilterを分散させない。
-- 通常運用は既存経路を使用し続ける。新経路の開発成功は切替済みを意味しない。新経路を選ぶ場合は同一snapshotの検証済みbundleを一括採用し、古い保持user群を混ぜない。
+- 最終接続前は通常運用で既存経路を使用する。新経路の開発成功だけでは切替済みを意味しない。新経路を選ぶ場合は同一snapshotの検証済みbundleを一括採用し、古い保持user群を混ぜない。
 - shadow比較は明示的な試験で行い、通常Compactionのたびに二重のLLM呼出しを常時追加しない。
 
 ## 1.2 本人入力の由来と最終利用データ
@@ -154,12 +294,22 @@ replacementの利用データは§1.2の表に従う。本人入力と確認で�
 既存role/metadata/identityの契約を維持し、生成した文を利用者の原文や高権限指示と偽装しない。
 削除済みの本文は要約、保持原文、添付の抜粋、旧要約由来の再構築からも復活させない。監査用の原本参照は残してよい。
 
-要約候補の参照coverage・必須項目・不正tool構文を機械検証する。意味的一致は同じモデルによる検証要求を上限1回行い、費用を含める。
-機械検証とモデルの一致だけで安全性が証明されたとは扱わず、独立評価fixtureと実作業で欠落・誤失効を検証する。
-検証が不確実なら元の範囲を残した候補を使うか、適用を中止する。再生成を無限反復しない。
+要約候補は同じsummary要求から一度だけ生成し、host-bound `summary_hash`、source inventory、view/input hash、invalidation、必須項目、空・上限超過本文、不正tool構文をhistory ownerが機械検証する。通常runtimeで自動summary review要求は行わない。`summary_review: null`は未実施を示すreceiptであり、合格reviewを意味しない。
+CLIの明示的な品質fixtureは、必要なら既存の`summary_review_input` helperを使って独立評価できる。これは通常runtimeのacceptance receiptに変換しない。
+machine checkだけでsummaryの意味的一致が証明されたとは扱わず、独立fixtureと実作業で欠落・誤失効を検証する。検証が不確実なら元の範囲を残すか適用を中止し、再生成を無限反復しない。
 
 System/Toolsの固定prefixに動的な整理状態を積まない。現行の正規developer/contextの再投入は既存owner経路を維持する。
 保持容量を理由に保護対象を途中切断しない。収まらない場合は`blocked`を明示する。
+
+### 完了済みexec_commandのsummary projection
+
+通常Compactionでは、既存の整理・要約・checkpoint経路の中で、正規rolloutの同threadにある一意なordinary `exec_command` callとtext outputを、`ItemCompleted → CommandExecution`の`UnifiedExecStartup` terminal receiptが証明し、対象callがactiveでないときだけ、一時的な検証済みWork sourceとして扱う。現在のselected historyとcanonical rolloutにあるcall本体は完全一致しなければならない。対応付けはcall IDで行い、selected history内の物理隣接性は要求しない。非隣接でもcallとresultの両側を一組として要約対象へ含め、間にあるrecordは変更しない。孤立resultは作らない。
+
+この投影は圧縮準備中だけの派生dataで、履歴・rolloutへ新marker、v2 pair schema、hash台帳、別証拠DBを保存しない。callのsummary textにはcall ID、tool、現在のarguments、terminal status、exit codeを含める。resultのsummary textはcall ID、tool、status、exit codeと、現在のselected historyにある全文をJSONの`result`として含める。既存v1参照なら現marker本文をresultに使い、call textへ現在のargumentsと`retrieval_argv`を含める。巨大な過去出力を再取得してsummary入力へ展開しない。以前の原本参照CLIはv1形式の取得を継続する。
+
+完了は成功を意味しない。非zero exitの`failed`も失敗結果として要約へ渡す。pending/no-output、active process、media、write_stdin、nonordinary provenance、duplicate/ambiguous item、canonical proofやcall一致が不確かなrecordは従来どおりopaqueで保持する。既存v1 markerはmarker、owner raw proof、現在のcallを検証する。commit直前に同じcall/result投影をcanonical rolloutで再検証し、既存snapshot競合検査を維持する。正本rolloutはappend-onlyで変更しない。
+
+CLIはpair適格性の検証とtext projection、LLMは同じ一要求の意味要約、Boundaryはsnapshot・canonical proof・競合・commitを所有する。human input、plan/reinsertion、initial context、invalidation routeは変更しない。hostが固定したsource IDは入力を結び付けるが、意味coverageを保証しない。固定Planではcompleted raw pairとv1 pairのsummary可視性、非隣接性、failed exit、pending/media/provenance保護、stale拒否、append-only原本、cold resumeと再圧縮を別々に検証する。Qwenによる実作業・実thread acceptanceはsource testの代用ではない。
 
 ## 7. 競合・永続化・失敗
 
@@ -217,11 +367,12 @@ remoteをlocalへ、AstraをQwenへ自動置換して成功にしない。Astra�
 | CMP-09 | 同条件baselineとの総token・時間・保持品質・受入成果の比較ができる |
 | CMP-10 | 本人入力・host生成・agent代理・引用・由来不明を区別し、本人入力枠への誤混入を防ぐ |
 | CMP-11 | 別経路の実行が既存履歴・設定・通常Compactionを変更せず、最終選択で一方の完全なbundleだけを採用する |
+| CMP-12 | 通常runtimeが一度だけ要約を生成し、hostが全Work IDを決定的にbindする。summary review未実施を明示し、既存のmachine checksとcheckpoint保護を維持する |
 
 fixtureは各保証の境界に絞る。実装時は関連unit→経路統合→実Qwenを依存順に一度実施し、失敗時は変更影響だけ再検証する。
 稼働QwenのIdentity作業は検証fixtureのために破壊・再実行しない。保存済み限定fixtureで先に確認する。
 
-測定対象は①通常の圧縮直前入力、②整理要求、③要約要求、④検証要求、⑤replacement、⑥圧縮後最初と継続後の通常入力。
+測定対象は①通常の圧縮直前入力、②必要な整理要求、③要約要求、④plan reviewと明示的な品質diagnosticの要求、⑤replacement、⑥圧縮後最初と継続後の通常入力。通常runtimeではsummary review要求を行わない。
 response IDで重複を除き、API usageと推定token、cached inputの内数、reasoningを含むoutput、文字数を区別する。
 CLI時間・モデル時間・圧縮間隔・再調査・誤った再実行も記録し、共有Backend tok/secをsession固有性能と混同しない。
 同じsource履歴/model/effort/tools/provider/configのupstream baselineと比較し、整理・検証自身の費用を含む総量を報告する。
@@ -397,3 +548,188 @@ ownerはForkの`history::input_intake`（記録契約）、TUIの`input_intake`�
 独立`rencrow-compaction`を更新し旧binaryを同試験directoryへ退避した。稼働TUIは従来SHA-256 `04159684a80c3751fa0903b81a04fa3d9b4b20550a4b86e927bf73b5b0e53c1d`のまま。
 新TUI試験版のSHA-256は`18d2d5522c68e9a620613f725613de78e13d0287bf3c1019d33ac4a40b7abdaf`。
 今回の入力別記録の受入と、未完了の通常Compaction接続・checkpoint/resume・履歴復元・総費用比較を区別する。
+
+### 通常Compaction接続の実装・固定Check Plan（2026-09-22）
+
+以下は2026-09-22の初期接続と4-request summary/review運用の記録である。2026-09-23のsummary review省略とhost-bound inventoryの現行契約は§6および「Failure Knowledge: Qwenのsource-ID申告でcoverageが欠けた」を優先する。過去のQwen usageと受入結果はその時点の証拠として保持する。
+
+利用者の「compactionを新方式に差し替えてQwenで確認」により最終接続を開始する。
+選択はFork設定`rencrow_compaction = true`。local Responses経路を対象とし、remote V2 / TokenBudgetとの併用は明示的に拒否する。Gateway・実model・effort・context window・通常turnのtool権限は変更しない。
+
+- CLI/Fork: 受理時のintake照合、owner復元済み履歴のsnapshot、参照・削減範囲・schema検証、replacement構築。raw rolloutの独自replayは行わない。
+- LLM/同じsession model: 撤回・完了の意味判断、独立review、整理後の要約、要約review。本人入力が0件の場合は許可された整理案が空に一意確定するため、前二段をownerで検証してLLMへ送らない。要約と要約reviewは実行する。候補応答は通常履歴へ追加しない。
+- Boundary/Fork: 入力queue・設定・履歴との競合確認、append-only checkpoint、保存barrier後のin-memory採用。保存結果が不確定なら以後の通常turnを停止し、再起動時はowner replayが、付随するworld/context/settingsとhash一致の`rencrow_compaction_commit`まで保存されたcheckpointだけを採用する。不完全なprepared prefixは読み取りviewから除外し、raw rolloutは変更しない。
+- 撤回・完了として採用した原文範囲は非model metadataへ持ち越す。過去要約の同一範囲を要約入力から除き、再生成要約への同一原文の復活を拒否する。言い換えの意味は要約reviewが確認する。
+- structured tool/image・由来不明データは元envelopeのまま保護。受理由来と整理後本文を非model metadataへ保存し、再圧縮・resumeでも同じ本人入力を再認識する。
+
+| purpose / phase | check | consumer / failure action |
+| --- | --- | --- |
+| 参照・保護 / unit | shared pipeline、intake一致、部分削減、未知・画像・tool保護、無効bundle拒否 | Fork / 採用停止 |
+| 接続・保存 / integration | 4段階出力の隔離、manual/auto dispatch、checkpoint再開、2回目圧縮、stale拒否 | Fork runtime / 切替停止 |
+| 回帰 / local | 変更crateの関連tests、fmt、Clippy、binary build、schema生成 | 配備 / 新失敗は原因調査 |
+| 実利用 / Qwen | 同じGateway worker/highで撤回・有効要求・添付を含むfixture→compact→通常応答→resume→再compact | 利用者 / 欠落・復活・不一致なら切替停止 |
+| 計測 / Qwen | response ID、usage、wall時間、output tok/sec、前後本文量、first normal request | 報告 / 総token削減は比較なしに断定しない |
+
+上流全suiteは別の許可が必要な規定を維持し、未実施を全成功と報告しない。既存ホスト依存失敗は上記記録と区別する。
+
+
+#### 通常Compaction接続の検証記録（2026-09-22）
+
+- 関連504件成功（history/config/CLI、coreのlocal compaction・入力キュー、rollout/thread-storeの履歴復元）。手動・自動の双方で選別済み履歴→通常要求→再起動→再圧縮→通常要求を検証した。上流全suiteの成功を意味しない。
+- 初回502件中17件の失敗を確認。4件はcommit markerのwire名、schemaのvariant数、forkの有界走査、testのmetadata参照箇所を修正。残る13件は一時dirが実repository内にあり上位のproject/AGENTSを継承した影響だった。期待snapshotは変更せず、repository外の私有TMPDIRで解消を確認した。
+- `just fix`（対象6package）と`just fmt`は終了コード0。静的検査には既知のexpect/unwrapと引数数などの警告が残り、warning-freeの受入とはしない。
+- 実Qwen初回の候補生成は92.66秒、出力5,417 token、58.46 output tok/sec（request全体のwall時間）。入力4,659、合計10,076 token。hostの根拠検証がInvalidEvidenceとして拒否し、checkpoint未作成、原ログprefix不変を確認した。初回は出力本文traceが無効だったため、誤った根拠の具体的内容は未確定。execution_evidence:trueが必要であることをpromptに明示し、新方式の各要求で既存の任意traceを利用できるようにした。判定条件は緩和していない。
+- 実Qwen再試行・稼働差替えの結果は引き続きこの節へ記録する。上記のmock/関連testだけでは実運用受入にしない。
+
+詳細ログは私有build領域の`target/fork-bootstrap/compaction-runtime-tests-final.log`、`compaction-fix-final-third.log`、`compaction-runtime-trial/first-attempt.json`。会話原文・runtime log・binaryは配布対象に含めない。
+
+
+##### Failure Knowledge: 検証用の削除本文が要約へ再混入
+
+文書情報: 2026-09-22の通常Compaction接続試験。契約正本は本書。根拠は私有`target/fork-bootstrap/compaction-runtime-trial/negative-data-diagnosis.json`と2回目checkpoint、同sessionのinference trace。
+
+- Failure: 再起動後の2回目圧縮で、撤回済み合言葉が「撤回済み」という注記として要約へ戻った。現行命令への昇格ではないが、不要な情報が再保持された。
+- Problem: 削減済みviewだけを要約する契約と一致しない。通常要求への候補構造の漏洩、旧原文の再追加、原ログ書換えはこの試験では確認されていない。
+- Cause: 実際のsummary要求はselected view内に旧合言葉を含まず、同じ要求のnegative_validation.passagesにだけ含んでいた。生成モデルへ検証用の削除本文も与えた設計が再混入の入力源になった。独立reviewも「撤回済み」の注記を許容していた。
+- Lesson: 生成と検証の入力境界を分ける。禁止資料を説明付きで生成入力へ戻しても、削除したことにはならない。
+- Invariant: 要約生成は選別済みviewのみを受け取り、削除本文は独立reviewだけに渡す。撤回命令・旧値の不要な歴史注記も再保持しない。一方で必要な完了結果・現行制約は残す。
+- Enforcement: 共通history ownerのsummary_inputからnegative_validationを除き、summary_review_inputへ隔離する。CLI/runtimeの双方を同じownerへ接続し、summary/review指示にも不要な撤回注記を再追加しない条件を記載する。
+- Tests: shared historyの回帰で、生成入力にnegative_validationがなくreviewだけが削除資料を持つことを検査する。実Qwenで同じsessionを再圧縮し、通常要求・再起動・再圧縮まで確認する。修正後の実Qwen結果は現時点で未確認。
+
+初回正常圧縮は107.63秒・10,794 token。2回目は179.78秒・17,704 tokenで、上記再混入があるため最終受入にはしない。通常toolによる実ファイル読取、添付1件の同一データ保持、再起動後の現行指定維持は確認済み。これらを全体の総token削減達成とは扱わない。
+
+
+修正後の診断追記:
+
+- negative_validationの生成側分離後、関連80件が成功。実Qwenは旧値を含まない要約を生成したが、「残存依存なし」が継続条件と矛盾し、独立reviewが拒否した。checkpointは増えず、拒否は維持した。
+- 実要求の再送診断で、継続条件を保持する生成指示と、過去記録の忠実な引継ぎ／新規の完了認定を区別するreview指示を確認した。正しい要約を受理し、撤回旧値の注記を加えた対照例と架空のStep20完了を加えた対照例は拒否した。同じworker/high・正規Gatewayを使用し、実セッションへの採用は行わない診断要求として区別した。
+- 上記3件のwall速度は56.41、56.60、58.48 output tok/sec。受理側103.88秒、旧値の拒否42.69秒、架空完了の拒否18.30秒。生成の診断は24.62秒・2,693 token。診断要求の費用は通常Compactionのcheckpoint usageと別であり、合算時の重複計上を避ける。
+- この指示変更はshared historyのSUMMARY_PROMPT / SUMMARY_REVIEW_PROMPTが所有し、CLI/runtimeに共通適用する。新しいhost削除権限、検証の省略、モデル置換は含めない。最終binaryでの実セッション再確認は次の受入境界である。
+- 要約は各コマンド自身の終了statusと、そのコマンドが調べたjobの結果を分ける。`ls`・`tail`・`grep`・`read`の成功やログpathの列挙だけでは、対象test/buildの完了・成功を認定しない。job結果が明示された出力がある場合だけ成功とし、過去の接続障害は記録された実行環境での観測として扱い、現在hostの状態へ転用しない。
+
+診断根拠: 私有`compaction-runtime-trial/review-positive-result.json`、`review-obsolete-result.json`、`review-fabricated-result.json`、同名request/response、`summary-diagnostic-v2-result.json`。過去記録だけで不在・完了を一括断定しない条件を明示し、外部実行の完了証拠をモデルの説明で置換しない。
+
+
+共有sessionの実履歴では134件（unknown107 / host4 / work23）、本人入力0件、plan dataset 202,618 bytesだった。最初の要求がresponse.completed前に切断され、checkpoint未採用を確認した。Gatewayのfirst-output budget 240秒到達が原因だった。MLXは52,600 tokenの入力を処理し約39秒で推論出力を開始、11,126 tokenまで生成したが、最終content前にGatewayが切断した。モデルのcrashや履歴採用の成功ではない。通信側の対応はRenCrow_LLMのowner記録に分ける。
+本人入力0件では削除を許せる対象がなく、空planの確定に意味推論は不要である。shared history ownerのrequires_plan_inferenceで判定し、CLI/runtime共通でplanとplan reviewのLLM要求を省く。空planの参照検証・view生成・要約review・保存境界は維持し、モデル応答やusageを捏造しない。runtime metadataのselection_modeに決定的な確定を記録する。未知・host・workだけの履歴の不削除と、実接続で要約2要求だけになることを回帰条件とする。
+
+追加した本人入力0件の決定経路は関連82件成功（4.592秒）。静的検査・整形・Linux buildも成功。配備binary SHA-256は`6e0261a20b1b10eb330507a7cce4818f358e3f6c653772563306c212af907a4d`。本人入力を含む実Qwen検証は直前binary `c8fa79af...`、新binaryでの共有履歴受入とは区別する。
+
+
+### 2026-09-22 共有Qwenへの切替・運用受入
+
+- CLI: history ownerが本人入力0件を確認し空planを確定。LLM: 同じworker/highで要約・要約reviewを実行。Boundary: hash/参照/採用条件を検査し、append-only checkpointとcommit markerを保存、cold resumeから復元した。
+- 稼働Forkは`6e0261a20b1b10eb330507a7cce4818f358e3f6c653772563306c212af907a4d`。`~/.codex-rencrow-safe/config.toml`の`rencrow_compaction = true`を専用profile生成後も維持する。共有session `01a0c338-4e7b-7c12-bdda-db0ad5415097`、tmux `codex-switch-share:0.0`、writerは一つ。通常ツール14件、worker/high、正規Gateway 8090を維持する。
+- 要約: 入力50,434／出力3,965 token、117.99秒、33.61 output tok/sec。要約review: 入力51,448／出力1,253 token、60.72秒、20.64 output tok/sec。wall速度には入力処理を含む。合計178.70秒・107,100 token、2要求。Gateway修正はcompactionだけ既存hard budgetへ合わせ、通常240秒と全体600秒を維持した。今回の成功2要求は各240秒未満であり、延長部分の実時間耐久を検証したとはしない。
+- 本人入力の由来を証明できる記録は0件。承認された削除は0、保護対象125件を保持した。従って旧sessionの不要指示をすべて削減済みとは扱わない。本人由来がある隔離fixtureでは、撤回旧値の除去、画像保持、実ツール、再起動・再圧縮後の非復活を確認した（直前binary c8fa79af、同じHuman経路）。
+- 圧縮後の初回通常要求は入力56,251 token。直前の旧方式末尾は69,934 tokenだったが要求本文・履歴位置が同一ではなく、削減率の対照比較ではない。圧縮処理の追加費用とcache効果を含む総作業費用の改善は未確定。
+- 最初の疎通指示ではQwenがID関連の再検索を始めたため中断。送信された最新指示はtraceで確認でき、圧縮保存の失敗ではない。短い明示指示の再送後は、Qwen自身が`pwd && git branch --show-current && git rev-parse --short HEAD`を実行し3行を返した。cold restart後も同じ実ツール操作と結果を確認した。最初から指示追従が正常だったとは報告しない。
+- 原ログ99,477,015 bytesの既存prefix hashは不変。COREのbranch `identity/03-dci`、HEAD `f159ed9249dac04c0fa893de0f77dc2a1d0b506c`、既存76件の差分とtracked diff hashも一致。ID移行の実装・merge・Step20完了は本切替の成果に含めない。
+- 私有証跡は`target/fork-bootstrap/compaction-runtime-deploy/main-acceptance.json`（11条件成功）、`candidate.json`、`inspection.json`、`gateway-deployment.json`。隔離試験は`compaction-runtime-trial/trial-acceptance.json`。traceは配備後のcold restartで無効化済み。公開sourceへ会話原文・実行binary・私有証跡をcommitしない。
+- 関連504件、後続の差分検証80件／82件、historyの指示変更60件は各成功（重複するため単純合算しない）。Gateway httpapi test、go vet/buildも成功。full upstream suite、Windows/macOS実機は未確認。
+
+
+### 新スレッド以降の継続計測（2026-09-22）
+
+`rencrow_compaction_metrics.py`はrolloutを読み取り専用で逐次集計する開発・監督CLI。Pythonは製品runtimeの起動条件にはしない。入力は単一rollout、出力は本文を含まない統計JSONと表示。LLM呼出し・原ログ書換え・自動compactを行わない。途中行は完結まで待ち、不正な完結行や同一response IDの相反する使用量はエラー終了する。
+
+固定Check Plan: purpose=計測の正確性、phase=監督CLI導入、consumer=Astraの効果報告、failure action=計測を停止し数値を未確定にする。checkは重複usage非加算、stage費用非二重計上、未commit候補非採用、live途中行、不正行拒否、比較欠落の6ケースと、既存実checkpointとの数値照合、新スレッドでの継続表示。
+
+前後の入力tokenは隣接した観測値であり同一要求の対照比較ではない。stage費用は既に総usageに含まれ、再加算しない。receiptには各stage時間・wall tok/sec・選別mode・適用件数がある。失敗してcheckpointを持たない要求の分類はこのCLI単独では確定できず、task errorと原証跡から監督者が補足する。意味的な継続性・撤回指示の非復活・再調査増減は独立確認とし、tool結果の件数から成功を推測しない。
+
+例: `python3 rencrow_compaction_metrics.py PATH_TO_ROLLOUT --watch --output PRIVATE_METRICS_JSON`。新スレッドごとに対象rolloutを指定する。派生JSONを進捗や指示の第二正本にしない。
+
+導入検証: CLIの6ケース成功。旧共有sessionの実receiptから107,100 token・178.702秒・直後入力56,251 tokenを再現し、既存記録と一致。新session `01a0cb3e-9142-7252-94f0-e64cd7f0a279` のrolloutで連続観測を開始した。派生出力は私有`target/fork-bootstrap/compaction-runtime-deploy/new-thread-metrics.json`、共有tmux下段に表示する。新sessionの初回圧縮は発生後に評価し、計測目的で強制圧縮しない。
+
+
+### 新スレッドで観測した自動Compaction停止（2026-09-22）
+
+新thread `01a0cb3e-9142-7252-94f0-e64cd7f0a279` はmid-turnのContextLimitによる自動Compactionで停止した。Codex logs_2.sqliteのrun_auto_compact spanとGateway実ログを照合し、入力72,661 token・出力16,384 token・418.928秒、finish_reason=length、Codex error=max_output_tokensを確認した。新checkpointは0件。既存の手動圧縮・cold resumeの成功を、この条件の自動圧縮成功へ一般化しない。
+
+失敗要求の使用量89,045 tokenはrolloutのtoken_usage_recordに記録されず、計測CLIのtotal_recorded_tokensには含まれない。Gatewayで得た実測を私有`compaction-runtime-deploy/new-thread-compaction-failure.json`へ補足した。記録済みusageの合計を全課金量と断定しない。エラーで停止していた事実は利用者から指摘されて確認した。計測paneは観測用であり、自動復旧やAstraへの通知を実装した監督daemonではない。
+
+同じsessionを原本保全のまま診断trace付きで再開し、手動Compactionを一度だけ再実行する。再発時は同条件の自動反復をせず入力構成と生成結果を診断する。モデル・high・安全境界の変更、完了扱いの偽装は行わない。
+
+
+#### Failure Knowledge: Qwenのsource-ID申告でcoverageが欠けた
+
+2026-09-23、共有Qwenの自動圧縮で候補が採用されず停止した。hostの期待inventoryは190 ID、モデルが返したIDは188件すべて一意で、`item-268`と`item-271`が欠けていた。checkpoint commit数は4のままで、error countは3から4になった。失敗した要求は再試行していない。
+
+- **Failure**: summary coverage mismatchにより通常の自動Compactionが停止した。
+- **Problem**: 意味要約と無関係な完全ID転記を生成に要求し、出力上限・転記漏れを作業継続の境界にしていた。
+- **Cause**: LLMがwork source ID全件を返すまで採用できない契約だった。
+- **Lesson**: 完全なsnapshot inventoryはhostが決定的に所有・再構築する。ID転記を意味判断のgeneration outputへ混ぜない。
+- **Invariant**: `summary.source_ids`はhistory ownerが同一inputから全Work recordについて決定的に生成し、`summary_hash`/summary/view/input bindingとcoverage検査を残す。summary inputの`separately_retained_work`はIDのみとし、hidden本文を削除・変更せず、SHA/byte数の非意味metadataを生成入力へ送らない。summary生成は一要求。自動summary reviewは行わず、`summary_review: null`を未実施receiptとして記録する。v1 bundleはhashに束縛されたaccepted reviewを必須とし、v2 bundleはhost-bound `summary_hash`必須・reviewなしを許すが、もしreviewがあれば同じhash/accepted検証を要求する。
+- **Enforcement**: shared historyの`bind_summary`がtextをviewへ結び、Work ID inventoryを生成する。runtime/CLI hostが`summary_hash`を同じsummaryへbindする。CandidateBundle version 2と`assemble`が必須hash、input/view hash、source coverage、invalidation、本文の非空・byte上限を検証する。runtimeのarchive、transaction、checkpoint、cold-resume checksは維持する。
+- **Tests**: v1 deserialization/必須accepted review、v2 `summary_review:null`、optional review hash/accepted、stale hash/ID protection、projectionのhidden text不変、one-summary request count、archive/cold resumeを固定related Planで確認する。Qwenの失敗・復帰は実runtime検証として別に記録し、unit/integration testの代用にしない。
+
+この変更ではモデル、effort、token/context上限、tool能力、archive検証、checkpoint transaction、human plan reviewを変更しない。既存4段階経路のusageは過去事実として保持し、修正後のwall time/token節約は同じsessionでの再開と継続が計測されるまで主張しない。
+
+
+### 未完了応答の使用量が保存されないコード経路と次版要件
+
+確認したコードでは、失敗・未完了状態自体は存在する。今回のprotocol状態は`response.incomplete`（reason=max_output_tokens）であり、`response.failed`や通信断と区別する。
+Gateway `gateway/internal/adapter/responses/converter.go` はfinish_reason=lengthをincompleteへ変換し、upstream usageがあればresponse.usageへ設定してからterminal eventを送る。
+Forkの`codex-rs/codex-api/src/sse/responses.rs`はresponse.incompleteから理由文字列だけを取得しApiError::Streamとして返す。その分岐ではresponse ID/usageをResponseEventへ渡さない。一方response.completedはID/usage付きCompletedを返す。
+`core/src/compact.rs::drain_to_completed`はCompleted時にだけrecord_observed_response_completedと使用量更新を呼び、Errはそのまま返す。`core/src/session/mod.rs::record_observed_response_completed`がTokenUsageRecordを保存する。そのため、turn/task errorは記録されても、未完了terminalのusageはこの保存経路へ到達しない。原因は失敗状態の不存在ではなく、使用量記録がcompleted経路へ結合していること。
+
+次版では要求の終端状態（completed/incomplete/failed/canceled/通信断）、提供元が返した使用量、候補の検証・採用結果を別々に保持する。未完了・失敗でも提供元usageがあればresponse IDと試行IDに結び付けて記録する。使用量不明はunknownとし0に補完しない。終端応答の再通知は同一応答として重複加算せず、実際の再試行は別の消費として数える。使用量保存を理由に失敗候補を採用しない。Gateway照合は当面の補完とし、恒久的にログを手で足し合わせる設計にしない。
+受入ケースはusage付きincomplete/failed、usageなし通信断、重複終端、別試行、モデル完了後の候補拒否。失敗状態・実usage・未採用の三点を同時に検証する。この計測修正は仕様化済みで、実装済みとは扱わない。
+
+由来のGit照合: Fork作成時の上流基点`94174e44cbc54cece45f6052328ca0c2cd7a8a2a`をgit showで確認した。`codex-rs/codex-api/src/sse/responses.rs`は現worktreeとbyte単位で同一で、incompleteをusageなしのエラーへ変換する分岐はFork前から存在した。上流基点のcompact.rsもCompleted時のみ使用量を記録し、Errは返却する。したがってこの計測漏れは上流から継承した挙動であり、Forkで新設したものではない。最新の公式版まで同じとは未確認。一方、保持するtool結果を要約入力へ重複投入する問題はFork新方式の設計に属し、両者を混同しない。
+
+### 二重投入修正の実測と残件（2026-09-23）
+
+実バイナリ`468ab649c0b3c89109783dc9d5d2684da6663270b941d729a6df7e9ab7afcde5`を配備し、同じ新thread・worker/highで失敗場面を再実行した。要約入力9,651／出力6,142 token・105.415秒（58.27 output tok/wall sec）、検証入力10,946／出力3,069 token・59.494秒（51.59 tok/wall sec）、計29,808 token・164.909秒。compactedとcommit markerを確認し、通常ツール実行へ復帰した。生成要求は前回失敗時72,653入力tokenから約87%減ったが、失敗要求との比較を同品質成果の費用削減率とは扱わない。
+
+独立照合で、圧縮前のfunction call/result 124項目がreplacement内に同内容で全件残存した。replacementは172項目。次の通常要求は86,877入力tokenで、直前の89,998からの差は−3,121に留まった（要求内容は異なる）。したがって今回の修正は要約要求の軽量化・失敗復旧であり、作業履歴全体の十分な圧縮を実証したものではない。本人入力なしの選択経路で、承認された削除操作は0件。本人指示整理の新しい実証とも扱わない。
+
+Failure / Problem: 圧縮が成功しても通常contextが大きく残る。Cause: 現adapterはtool結果をopaque Work、callやreasoningをUnknown等として原文保持する。Lesson: 要約要求量とreplacement量は別々に測定する。Invariant: 原本保全、未完了tool/process、添付、由来不明情報、再取得権限を維持する。Enforcement / Tests: 完了済み履歴の扱いを§1.2・§5と照合して修正範囲を確定し、通常context縮小と実作業継続を別途検証する。新バイナリのcold resume、再圧縮、失敗usage保存修正は本実測だけでは完了にしない。私有証跡は既存`compaction-runtime-deploy/new-thread-metrics.json`と`protected-work-acceptance.json`。
+
+通常ツール再開後にContextLimitの自動圧縮が再発したため、同条件反復を中断した。次の実装単位は既知の`ResponseItem::Reasoning`のうち、非空のテキストsummary/content、`encrypted_content=None`、通常のturn_id/create_time以外のpassthrough情報なし、harness metadataがdefault相当の項目だけをWorkとして要約する。原本の保存形式は変えず、既存の要約coverage・review・transaction検証後にだけreplacementから除外する。暗号化、特殊metadata、未知項目、tool call/resultは原文保持を継続する。判定はCLI/adapter、意味の継続は同じQwenによる要約、採用は既存Boundaryが所有する。受入は通常metadata付き推論の要約入力・coverage・replacement縮小、元項目不変、暗号化/特殊metadata保護、同一Qwenでの圧縮後の実作業。完了済みtool pairの参照化は、pending/process/mediaと再取得権限のowner契約を別途確定するまで本変更へ含めない。
+
+同日、上記の推論分類修正をLuna `xhigh`が実装し、Astraが差分と既存保護境界をreviewした。関連7件成功。初回のテストfilterは実module名と異なり0件・exit4だったため、実名`compact::rencrow::history::tests`で検証し直した。異なるpackage指定による依存再buildとtest binary生成を含め約15分、配備用buildは2分01秒。検査の実行時間とQwen圧縮時間を混同しない。
+
+配備binary `77c055b01cb8d51334926f3ac5bbb3c0eeab1eaeaf017271d6d089229537e21c`、同thread・worker/highで再実行。生成28,837入力＋7,699出力 token・138.413秒（55.62 tok/wall sec）、検証30,275入力＋7,066出力 token・142.695秒（49.52 tok/wall sec）、合計73,877 token・281.108秒で採用。推論47項目がreplacementから除かれ、function call/result 130項目は同内容で全件保持。正常終了・同thread cold resumeで圧縮済み履歴を読み込めた。詳細traceを無効化して通常作業を再開した。次の通常入力と自走継続は引き続き計測する。証跡は既存私有directoryの`reasoning-acceptance.json`、`new-thread-metrics.json`、`candidate.json`。
+
+実装修正のLuna CLI費用はQwen実測と別に保存した（`reasoning-coder-usage.json`）。input 14,138,526（うちcache 13,924,352）、output 25,394（うちreasoning 13,588）。cache/推論内訳を総数へ二重加算しない。この実装作業費用を除外して全作業の節約を主張しない。Astraや別のreviewの費用はこのCLI集計に含まれない。
+
+追測では通常入力88,676→88,219 token（差−457）で、少数の通常ツール実行後に自動圧縮が再発し中断した。推論分類修正は通常context消費の解決になっていない。Gateway所有`responses/converter.go`のreasoning分岐は`i > lastUserIndex`の内容だけをreplayし、それより古い推論は通常送信へ含めない。一方function call output本文はtoolメッセージへ渡す。したがって保存履歴の47推論削減を実プロンプトの大幅削減と予測した診断は不十分だった。Lesson: 先に履歴→Codex要求→Gateway変換→実モデル入力の各段を照合する。次の候補は§5に従う完了済みtool本文の参照化だが、元rolloutの正規取得・hash照合・取得権限、未完了call/process/media保持を機械的に保証してから実装する。現状の自動圧縮ループを未解決と明記する。
+
+### 完了済みコマンド結果の参照化契約
+
+- CLI/履歴owner: 保存済みrolloutの同threadに属する`ItemCompleted → CommandExecution`を完了証拠とする。call ID、terminal status、exit code、対応するcall/output原本を照合し、重複・曖昧な組合せは対象外。stdoutの文字列やモデル申告から完了を推測しない。
+- 初期適用範囲は既知のexec_commandのテキスト結果。write_stdinは元のexec_commandと完了receiptを共有するため、独立した対応契約ができるまで原文を保持する。実行中process、未完了call、画像/添付、特殊provenance、対応証拠のない結果は原文保持。正常終了と失敗終了を混同せず、非zero終了を成功化しない。
+- `client_authored=false`と既存`fallback_token_limit_override`は通常のharness metadataとして扱い、上限値自体は変更しない。実Qwenの67結果に後者が付いていることを確認した。これを無条件に特殊metadata扱いすると実データへ適用できない。その他の入力由来・継承・attribution等は保護する。適用条件の判定をhistory ownerへ集約し、rollout側で異なる条件を複製しない。
+- 元のcallとoutput構造を保持し、対象output本文だけをhostが生成した原本参照へ置換する。参照はthread ID・call ID・元内容hashを持ち、専用metadataで再参照化を防ぐ。巨大本文の常時再投入を避けるための参照化であり、参照文字列を元の実行結果や新しい証拠として扱わない。
+- 原本は既存rolloutだけを正本とし、別の編集可能な証拠DBを新設しない。取得CLIは正規CODEX_HOMEのsession/archived-session resolverと履歴readerを使い、thread・call・hash不一致、破損・未取得は明示的に失敗する。元内容を取得してから判断する手順を参照に含める。OS移行で旧絶対pathへ固定されないthread参照とする。
+- Boundary/runtime: rolloutをflushし、原本の読取・照合ができた候補だけを整理入力へ渡す。元snapshotのbinding・既存競合検出・要約coverage/review・checkpoint transactionは維持する。参照化後の候補を検証し、保存前にも原本が検証可能なことを確認する。原本へ戻れない場合に未検証の参照を採用しない。
+- LLMは既存要約の意味判断だけを担当し、完了判定・参照作成・hash検証・取得可否を決めない。既に参照化したtool outputは通常の実行成功を表す新規証拠として重複集計しない。
+- 受入: terminal完了/失敗の原文取得、違うthread/hash・欠落・破損の拒否、pending/process/media/provenanceの保持、原本不変、call/output整合性、cold resume・再圧縮後の取得、同じQwenの通常要求縮小と実作業継続。関連最小チェック後にbuild・配備・実測する。旧fallbackで黙って成功扱いにしない。
+
+### 参照化のLinux実測（2026-09-23）
+
+- 前回中断した関連検査を再開し、106件成功・0件失敗（固定filterによる対象外4,741件）。コードの追加修正なし。`target/fork-bootstrap/tool-archive-tests-final.log`が検査証拠、`tool-archive-build.log`が7分14秒で完了した`dev-small` build証拠。共有状態と旧binaryを私有`compaction-runtime-deploy/before-tool-archive/`へ保全して配備した。実行中binaryのSHA256は`0777542d5df975ac7b81a67ecf9291124b6c18138279267658890267c1505304`。source tree hash・CLI hash・backupは同directoryの`archive-candidate.json`と`archive-deployed.json`。
+- 隔離thread `01a0cc4d-897a-7362-b9ae-12cf5e4fb7b7`で同じworker/highを使用。4,998 byteの完了出力を1参照へ置換し、原本prefix不変・CLI原文取得・継続制約と通常toolを確認。正常終了・cold resume後の2回目の圧縮でも参照を保持・取得できた。`archive-isolated-before.json`、`archive-isolated-after.json`、`archive-isolated-second.json`が集計証拠。
+- 共有thread `01a0cb3e-9142-7252-94f0-e64cd7f0a279`の手動圧縮で223,845 byteの完了出力を51参照へ置換。全51件をowner CLIで取得し、原文hashとterminal状態を照合した。元rollout prefix不変。`archive-before-live.json`と`archive-after-live.json`に記録。helperのcheckpoint候補観測だけを採用成功の証明にはせず、runtimeの完了表示・正常継続・cold resumeと合わせて判定する。
+- 通常要求の観測inputは90,718→38,324 token（差−52,394、約57.8%減）、その後のtool往復で39,830 token。前後の要求は同一ではないため、統制比較の削減率や金額節約率とは扱わない。圧縮2段の実usage合計40,818 token、実request wall合計247.784秒（TUI表示4分9秒）。モデルはworker、effortはhigh。`new-thread-metrics.json`の2026-09-23T03:39:50.252Zのcheckpointが計測証拠。
+- Qwen自身が正規toolでbranch・既存差分を読み、参照1件を専用CLIから取得した。Identityのコード・文書は変更しない読み取り専用試験であり、Step13〜20の完了ではない。共有cold resume後も全51参照をowner CLIで取得できた（`archive-after-cold-resume.json`）。
+- 未確認範囲: 長時間のIdentity実作業中の自動圧縮・継続品質、実automatic triggerでの参照化、Windows/macOS native、remote経路。今回のLinux手動試験と既存自動経路の統合テストだけで、圧縮ループの恒久解消や全経路受入完了とは主張しない。由来なしの過去指示を全削除したとも扱わない。
+
+### 要約1要求化のLinux実測（2026-09-23）
+
+- `compaction-speed-tests-fixed.log`: 固定した関連110 testsが成功、4741件は対象外filter。初回の109成功/1失敗ではreview情報の除去に伴う本文hash検証の欠落を検出し、v2の独立したhost `summary_hash`で修正した。改変拒否の期待値は緩めていない。独立差分reviewを経て`compaction-speed-build.log`のbuildが成功（3分40秒）。配備binary SHA256は`c8e8df1ed2da365579bed351981758e14e102762b99637580f93633c1eac6a2b`。CLI hash・source manifest hash・旧版退避は既存`compaction-runtime-deploy/speed-candidate.json`、`candidate.json`、`before-speed/`。
+- 共有threadの直前失敗要求と新要求で、selected viewの`retained`（368 records）、`results`、`applied_operations`、`unresolved_operations`が完全一致。model、effort、base instructionsも一致。意味判断に不要なinventory/hash/sizeを除き、生成データは85,172→66,639 byte（約21.76%減）。比較証拠は`speed-live-input-comparison.json`。モデル生成の確率的変動や通常要求全体の費用を同一とは仮定しない。
+- 旧要求はsummary 199.103秒＋review 95.899秒、75,632 tokenの後に190 ID中2 IDの欠落で不採用。時間は`source-coverage-failure.json`の同一inference_call_idによる開始/終了trace照合値。新要求は2026-09-23T05:44:02.062Zにcommitし、summaryのみ108.310秒、入力19,001＋出力5,551＝24,552 token、worker/high、190/190 IDのhost bindingに成功。旧は失敗、新は成功という試行比較であり、同等の成功成果に対する一般的な削減率とはしない。
+- 新版の共有圧縮後、116参照（元本文380,054 byte）を全件owner CLIで取得・hash照合し、元rollout prefix不変を確認（`speed-after-live.json`）。同threadを正常終了/cold resumeし、利用者指定の「Step20まで終わらせて」だけで通常toolへ復帰。圧縮後最初の通常要求は78,231 input token。要約にはStep20、branch制約、仕様path、未完了・未検証の境界が保持された。Identity自体の完了証拠ではない。
+- 隔離threadでもsummary 1要求・38.349秒、原本参照と継続条件を保持。ただしcold resume後の初回要求を過去のコマンドと混同し、明示訂正後に新しい実tool出力を確認した。要約本文だけを旧v1へ差し替えた読み取り専用の比較生成でも過去コマンドを選んだため、新要約だけを原因とは断定できない。Gatewayコードでは末尾userの保持・順序を確認したが、providerへ渡った実Chat本文の採取まではしていない。この文脈混同を修正済み・初回継続を常時保証と扱わない。証拠は`speed-isolated-acceptance.json`と隔離試験の`speed-old-summary-control-*`。
+- 本実測はLinux localの限定受入。新版の長時間自動圧縮、三OS native、remote、一般的な意味品質・総費用削減は別の未確認境界として維持する。品質確認はCodex側の`speed-quality-checklist.json`で行い、自動summary reviewの合格receiptを捏造しない。
+
+### 完了履歴削減と意味訂正のLinux実測（2026-09-23）
+
+- 関連gateは初回121件中119件成功、残り2件のfixture修正後の個別gateも成功。全件の再実行はしていない。後続のSUMMARY_PROMPTだけの修正は既存history gate1/1成功（74 skipped）。buildは双方exit0。既存check-planと `completed-work-tests*.log`、`completed-work-prompt-tests.log`、`completed-work-prompt-build.log` を参照。
+- 隔離human threadではcall/result除去、成功と意図したexit7の区別、現行合言葉・日本語・添付1件の保持、撤回済み合言葉の不在、原本prefix不変、cold resume後の新command実行を確認。archive threadでも既存v1参照と新しい完了pairを入力から除去し、旧参照取得と再圧縮を確認。初回の新commandを別文字列へ取り違えるQwen挙動が1件あり、訂正後は正しい実行を確認。同じ新版入力と要約だけ旧版にしたread-only比較はいずれも正しいcallを返し、取り違えの一般解消は主張しない。
+- 共有thread `01a0cb3e-9142-7252-94f0-e64cd7f0a279` の初回replacementは388→37項目、174 call/output組を削減、v1参照135→0。原本の6,894,095-byte prefixは不変で、旧135参照をowner CLIから全件取得・hash照合した。適格でない10組は保護したまま。
+- 初回共有要約はworkstreamのstart-onlyログをexit0と誤記したため不合格。ログ一覧取得コマンドのexit0と対象テストの成否を分ける既存promptの4文補足を、同じ実入力のread-only比較で確認後に実装した。通常runtimeの追加review要求、新schema、新保存経路は増やしていない。誤checkpointの物理書換え・truncateはせず、正規入力で不具合を伝え、Qwenが実ログを再読して訂正した。
+- 新binaryでの再圧縮は89.65秒、input12,843/output5,068 token、replacement38項目。scheduler 3pkg成功・features/schedulerテストなし・workstream結果未確認・過去接続障害を過去観測とする区別をCodexが実要約で確認。原本prefix不変、確認用の新しい完了pair除去、正常終了/cold resume後に指定の「Step20まで終わらせて」だけで通常toolへ復帰。最初の通常入力18,485 token（直前旧観測87,117と要求内容が違うため厳密な削減率ではない）。
+- 現候補・source hash・binary hash・trace・受入境界は既存 `target/fork-bootstrap/compaction-runtime-deploy/candidate.json` と固定check-planが指す証拠を参照。長時間自動圧縮、remote、三OS、総費用、Step20の運用受入は未完了であり、今回の成功を全経路の無条件保証としない。

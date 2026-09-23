@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-09-22: model-invisible compaction commit marker.
 use crate::ARCHIVED_SESSIONS_SUBDIR;
 use crate::RolloutItem;
 use crate::SESSIONS_SUBDIR;
@@ -77,6 +78,7 @@ pub fn builder_from_items(
         RolloutItem::ResponseItem(_)
         | RolloutItem::InterAgentCommunication(_)
         | RolloutItem::InterAgentCommunicationMetadata { .. }
+        | RolloutItem::RenCrowCompactionCommit { .. }
         | RolloutItem::Compacted(_)
         | RolloutItem::TurnContext(_)
         | RolloutItem::WorldState(_)
@@ -169,6 +171,7 @@ pub async fn extract_metadata_from_rollout(
             RolloutItem::ResponseItem(_)
             | RolloutItem::InterAgentCommunication(_)
             | RolloutItem::InterAgentCommunicationMetadata { .. }
+            | RolloutItem::RenCrowCompactionCommit { .. }
             | RolloutItem::Compacted(_)
             | RolloutItem::TurnContext(_)
             | RolloutItem::WorldState(_)

@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-09-22: runtime compaction regression.
 // Aggregates all former standalone integration tests as modules.
 use codex_apply_patch::CODEX_CORE_APPLY_PATCH_ARG1;
 #[cfg(unix)]
@@ -59,6 +60,7 @@ mod codex_delegate;
 mod collaboration_instructions;
 mod compact;
 mod compact_remote;
+mod compact_rencrow;
 mod compact_resume_fork;
 mod context_annotations;
 mod current_time_reminder;

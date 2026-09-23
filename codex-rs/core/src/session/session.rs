@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-09-22: handle durable compaction markers.
 use super::input_queue::InputQueue;
 use super::mcp_refresh::McpRefresh;
 use super::step_context::StepContext;
@@ -1604,7 +1605,8 @@ impl Session {
                     | RolloutItem::RealtimeItem(_)
                     | RolloutItem::TokenUsageRecord(_)
                     | RolloutItem::RetainedContext(_)
-                    | RolloutItem::SecurityRiskScore(_) => {}
+                    | RolloutItem::RenCrowCompactionCommit { .. }
+                | RolloutItem::SecurityRiskScore(_) => {}
                 }
             }
             let session_extension_data =

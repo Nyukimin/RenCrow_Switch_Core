@@ -1,6 +1,8 @@
+// Modified by RenCrow Switch Core, 2026-09-22: halt after an uncertain checkpoint write.
 //! Session-wide mutable state.
 
 use codex_protocol::models::AdditionalPermissionProfile;
+use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::BaseInstructionsProvenance;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort;
@@ -42,6 +44,13 @@ pub(crate) enum ReasoningEffortPin {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum TokenUsageSource {
+    #[default]
+    RecordedUsage,
+    CurrentHistoryEstimate,
+}
+
 impl ReasoningEffortPin {
     pub(crate) fn get(&self, model: &str) -> Option<ReasoningEffort> {
         match self {
@@ -67,6 +76,7 @@ impl ReasoningEffortPin {
 
 /// Persistent, session-scoped state previously stored directly on `Session`.
 pub(crate) struct SessionState {
+    pub(crate) rencrow_checkpoint_failed: bool,
     pub(crate) session_configuration: SessionConfiguration,
     /// Plugin selection of the last admitted task; settings updates take effect on the next task.
     pub(crate) active_disabled_plugin_ids: Vec<String>,
@@ -77,6 +87,9 @@ pub(crate) struct SessionState {
     pub(crate) history_reset: CancellationToken,
     pub(crate) latest_rate_limits: Option<RateLimitSnapshot>,
     pub(crate) latest_token_usage_record: Option<TokenUsageRecord>,
+    /// Invalidates in-flight auxiliary usage snapshots after any regular response completes.
+    pub(crate) active_usage_generation: u64,
+    token_usage_source: TokenUsageSource,
     pub(crate) server_reasoning_included: bool,
     pub(crate) mcp_dependency_prompted: HashSet<String>,
     pub(crate) additional_context: AdditionalContextStore,
@@ -126,6 +139,8 @@ impl SessionState {
             history_reset: CancellationToken::new(),
             latest_rate_limits: None,
             latest_token_usage_record: None,
+            active_usage_generation: 0,
+            token_usage_source: TokenUsageSource::RecordedUsage,
             server_reasoning_included: false,
             mcp_dependency_prompted: HashSet::new(),
             additional_context: AdditionalContextStore::default(),
@@ -140,6 +155,7 @@ impl SessionState {
             pending_session_start_sources: VecDeque::new(),
             granted_permissions_by_environment_id: HashMap::new(),
             next_turn_is_first: true,
+            rencrow_checkpoint_failed: false,
         }
     }
 
@@ -216,6 +232,20 @@ impl SessionState {
 
     pub(crate) fn set_token_info(&mut self, info: Option<TokenUsageInfo>) {
         self.history.set_token_info(info);
+        self.token_usage_source = TokenUsageSource::RecordedUsage;
+    }
+
+    pub(crate) fn set_token_info_with_source(
+        &mut self,
+        info: Option<TokenUsageInfo>,
+        source: TokenUsageSource,
+    ) {
+        self.history.set_token_info(info);
+        self.token_usage_source = source;
+    }
+
+    pub(crate) fn token_usage_source(&self) -> TokenUsageSource {
+        self.token_usage_source
     }
 
     pub(crate) fn record_token_usage(
@@ -271,6 +301,7 @@ impl SessionState {
         model_context_window: Option<i64>,
     ) {
         self.history.update_token_info(usage, model_context_window);
+        self.token_usage_source = TokenUsageSource::RecordedUsage;
     }
 
     pub(crate) fn ensure_auto_compact_window_server_prefill_from_usage(
@@ -313,6 +344,15 @@ impl SessionState {
         self.auto_compact_window.restore(window_number, ids);
     }
 
+    pub(crate) fn adopt_rencrow_compaction_window(
+        &mut self,
+        window_number: u64,
+        ids: AutoCompactWindowIds,
+    ) {
+        self.auto_compact_window = AutoCompactWindow::new_with_ids(ids);
+        self.auto_compact_window.restore(window_number, ids);
+    }
+
     pub(crate) fn advance_auto_compact_window(&mut self) -> (u64, AutoCompactWindowIds) {
         self.auto_compact_window.advance()
     }
@@ -350,11 +390,31 @@ impl SessionState {
 
     pub(crate) fn set_token_usage_full(&mut self, context_window: i64) {
         self.history.set_token_usage_full(context_window);
+        self.token_usage_source = TokenUsageSource::RecordedUsage;
     }
 
-    pub(crate) fn get_total_token_usage(&self, server_reasoning_included: bool) -> i64 {
-        self.history
-            .get_total_token_usage(server_reasoning_included)
+    pub(crate) fn get_total_token_usage(
+        &self,
+        server_reasoning_included: bool,
+        base_instructions_text: &str,
+    ) -> i64 {
+        match self.token_usage_source {
+            TokenUsageSource::RecordedUsage => self
+                .history
+                .get_total_token_usage(server_reasoning_included),
+            TokenUsageSource::CurrentHistoryEstimate => {
+                let last_active_total = self
+                    .token_info()
+                    .map_or(0, |info| info.last_token_usage.total_tokens);
+                let base_instructions = BaseInstructions {
+                    text: base_instructions_text.to_owned(),
+                    provenance: self.base_instructions_provenance.clone(),
+                };
+                self.history
+                    .estimate_token_count_with_base_instructions(&base_instructions)
+                    .map_or(last_active_total, |tokens| tokens.max(0))
+            }
+        }
     }
 
     pub(crate) fn set_server_reasoning_included(&mut self, included: bool) {

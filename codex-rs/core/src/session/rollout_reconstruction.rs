@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-09-22: handle durable compaction markers.
 use super::*;
 use crate::context::GuardianContextMode;
 use crate::context::world_state::WorldStateSnapshot;
@@ -303,6 +304,7 @@ impl Session {
                 | RolloutItem::SessionMeta(_)
                 | RolloutItem::RealtimeItem(_)
                 | RolloutItem::RetainedContext(_)
+                | RolloutItem::RenCrowCompactionCommit { .. }
                 | RolloutItem::SecurityRiskScore(_)
                 | RolloutItem::TokenUsageRecord(_)
                 | RolloutItem::InterAgentCommunicationMetadata { .. } => {}
@@ -420,6 +422,7 @@ impl Session {
                 | RolloutItem::TurnContext(_)
                 | RolloutItem::RealtimeItem(_)
                 | RolloutItem::WorldState(_)
+                | RolloutItem::RenCrowCompactionCommit { .. }
                 | RolloutItem::SecurityRiskScore(_)
                 | RolloutItem::TokenUsageRecord(_)
                 | RolloutItem::SessionMeta(_) => {}
@@ -463,6 +466,7 @@ impl Session {
                 | RolloutItem::RealtimeItem(_)
                 | RolloutItem::TokenUsageRecord(_)
                 | RolloutItem::RetainedContext(_)
+                | RolloutItem::RenCrowCompactionCommit { .. }
                 | RolloutItem::SecurityRiskScore(_)
                 | RolloutItem::EventMsg(_) => {
                     unreachable!("only world-state replay items are collected")

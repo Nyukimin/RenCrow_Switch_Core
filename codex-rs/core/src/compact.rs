@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-09-22: isolated validated local compaction.
 use crate::context::GuardianContextMode;
 use std::sync::Arc;
 use std::time::Instant;
@@ -254,6 +255,15 @@ async fn run_compact_task_inner_impl(
     initial_context_injection: InitialContextInjection,
     compaction_metadata: CompactionTurnMetadata,
 ) -> CodexResult<String> {
+    if turn_context.config.rencrow_compaction {
+        return rencrow::run(
+            sess,
+            turn_context,
+            initial_context_injection,
+            compaction_metadata,
+        )
+        .await;
+    }
     let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
     sess.emit_turn_item_started(&turn_context, &compaction_item)
         .await;
@@ -761,8 +771,12 @@ fn build_compacted_history_with_limit(
     history
 }
 
+#[path = "compact_rencrow.rs"]
+mod rencrow;
+
 struct CompactionResponse {
     response_id: String,
+    token_usage: Option<codex_protocol::protocol::TokenUsage>,
     output: Vec<ResponseItem>,
 }
 
@@ -774,6 +788,21 @@ async fn drain_to_completed(
     prompt: &Prompt,
     phase: CompactionPhase,
 ) -> CodexResult<CompactionResponse> {
+    let compaction_usage_guard = if turn_context.config.rencrow_compaction {
+        Some(sess.capture_compaction_usage_guard(turn_context).await)
+    } else {
+        None
+    };
+    // Opt-in owner tracing also captures rejected staged proposals for diagnosis.
+    let inference_trace = if turn_context.config.rencrow_compaction {
+        sess.services.rollout_thread_trace.inference_trace_context(
+            turn_context.sub_id.as_str(),
+            turn_context.model_info().slug.as_str(),
+            turn_context.provider.info().name.as_str(),
+        )
+    } else {
+        InferenceTraceContext::disabled()
+    };
     let mut stream = client_session
         .stream(
             prompt,
@@ -787,9 +816,7 @@ async fn drain_to_completed(
             turn_context.reasoning_summary(),
             turn_context.config.service_tier.clone(),
             responses_metadata,
-            // Rollout tracing currently models remote compaction only; local compaction streams
-            // are left untraced until the reducer has a first-class local compaction lifecycle.
-            &InferenceTraceContext::disabled(),
+            &inference_trace,
         )
         .await?;
     let mut output = Vec::new();
@@ -802,9 +829,11 @@ async fn drain_to_completed(
         };
         match event {
             Ok(ResponseEvent::OutputItemDone(item)) => {
-                if matches!(phase, CompactionPhase::PostTurn) {
-                    // Commit post-turn summaries only after success; failures must leave both
-                    // the live history and persisted rollout intact.
+                if turn_context.config.rencrow_compaction
+                    || matches!(phase, CompactionPhase::PostTurn)
+                {
+                    // Fork compaction stages proposal output in every actual phase. The real
+                    // phase remains in request metadata; disabled compaction keeps its old path.
                     output.push(item);
                 } else {
                     sess.record_conversation_items(
@@ -834,10 +863,21 @@ async fn drain_to_completed(
                     usage_metadata.as_ref(),
                 )
                 .await;
-                sess.update_token_usage_info(turn_context, token_usage.as_ref())
+                if let Some(guard) = compaction_usage_guard.as_ref() {
+                    sess.update_compaction_aux_token_usage_info(
+                        turn_context,
+                        &turn_context.initial_settings,
+                        token_usage.as_ref(),
+                        guard,
+                    )
                     .await?;
+                } else {
+                    sess.update_token_usage_info(turn_context, token_usage.as_ref())
+                        .await?;
+                }
                 return Ok(CompactionResponse {
                     response_id,
+                    token_usage,
                     output,
                 });
             }

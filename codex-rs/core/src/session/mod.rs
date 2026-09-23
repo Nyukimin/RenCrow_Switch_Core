@@ -1,3 +1,6 @@
+// Modified by RenCrow Switch Core, 2026-09-22: intake and validated checkpoint integration.
+mod rencrow_compaction;
+pub(crate) use rencrow_compaction::RenCrowCheckpoint;
 pub(crate) mod startup;
 
 use std::borrow::Cow;
@@ -314,6 +317,7 @@ use crate::state::PendingRequestPermissions;
 use crate::state::ReasoningEffortPin;
 use crate::state::SessionServices;
 use crate::state::SessionState;
+use crate::state::TokenUsageSource;
 #[cfg(test)]
 use crate::stream_events_utils::HandleOutputCtx;
 #[cfg(test)]
@@ -507,6 +511,62 @@ pub(crate) const SUBMISSION_CHANNEL_CAPACITY: usize = 512;
 const CYBER_VERIFY_URL: &str = "https://chatgpt.com/cyber";
 const CYBER_SAFETY_URL: &str = "https://developers.openai.com/codex/concepts/cyber-safety";
 
+#[derive(Clone)]
+pub(crate) struct CompactionUsageGuard {
+    usage_generation: u64,
+    window_number: u64,
+    window_ids: AutoCompactWindowIds,
+    last_started_turn_id: Option<String>,
+    step_settings: Arc<StepSettings>,
+    token_info: Option<TokenUsageInfo>,
+    token_usage_source: TokenUsageSource,
+    request_turn_matches: bool,
+    request_settings_match: bool,
+}
+
+impl CompactionUsageGuard {
+    fn capture(state: &SessionState, turn_context: &TurnContext) -> Self {
+        Self {
+            usage_generation: state.active_usage_generation,
+            window_number: state.auto_compact_window_number(),
+            window_ids: state.auto_compact_window_ids(),
+            last_started_turn_id: state.last_started_turn_id.clone(),
+            step_settings: Arc::clone(&state.session_configuration.step_settings),
+            token_info: state.token_info(),
+            token_usage_source: state.token_usage_source(),
+            request_turn_matches: state
+                .last_started_turn_id
+                .as_deref()
+                .is_none_or(|turn_id| turn_id == turn_context.sub_id),
+            request_settings_match: std::ptr::eq(
+                state.session_configuration.step_settings.as_ref(),
+                turn_context.initial_settings.selected(),
+            ),
+        }
+    }
+
+    fn matches(&self, state: &SessionState) -> bool {
+        self.request_turn_matches
+            && self.request_settings_match
+            && self.usage_generation == state.active_usage_generation
+            && self.window_number == state.auto_compact_window_number()
+            && self.window_ids == state.auto_compact_window_ids()
+            && self.last_started_turn_id == state.last_started_turn_id
+            && Arc::ptr_eq(
+                &self.step_settings,
+                &state.session_configuration.step_settings,
+            )
+            && self.token_usage_source == state.token_usage_source()
+            && self.token_info == state.token_info()
+    }
+}
+
+#[derive(Clone, Copy)]
+enum TokenUsageAccountingMode<'a> {
+    Normal,
+    CompactionAux(&'a CompactionUsageGuard),
+}
+
 impl Session {
     /// Spawn and initialize a new session.
     /// Hide the concrete startup future from callers while keeping initialization lazy.
@@ -555,7 +615,7 @@ impl Session {
             mcp_manager,
             code_mode_session_provider,
             extensions,
-            conversation_history,
+            mut conversation_history,
             disabled_plugin_ids,
             requested_history_mode,
             fork_persistence,
@@ -585,6 +645,19 @@ impl Session {
             git_enrichment_policy,
             windows_sandbox_proxy_settings_mode,
         } = args;
+        match &mut conversation_history {
+            InitialHistory::Resumed(history) => {
+                history.history = Arc::new(
+                    codex_history::compaction_transaction::committed_items(&history.history)
+                        .map_err(CodexErr::Fatal)?,
+                );
+            }
+            InitialHistory::Forked(items) => {
+                *items = codex_history::compaction_transaction::committed_items(items)
+                    .map_err(CodexErr::Fatal)?;
+            }
+            InitialHistory::New | InitialHistory::Cleared => {}
+        }
         let (tx_sub, rx_sub) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
         let (tx_event, rx_event) = async_channel::unbounded();
 
@@ -1441,7 +1514,10 @@ impl Session {
 
     pub(crate) async fn get_total_token_usage(&self) -> i64 {
         let state = self.state.lock().await;
-        state.get_total_token_usage(state.server_reasoning_included())
+        state.get_total_token_usage(
+            state.server_reasoning_included(),
+            &state.session_configuration.base_instructions,
+        )
     }
 
     pub(crate) async fn auto_compact_window_snapshot(&self) -> AutoCompactWindowSnapshot {
@@ -1606,6 +1682,9 @@ impl Session {
                 }
                 self.state.lock().await.latest_token_usage_record =
                     Self::last_token_usage_record_from_rollout(&rollout_items);
+                if turn_context.config.rencrow_compaction {
+                    self.recompute_token_usage(&turn_context).await;
+                }
 
                 // Checkpoint effective settings even when no turn follows the resume.
                 self.persist_rollout_items(&[RolloutItem::EventMsg(
@@ -1664,6 +1743,12 @@ impl Session {
                 // Forked threads should remain file-backed immediately after startup.
                 self.ensure_rollout_materialized(PersistContext::Standard)
                     .await;
+
+                // Persist a refreshed count after the copied prefix so it remains the latest
+                // TokenCount row when this fork is resumed.
+                if turn_context.config.rencrow_compaction {
+                    self.recompute_token_usage(&turn_context).await;
+                }
 
                 // Flush after seeding history and any persisted rollout copy.
                 if !is_subagent {
@@ -4632,6 +4717,33 @@ impl Session {
         result
     }
 
+    pub(crate) async fn capture_compaction_usage_guard(
+        &self,
+        turn_context: &TurnContext,
+    ) -> CompactionUsageGuard {
+        let state = self.state.lock().await;
+        CompactionUsageGuard::capture(&state, turn_context)
+    }
+
+    pub(crate) async fn update_compaction_aux_token_usage_info(
+        &self,
+        turn_context: &TurnContext,
+        settings: &ResolvedStepSettings,
+        token_usage: Option<&TokenUsage>,
+        guard: &CompactionUsageGuard,
+    ) -> CodexResult<()> {
+        let result = self
+            .record_token_usage_info_with_mode(
+                turn_context,
+                settings,
+                token_usage,
+                TokenUsageAccountingMode::CompactionAux(guard),
+            )
+            .await;
+        self.send_token_count_event(turn_context).await;
+        result
+    }
+
     pub(crate) async fn record_observed_response_completed(
         &self,
         turn_context: &TurnContext,
@@ -4672,45 +4784,126 @@ impl Session {
         settings: &ResolvedStepSettings,
         token_usage: Option<&TokenUsage>,
     ) -> CodexResult<()> {
-        if let Some(token_usage) = token_usage {
-            let token_info = {
+        self.record_token_usage_info_with_mode(
+            turn_context,
+            settings,
+            token_usage,
+            TokenUsageAccountingMode::Normal,
+        )
+        .await
+    }
+
+    async fn record_token_usage_info_with_mode(
+        &self,
+        turn_context: &TurnContext,
+        settings: &ResolvedStepSettings,
+        token_usage: Option<&TokenUsage>,
+        mode: TokenUsageAccountingMode<'_>,
+    ) -> CodexResult<()> {
+        let Some(token_usage) = token_usage else {
+            if matches!(mode, TokenUsageAccountingMode::Normal) {
                 let mut state = self.state.lock().await;
-                state
-                    .update_token_info_from_usage(token_usage, turn_context.model_context_window());
-                if matches!(
-                    turn_context.config.model_auto_compact_token_limit_scope,
-                    AutoCompactTokenLimitScope::BodyAfterPrefix
-                ) {
-                    state.ensure_auto_compact_window_server_prefill_from_usage(token_usage);
+                state.active_usage_generation = state.active_usage_generation.wrapping_add(1);
+            }
+            return Ok(());
+        };
+
+        let callback_token_info = {
+            let mut state = self.state.lock().await;
+            let previous_token_info = state.token_info();
+            let previous_usage_source = state.token_usage_source();
+            let auxiliary_guard_matches = match mode {
+                TokenUsageAccountingMode::Normal => {
+                    state.active_usage_generation = state.active_usage_generation.wrapping_add(1);
+                    None
                 }
-                state.token_info()
+                TokenUsageAccountingMode::CompactionAux(guard) => Some(guard.matches(&state)),
             };
-            let turn_state = self
-                .input_queue
-                .turn_state_for_sub_id(&self.active_turn, &turn_context.sub_id)
-                .await;
-            if let Some(turn_state) = turn_state {
-                turn_state.lock().await.token_usage_by_model.record(
-                    settings.selected_collaboration_mode().model(),
-                    settings.telemetry(&turn_context.session_telemetry),
-                    token_usage,
-                );
-            }
-            let budget_result = self.record_rollout_budget_usage(token_usage);
-            if let Some(token_info) = token_info.as_ref() {
-                for contributor in self.services.extensions.token_usage_contributors() {
-                    contributor
-                        .on_token_usage(
-                            &self.services.session_extension_data,
-                            &self.services.thread_extension_data,
-                            turn_context.extension_data.as_ref(),
-                            token_info,
-                        )
-                        .await;
+
+            state.update_token_info_from_usage(token_usage, turn_context.model_context_window());
+            let billing_token_info = state.token_info();
+
+            match mode {
+                TokenUsageAccountingMode::Normal => {
+                    if matches!(
+                        turn_context.config.model_auto_compact_token_limit_scope,
+                        AutoCompactTokenLimitScope::BodyAfterPrefix
+                    ) {
+                        state.ensure_auto_compact_window_server_prefill_from_usage(token_usage);
+                    }
+                    billing_token_info
+                }
+                TokenUsageAccountingMode::CompactionAux(_) => {
+                    if let Some(mut active_token_info) = billing_token_info.clone() {
+                        let estimated_total_tokens = if auxiliary_guard_matches == Some(true) {
+                            let base_instructions = BaseInstructions {
+                                text: state.session_configuration.base_instructions.clone(),
+                                provenance: state.base_instructions_provenance.clone(),
+                            };
+                            state
+                                .history
+                                .estimate_token_count_with_base_instructions(&base_instructions)
+                        } else {
+                            None
+                        };
+
+                        if let Some(estimated_total_tokens) = estimated_total_tokens {
+                            active_token_info.last_token_usage = TokenUsage {
+                                total_tokens: estimated_total_tokens.max(0),
+                                ..TokenUsage::default()
+                            };
+                            state.set_token_info_with_source(
+                                Some(active_token_info),
+                                TokenUsageSource::CurrentHistoryEstimate,
+                            );
+                        } else if let Some(previous_token_info) = previous_token_info {
+                            active_token_info.last_token_usage =
+                                previous_token_info.last_token_usage;
+                            active_token_info.model_context_window =
+                                previous_token_info.model_context_window;
+                            state.set_token_info_with_source(
+                                Some(active_token_info),
+                                previous_usage_source,
+                            );
+                        } else {
+                            active_token_info.last_token_usage = TokenUsage::default();
+                            active_token_info.model_context_window = None;
+                            state.set_token_info_with_source(
+                                Some(active_token_info),
+                                previous_usage_source,
+                            );
+                        }
+                    }
+                    billing_token_info
                 }
             }
-            budget_result?;
+        };
+
+        let turn_state = self
+            .input_queue
+            .turn_state_for_sub_id(&self.active_turn, &turn_context.sub_id)
+            .await;
+        if let Some(turn_state) = turn_state {
+            turn_state.lock().await.token_usage_by_model.record(
+                settings.selected_collaboration_mode().model(),
+                settings.telemetry(&turn_context.session_telemetry),
+                token_usage,
+            );
         }
+        let budget_result = self.record_rollout_budget_usage(token_usage);
+        if let Some(token_info) = callback_token_info.as_ref() {
+            for contributor in self.services.extensions.token_usage_contributors() {
+                contributor
+                    .on_token_usage(
+                        &self.services.session_extension_data,
+                        &self.services.thread_extension_data,
+                        turn_context.extension_data.as_ref(),
+                        token_info,
+                    )
+                    .await;
+            }
+        }
+        budget_result?;
         Ok(())
     }
 
@@ -4744,7 +4937,12 @@ impl Session {
                 info.model_context_window = Some(model_context_window);
             }
 
-            state.set_token_info(Some(info));
+            let usage_source = if turn_context.config.rencrow_compaction {
+                TokenUsageSource::CurrentHistoryEstimate
+            } else {
+                TokenUsageSource::RecordedUsage
+            };
+            state.set_token_info_with_source(Some(info), usage_source);
         }
         self.set_auto_compact_window_estimated_prefill_for_scope(
             turn_context,
@@ -4843,7 +5041,7 @@ impl Session {
             input.to_vec(),
             &mut user_image_content_indices,
         );
-        let (prepared_items, image_preparations) = self
+        let (mut prepared_items, image_preparations) = self
             .prepare_annotated_conversation_items_for_history(
                 turn_context,
                 model_info,
@@ -4857,6 +5055,13 @@ impl Session {
             )
             .await;
         let mut user_message_item = UserMessageItem::new(input);
+        self.bind_rencrow_intake(
+            turn_context,
+            client_id.as_deref(),
+            &user_message_item.message(),
+            &mut prepared_items,
+        )
+        .await;
         apply_prepared_image_file_ids(
             &mut user_message_item,
             &prepared_items,

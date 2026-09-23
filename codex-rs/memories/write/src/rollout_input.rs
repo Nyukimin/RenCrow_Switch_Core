@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-09-22: keep transaction markers out of model input.
 //! Selects v2 extraction evidence by provenance, then restores chronological order.
 //! Human replies retain their questions; message media is replaced with placeholders.
 //! Budgets use the same token estimate as the rest of the memory pipeline.
@@ -51,6 +52,7 @@ pub(crate) fn serialize_tiered_input(
             | RolloutItem::TurnContext(_)
             | RolloutItem::RealtimeItem(_)
             | RolloutItem::WorldState(_)
+            | RolloutItem::RenCrowCompactionCommit { .. }
             | RolloutItem::SecurityRiskScore(_)
             | RolloutItem::TokenUsageRecord(_)
             | RolloutItem::RetainedContext(_)

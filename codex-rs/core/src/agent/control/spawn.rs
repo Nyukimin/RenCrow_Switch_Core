@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-09-22: handle durable compaction markers.
 use super::residency::is_v2_resident_session_source;
 use super::*;
 use crate::agent::child_config::build_agent_resume_config;
@@ -102,6 +103,7 @@ fn keep_forked_rollout_item(item: &RolloutItem, preserve_reference_context_item:
         | RolloutItem::InterAgentCommunication(_)
         | RolloutItem::InterAgentCommunicationMetadata { .. }
         | RolloutItem::RetainedContext(_)
+        | RolloutItem::RenCrowCompactionCommit { .. }
         | RolloutItem::SecurityRiskScore(_) => false,
         // Full-history forks preserve the cached prompt prefix and can keep diffing
         // from the parent's durable baseline. Truncated forks drop part of that prompt,
@@ -915,6 +917,10 @@ impl LocalAgentControl {
                     ))
                 })?;
 
+        forked_rollout_items =
+            codex_history::compaction_transaction::committed_items(&forked_rollout_items)
+                .map_err(CodexErr::Fatal)?;
+
         let selected_capability_roots = forked_rollout_items
             .iter()
             .find_map(|item| {
@@ -1098,6 +1104,7 @@ impl LocalAgentControl {
                 | RolloutItem::InterAgentCommunicationMetadata { .. } => true,
                 RolloutItem::RetainedContext(_)
                 | RolloutItem::TokenUsageRecord(_)
+                | RolloutItem::RenCrowCompactionCommit { .. }
                 | RolloutItem::SecurityRiskScore(_) => false,
             }
         });

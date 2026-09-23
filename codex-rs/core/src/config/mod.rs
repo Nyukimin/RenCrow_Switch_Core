@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-09-22: validated compaction configuration.
 use crate::config::edit::ConfigEdit;
 use crate::config::edit::ConfigEditsBuilder;
 use crate::context::world_state::validate_managed_developer_instructions;
@@ -723,6 +724,9 @@ pub struct Config {
 
     /// Compact prompt override.
     pub compact_prompt: Option<String>,
+
+    /// Select the fork-owned local compaction pipeline.
+    pub rencrow_compaction: bool,
 
     /// Optional external notifier command. When set, Codex will spawn this
     /// program after each completed *turn* (i.e. when the agent finishes
@@ -4238,6 +4242,7 @@ impl Config {
             personality,
             developer_instructions,
             compact_prompt,
+            rencrow_compaction: cfg.rencrow_compaction.unwrap_or(false),
             include_permissions_instructions,
             include_apps_instructions,
             include_collaboration_mode_instructions,

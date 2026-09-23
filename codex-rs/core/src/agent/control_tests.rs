@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-09-22: handle durable compaction markers.
 use super::*;
 use crate::CodexThread;
 use crate::StateDbHandle;
@@ -302,6 +303,7 @@ async fn persisted_originator(thread: &CodexThread) -> String {
             | RolloutItem::WorldState(_)
             | RolloutItem::RealtimeItem(_)
             | RolloutItem::RetainedContext(_)
+            | RolloutItem::RenCrowCompactionCommit { .. }
             | RolloutItem::SecurityRiskScore(_)
             | RolloutItem::TokenUsageRecord(_)
             | RolloutItem::TurnContext(_) => None,

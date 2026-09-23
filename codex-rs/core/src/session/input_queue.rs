@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-09-22: serialize compaction commit with input acceptance.
 use crate::state::ActiveTurn;
 use crate::state::MailboxDeliveryPhase;
 use crate::state::TurnState;
@@ -79,6 +80,7 @@ pub(crate) struct TurnInputQueue {
 
 /// Session-scoped pending input storage and active-turn mailbox delivery coordination.
 pub(crate) struct InputQueue {
+    pub(crate) compaction_gate: tokio::sync::Semaphore,
     activity_tx: watch::Sender<InputQueueActivity>,
     mailbox_pending_mails: Mutex<VecDeque<PendingMailboxCommunication>>,
 }
@@ -94,6 +96,7 @@ impl InputQueue {
         let (activity_tx, _) = watch::channel(InputQueueActivity::Mailbox);
         Self {
             activity_tx,
+            compaction_gate: tokio::sync::Semaphore::new(1),
             mailbox_pending_mails: Mutex::new(VecDeque::new()),
         }
     }
@@ -126,6 +129,11 @@ impl InputQueue {
         communication: InterAgentCommunication,
         start_options: TurnStartOptions,
     ) {
+        let _commit_guard = self
+            .compaction_gate
+            .acquire()
+            .await
+            .expect("compaction gate is never closed");
         self.mailbox_pending_mails
             .lock()
             .await
@@ -261,6 +269,11 @@ impl InputQueue {
         turn_state: &Mutex<TurnState>,
         input: Vec<TurnInput>,
     ) {
+        let _commit_guard = self
+            .compaction_gate
+            .acquire()
+            .await
+            .expect("compaction gate is never closed");
         {
             let mut turn_state = turn_state.lock().await;
             turn_state.pending_input.items.extend(input);

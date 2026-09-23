@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-09-22: normalize prepared checkpoint history before counting inherited rows.
 mod managed;
 mod shared_instructions;
 
@@ -1471,14 +1472,18 @@ impl ThreadManager {
         options: StartThreadOptions,
         prepared: PreparedFork,
     ) -> CodexResult<NewThread> {
+        let model_context = Arc::new(
+            codex_history::compaction_transaction::committed_items(&prepared.model_context)
+                .map_err(CodexErr::Fatal)?,
+        );
         let history = InitialHistory::Resumed(ResumedHistory {
             conversation_id: prepared.source_thread_id,
-            history: Arc::clone(&prepared.model_context),
+            history: Arc::clone(&model_context),
             rollout_path: None,
         });
         let fork_persistence = ForkPersistence::Referenced {
             history_base: prepared.history_base,
-            inherited_item_count: prepared.model_context.len(),
+            inherited_item_count: model_context.len(),
         };
         let result = self
             .fork_thread_with_initial_history(

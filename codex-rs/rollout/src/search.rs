@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-09-22: model-invisible compaction commit marker.
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io;
@@ -308,6 +309,7 @@ fn conversation_text_from_item(item: &RolloutItem) -> Option<String> {
         | RolloutItem::ResponseItem(_)
         | RolloutItem::InterAgentCommunication(_)
         | RolloutItem::InterAgentCommunicationMetadata { .. }
+        | RolloutItem::RenCrowCompactionCommit { .. }
         | RolloutItem::Compacted(_)
         | RolloutItem::RealtimeItem(_)
         | RolloutItem::RetainedContext(_)

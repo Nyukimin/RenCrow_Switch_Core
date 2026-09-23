@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-09-22: keep compaction markers outside user boundaries.
 //! Decides which legacy records remain visible after historical rollback.
 //!
 //! Legacy rollback removes logical instruction turns, not a physical suffix of the rollout file.
@@ -278,7 +279,9 @@ impl RollbackPlanner {
                     acceptance_order: *acceptance_order,
                 });
             }
-            RolloutItem::SecurityRiskScore(_) => self.record_boundaries[index] = None,
+            RolloutItem::RenCrowCompactionCommit { .. } | RolloutItem::SecurityRiskScore(_) => {
+                self.record_boundaries[index] = None
+            }
         }
 
         Ok(())

@@ -39,6 +39,10 @@ pub(super) enum RolloutItemWire<'a> {
     Compacted {
         payload: Cow<'a, CompactedItem>,
     },
+    #[serde(rename = "rencrow_compaction_commit")]
+    RenCrowCompactionCommit {
+        payload: RenCrowCompactionCommitPayload,
+    },
     TurnContext {
         payload: Cow<'a, TurnContextItem>,
     },
@@ -85,6 +89,13 @@ impl<'a> From<&'a RolloutItem> for RolloutItemWire<'a> {
             RolloutItem::Compacted(payload) => Self::Compacted {
                 payload: Cow::Borrowed(payload),
             },
+            RolloutItem::RenCrowCompactionCommit { checkpoint_hash } => {
+                Self::RenCrowCompactionCommit {
+                    payload: RenCrowCompactionCommitPayload {
+                        checkpoint_hash: checkpoint_hash.clone(),
+                    },
+                }
+            }
             RolloutItem::TurnContext(payload) => Self::TurnContext {
                 payload: Cow::Borrowed(payload),
             },
@@ -129,6 +140,9 @@ impl From<RolloutItemWire<'_>> for RolloutItem {
                 }
             }
             RolloutItemWire::Compacted { payload } => Self::Compacted(payload.into_owned()),
+            RolloutItemWire::RenCrowCompactionCommit { payload } => Self::RenCrowCompactionCommit {
+                checkpoint_hash: payload.checkpoint_hash,
+            },
             RolloutItemWire::TurnContext { payload } => Self::TurnContext(payload.into_owned()),
             RolloutItemWire::TokenUsageRecord { payload } => {
                 Self::TokenUsageRecord(payload.into_owned())
@@ -149,6 +163,11 @@ impl From<RolloutItemWire<'_>> for RolloutItem {
 #[derive(Serialize, Deserialize, JsonSchema)]
 pub(super) struct InterAgentCommunicationMetadataPayload {
     trigger_turn: bool,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub(super) struct RenCrowCompactionCommitPayload {
+    checkpoint_hash: String,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]

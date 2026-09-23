@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-09-22: model-invisible compaction commit marker.
 use super::*;
 use crate::SortDirection;
 use codex_protocol::SanitizedGitUrl;
@@ -1360,6 +1361,7 @@ pub(super) fn extract_memory_mode(items: &[RolloutItem]) -> Option<String> {
         RolloutItem::ResponseItem(_)
         | RolloutItem::InterAgentCommunication(_)
         | RolloutItem::InterAgentCommunicationMetadata { .. }
+        | RolloutItem::RenCrowCompactionCommit { .. }
         | RolloutItem::Compacted(_)
         | RolloutItem::TurnContext(_)
         | RolloutItem::WorldState(_)

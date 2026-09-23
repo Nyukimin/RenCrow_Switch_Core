@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-09-22: model-invisible compaction commit marker.
 //! Persist Codex session rollouts (.jsonl) so sessions can be replayed or inspected later.
 
 use std::collections::HashSet;
@@ -2198,6 +2199,7 @@ async fn resume_candidate_matches_cwd(
             | RolloutItem::ResponseItem(_)
             | RolloutItem::InterAgentCommunication(_)
             | RolloutItem::InterAgentCommunicationMetadata { .. }
+            | RolloutItem::RenCrowCompactionCommit { .. }
             | RolloutItem::Compacted(_)
             | RolloutItem::WorldState(_)
             | RolloutItem::RealtimeItem(_)

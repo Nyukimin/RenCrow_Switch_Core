@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-09-22: model-invisible compaction commit marker.
 use std::time::Duration;
 use std::time::Instant;
 
@@ -311,6 +312,7 @@ impl ThreadMetadataSync {
                 | RolloutItem::ResponseItem(_)
                 | RolloutItem::InterAgentCommunication(_)
                 | RolloutItem::InterAgentCommunicationMetadata { .. }
+                | RolloutItem::RenCrowCompactionCommit { .. }
                 | RolloutItem::Compacted(_)
                 | RolloutItem::RealtimeItem(_)
                 | RolloutItem::TokenUsageRecord(_)

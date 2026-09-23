@@ -1,8 +1,10 @@
+// Modified by RenCrow Switch Core, 2026-09-22: validate checkpoints before startup metadata consumers.
 //! Reconstructs model context and preserves source runtime metadata across fork cutoffs.
 
 use std::io;
 
 use codex_protocol::protocol::HistoryPosition;
+use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_rollout::ModelContextScan;
@@ -70,7 +72,8 @@ pub(super) async fn load_latest_model_context(
         let lineage = store.resolve_rollout_lineage(params.thread_id).await?;
         scan_model_context_from_lineage(lineage, session_meta).await?
     } else {
-        read_thread::load_history_items(path.as_path()).await?
+        let items = read_thread::load_history_items(path.as_path()).await?;
+        normalize_committed_items(items)?
     };
 
     Ok(StoredModelContext {
@@ -100,41 +103,20 @@ pub(super) async fn load_for_fork(
             ),
         })?;
     if session_meta.meta.multi_agent_version.is_none() {
-        // Recover only the runtime version before applying the fork cutoff. Stop at the
-        // newest version-bearing context instead of retaining the source's full replay.
+        // Recover the runtime version from the newest committed source context before applying
+        // the fork cutoff. Keep this bounded so a valid current-segment context does not require
+        // reading unavailable older segments; a prepared transaction is validated first so its
+        // uncommitted companion context cannot supply the version.
         let source_lineage = lineage.clone();
-        session_meta.meta.multi_agent_version = tokio::task::spawn_blocking(move || {
-            for segment in source_lineage.segments().iter().rev() {
-                let file =
-                    codex_rollout::open_rollout_seekable_reader(segment.rollout_path.as_path())?;
-                let mut scanner = match segment.end.map(|end| end.end_byte_offset) {
-                    Some(end_byte_offset) => ReverseJsonlScanner::new_at(file, end_byte_offset)?,
-                    None => ReverseJsonlScanner::new(file)?,
-                };
-                while let Some(outcome) = scanner.scan_next_rollout_line()? {
-                    let ScanOutcome::Parsed(line) = outcome else {
-                        continue;
-                    };
-                    if let RolloutItem::TurnContext(context) = &line.item
-                        && let Some(version) = context.multi_agent_version
-                    {
-                        return Ok(Some(version));
-                    }
-                    // Ancestor metadata does not describe the immediate source's runtime.
-                    if matches!(line.item, RolloutItem::SessionMeta(_)) {
-                        break;
-                    }
-                }
-            }
-            Ok::<_, io::Error>(None)
-        })
-        .await
-        .map_err(|err| ThreadStoreError::Internal {
-            message: format!("failed to join fork runtime version scan: {err}"),
-        })?
-        .map_err(|err| ThreadStoreError::Internal {
-            message: format!("failed to read fork runtime version: {err}"),
-        })?;
+        session_meta.meta.multi_agent_version =
+            tokio::task::spawn_blocking(move || recover_fork_runtime_version(&source_lineage))
+                .await
+                .map_err(|err| ThreadStoreError::Internal {
+                    message: format!("failed to join fork runtime version scan: {err}"),
+                })?
+                .map_err(|err| ThreadStoreError::Internal {
+                    message: format!("failed to read fork runtime version: {err}"),
+                })?;
     }
     match history_base {
         Some(history_base) => {
@@ -157,11 +139,127 @@ async fn scan_model_context_from_lineage(
         message: format!("failed to join model context scan: {err}"),
     })?;
     match scan {
-        Ok(items) => Ok(items),
+        Ok(items) => normalize_committed_items(items),
         Err(err) => Err(ThreadStoreError::Internal {
             message: format!("failed to scan paginated model context lineage: {err}"),
         }),
     }
+}
+
+fn normalize_committed_items(items: Vec<RolloutItem>) -> ThreadStoreResult<Vec<RolloutItem>> {
+    codex_rollout::compaction_transaction::committed_items(&items).map_err(|err| {
+        ThreadStoreError::Internal {
+            message: format!("failed to validate compaction transactions: {err}"),
+        }
+    })
+}
+
+struct PendingRuntimeVersion {
+    version: MultiAgentVersion,
+    candidate: RolloutItem,
+    /// Newest-to-oldest rows surrounding the candidate. The scanner has already seen the
+    /// newer suffix; older rows are appended until the possible prepared checkpoint is found.
+    window: Vec<RolloutItem>,
+    saw_older_world_state: bool,
+}
+
+fn recover_fork_runtime_version(lineage: &RolloutLineage) -> io::Result<Option<MultiAgentVersion>> {
+    let mut recent = Vec::new();
+    let mut pending: Option<PendingRuntimeVersion> = None;
+
+    for segment in lineage.segments().iter().rev() {
+        let file = codex_rollout::open_rollout_seekable_reader(segment.rollout_path.as_path())?;
+        let mut scanner = match segment.end.map(|end| end.end_byte_offset) {
+            Some(end_byte_offset) => ReverseJsonlScanner::new_at(file, end_byte_offset)?,
+            None => ReverseJsonlScanner::new(file)?,
+        };
+        while let Some(outcome) = scanner.scan_next_rollout_line()? {
+            let ScanOutcome::Parsed(line) = outcome else {
+                continue;
+            };
+            let item = line.item;
+
+            if matches!(&item, RolloutItem::SessionMeta(_)) {
+                if pending
+                    .as_ref()
+                    .is_some_and(|pending_version| !pending_version.saw_older_world_state)
+                    && let Some(pending_version) = pending.take()
+                {
+                    if let Some(version) = committed_runtime_version(pending_version)? {
+                        return Ok(Some(version));
+                    }
+                    recent.clear();
+                }
+                // A world state may be the first older row of a prepared transaction whose
+                // checkpoint is in an ancestor segment. Keep waiting across this segment head.
+                recent.clear();
+                break;
+            }
+
+            if let Some(mut pending_version) = pending.take() {
+                if !pending_version.saw_older_world_state
+                    && matches!(&item, RolloutItem::WorldState(_))
+                {
+                    pending_version.window.push(item);
+                    pending_version.saw_older_world_state = true;
+                    pending = Some(pending_version);
+                    continue;
+                }
+                let is_checkpoint = matches!(&item, RolloutItem::Compacted(_));
+                if is_checkpoint {
+                    pending_version.window.push(item.clone());
+                }
+                if let Some(version) = committed_runtime_version(pending_version)? {
+                    return Ok(Some(version));
+                }
+                recent.clear();
+                if is_checkpoint {
+                    continue;
+                }
+            }
+
+            if let RolloutItem::TurnContext(context) = &item
+                && let Some(version) = context.multi_agent_version
+            {
+                let mut window = recent.clone();
+                window.push(item.clone());
+                pending = Some(PendingRuntimeVersion {
+                    version,
+                    candidate: item,
+                    window,
+                    saw_older_world_state: false,
+                });
+            } else {
+                recent.push(item);
+                if recent.len() > 4 {
+                    recent.remove(0);
+                }
+            }
+        }
+    }
+
+    pending
+        .map(committed_runtime_version)
+        .transpose()
+        .map(std::option::Option::flatten)
+}
+
+fn committed_runtime_version(
+    pending: PendingRuntimeVersion,
+) -> io::Result<Option<MultiAgentVersion>> {
+    let chronological = pending.window.iter().rev().cloned().collect::<Vec<_>>();
+    let committed = codex_rollout::compaction_transaction::committed_items(&chronological)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    let candidate = serde_json::to_value(&pending.candidate)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    for item in &committed {
+        let value = serde_json::to_value(item)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+        if value == candidate {
+            return Ok(Some(pending.version));
+        }
+    }
+    Ok(None)
 }
 
 fn scan_model_context_from_lineage_blocking(

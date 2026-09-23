@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-09-22: model-invisible compaction commit marker.
 #![allow(warnings, clippy::all)]
 
 use codex_utils_path as path_utils;
@@ -1202,7 +1203,7 @@ async fn read_head_summary(path: &Path, head_limit: usize) -> io::Result<HeadTai
             RolloutItem::RealtimeItem(_) => {
                 // Realtime presentation does not affect model-visible thread summaries.
             }
-            RolloutItem::Compacted(_) => {
+            RolloutItem::Compacted(_) | RolloutItem::RenCrowCompactionCommit { .. } => {
                 // Not included in `head`; skip.
             }
             RolloutItem::EventMsg(ev) => {
@@ -1269,6 +1270,7 @@ pub async fn read_head_for_summary(path: &Path) -> io::Result<Vec<serde_json::Va
                     }
                 }
                 RolloutItem::InterAgentCommunicationMetadata { .. }
+                | RolloutItem::RenCrowCompactionCommit { .. }
                 | RolloutItem::Compacted(_)
                 | RolloutItem::TurnContext(_)
                 | RolloutItem::TokenUsageRecord(_)
@@ -1363,6 +1365,7 @@ pub async fn read_session_meta_line(path: &Path) -> io::Result<SessionMetaLine> 
                 }));
             }
             RolloutItem::InterAgentCommunicationMetadata { .. }
+            | RolloutItem::RenCrowCompactionCommit { .. }
             | RolloutItem::Compacted(_)
             | RolloutItem::TurnContext(_)
             | RolloutItem::TokenUsageRecord(_)

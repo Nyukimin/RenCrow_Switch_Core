@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-09-22: handle durable compaction markers.
 //! Replays normalized legacy rollout records into canonical paginated JSONL.
 //!
 //! `line_parser` makes old JSON shapes parseable, `legacy_event` converts obsolete completion
@@ -295,6 +296,7 @@ impl LegacyRolloutCanonicalizer {
             | RolloutItem::TokenUsageRecord(_)
             | RolloutItem::RealtimeItem(_)
             | RolloutItem::RetainedContext(_)
+            | RolloutItem::RenCrowCompactionCommit { .. }
             | RolloutItem::SecurityRiskScore(_)
             | RolloutItem::WorldState(_)) => {
                 self.write_item(writer, &timestamp, item).await?;
