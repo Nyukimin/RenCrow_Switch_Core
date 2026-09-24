@@ -69,9 +69,9 @@ impl StageFailure {
             Self::Capacity(reason) => CodexErr::InvalidRequest(format!(
                 "RenCrow compaction is capacity-blocked: the authoritative retained context exceeds the currently available context capacity. No source data was discarded. ({reason})"
             )),
-            Self::Integrity(reason) => CodexErr::InvalidRequest(format!(
-                "RenCrow detected a deterministic integrity conflict in stored compaction data. The current state was not replaced. ({reason})"
-            )),
+            Self::Integrity(reason) => CodexErr::InvalidRequest(
+                codex_history::compaction_transaction::integrity_blocked_message(&reason),
+            ),
         }
     }
 }

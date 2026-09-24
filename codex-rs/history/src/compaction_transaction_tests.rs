@@ -279,7 +279,11 @@ fn invalid_transaction_metadata_and_hash_are_errors() -> Result<()> {
     let batch = complete_batch()?;
     let mut invalid_marker = batch;
     invalid_marker.push(marker("not-a-hash".to_string()));
-    assert!(committed_items(&invalid_marker).is_err());
+    let error = committed_items(&invalid_marker).unwrap_err();
+    // Replay fails the same way after every restart, so it never asks for one (§73 G04).
+    assert!(error.contains("deterministic integrity conflict"));
+    assert!(error.contains("restarting cannot repair it"));
+    assert!(error.contains("invalid RenCrow compaction commit hash"));
     Ok(())
 }
 

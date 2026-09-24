@@ -645,7 +645,8 @@ fn v2_blocked_diagnostics_state_that_no_source_data_was_replaced_or_discarded() 
     .into_error()
     .to_string();
     assert!(integrity.contains("deterministic integrity conflict"));
-    assert!(integrity.contains("The current state was not replaced."));
+    assert!(integrity.contains("The current state was not replaced"));
+    assert!(integrity.contains("restarting cannot repair it"));
 
     // Model and abort errors pass through unchanged.
     assert!(matches!(

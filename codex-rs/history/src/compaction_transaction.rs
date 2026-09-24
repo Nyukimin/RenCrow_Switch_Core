@@ -27,12 +27,27 @@ pub fn is_prepared_checkpoint(item: &RolloutItem) -> bool {
     }
 }
 
+/// User-visible diagnostic for a deterministic conflict in stored compaction data (Part 2 §6).
+///
+/// The same stored data fails the same way after every restart, so the message states that a
+/// restart cannot repair it instead of requesting one (Part 2 §7, §73 G04).
+pub fn integrity_blocked_message(reason: &str) -> String {
+    format!(
+        "RenCrow detected a deterministic integrity conflict in stored compaction data. The current state was not replaced, and restarting cannot repair it. ({reason})"
+    )
+}
+
 /// Keep only committed prepared checkpoints and ordinary rollout rows.
 ///
 /// Commit markers are persistence-only and are removed from the returned
 /// replay input. Legacy compacted items without the transaction metadata are
-/// retained unchanged.
+/// retained unchanged. Malformed transaction data is an integrity conflict, not a
+/// persistence uncertainty, so its error is the IntegrityBlocked diagnostic.
 pub fn committed_items(items: &[RolloutItem]) -> Result<Vec<RolloutItem>, String> {
+    replay_committed_items(items).map_err(|reason| integrity_blocked_message(&reason))
+}
+
+fn replay_committed_items(items: &[RolloutItem]) -> Result<Vec<RolloutItem>, String> {
     let mut committed = Vec::with_capacity(items.len());
     let mut index = 0;
     while index < items.len() {
