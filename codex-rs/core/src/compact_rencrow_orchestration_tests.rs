@@ -4,7 +4,6 @@
 //! transport. `ServerReasoningIncluded` is websocket metadata, so its drain dispatch boundary needs
 //! a transport-level regression in addition to the pure policy cases below.
 
-use super::*;
 use crate::compact::SUMMARY_PREFIX;
 use codex_history::ResponseItemEnvelope;
 use codex_history::archive_reference::ObservationReference;
@@ -13,6 +12,7 @@ use codex_history::compaction_candidate::CandidateInput;
 use codex_history::compaction_candidate::Origin;
 use codex_history::compaction_checkpoint_metadata::RenCrowCompactionMetadataV2;
 use codex_history::compaction_plan::ByteRange;
+use codex_history::compaction_preprocess::InstructionPruning;
 use codex_history::compaction_preprocess::prune_known_obsolete;
 use codex_history::compaction_selection::InstructionSelectionApplication;
 use codex_protocol::ResponseItemId;
@@ -1009,5 +1009,63 @@ fn v2_cumulative_observation_coverage_deduplicates_identity_and_rejects_digest_c
             &[coverage("first-call", "changed output")],
         )
         .is_err()
+    );
+}
+
+#[test]
+fn v2_known_pruning_applies_adopted_refs_only_while_their_source_text_is_unchanged() {
+    let original = human("remove this; keep", "human-request");
+    let first_input = candidate_input(std::slice::from_ref(&original), &[]);
+    let source = first_input
+        .snapshot()
+        .unwrap()
+        .reference(
+            "human-request",
+            ByteRange {
+                start: 0,
+                end: "remove this; ".len(),
+            },
+        )
+        .unwrap();
+    let first_application = InstructionSelectionApplication {
+        pruning: prune_known_obsolete(&first_input, std::slice::from_ref(&source)).unwrap(),
+        plan_hash: Some("host-plan".into()),
+        results: vec![],
+    };
+    let native = super::native::filter_retained_instructions(
+        std::slice::from_ref(&original),
+        &first_input,
+        first_application,
+    )
+    .unwrap();
+    let pruned = native.summary_human_messages().next().unwrap().clone();
+    let summary = with_compaction_metadata(checkpoint_summary("state"), |metadata| {
+        metadata["applied_refs"] = json!([source]);
+    });
+
+    // After the committed replacement physically removed the passage, the adopted ref is stale
+    // for the current text: it applies nothing and the removed passage is not revived.
+    let compacted = vec![pruned, summary.clone()];
+    let adopted = super::summary::find_adopted_v2_checkpoint(&compacted, THREAD_ID)
+        .unwrap()
+        .unwrap();
+    let compacted_input = candidate_input(&compacted, &[]);
+    assert_eq!(compacted_input.records[0].text, "keep");
+    assert_eq!(
+        prune_known_obsolete(&compacted_input, &adopted.metadata.applied_refs),
+        Ok(InstructionPruning::default())
+    );
+
+    // While the original source text is still present, the same adopted ref applies exactly.
+    let unpruned = vec![original, summary];
+    let unpruned_input = candidate_input(&unpruned, &[]);
+    let pruning = prune_known_obsolete(&unpruned_input, &adopted.metadata.applied_refs).unwrap();
+    assert_eq!(pruning.applied, vec![source]);
+    assert_eq!(
+        pruning
+            .retained_human_text
+            .get("human-request")
+            .map(String::as_str),
+        Some("keep")
     );
 }
