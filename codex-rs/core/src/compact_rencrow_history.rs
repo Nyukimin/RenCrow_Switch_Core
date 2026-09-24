@@ -7,11 +7,13 @@ use codex_history::compaction_candidate::CandidateInput;
 use codex_history::compaction_candidate::CandidateRecord;
 use codex_history::compaction_candidate::Origin;
 use codex_history::compaction_candidate::digest;
+use codex_history::observation_projection::OBSERVATION_PART_FULL_LIMIT_BYTES;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::InternalChatMessageMetadataPassthrough;
 use codex_protocol::models::ReasoningItemContent;
 use codex_protocol::models::ReasoningItemReasoningSummary;
 use codex_protocol::models::ResponseItem;
+use codex_rollout::PreparedCompactionSources;
 use serde_json::Value;
 use serde_json::json;
 use std::collections::HashMap;
@@ -22,6 +24,38 @@ pub(super) struct CompletedWorkProjection {
     pub output_index: usize,
     pub call_text: String,
     pub output_text: String,
+}
+
+/// Build capture pairs from host-verified prepared sources for V2 compaction.
+///
+/// CandidateInput keeps full text only when both call and output fit the completion-link bound;
+/// larger raw bodies stay in the rollout and reach the summary through bounded observations.
+#[allow(dead_code)]
+pub(super) fn verified_pair_projections(
+    prepared: &PreparedCompactionSources<'_>,
+) -> Vec<CompletedWorkProjection> {
+    prepared
+        .pairs
+        .iter()
+        .map(|pair| {
+            let (call_text, output_text) =
+                match (pair.canonical_call_input, pair.canonical_output_text) {
+                    (Some(call), Some(output))
+                        if call.len() <= OBSERVATION_PART_FULL_LIMIT_BYTES
+                            && output.len() <= OBSERVATION_PART_FULL_LIMIT_BYTES =>
+                    {
+                        (call.to_owned(), output.to_owned())
+                    }
+                    _ => (String::new(), String::new()),
+                };
+            CompletedWorkProjection {
+                call_index: pair.call_index,
+                output_index: pair.output_index,
+                call_text,
+                output_text,
+            }
+        })
+        .collect()
 }
 
 pub(super) fn capture(
@@ -36,27 +70,30 @@ pub(super) fn capture(
         if pair.call_index == pair.output_index {
             return Err("completed work call and output indexes overlap".into());
         }
-        let call_id = match &items
-            .get(pair.call_index)
-            .ok_or_else(|| "completed work call index is out of range".to_owned())?
-            .item
-        {
-            ResponseItem::FunctionCall { call_id, .. } => call_id,
-            _ => return Err("completed work call index is not a function call".into()),
+        let (Some(call), Some(output)) = (items.get(pair.call_index), items.get(pair.output_index))
+        else {
+            return Err("completed work index is out of range".into());
         };
-        let output_call_id = match &items
-            .get(pair.output_index)
-            .ok_or_else(|| "completed work output index is out of range".to_owned())?
-            .item
-        {
-            ResponseItem::FunctionCallOutput {
-                call_id: Some(call_id),
-                ..
-            } => call_id,
-            _ => return Err("completed work output index is not a function output".into()),
-        };
-        if call_id != output_call_id {
-            return Err("completed work call and output IDs do not match".into());
+        match (&call.item, &output.item) {
+            (
+                ResponseItem::FunctionCall { call_id, .. },
+                ResponseItem::FunctionCallOutput {
+                    call_id: Some(output_call_id),
+                    ..
+                },
+            )
+            | (
+                ResponseItem::CustomToolCall { call_id, .. },
+                ResponseItem::CustomToolCallOutput {
+                    call_id: output_call_id,
+                    ..
+                },
+            ) if call_id == output_call_id => {}
+            _ => {
+                return Err(
+                    "completed work indexes are not one matching tool call and output".into(),
+                );
+            }
         }
         if completed_work_records
             .insert(pair.call_index, (pair.call_text.as_str(), true))

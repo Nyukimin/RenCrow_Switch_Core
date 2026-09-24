@@ -21,6 +21,9 @@ use codex_protocol::models::ContentItemKind;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::InternalChatMessageMetadataPassthrough;
 use codex_protocol::models::ResponseItem;
+use codex_rollout::PreparedCompactionReferenceKind;
+use codex_rollout::PreparedCompactionSourcePair;
+use codex_rollout::PreparedCompactionSources;
 use serde_json::json;
 
 const THREAD_ID: &str = "thread-v2-orchestration";
@@ -305,40 +308,42 @@ fn v2_generic_capture_projects_large_custom_tool_input_from_canonical_raw_pair()
         current_custom_output,
         active_custom_call.clone(),
     ];
-    let completed = [super::history::CompletedWorkProjection {
-        call_index: 1,
-        output_index: 2,
-        call_text: canonical_call.clone(),
-        output_text: canonical_output.clone(),
-    }];
+    let reference =
+        ObservationReference::new(THREAD_ID, "custom-call", content_sha256(&canonical_output));
+    let prepared = PreparedCompactionSources {
+        pairs: vec![PreparedCompactionSourcePair {
+            call_index: 1,
+            output_index: 2,
+            reference: reference.clone(),
+            reference_kind: PreparedCompactionReferenceKind::Fresh,
+            output_total_bytes: canonical_output.len(),
+            tool_name: "custom_read",
+            canonical_call_input: Some(&canonical_call),
+            canonical_output_text: Some(&canonical_output),
+            terminal_reference: None,
+        }],
+        protected_indices: vec![3],
+    };
 
-    // The old capture adapter supports only FunctionCall/FunctionCallOutput. This valid
-    // host-proven custom pair must become ordinary Work so the same native projection can remove
-    // it; a failure here is the expected generic-pair RED, not evidence about F01 source lookup.
-    let input_result = super::history::capture(
+    // The host-proven custom pair becomes ordinary Work so the same native projection removes
+    // it. Its large raw bodies stay in the rollout; CandidateInput does not copy them (Annex A F07).
+    let input = super::history::capture(
         &originals,
         "snapshot-binding".into(),
         THREAD_ID,
         vec![],
-        &completed,
-    );
-    assert!(
-        input_result.is_ok(),
-        "verified custom tool pair should be captured from canonical source text: {input_result:?}"
-    );
-    let input = input_result.unwrap();
-    assert_eq!(input.records[1].origin, Origin::Work);
-    assert!(input.records[1].opaque.is_none());
-    assert_eq!(input.records[1].text, canonical_call);
-    assert_eq!(input.records[2].origin, Origin::Work);
-    assert!(input.records[2].opaque.is_none());
-    assert_eq!(input.records[2].text, canonical_output);
+        &super::history::verified_pair_projections(&prepared),
+    )
+    .unwrap();
+    for index in [1, 2] {
+        assert_eq!(input.records[index].origin, Origin::Work);
+        assert!(input.records[index].opaque.is_none());
+        assert!(input.records[index].text.is_empty());
+    }
 
     let native =
         super::native::filter_retained_instructions(&originals, &input, application(&input))
             .unwrap();
-    let reference =
-        ObservationReference::new(THREAD_ID, "custom-call", content_sha256(&canonical_output));
     let observation = codex_history::project_observation(
         &reference,
         "custom_read",
@@ -361,9 +366,10 @@ fn v2_generic_capture_projects_large_custom_tool_input_from_canonical_raw_pair()
     assert!(summary_items.iter().any(|item| item == &active_custom_call));
     assert!(candidate.iter().any(|item| item == &active_custom_call));
     for projected in [&summary_items, &candidate] {
+        let ids = projected.iter().filter_map(item_id).collect::<Vec<_>>();
+        assert!(!ids.contains(&"custom-call-item"));
+        assert!(!ids.contains(&"custom-output-item"));
         let serialized = serde_json::to_string(&model_items(projected)).unwrap();
-        assert!(!serialized.contains("custom-call-item"));
-        assert!(!serialized.contains("custom-output-item"));
         assert!(!serialized.contains(&"c".repeat(5_000)));
         assert!(!serialized.contains(&"o".repeat(5_000)));
     }
@@ -371,6 +377,78 @@ fn v2_generic_capture_projects_large_custom_tool_input_from_canonical_raw_pair()
     assert!(summary_json.contains("CANONICAL-CALL-TAIL"));
     assert!(summary_json.contains("CANONICAL-OUTPUT-TAIL"));
     assert!(!summary_json.contains("normal-history-truncated"));
+}
+
+#[test]
+fn v2_verified_pair_capture_keeps_full_text_only_for_bounded_pairs() {
+    let small_call = r#"{"cmd":"cargo test"}"#;
+    let small_output = "test result: ok";
+    let large_call = r#"{"path":"large.txt"}"#;
+    let large_output = "L".repeat(2_049);
+    let reference =
+        |output: &str| ObservationReference::new(THREAD_ID, "call", content_sha256(output));
+    let prepared = PreparedCompactionSources {
+        pairs: vec![
+            PreparedCompactionSourcePair {
+                call_index: 0,
+                output_index: 1,
+                reference: reference(small_output),
+                reference_kind: PreparedCompactionReferenceKind::Fresh,
+                output_total_bytes: small_output.len(),
+                tool_name: "exec_command",
+                canonical_call_input: Some(small_call),
+                canonical_output_text: Some(small_output),
+                terminal_reference: None,
+            },
+            PreparedCompactionSourcePair {
+                call_index: 2,
+                output_index: 3,
+                reference: reference(&large_output),
+                reference_kind: PreparedCompactionReferenceKind::Fresh,
+                output_total_bytes: large_output.len(),
+                tool_name: "read_file",
+                canonical_call_input: Some(large_call),
+                canonical_output_text: Some(&large_output),
+                terminal_reference: None,
+            },
+            PreparedCompactionSourcePair {
+                call_index: 4,
+                output_index: 5,
+                reference: reference("archived output"),
+                reference_kind: PreparedCompactionReferenceKind::Existing,
+                output_total_bytes: "archived output".len(),
+                tool_name: "exec_command",
+                canonical_call_input: None,
+                canonical_output_text: None,
+                terminal_reference: None,
+            },
+        ],
+        protected_indices: vec![],
+    };
+
+    assert_eq!(
+        super::history::verified_pair_projections(&prepared),
+        vec![
+            super::history::CompletedWorkProjection {
+                call_index: 0,
+                output_index: 1,
+                call_text: small_call.into(),
+                output_text: small_output.into(),
+            },
+            super::history::CompletedWorkProjection {
+                call_index: 2,
+                output_index: 3,
+                call_text: String::new(),
+                output_text: String::new(),
+            },
+            super::history::CompletedWorkProjection {
+                call_index: 4,
+                output_index: 5,
+                call_text: String::new(),
+                output_text: String::new(),
+            },
+        ]
+    );
 }
 
 #[test]
