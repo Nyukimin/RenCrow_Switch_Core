@@ -1,4 +1,4 @@
-// Modified by RenCrow Switch Core, 2026-09-24: bounded compaction observation fragment.
+// Modified by RenCrow Switch Core, 2026-09-24: compaction observation and result fragments.
 //! Context fragments injected into model input.
 
 mod agent_message_board_notification;
@@ -7,6 +7,7 @@ mod apps_instructions;
 mod available_plugins_instructions;
 mod base_instructions;
 mod compaction_observation;
+mod compaction_results;
 mod compaction_summary;
 mod contextual_user_message;
 mod current_time_reminder;
@@ -66,6 +67,7 @@ pub use codex_context_fragments::ContextualUserFragment;
 pub(crate) use codex_prompts::MultiAgentRoleInstructions;
 pub use codex_prompts::PermissionsInstructions;
 pub(crate) use compaction_observation::CompactionObservation;
+pub(crate) use compaction_results::CompactionResults;
 pub(crate) use compaction_summary::CompactionSummary;
 pub(crate) use contextual_user_message::is_contextual_user_fragment;
 pub(crate) use contextual_user_message::is_user_authorization_message;

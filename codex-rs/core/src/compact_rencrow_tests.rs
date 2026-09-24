@@ -5,6 +5,9 @@ use codex_analytics::CompactionImplementation;
 use codex_analytics::CompactionPhase;
 use codex_analytics::CompactionReason;
 use codex_analytics::CompactionTrigger;
+use codex_history::compaction_plan::ByteRange;
+use codex_history::compaction_plan::DerivedResult;
+use codex_history::compaction_plan::SourceRef;
 use codex_login::CodexAuth;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
@@ -189,6 +192,16 @@ async fn v2_selection_sends_only_candidates_once_and_keeps_host_snapshot_binding
     assert_eq!(selected.snapshot_hash(), SNAPSHOT_HASH);
     assert_eq!(selected.presentation_hash(), PRESENTATION_HASH);
     assert_eq!(selected.proposed().operations.len(), 1);
+    assert_eq!(
+        receipts
+            .iter()
+            .map(|receipt| (receipt.stage, receipt.response_id.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(
+            CheckpointResponseStage::InstructionSelection,
+            "selection-response"
+        )]
+    );
     assert_eq!(mock.requests().len(), 1);
     assert_eq!(
         serde_json::to_value(&original).unwrap(),
@@ -449,4 +462,80 @@ async fn v2_staging_buffers_fork_output_for_every_phase_and_preserves_disabled_b
         }
         assert_eq!(mock.requests().len(), 1);
     }
+}
+
+#[tokio::test]
+async fn v2_summary_request_normalizes_history_and_records_one_typed_receipt() {
+    let server = responses::start_mock_server().await;
+    let (session, turn) = test_context(server.uri().to_string(), true).await;
+    let mock = responses::mount_sse_once(
+        &server,
+        responses::sse(vec![
+            responses::ev_assistant_message("summary", "Verified: the test suite passed."),
+            responses::ev_completed("summary-response"),
+        ]),
+    )
+    .await;
+    let before = serialized_history(&session).await;
+    let pending_call = ResponseItemEnvelope::new(ResponseItem::FunctionCall {
+        id: None,
+        name: "exec_command".into(),
+        namespace: None,
+        arguments: "{}".into(),
+        call_id: "pending-call".into(),
+        encrypted_function_args: None,
+        internal_chat_message_metadata_passthrough: None,
+    });
+    let summary_history = vec![
+        ResponseItemEnvelope::new(responses::user_message_item("Keep the current label.")),
+        pending_call,
+    ];
+    let reference = |id: &str| SourceRef {
+        id: id.into(),
+        hash: "a".repeat(64),
+        range: ByteRange { start: 0, end: 1 },
+    };
+    let results = vec![DerivedResult {
+        source: reference("human-a"),
+        evidence: reference("output-a"),
+        text: "The test suite passed.".into(),
+    }];
+    let mut receipts = Vec::new();
+
+    let (summary, response_id) = model_request::request_compaction_summary(
+        &session,
+        &turn,
+        compaction_metadata(CompactionPhase::MidTurn),
+        summary_history,
+        &results,
+        &mut receipts,
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(summary, "Verified: the test suite passed.");
+    assert_eq!(response_id, "summary-response");
+    assert_eq!(
+        receipts
+            .iter()
+            .map(|receipt| (receipt.stage, receipt.response_id.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(CheckpointResponseStage::Summary, "summary-response")]
+    );
+    assert_eq!(serialized_history(&session).await, before);
+
+    let request = mock.single_request();
+    let input = request.body_json()["input"].as_array().unwrap().clone();
+    assert_eq!(input.last().unwrap()["role"], "developer");
+    assert!(input.iter().any(|item| {
+        item["type"] == "function_call_output" && item["call_id"] == "pending-call"
+    }));
+    let user_text = request.message_input_texts("user").join("\n");
+    assert!(user_text.contains("Keep the current label."));
+    assert!(user_text.contains("\"completed_results\""));
+    assert!(user_text.contains("The test suite passed."));
+    let developer_text = request.message_input_texts("developer").join("");
+    assert!(developer_text.contains("authoritative exact text"));
+    assert!(developer_text.contains("observation:\"<call_id>\""));
 }
