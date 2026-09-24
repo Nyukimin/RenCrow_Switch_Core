@@ -4787,7 +4787,7 @@ RenCrow Switch Core Compaction V2の役割は、
 
 # 第3部 現在の実装状態（2026-09-24、HEAD 458121d2f）
 
-第2部 §70のPhase 1はStep 1（下記「Phase 1の進捗」）まで実装し、Phase 2〜6は未着手。本部は第4部「第2版の実装契約」の8責務とsourceの対応だけを示す。工程別の検査・証拠・未解決の指摘は私有の`target/fork-bootstrap/compaction-check-plan.json`（`v2`）が正本であり、ここへ複製しない。
+第2部 §70のPhase 1は項目1〜3（下記「Phase 1の進捗」）まで実装し、Phase 2〜6は未着手。本部は第4部「第2版の実装契約」の8責務とsourceの対応だけを示す。工程別の検査・証拠・未解決の指摘は私有の`target/fork-bootstrap/compaction-check-plan.json`（`v2`）が正本であり、ここへ複製しない。
 
 `rencrow_compaction = true`で実行されるのは、現在も旧Fork経路の`compact::rencrow::run`（`codex-rs/core/src/compact_rencrow.rs`）である。owner復元済み履歴をcaptureし、本人入力がある場合だけplan・plan reviewを要求し、要約を1要求で生成し、既存の`commit_rencrow_checkpoint`で保存する。V2の①〜⑧はこの経路から呼ばれていない。上表の差込位置である元のlocal要約loopへの統合と、旧Fork経路の置換は未実装。
 
@@ -4808,6 +4808,7 @@ RenCrow Switch Core Compaction V2の役割は、
 
 - Step 1（要約入力の組立て、要約出力の検査、fail-softの重要参照、reasoning判定）: source実装済み・未接続。`build_summary_history`はHumanと保護itemを`NativeProjection`の判断から取り（`RetainedItem`に元の位置を追加）、採用済み要約より前のordinary Workを除き、検証済みの呼出し・出力の組を`core/src/context/compaction_observation.rs`の上限つき断片1件へ置き換える。重要参照は付属A §41〜42に従いfail-softとし、旧REDテスト（不正ならErr）を書き換えた。reasoning判定は`drain_to_completed`の`ServerReasoningIncluded`分岐へ接続した。
 - 検査: `just test --cargo-profile dev-small -p codex-core --lib -E "test(compact::rencrow)"`で42件中41件成功。Step 1の対象10件はすべて成功。失敗1件（`v2_generic_capture_projects_large_custom_tool_input_from_canonical_raw_pair`）は旧captureがcustom toolの組を扱えないことによるもので、Phase 1項目4（汎用capture）で扱う。足場テストの未compile不具合2点（別テストの変数参照、`ResponseItemEnvelope`のserialize）もあわせて修正した。
+- 項目3（採用済みV2 checkpointの検出、付属A F02）: `compact_rencrow_summary.rs`の`find_adopted_v2_checkpoint`として実装済み・未接続。履歴の末尾から最新のV2 metadataを探し、typed summary（user、InputText 1件、`compaction.summary`）かつ`RenCrowCompactionMetadataV2::parse_and_validate`成功の場合だけ採用する。live（`transaction_following_items`）とcold resume後（`committed_transaction_hash`）の双方を受理し、両方ある場合・hash不一致・typed summaryでないitemへのV2 metadataは古いcheckpointへ戻らず失敗する。V2 metadataのない旧summaryは境界にしない。検査は同じcommandで45件中44件成功（追加3件は全成功、失敗1件は上記の項目4のRED）。
 - 未完了: `ServerReasoningIncluded`はwebsocketのmetadataでsession内部状態に作用するため、drain分岐を実際に通す回帰はPhase 1の結合段階で扱う。`just fix -p codex-core`は未実行。
 
 稼働binaryはHEADより前のsource（`bf9d00a6a`＋当時の未commit差分）からbuildした。`~/.local/bin/rencrow-switch-core`はSHA-256 `3f6d6d61bd176ee08e65c0a486a4dfc3a9aceb7c6cbbcfc7024305ea87ad03b9`、`~/.local/bin/rencrow-compaction`は`ea38850361a312927227cb90f63fe73589afe8d8b1631801f0add61e8624acb1`（記録は私有の`compaction-runtime-deploy/candidate.json`）。HEADのV2部品と、usage・resume関連の後続修正は未配備。

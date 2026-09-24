@@ -11,6 +11,7 @@ use codex_history::archive_reference::ObservationReference;
 use codex_history::archive_reference::content_sha256;
 use codex_history::compaction_candidate::CandidateInput;
 use codex_history::compaction_candidate::Origin;
+use codex_history::compaction_checkpoint_metadata::RenCrowCompactionMetadataV2;
 use codex_history::compaction_plan::ByteRange;
 use codex_history::compaction_preprocess::prune_known_obsolete;
 use codex_history::compaction_selection::InstructionSelectionApplication;
@@ -623,4 +624,116 @@ fn disabled_compaction_keeps_server_reasoning_sideband_policy() {
     assert!(super::summary::should_apply_server_reasoning_included(
         /*rencrow_compaction*/ false
     ));
+}
+
+fn with_compaction_metadata(
+    mut summary: ResponseItemEnvelope,
+    update: impl FnOnce(&mut serde_json::Value),
+) -> ResponseItemEnvelope {
+    update(
+        summary
+            .metadata
+            .as_mut()
+            .unwrap()
+            .rencrow_compaction
+            .as_mut()
+            .unwrap(),
+    );
+    summary
+}
+
+fn adopted_checkpoint(
+    summary: &ResponseItemEnvelope,
+    index: usize,
+) -> super::summary::AdoptedV2Checkpoint {
+    let summary_text = item_text(summary);
+    let metadata = summary
+        .metadata
+        .as_ref()
+        .unwrap()
+        .rencrow_compaction
+        .clone()
+        .unwrap();
+    super::summary::AdoptedV2Checkpoint {
+        index,
+        metadata: RenCrowCompactionMetadataV2::parse_and_validate(
+            metadata,
+            THREAD_ID,
+            &summary_text,
+        )
+        .unwrap(),
+        summary_text,
+    }
+}
+
+#[test]
+fn v2_adopted_checkpoint_accepts_live_and_replayed_transaction_lifecycles() {
+    let replayed = checkpoint_summary("replayed state");
+    let live = with_compaction_metadata(checkpoint_summary("live state"), |metadata| {
+        metadata
+            .as_object_mut()
+            .unwrap()
+            .remove("committed_transaction_hash");
+        metadata["transaction_following_items"] = json!(1);
+    });
+
+    for summary in [replayed, live] {
+        let history = vec![
+            message("assistant", "earlier work", "work"),
+            summary.clone(),
+        ];
+        assert_eq!(
+            super::summary::find_adopted_v2_checkpoint(&history, THREAD_ID),
+            Ok(Some(adopted_checkpoint(&summary, 1)))
+        );
+    }
+}
+
+#[test]
+fn v2_adopted_checkpoint_rejects_invalid_typed_metadata_instead_of_falling_back() {
+    let valid = checkpoint_summary("older valid state");
+    let both_lifecycles = with_compaction_metadata(checkpoint_summary("ambiguous"), |metadata| {
+        metadata["transaction_following_items"] = json!(1);
+    });
+    let tampered = with_compaction_metadata(checkpoint_summary("tampered"), |metadata| {
+        metadata["summary_hash"] = json!("c".repeat(64));
+    });
+    let mut untyped = message("assistant", "not a summary", "assistant-with-v2");
+    untyped.metadata.get_or_insert_default().rencrow_compaction = checkpoint_summary("state")
+        .metadata
+        .unwrap()
+        .rencrow_compaction;
+
+    for broken in [both_lifecycles, tampered, untyped] {
+        let history = vec![valid.clone(), message("assistant", "work", "work"), broken];
+        assert!(super::summary::find_adopted_v2_checkpoint(&history, THREAD_ID).is_err());
+    }
+}
+
+#[test]
+fn v2_adopted_checkpoint_selects_the_latest_v2_and_ignores_legacy_summaries() {
+    let older = checkpoint_summary("older state");
+    let latest = checkpoint_summary("latest state");
+    let legacy = with_compaction_metadata(checkpoint_summary("legacy state"), |metadata| {
+        *metadata = json!({"version": 1, "input_hash": "legacy"});
+    });
+    let history = vec![
+        older,
+        message("assistant", "first work", "work-1"),
+        latest.clone(),
+        message("assistant", "second work", "work-2"),
+        legacy.clone(),
+    ];
+
+    assert_eq!(
+        super::summary::find_adopted_v2_checkpoint(&history, THREAD_ID),
+        Ok(Some(adopted_checkpoint(&latest, 2)))
+    );
+    assert_eq!(
+        super::summary::find_adopted_v2_checkpoint(
+            &[message("assistant", "work", "work"), legacy],
+            THREAD_ID,
+        ),
+        Ok(None)
+    );
 }

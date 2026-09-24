@@ -8,6 +8,7 @@ use codex_history::ResponseItemEnvelope;
 use codex_history::archive_reference::ObservationReference;
 use codex_history::compaction_candidate::CandidateInput;
 use codex_history::compaction_candidate::Origin;
+use codex_history::compaction_checkpoint_metadata::RenCrowCompactionMetadataV2;
 use codex_history::observation_projection::ObservationSummaryExcerpt;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
@@ -16,6 +17,67 @@ use std::collections::HashSet;
 
 /// Only this exact prefix starts an important-observation marker; the JSON string follows it.
 const IMPORTANT_REF_MARKER: &str = "observation:\"";
+
+/// The latest adopted V2 compaction summary in the current selected history.
+#[allow(dead_code)]
+#[derive(Debug, PartialEq)]
+pub(super) struct AdoptedV2Checkpoint {
+    pub(super) index: usize,
+    pub(super) metadata: RenCrowCompactionMetadataV2,
+    /// Exact summary message body bound by `metadata.summary_hash`.
+    pub(super) summary_text: String,
+}
+
+/// Find the latest adopted V2 summary in session-owned history.
+///
+/// The owner replaces live history only after a durable commit and replays only committed
+/// transactions, so presence here means adoption. The lifecycle fields may therefore carry either
+/// the live prepared count or the replayed committed hash; the fresh-candidate rule that both are
+/// absent does not apply. Summaries without V2 metadata are not boundaries. V2 metadata on an item
+/// that is not a valid typed summary fails closed instead of falling back to an older checkpoint.
+#[allow(dead_code)]
+pub(super) fn find_adopted_v2_checkpoint(
+    items: &[ResponseItemEnvelope],
+    thread_id: &str,
+) -> Result<Option<AdoptedV2Checkpoint>, String> {
+    for (index, envelope) in items.iter().enumerate().rev() {
+        let Some(metadata) = envelope
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.rencrow_compaction.as_ref())
+        else {
+            continue;
+        };
+        if metadata.get("version").and_then(serde_json::Value::as_u64) != Some(2) {
+            continue;
+        }
+        let ResponseItem::Message {
+            role,
+            content,
+            internal_chat_message_metadata_passthrough,
+            ..
+        } = &envelope.item
+        else {
+            return Err("V2 compaction metadata is not attached to a typed summary".into());
+        };
+        let typed = role == "user"
+            && internal_chat_message_metadata_passthrough
+                .as_ref()
+                .and_then(|passthrough| passthrough.content_item_kinds.as_deref())
+                .is_some_and(|kinds| matches!(kinds, [kind] if kind.0 == "compaction.summary"));
+        let (true, [ContentItem::InputText { text }]) = (typed, content.as_slice()) else {
+            return Err("V2 compaction metadata is not attached to a typed summary".into());
+        };
+        let metadata =
+            RenCrowCompactionMetadataV2::parse_and_validate(metadata.clone(), thread_id, text)?;
+        return Ok(Some(AdoptedV2Checkpoint {
+            index,
+            metadata,
+            summary_text: text.clone(),
+        }));
+    }
+    Ok(None)
+}
 
 /// Build the model-visible history for the single V2 summary request.
 ///
