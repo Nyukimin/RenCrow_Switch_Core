@@ -1,7 +1,14 @@
-//! Observation handling for V2 compaction: new verified pairs and the cumulative inventory.
+//! Observation handling for V2 compaction: new verified pairs, the cumulative inventory, and
+//! host completion-candidate links.
 
 use codex_history::ResponseItemEnvelope;
 use codex_history::archive_reference::ObservationReference;
+use codex_history::compaction_candidate::CandidateInput;
+use codex_history::compaction_candidate::Origin;
+use codex_history::compaction_plan::ByteRange;
+use codex_history::compaction_preprocess::InstructionObservationLink;
+use codex_history::compaction_preprocess::InstructionPruning;
+use codex_history::observation_projection::OBSERVATION_PART_FULL_LIMIT_BYTES;
 use codex_history::observation_projection::ObservationCoverage;
 use codex_history::observation_projection::ObservationProjection;
 use codex_history::observation_projection::project_existing_observation;
@@ -9,6 +16,7 @@ use codex_history::observation_projection::project_observation;
 use codex_protocol::models::ResponseItem;
 use codex_rollout::PreparedCompactionReferenceKind;
 use codex_rollout::PreparedCompactionSources;
+use std::collections::BTreeMap;
 
 /// Project verified pairs whose observation identity is not already covered.
 ///
@@ -90,4 +98,120 @@ pub(super) fn cumulative_observation_coverage(
         }
     }
     Ok(merged)
+}
+
+/// Build host completion-candidate links, at most one per unambiguous turn.
+///
+/// A link only allows semantic review to consider completion; it never proves success. A turn
+/// yields a link only when its single user message is a verified Human with a stable ID and no
+/// protected or already pruned text, and its only tool activity is one verified terminal
+/// `exec_command` pair whose call and output are fully present in CandidateInput. Any tool item
+/// without a turn ID cannot be attributed, so it disables linking for the whole history.
+#[allow(dead_code)]
+pub(super) fn build_completion_links(
+    originals: &[ResponseItemEnvelope],
+    input: &CandidateInput,
+    pruning: &InstructionPruning,
+    prepared: &PreparedCompactionSources<'_>,
+) -> Result<Vec<InstructionObservationLink>, String> {
+    if input.records.len() != originals.len() {
+        return Err("completion link history and candidate record counts differ".into());
+    }
+    let mut turns = BTreeMap::<&str, (Vec<usize>, Vec<usize>)>::new();
+    for (index, (record, envelope)) in input.records.iter().zip(originals).enumerate() {
+        let tool = match &envelope.item {
+            ResponseItem::LocalShellCall { .. }
+            | ResponseItem::FunctionCall { .. }
+            | ResponseItem::ToolSearchCall { .. }
+            | ResponseItem::FunctionCallOutput { .. }
+            | ResponseItem::CustomToolCall { .. }
+            | ResponseItem::CustomToolCallOutput { .. }
+            | ResponseItem::ToolSearchOutput { .. }
+            | ResponseItem::WebSearchCall { .. }
+            | ResponseItem::ImageGenerationCall { .. }
+            | ResponseItem::Other => true,
+            ResponseItem::AdditionalTools { .. }
+            | ResponseItem::Message { .. }
+            | ResponseItem::AgentMessage { .. }
+            | ResponseItem::Reasoning { .. }
+            | ResponseItem::Compaction { .. }
+            | ResponseItem::ConfigurationUpdate { .. }
+            | ResponseItem::CompactionTrigger { .. }
+            | ResponseItem::ContextCompaction { .. } => false,
+        };
+        let user =
+            record.role == "user" && matches!(record.origin, Origin::Human | Origin::Unknown);
+        if !tool && !user {
+            continue;
+        }
+        let Some(turn_id) = envelope.item.turn_id() else {
+            if tool {
+                return Ok(Vec::new());
+            }
+            continue;
+        };
+        let (users, tools) = turns.entry(turn_id).or_default();
+        if tool {
+            tools.push(index);
+        } else {
+            users.push(index);
+        }
+    }
+
+    let snapshot = input.snapshot()?;
+    let whole = |index: usize| {
+        let record = &input.records[index];
+        snapshot
+            .reference(
+                &record.id,
+                ByteRange {
+                    start: 0,
+                    end: record.text.len(),
+                },
+            )
+            .map_err(|error| format!("invalid completion link source: {error:?}"))
+    };
+    let bounded = |index: usize| {
+        let text = &input.records[index].text;
+        !text.is_empty() && text.len() <= OBSERVATION_PART_FULL_LIMIT_BYTES
+    };
+    let mut links = Vec::new();
+    for (users, tools) in turns.values() {
+        let ([human], [call, output]) = (users.as_slice(), tools.as_slice()) else {
+            continue;
+        };
+        let Some(terminal) = prepared
+            .pairs
+            .iter()
+            .find(|pair| pair.call_index == *call && pair.output_index == *output)
+            .and_then(|pair| pair.terminal_reference.as_ref())
+        else {
+            continue;
+        };
+        let record = &input.records[*human];
+        if record.origin != Origin::Human
+            || record.opaque.is_some()
+            || !record.protected.is_empty()
+            || record.text.is_empty()
+            || human >= call
+            || pruning
+                .applied
+                .iter()
+                .any(|reference| reference.id == record.id)
+            || [*human, *call, *output]
+                .iter()
+                .any(|index| originals[*index].item.id().is_none())
+            || !bounded(*call)
+            || !bounded(*output)
+        {
+            continue;
+        }
+        links.push(InstructionObservationLink {
+            instruction: whole(*human)?,
+            call: whole(*call)?,
+            output: whole(*output)?,
+            terminal: terminal.clone(),
+        });
+    }
+    Ok(links)
 }

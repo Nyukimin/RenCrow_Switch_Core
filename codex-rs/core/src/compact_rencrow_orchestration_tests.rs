@@ -6,13 +6,17 @@
 
 use crate::compact::SUMMARY_PREFIX;
 use codex_history::ResponseItemEnvelope;
+use codex_history::archive_reference::ArchiveReference;
+use codex_history::archive_reference::ArchiveTerminalStatus;
 use codex_history::archive_reference::ObservationReference;
 use codex_history::archive_reference::content_sha256;
 use codex_history::compaction_candidate::CandidateInput;
 use codex_history::compaction_candidate::Origin;
 use codex_history::compaction_checkpoint_metadata::RenCrowCompactionMetadataV2;
 use codex_history::compaction_plan::ByteRange;
+use codex_history::compaction_preprocess::InstructionObservationLink;
 use codex_history::compaction_preprocess::InstructionPruning;
+use codex_history::compaction_preprocess::collect_instruction_candidates;
 use codex_history::compaction_preprocess::prune_known_obsolete;
 use codex_history::compaction_selection::InstructionSelectionApplication;
 use codex_protocol::ResponseItemId;
@@ -1067,5 +1071,152 @@ fn v2_known_pruning_applies_adopted_refs_only_while_their_source_text_is_unchang
             .get("human-request")
             .map(String::as_str),
         Some("keep")
+    );
+}
+
+fn in_turn(mut envelope: ResponseItemEnvelope, turn_id: &str) -> ResponseItemEnvelope {
+    envelope.item.set_turn_id_if_missing(turn_id);
+    envelope
+}
+
+fn terminal_exec_pair<'a>(
+    call_index: usize,
+    call_id: &str,
+    call: &'a str,
+    output: &'a str,
+) -> PreparedCompactionSourcePair<'a> {
+    PreparedCompactionSourcePair {
+        terminal_reference: Some(ArchiveReference::new(
+            THREAD_ID,
+            call_id,
+            content_sha256(output),
+            ArchiveTerminalStatus::Completed,
+            0,
+            None,
+        )),
+        ..prepared_pair(
+            call_index,
+            ObservationReference::new(THREAD_ID, call_id, content_sha256(output)),
+            PreparedCompactionReferenceKind::Fresh,
+            Some((call, output)),
+            output.len(),
+        )
+    }
+}
+
+fn whole_ref(input: &CandidateInput, index: usize) -> codex_history::compaction_plan::SourceRef {
+    let record = &input.records[index];
+    input
+        .snapshot()
+        .unwrap()
+        .reference(
+            &record.id,
+            ByteRange {
+                start: 0,
+                end: record.text.len(),
+            },
+        )
+        .unwrap()
+}
+
+#[test]
+fn v2_completion_links_link_only_the_unambiguous_single_exec_turn() {
+    let call = r#"{"cmd":"cargo test"}"#;
+    let output = "test result: ok";
+    let large_output = "L".repeat(2_049);
+    let originals = vec![
+        in_turn(human("Run the tests.", "human-a"), "turn-a"),
+        in_turn(function_call("call-a", call), "turn-a"),
+        in_turn(function_output("call-a", output), "turn-a"),
+        in_turn(human("Run both checks.", "human-b"), "turn-b"),
+        in_turn(function_call("call-b1", call), "turn-b"),
+        in_turn(function_output("call-b1", output), "turn-b"),
+        in_turn(function_call("call-b2", call), "turn-b"),
+        in_turn(function_output("call-b2", output), "turn-b"),
+        in_turn(human("First request.", "human-c1"), "turn-c"),
+        in_turn(human("Second request.", "human-c2"), "turn-c"),
+        in_turn(function_call("call-c", call), "turn-c"),
+        in_turn(function_output("call-c", output), "turn-c"),
+        in_turn(human("Show the large file.", "human-d"), "turn-d"),
+        in_turn(function_call("call-d", call), "turn-d"),
+        in_turn(function_output("call-d", &large_output), "turn-d"),
+    ];
+    let prepared = PreparedCompactionSources {
+        pairs: vec![
+            terminal_exec_pair(1, "call-a", call, output),
+            terminal_exec_pair(4, "call-b1", call, output),
+            terminal_exec_pair(6, "call-b2", call, output),
+            terminal_exec_pair(10, "call-c", call, output),
+            terminal_exec_pair(13, "call-d", call, &large_output),
+        ],
+        protected_indices: vec![],
+    };
+    let input = candidate_input(
+        &originals,
+        &super::history::verified_pair_projections(&prepared),
+    );
+    let pruning = prune_known_obsolete(&input, &[]).unwrap();
+
+    let links = super::observation::build_completion_links(&originals, &input, &pruning, &prepared)
+        .unwrap();
+
+    assert_eq!(
+        links,
+        vec![InstructionObservationLink {
+            instruction: whole_ref(&input, 0),
+            call: whole_ref(&input, 1),
+            output: whole_ref(&input, 2),
+            terminal: prepared.pairs[0].terminal_reference.clone().unwrap(),
+        }]
+    );
+    let payload = collect_instruction_candidates(&input, &pruning, &links)
+        .unwrap()
+        .unwrap();
+    assert_eq!(payload["completion_links"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn v2_completion_links_skip_pruned_humans_and_unattributed_tool_activity() {
+    let call = r#"{"cmd":"cargo test"}"#;
+    let output = "test result: ok";
+    let linked = vec![
+        in_turn(human("Old detail. Run the tests.", "human-a"), "turn-a"),
+        in_turn(function_call("call-a", call), "turn-a"),
+        in_turn(function_output("call-a", output), "turn-a"),
+    ];
+    let prepared = PreparedCompactionSources {
+        pairs: vec![terminal_exec_pair(1, "call-a", call, output)],
+        protected_indices: vec![],
+    };
+    let completed = super::history::verified_pair_projections(&prepared);
+    let input = candidate_input(&linked, &completed);
+    let known = input
+        .snapshot()
+        .unwrap()
+        .reference(
+            "human-a",
+            ByteRange {
+                start: 0,
+                end: "Old detail. ".len(),
+            },
+        )
+        .unwrap();
+    let pruning = prune_known_obsolete(&input, &[known]).unwrap();
+    assert_eq!(
+        super::observation::build_completion_links(&linked, &input, &pruning, &prepared),
+        Ok(vec![])
+    );
+
+    let mut unattributed = linked.clone();
+    unattributed.push(function_call("call-without-turn", call));
+    let input = candidate_input(&unattributed, &completed);
+    assert_eq!(
+        super::observation::build_completion_links(
+            &unattributed,
+            &input,
+            &prune_known_obsolete(&input, &[]).unwrap(),
+            &prepared,
+        ),
+        Ok(vec![])
     );
 }
