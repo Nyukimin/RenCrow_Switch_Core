@@ -8,10 +8,18 @@ use crate::context_manager::ContextManager;
 use crate::session::context_window::ContextWindowTokenStatus;
 use codex_history::RenCrowCompactionMetadataV2;
 use codex_history::ResponseItemEnvelope;
+use codex_history::archive_reference::ObservationReference;
+use codex_history::archive_reference::content_sha256;
+use codex_history::compaction_checkpoint_metadata::CheckpointResponseStage;
+use codex_history::compaction_checkpoint_metadata::CompactionModelResponseReceipt;
+use codex_history::compaction_checkpoint_metadata::CompactionSelectionMode;
+use codex_history::compaction_selection::InstructionSelectionApplication;
+use codex_history::observation_projection::ObservationCoverage;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::openai_models::ReasoningEffort;
 
 /// Validate a fully assembled V2 history candidate without changing the live session.
 pub(super) fn validate_compaction_candidate(
@@ -87,6 +95,50 @@ pub(super) fn validate_compaction_candidate(
     }
 
     check_context_budget(original, base, candidate.to_vec(), scope, limits)
+}
+
+/// Create fresh checkpoint metadata for the final V2 summary body (Annex A F25).
+///
+/// The selection mode follows the actual receipts: an instruction-selection receipt means
+/// `ModelSelection`, otherwise `NoCandidates`, and only a model selection keeps its presentation
+/// hash. The applied refs, results, and plan hash come from the one application shared by summary
+/// input and replacement. Transaction lifecycle fields stay empty for a fresh candidate.
+#[allow(dead_code, clippy::too_many_arguments)]
+pub(super) fn fresh_checkpoint_metadata(
+    summary_text: &str,
+    snapshot_hash: String,
+    presentation_hash: Option<String>,
+    application: &InstructionSelectionApplication,
+    observations: Vec<ObservationCoverage>,
+    important_refs: Vec<ObservationReference>,
+    responses: Vec<CompactionModelResponseReceipt>,
+    model: String,
+    effort: Option<ReasoningEffort>,
+) -> RenCrowCompactionMetadataV2 {
+    let model_selection = responses
+        .iter()
+        .any(|receipt| receipt.stage == CheckpointResponseStage::InstructionSelection);
+    RenCrowCompactionMetadataV2 {
+        version: 2,
+        snapshot_hash,
+        presentation_hash: presentation_hash.filter(|_| model_selection),
+        summary_hash: content_sha256(summary_text),
+        selection_mode: if model_selection {
+            CompactionSelectionMode::ModelSelection
+        } else {
+            CompactionSelectionMode::NoCandidates
+        },
+        plan_hash: application.plan_hash.clone(),
+        applied_refs: application.pruning.applied.clone(),
+        results: application.results.clone(),
+        observations,
+        important_refs,
+        model,
+        effort,
+        responses,
+        transaction_following_items: None,
+        committed_transaction_hash: None,
+    }
 }
 
 /// Check the minimum retained floor before spending a summary request (Annex A F19).

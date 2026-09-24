@@ -646,3 +646,215 @@ fn checkpoint_metadata_mut(candidate: &mut [ResponseItemEnvelope]) -> &mut Value
         .as_mut()
         .unwrap()
 }
+
+fn human_message(text: &str, id: &str) -> ResponseItemEnvelope {
+    let mut human = message("user", text, id);
+    human.metadata.get_or_insert_default().rencrow_input = Some(json!({
+        "version": 1,
+        "author": "human",
+        "thread_id": THREAD_ID,
+        "selected_text": text,
+        "receipt_hash": format!("receipt-{id}"),
+    }));
+    human
+}
+
+fn receipt(stage: CheckpointResponseStage, response_id: &str) -> CompactionModelResponseReceipt {
+    CompactionModelResponseReceipt {
+        stage,
+        response_id: response_id.into(),
+        seconds: 0.1,
+        usage: None,
+    }
+}
+
+fn capture_input(
+    originals: &[ResponseItemEnvelope],
+) -> codex_history::compaction_candidate::CandidateInput {
+    super::super::history::capture(
+        originals,
+        "candidate-binding".into(),
+        THREAD_ID,
+        vec![],
+        &[],
+    )
+    .unwrap()
+}
+
+fn validate_fresh_candidate(
+    originals: &[ResponseItemEnvelope],
+    application: InstructionSelectionApplication,
+    presentation_hash: Option<String>,
+    responses: Vec<CompactionModelResponseReceipt>,
+    important_refs: Vec<ObservationReference>,
+) -> Result<(), String> {
+    let input = capture_input(originals);
+    let projection =
+        super::super::native::filter_retained_instructions(originals, &input, application.clone())?;
+    let summary_text = format!("{SUMMARY_PREFIX}\nCurrent verified facts.");
+    let metadata = fresh_checkpoint_metadata(
+        &summary_text,
+        input.snapshot()?.hash().to_owned(),
+        presentation_hash,
+        &application,
+        vec![],
+        important_refs,
+        responses,
+        "candidate-model".into(),
+        None,
+    );
+    let mut candidate =
+        super::super::native::build_native_replacement(&projection, &summary_text, vec![])?;
+    candidate
+        .last_mut()
+        .unwrap()
+        .metadata
+        .get_or_insert_default()
+        .rencrow_compaction = Some(serde_json::to_value(&metadata).unwrap());
+    let mut original = ContextManager::new();
+    original.replace_annotated(originals.to_vec());
+    validate_compaction_candidate(
+        &original,
+        &BaseInstructions {
+            text: "system instructions".into(),
+            provenance: None,
+        },
+        &projection,
+        &[],
+        &candidate,
+        THREAD_ID,
+        AutoCompactTokenLimitScope::Total,
+        &limits(Some(i64::MAX), Some(i64::MAX)),
+    )
+}
+
+#[test]
+fn v2_fresh_metadata_without_selection_passes_final_validation() {
+    let originals = vec![
+        message("assistant", &"old work ".repeat(2_000), "old-work"),
+        human_message("Keep Japanese.", "human-a"),
+    ];
+    let input = capture_input(&originals);
+    let pruning = codex_history::compaction_preprocess::prune_known_obsolete(&input, &[]).unwrap();
+    let application = codex_history::compaction_selection::validate_and_apply_selection(
+        &input,
+        &pruning,
+        &[],
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(
+        validate_fresh_candidate(
+            &originals,
+            application.clone(),
+            None,
+            vec![receipt(
+                CheckpointResponseStage::Summary,
+                "summary-response"
+            )],
+            vec![],
+        ),
+        Ok(())
+    );
+    // A presentation hash without an instruction-selection request is not recorded.
+    assert_eq!(
+        validate_fresh_candidate(
+            &originals,
+            application,
+            Some("d".repeat(64)),
+            vec![receipt(
+                CheckpointResponseStage::Summary,
+                "summary-response"
+            )],
+            vec![],
+        ),
+        Ok(())
+    );
+}
+
+#[test]
+fn v2_fresh_metadata_with_selection_passes_and_inconsistent_parts_are_rejected() {
+    use codex_history::compaction_pipeline::InstructionSelection;
+    use codex_history::compaction_pipeline::ProposedOperation;
+    use codex_history::compaction_pipeline::ProposedPlan;
+
+    let originals = vec![
+        message("assistant", &"old work ".repeat(2_000), "old-work"),
+        human_message("Keep Japanese. Use obsolete-label.", "human-a"),
+        human_message("Use current-label instead.", "human-b"),
+    ];
+    let input = capture_input(&originals);
+    let pruning = codex_history::compaction_preprocess::prune_known_obsolete(&input, &[]).unwrap();
+    let payload =
+        codex_history::compaction_preprocess::collect_instruction_candidates(&input, &pruning, &[])
+            .unwrap()
+            .unwrap();
+    let presentation_hash = payload["presentation_hash"].as_str().unwrap().to_owned();
+    let selection = InstructionSelection::from_host(
+        payload["snapshot_hash"].as_str().unwrap().into(),
+        presentation_hash.clone(),
+        ProposedPlan {
+            operations: vec![ProposedOperation::DropSuperseded {
+                source: "human-a".into(),
+                source_text: Some("Use obsolete-label.".into()),
+                correction: "human-b".into(),
+                correction_text: Some("Use current-label instead.".into()),
+            }],
+        },
+    );
+    let application = codex_history::compaction_selection::validate_and_apply_selection(
+        &input,
+        &pruning,
+        &[],
+        Some(selection),
+    )
+    .unwrap();
+    let both_receipts = vec![
+        receipt(
+            CheckpointResponseStage::InstructionSelection,
+            "selection-response",
+        ),
+        receipt(CheckpointResponseStage::Summary, "summary-response"),
+    ];
+
+    assert_eq!(
+        validate_fresh_candidate(
+            &originals,
+            application.clone(),
+            Some(presentation_hash.clone()),
+            both_receipts.clone(),
+            vec![],
+        ),
+        Ok(())
+    );
+    // Missing the selection receipt makes the mode disagree with the applied plan.
+    assert!(
+        validate_fresh_candidate(
+            &originals,
+            application.clone(),
+            Some(presentation_hash.clone()),
+            vec![receipt(
+                CheckpointResponseStage::Summary,
+                "summary-response"
+            )],
+            vec![],
+        )
+        .is_err()
+    );
+    // An important reference must belong to the checkpoint observation inventory.
+    assert!(
+        validate_fresh_candidate(
+            &originals,
+            application,
+            Some(presentation_hash),
+            both_receipts,
+            vec![ObservationReference::new(
+                THREAD_ID,
+                "unknown-call",
+                "e".repeat(64),
+            )],
+        )
+        .is_err()
+    );
+}
