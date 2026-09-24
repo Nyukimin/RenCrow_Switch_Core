@@ -24,6 +24,8 @@ mod native;
 #[path = "compact_rencrow_summary.rs"]
 mod summary;
 
+pub(super) use summary::should_apply_server_reasoning_included;
+
 #[cfg(test)]
 #[path = "compact_rencrow_orchestration_tests.rs"]
 mod orchestration_tests;

@@ -845,7 +845,11 @@ async fn drain_to_completed(
                 }
             }
             Ok(ResponseEvent::ServerReasoningIncluded(included)) => {
-                sess.set_server_reasoning_included(included).await;
+                if rencrow::should_apply_server_reasoning_included(
+                    turn_context.config.rencrow_compaction,
+                ) {
+                    sess.set_server_reasoning_included(included).await;
+                }
             }
             Ok(ResponseEvent::RateLimits(snapshot)) => {
                 sess.update_rate_limits(turn_context, snapshot).await;

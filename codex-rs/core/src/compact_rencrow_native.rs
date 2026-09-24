@@ -23,6 +23,7 @@ use std::collections::HashMap;
 use std::ops::Range;
 
 struct RetainedItem {
+    original_index: usize,
     envelope: ResponseItemEnvelope,
 }
 
@@ -39,6 +40,15 @@ impl NativeProjection {
         self.human_positions
             .iter()
             .map(|index| &self.retained[*index].envelope)
+    }
+
+    /// Borrow each retained native item with its index in the original selected history.
+    pub(super) fn retained_by_original_index(
+        &self,
+    ) -> impl Iterator<Item = (usize, &ResponseItemEnvelope)> + '_ {
+        self.retained
+            .iter()
+            .map(|item| (item.original_index, &item.envelope))
     }
 
     pub(super) fn retained_native_items(
@@ -155,7 +165,7 @@ pub(super) fn filter_retained_instructions(
     };
     let mut retained = Vec::new();
     let mut human_positions = Vec::new();
-    for (record, original) in input.records.iter().zip(originals) {
+    for (original_index, (record, original)) in input.records.iter().zip(originals).enumerate() {
         if is_user_summary(original) && record.origin != Origin::Human {
             continue;
         }
@@ -220,7 +230,10 @@ pub(super) fn filter_retained_instructions(
         if record.origin == Origin::Human {
             human_positions.push(retained_index);
         }
-        retained.push(RetainedItem { envelope });
+        retained.push(RetainedItem {
+            original_index,
+            envelope,
+        });
     }
 
     let user_messages = collect_user_slots(&retained)?;
@@ -443,7 +456,7 @@ fn ranges_overlap(left: &Range<usize>, right: &Range<usize>) -> bool {
     left.start < right.end && right.start < left.end
 }
 
-fn is_user_summary(envelope: &ResponseItemEnvelope) -> bool {
+pub(super) fn is_user_summary(envelope: &ResponseItemEnvelope) -> bool {
     matches!(&envelope.item, ResponseItem::Message { role, .. } if role == "user")
         && is_provenance_summary(envelope)
 }

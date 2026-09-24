@@ -1,9 +1,8 @@
-//! Prepared integration regressions for the V2 original-loop connection.
+//! Integration regressions for the V2 original-loop connection.
 //!
-//! This sibling is intentionally unreferenced until the summary-projection helper lands. It
-//! targets the pure `compact_rencrow_summary` boundary, not the model/session transport. Add the
-//! ServerReasoningIncluded dispatch regression with the drain change; its event is websocket
-//! metadata, so an SSE fixture would not exercise that production boundary.
+//! These cases target the pure `compact_rencrow_summary` boundary, not the model/session
+//! transport. `ServerReasoningIncluded` is websocket metadata, so its drain dispatch boundary needs
+//! a transport-level regression in addition to the pure policy cases below.
 
 use super::*;
 use crate::compact::SUMMARY_PREFIX;
@@ -15,7 +14,6 @@ use codex_history::compaction_candidate::Origin;
 use codex_history::compaction_plan::ByteRange;
 use codex_history::compaction_preprocess::prune_known_obsolete;
 use codex_history::compaction_selection::InstructionSelectionApplication;
-use codex_history::observation_projection::ObservationSummaryExcerpt;
 use codex_protocol::ResponseItemId;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ContentItemKind;
@@ -119,6 +117,10 @@ fn item_text(envelope: &ResponseItemEnvelope) -> String {
             .join(""),
         _ => String::new(),
     }
+}
+
+fn model_items(envelopes: &[ResponseItemEnvelope]) -> Vec<&ResponseItem> {
+    envelopes.iter().map(|envelope| &envelope.item).collect()
 }
 
 fn item_id(envelope: &ResponseItemEnvelope) -> Option<&str> {
@@ -253,7 +255,7 @@ fn v2_summary_projection_replaces_both_verified_pair_slots_with_one_bounded_obse
             _ => false,
         }
     }));
-    let serialized = serde_json::to_string(&projected).unwrap();
+    let serialized = serde_json::to_string(&model_items(&projected)).unwrap();
     assert!(!serialized.contains("verified-call-item"));
     assert!(!serialized.contains("verified-output-item"));
     assert!(!serialized.contains(&"x".repeat(5_000)));
@@ -358,13 +360,13 @@ fn v2_generic_capture_projects_large_custom_tool_input_from_canonical_raw_pair()
     assert!(summary_items.iter().any(|item| item == &active_custom_call));
     assert!(candidate.iter().any(|item| item == &active_custom_call));
     for projected in [&summary_items, &candidate] {
-        let serialized = serde_json::to_string(projected).unwrap();
+        let serialized = serde_json::to_string(&model_items(projected)).unwrap();
         assert!(!serialized.contains("custom-call-item"));
         assert!(!serialized.contains("custom-output-item"));
         assert!(!serialized.contains(&"c".repeat(5_000)));
         assert!(!serialized.contains(&"o".repeat(5_000)));
     }
-    let summary_json = serde_json::to_string(&summary_items).unwrap();
+    let summary_json = serde_json::to_string(&model_items(&summary_items)).unwrap();
     assert!(summary_json.contains("CANONICAL-CALL-TAIL"));
     assert!(summary_json.contains("CANONICAL-OUTPUT-TAIL"));
     assert!(!summary_json.contains("normal-history-truncated"));
@@ -476,8 +478,17 @@ fn v2_summary_response_validation_rejects_nonassistant_or_tool_output_even_with_
     }];
     assert!(super::summary::summary_suffix_from_staged_output(&user).is_err());
 
+    let assistant = ResponseItem::Message {
+        id: None,
+        role: "assistant".into(),
+        content: vec![ContentItem::OutputText {
+            text: "Current work and unresolved checks.".into(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
     let tool = [
-        valid[1].clone(),
+        assistant,
         serde_json::from_value(json!({
             "type": "function_call",
             "id": "unexpected-tool",
@@ -502,39 +513,72 @@ fn v2_important_refs_resolve_only_explicit_json_string_markers_and_deduplicate()
         serde_json::to_string(call_id).unwrap(),
     );
 
-    let important =
-        super::summary::important_refs_from_summary(&marker, &[reference.clone()]).unwrap();
-
-    assert_eq!(important, vec![reference]);
-    assert!(
-        super::summary::important_refs_from_summary("No archive citation.", &[])
-            .unwrap()
-            .is_empty()
+    assert_eq!(
+        super::summary::important_refs_from_summary(&marker, std::slice::from_ref(&reference)),
+        super::summary::ImportantRefResolution {
+            refs: vec![reference],
+            ignored_markers: 0,
+        }
+    );
+    assert_eq!(
+        super::summary::important_refs_from_summary("No archive citation.", &[]),
+        super::summary::ImportantRefResolution::default()
     );
 }
 
 #[test]
-fn v2_important_refs_reject_malformed_unknown_or_ambiguous_markers() {
+fn v2_important_refs_ignore_malformed_unknown_or_ambiguous_markers_without_failing() {
     let known = ObservationReference::new(THREAD_ID, "known-call", content_sha256("known output"));
-    assert!(super::summary::important_refs_from_summary("observation:not-json", &[]).is_err());
-    assert!(
-        super::summary::important_refs_from_summary("observation:\"unterminated", &[]).is_err()
-    );
-    assert!(
-        super::summary::important_refs_from_summary(
-            "observation:\"unknown-call\"",
-            std::slice::from_ref(&known),
-        )
-        .is_err()
-    );
-
     let ambiguous = [
         known.clone(),
         ObservationReference::new(THREAD_ID, "known-call", content_sha256("different output")),
     ];
-    assert!(
-        super::summary::important_refs_from_summary("observation:\"known-call\"", &ambiguous,)
-            .is_err()
+    let ignored = |ignored_markers| super::summary::ImportantRefResolution {
+        refs: vec![],
+        ignored_markers,
+    };
+
+    assert_eq!(
+        super::summary::important_refs_from_summary(
+            "key observation: useful; observation:not-json; observation: maybe",
+            std::slice::from_ref(&known),
+        ),
+        ignored(0)
+    );
+    assert_eq!(
+        super::summary::important_refs_from_summary(
+            "observation:\"unterminated",
+            std::slice::from_ref(&known),
+        ),
+        ignored(1)
+    );
+    assert_eq!(
+        super::summary::important_refs_from_summary(
+            r#"observation:"bad\x" then text"#,
+            std::slice::from_ref(&known),
+        ),
+        ignored(1)
+    );
+    assert_eq!(
+        super::summary::important_refs_from_summary(
+            "observation:\"unknown-call\"",
+            std::slice::from_ref(&known),
+        ),
+        ignored(1)
+    );
+    assert_eq!(
+        super::summary::important_refs_from_summary("observation:\"known-call\"", &ambiguous),
+        ignored(1)
+    );
+    assert_eq!(
+        super::summary::important_refs_from_summary(
+            "Use observation:\"known-call\", skip observation:\"missing\", reuse observation:\"known-call\".",
+            std::slice::from_ref(&known),
+        ),
+        super::summary::ImportantRefResolution {
+            refs: vec![known],
+            ignored_markers: 1,
+        }
     );
 }
 
@@ -555,10 +599,13 @@ fn v2_important_refs_do_not_promote_an_inventory_without_explicit_markers() {
         serde_json::to_string("call-197").unwrap(),
     );
 
-    let important = super::summary::important_refs_from_summary(&marker, &inventory).unwrap();
-
-    assert_eq!(important.len(), 1);
-    assert_eq!(important[0].call_id, "call-197");
+    assert_eq!(
+        super::summary::important_refs_from_summary(&marker, &inventory),
+        super::summary::ImportantRefResolution {
+            refs: vec![inventory[197].clone()],
+            ignored_markers: 0,
+        }
+    );
 }
 
 #[test]
@@ -567,13 +614,13 @@ fn fork_auxiliary_server_reasoning_metadata_does_not_change_active_context_polic
     // Responses websocket ServerReasoningIncluded event. The drain integration still needs that
     // event or a direct test of the dispatch boundary after the policy is wired.
     assert!(!super::summary::should_apply_server_reasoning_included(
-        true
+        /*rencrow_compaction*/ true
     ));
 }
 
 #[test]
 fn disabled_compaction_keeps_server_reasoning_sideband_policy() {
     assert!(super::summary::should_apply_server_reasoning_included(
-        false
+        /*rencrow_compaction*/ false
     ));
 }
