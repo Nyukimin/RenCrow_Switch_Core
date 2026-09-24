@@ -2,6 +2,8 @@
 
 use super::native::NativeProjection;
 use crate::compact::SUMMARY_PREFIX;
+use crate::context::CompactionSummary;
+use crate::context::ContextualUserFragment;
 use crate::context_manager::ContextManager;
 use crate::session::context_window::ContextWindowTokenStatus;
 use codex_history::RenCrowCompactionMetadataV2;
@@ -84,11 +86,48 @@ pub(super) fn validate_compaction_candidate(
         );
     }
 
+    check_context_budget(original, base, candidate.to_vec(), scope, limits)
+}
+
+/// Check the minimum retained floor before spending a summary request (Annex A F19).
+///
+/// The floor is the retained native items and canonical initial context with the smallest valid
+/// summary body. If even this floor does not shrink the context or fit the configured limits, no
+/// generated summary can make the candidate valid (Part 2 §15). Passing does not accept the final
+/// candidate; `validate_compaction_candidate` still checks it independently.
+#[allow(dead_code)]
+pub(super) fn preflight_compaction_floor(
+    original: &ContextManager,
+    base: &BaseInstructions,
+    projection: &NativeProjection,
+    initial_context: &[ResponseItemEnvelope],
+    scope: AutoCompactTokenLimitScope,
+    limits: &ContextWindowTokenStatus,
+) -> Result<(), String> {
+    let floor_summary = ResponseItemEnvelope::new(ContextualUserFragment::into(
+        CompactionSummary::new(format!("{SUMMARY_PREFIX}\n.")),
+    ));
+    let floor = projection
+        .retained_native_items_with_initial_context(initial_context, &floor_summary)
+        .cloned()
+        .collect();
+    check_context_budget(original, base, floor, scope, limits)
+        .map_err(|error| format!("minimum compaction floor: {error}"))
+}
+
+/// Require a candidate history to shrink the estimated context and fit the configured limits.
+fn check_context_budget(
+    original: &ContextManager,
+    base: &BaseInstructions,
+    candidate: Vec<ResponseItemEnvelope>,
+    scope: AutoCompactTokenLimitScope,
+    limits: &ContextWindowTokenStatus,
+) -> Result<(), String> {
     let before = original
         .estimate_token_count_with_base_instructions(base)
         .ok_or_else(|| "original compaction context estimate is unavailable".to_owned())?;
     let mut candidate_history = ContextManager::new();
-    candidate_history.replace_annotated(candidate.to_vec());
+    candidate_history.replace_annotated(candidate);
     let after = candidate_history
         .estimate_token_count_with_base_instructions(base)
         .ok_or_else(|| "candidate compaction context estimate is unavailable".to_owned())?;

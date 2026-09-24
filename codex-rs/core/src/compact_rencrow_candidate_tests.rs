@@ -566,3 +566,83 @@ fn v2_candidate_enforces_total_and_fresh_body_after_prefix_limits() {
         .is_err()
     );
 }
+
+fn preflight(
+    fixture: &CandidateFixture,
+    scope: AutoCompactTokenLimitScope,
+    limits: &ContextWindowTokenStatus,
+) -> Result<(), String> {
+    preflight_compaction_floor(
+        &fixture.original,
+        &fixture.base,
+        &fixture.projection,
+        &fixture.initial_context,
+        scope,
+        limits,
+    )
+}
+
+#[test]
+fn v2_preflight_rejects_a_floor_that_cannot_shrink_or_fit_before_any_summary() {
+    let unshrinkable = fixture(0, false);
+    assert!(
+        preflight(
+            &unshrinkable,
+            AutoCompactTokenLimitScope::Total,
+            &limits(Some(i64::MAX), Some(i64::MAX)),
+        )
+        .is_err()
+    );
+
+    let large = fixture(100_000, false);
+    assert!(
+        preflight(
+            &large,
+            AutoCompactTokenLimitScope::Total,
+            &limits(Some(i64::MAX), Some(0)),
+        )
+        .is_err()
+    );
+    assert!(
+        preflight(
+            &large,
+            AutoCompactTokenLimitScope::Total,
+            &limits(Some(0), Some(i64::MAX)),
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn v2_preflight_allows_a_viable_floor_while_final_validation_stays_independent() {
+    let fixture = fixture(100_000, true);
+    let open_limits = limits(Some(i64::MAX), Some(i64::MAX));
+    assert_eq!(
+        preflight(&fixture, AutoCompactTokenLimitScope::Total, &open_limits),
+        Ok(())
+    );
+
+    let mut tampered = fixture.candidate.clone();
+    checkpoint_metadata_mut(&mut tampered)["summary_hash"] = json!("c".repeat(64));
+    assert!(
+        validate(
+            &fixture,
+            &tampered,
+            AutoCompactTokenLimitScope::Total,
+            &open_limits,
+        )
+        .is_err()
+    );
+}
+
+fn checkpoint_metadata_mut(candidate: &mut [ResponseItemEnvelope]) -> &mut Value {
+    candidate
+        .last_mut()
+        .unwrap()
+        .metadata
+        .as_mut()
+        .unwrap()
+        .rencrow_compaction
+        .as_mut()
+        .unwrap()
+}
