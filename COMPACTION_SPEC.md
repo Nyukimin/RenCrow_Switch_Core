@@ -4787,7 +4787,7 @@ RenCrow Switch Core Compaction V2の役割は、
 
 # 第3部 現在の実装状態（2026-09-24）
 
-第2部 §70のPhase 1（項目1〜13、下記「Phase 1の進捗」）、Phase 2（Level 2 schema、下記「Phase 2の進捗」）、Phase 3（Level 2 runtime、下記「Phase 3の進捗」）、Phase 4（Level 5 / Integrity、下記「Phase 4の進捗」）を実装し、Phase 5（実QwenのE2E、下記「Phase 5の進捗」）を実施した。Phase 6は未着手。本部は第4部「第2版の実装契約」の8責務とsourceの対応だけを示す。工程別の検査・証拠・未解決の指摘は私有の`target/fork-bootstrap/compaction-check-plan.json`（`v2`）が正本であり、ここへ複製しない。
+第2部 §70のPhase 1（項目1〜13、下記「Phase 1の進捗」）、Phase 2（Level 2 schema、下記「Phase 2の進捗」）、Phase 3（Level 2 runtime、下記「Phase 3の進捗」）、Phase 4（Level 5 / Integrity、下記「Phase 4の進捗」）を実装し、Phase 5（実QwenのE2E、下記「Phase 5の進捗」）とPhase 6（共有配備、下記「Phase 6の進捗」）を実施した。本部は第4部「第2版の実装契約」の8責務とsourceの対応だけを示す。工程別の検査・証拠・未解決の指摘は私有の`target/fork-bootstrap/compaction-check-plan.json`（`v2`）が正本であり、ここへ複製しない。
 
 `rencrow_compaction = true`で実行されるのは、項目13で置き換えたNormal V2の`compact::rencrow::run`（`codex-rs/core/src/compact_rencrow.rs`、付属A F01の処理順）である。model requestは必要時だけのSelectionと要約の最大2回で、既存の`commit_rencrow_checkpoint`だけが履歴を置き換える。旧Fork経路のplan・plan review・要約の3要求と完了済みexecの独自投影は除去し、fallbackとして残していない。Normalが意味・モデルの理由で失敗した場合は決定的なEmergency（Level 2）へ進み、容量不足はCapacityBlocked、決定的な不整合はIntegrityBlockedとして履歴を変えずに明示エラーを返す（Phase 3、下記）。
 
@@ -4825,7 +4825,7 @@ RenCrow Switch Core Compaction V2の役割は、
   - 結合試験（第2部 §71の一部）: `core/tests/suite/compact_rencrow.rs`をV2向けに書き直した。mockは要求を選別・要約・通常に分類し、応答item IDを連番にした（旧fixtureの`"answer"`重複IDによる`InvalidSnapshot`を解消）。manual/automaticの2件は、ModelSelectionで撤回文だけが消えること、要約入力と置換後履歴に撤回文が残らないこと、再起動後の2回目がSelectionなし（NoCandidates）で要約1回だけになることを確認する。非Humanの1件はSelectionを送らないこと、exec組の1件は検証済みの組が要約入力に上限つきObservation 1件としてだけ現れ、置換後履歴とcold resume後の入力に元のcallが戻らないことを確認する。
   - 検査: `just test --cargo-profile dev-small -p codex-core --lib -E "test(compact)"`で153件全成功（うち`compact::rencrow`は63件、追加3件）、`-p codex-rollout`で171件全成功、`-p codex-core --test all -E "test(suite::compact)"`で72件全成功（`suite::compact_rencrow`の4件を含む。Fork無効の上流試験も通る）。上流のremote compaction試験2件（`compact_remote::remote_compact_v2_charges_retained_images_to_token_budget`）は1回目が約49秒で失敗し再試行で成功した。Fork経路を通らない試験で、今回の変更とは無関係と判断した。`just fix -p codex-core`・`-p codex-rollout`を実行し、項目13の変更ファイルへの修正だけを残した（他ファイルへの既存指摘の修正は別単位とし、取り込んでいない）。
 - 既存の失敗の解消: 以前記録した結合試験4件中3件の失敗（manual/automaticの重複ID、完了済みexec組）は、上記の書き直しと正本照合の修正で解消した。
-- 未完了: `ServerReasoningIncluded`のdrain分岐を実際に通す回帰、付属AのI15（preflight失敗）とI16（自動再試行抑止）の結合試験は未作成（判定関数は単体試験済み）。Phase 2（schema確定）は下記のとおり実装した。Phase 6（共有配備と§77の旧binary互換確認）が未実施のため、HEADはまだ配備しない。
+- 未完了: `ServerReasoningIncluded`のdrain分岐を実際に通す回帰、付属AのI15（preflight失敗）とI16（自動再試行抑止）の結合試験は未作成（判定関数は単体試験済み）。Phase 2（schema確定）は下記のとおり実装した。Phase 6で共有配備した（下記）。
 
 ### Phase 2の進捗（2026-09-24）
 
@@ -4839,7 +4839,7 @@ RenCrow Switch Core Compaction V2の役割は、
 - `RenCrowCheckpoint.response_id`を`Option<String>`にし、`commit_rencrow_checkpoint`は`compaction_response_id: candidate.response_id`をそのまま保存する（§50〜51の承認済み例外。commitの安全境界は変えていない）。Normalは要約responseのIDを渡す。
 - `CodexHarnessMetadata`へV2 marker専用の`rencrow_observation_projection: Option<ObservationCoverage>`を追加した（§34、上流`history/src/lib.rs`へ変更注記）。V1の`rencrow_archive_reference`とは別の欄で、`None`の間は保存されない。このmetadataを持つ出力は、Phase 3のmarker検証（§38〜40）が入るまで検証済みの組として扱われず、保護される。`CodexHarnessMetadata`の`JsonSchema`に合わせて、`ObservationCoverage`・`ObservationPartCoverage`・`ByteRange`へ`JsonSchema`を加えた。
 - 検査: `just test --cargo-profile dev-small -p codex-history`で134件全成功（追加3件、既存のfixtureを新しい欄へ更新）。`-p codex-rollout`171件、`-p codex-core --lib -E "test(compact) | test(session::)"`523件、`-p codex-core --test all -E "test(suite::compact)"`72件が全成功。exec組の結合試験で、要約へ提示したObservationが`summary_covered_observations`へ記録されることも確認した。上流の`compact_remote::remote_compact_v2_rewrites_multiple_trailing_function_call_outputs`（manual・automatic）は、並列の全体実行でだけ断続的に失敗する（単独実行は24回全成功）。全体実行3回ずつの比較で、本Phase適用後・項目13 commit（`a6553137b`）・項目13より前（`30850fe40`、`suite::compact_remote::`のみ）のいずれでも同じ頻度で失敗したため、本Phaseと項目13の変更による退行ではない。原因は未調査で、Fork無効の上流経路の既存の不安定試験として扱う。
-- 未完了: 旧production binaryがV2の保存状態を読めるかの確認（§77）は配備前のPhase 6で行う。
+- 旧production binaryがV2の保存状態を読めるかの確認（§77）はPhase 6で行った（下記）。
 
 ### Phase 3の進捗（2026-09-24）
 
@@ -4874,7 +4874,21 @@ RenCrow Switch Core Compaction V2の役割は、
 - 検査: `just test --cargo-profile dev-small -p codex-history` 137件、`-p codex-rollout` 174件、`-p codex-thread-store` 260件、`-p codex-core --lib -E "test(compact) | test(session::) | test(agent::control)"` 597件、`-p codex-core --test all -E "test(suite::compact)"` 79件、`-p codex-cli -E "binary_id(codex-cli::bin/rencrow-compaction)"` 15件がすべて成功した（上流の既存の不安定試験1件は再試行で成功）。`just fmt`・`just fix`を実行し、無関係なファイルへの修正は取り込んでいない。
 - 未完了: 自動圧縮（token上限による起動）の実Qwen試験、CapacityBlockedの実Qwen試験は未実施。実Qwenの選別は1回目に成功、2回目に不正なIDで失敗しており、選別の安定性は保証しない（失敗時はEmergencyで安全に継続する）。
 
-稼働binaryはHEADより前のsource（`bf9d00a6a`＋当時の未commit差分）からbuildした。`~/.local/bin/rencrow-switch-core`はSHA-256 `3f6d6d61bd176ee08e65c0a486a4dfc3a9aceb7c6cbbcfc7024305ea87ad03b9`、`~/.local/bin/rencrow-compaction`は`ea38850361a312927227cb90f63fe73589afe8d8b1631801f0add61e8624acb1`（記録は私有の`compaction-runtime-deploy/candidate.json`）。HEADのV2部品と、usage・resume関連の後続修正は未配備。
+### Phase 6の進捗（2026-09-24、共有配備まで）
+
+第2部 §70 Phase 6と§77に従い、共有配備の前に次を確認した。私有の記録は`target/fork-bootstrap/compaction-runtime-deploy/phase6-predeploy.json`。本番のCODEX_HOMEには書き込んでいない。
+
+- 本番の現状: `~/.local/bin/rencrow-switch-core`（SHA-256 `3f6d6d61…`）と`rencrow-compaction`（`ea388503…`）が、`~/.codex-rencrow-safe`の共有thread `01a0cb3e-9142-7252-94f0-e64cd7f0a279`を2026-09-23 09:11から開いている。入力の作者は`automation`で、V2では検証済みHumanがないため選別は行わずNoCandidatesになる。
+- 旧binaryでの読戻し（§77）: 隔離した複製で、最新のcheckpointがV2のNormalの場合、旧binaryでresume・通常turn・tool・手動compact（旧V1）・2回目のresumeがすべて成立した。最新のcheckpointがmarkerを含むEmergencyの場合、旧binaryは`CodexHarnessMetadata`の未知の欄（`rencrow_observation_projection`）を読み捨て、型付きの値の再serializeが変わってtransaction hashが一致しなくなり、そのcheckpointを黙って捨てて前の状態（生のtool出力を含む）から再開した。データは失われないが、圧縮が失われ、撤回済みの指示が戻りうる。したがって§77に従い、rollback方式はbinaryの差し戻しだけでなく、rolloutとstateのbackupからの復元を伴うbackup-onlyとする。
+- 新binaryでの読込: 本番threadの隔離した複製を新binaryでresumeすると、既存55件のうち最新のcheckpointを採用した（通常turnの入力に55件目の要約が入った）。
+- hash不一致の調査（判断待ちの件）: 本番threadのcheckpoint 55件はすべて、binaryと同じ条件（保存された行のkey順のbytes）でhashが一致した（不一致0件、marker欠落0件）。現在の本番データには該当するcheckpointがない。
+- 新しい知見（transaction hashのbuild依存）: `transaction_hash`は型付きの値を`serde_json::Value`経由で再serializeしてhashする。`codex`のbinaryではserde_jsonの`preserve_order`が有効で、codex-core・codex-rolloutのtest buildでは無効のため、同じ行でもtest buildでは別のhashになる（最初の調査をtest buildで行い、55件すべて不一致と誤って出た）。別の依存構成でbuildした道具がreplayすると、全checkpointを黙って捨てうる。hashを保存済みの行のbytesから計算する方式への変更を、判断待ちの件とあわせて提案する。
+- 隔離手順の注意（§76）: CODEX_HOMEを複製するときは`state_5.sqlite`のrolloutの絶対pathを複製先へ書き換える必要がある。書換え前の複製で旧binaryを動かしたため、E2E試験のrolloutの末尾へ旧binaryのturnが1件追記された（全シナリオの後、本番は無関係）。
+- 共有配備（利用者の承認後に実施、私有の記録は`compaction-runtime-deploy/phase6-deploy.json`）: 本番のTUIが入力待ちであることを確認して正常終了させ、binary 2つ・共有threadのrollout・sqlite一式・configを`compaction-runtime-deploy/before-v2/`へ保存した（`SHA256SUMS`あり、終了後のため`-wal`・`-shm`は残っていない）。`5020bd39b`からbuildしたbinary（Phase 5の実QwenのE2Eで受入したものとSHA-256が一致）へ差し替え、元の起動コマンドでpaneを起動し直した。
+- 配備後の確認: 新binaryは共有threadを再開して既存55件のうち最新のcheckpointを採用した。通常turnは141.2秒で作業状態を正しく答えた。手動`/compact`は201.5秒で本番初のV2 checkpointをcommitした（NoCandidates、要約要求1回、66件のObservationを提示して処理済み、重要参照2件、置換後38 item、要約5,143文字で最終目標・作業基準・制約・稼働環境を保持）。2回目の再開後の通常turnは37.0秒（圧縮前の141.2秒から短縮）で、最終目標・branchとHEAD・次の作業を正しく答えた。
+- 戻し方: backup-only。sessionを止め、binaryとあわせてrollout・sqliteを`before-v2/`から戻す（binaryだけを戻すと、markerを含むEmergencyのcheckpointを旧binaryが黙って捨てうるため）。
+
+2026-09-24に`5020bd39b`からbuildしたV2のbinaryを共有配備した。`~/.local/bin/rencrow-switch-core`はSHA-256 `5f3fc14ddf39927fa8bd4778661861376e10612f0eb3b5b3997d9da712dd5169`、`~/.local/bin/rencrow-compaction`は`a562dd444f2f4086492e2bce5ebc4b56d3de673046ba75ded75986888a35fc3e`（記録は私有の`compaction-runtime-deploy/phase6-deploy.json`）。それ以前の稼働binary（`bf9d00a6a`＋当時の未commit差分、`3f6d6d61…`・`ea388503…`）は`before-v2/`に保存した。
 
 # 第4部 部品契約・Failure Knowledge・実測・旧仕様（2026-09-24以前の記録）
 
