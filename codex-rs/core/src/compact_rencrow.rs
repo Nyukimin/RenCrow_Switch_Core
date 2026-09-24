@@ -4,10 +4,13 @@ use super::*;
 use codex_history::archive_reference::ArchiveOutputDecision;
 use codex_history::archive_reference::ArchiveReference;
 use codex_history::compaction_candidate::CandidateBundle;
+use codex_history::compaction_candidate::CandidateInput;
+use codex_history::compaction_candidate::Origin;
 use codex_history::compaction_candidate::digest;
 use codex_history::compaction_candidate::history_digest;
 use codex_history::compaction_pipeline::*;
 use codex_history::compaction_plan::SemanticReview;
+use codex_history::compaction_preprocess::InstructionObservationLink;
 use codex_protocol::models::ContentItem;
 use codex_rollout::RolloutRecorder;
 use serde::de::DeserializeOwned;
@@ -34,6 +37,25 @@ mod orchestration_tests;
 
 #[allow(dead_code)]
 const INSTRUCTION_SELECTION_PROMPT: &str = "Select only explicit obsolete Human instructions from candidate:true Human sources. Candidate:false Human sources are context only; never remove them. Use completion_links only for the Human identified by instruction_id; a link is a candidate and does not prove success. Preserve failed, pending, ambiguous, protected, opaque, and continuing work. Do not infer completion from unrelated sources. For drop_superseded, correction_text is required and must be the exact unique correction passage that remains current; corrections must remain. source_text is optional only when the entire source is safe to remove; for a mixed instruction provide the exact unique source passage. Never remove protected portions or an entire partly protected source. For replace_completed, evidence must be the linked output_source_id; use it as factual grounding and do not claim more than the output and terminal status/exit establish. A successful command that inspects another job (such as ls or tail) does not prove that job succeeded. Keep unresolved conditions and uncertainty. Return only {\"operations\":[{\"action\":\"drop_superseded\",\"source\":\"<Human id>\",\"source_text\":\"<optional exact unique passage>\",\"correction\":\"<later Human id>\",\"correction_text\":\"<exact unique passage>\"},{\"action\":\"replace_completed\",\"source\":\"<Human id>\",\"source_text\":\"<optional exact unique passage>\",\"evidence\":\"<linked output_source_id>\",\"result\":\"<brief factual result supported by the output>\"}]}. Use only the fields shown for the chosen action. Omit source_text only when the whole source is safe to remove. Do not return a snapshot hash or extra keys. JSON only.";
+
+/// Decide whether instruction selection is needed at all (Annex A F13).
+///
+/// Selection is needed only when a host completion link exists or a verified Human appears after
+/// the semantic boundary. Humans before the boundary were already considered by an accepted
+/// selection; when a new Human arrives, the candidate payload still presents every active Human.
+/// Without a boundary every verified Human is new.
+#[allow(dead_code)]
+pub(super) fn selection_required(
+    input: &CandidateInput,
+    semantic_boundary: Option<usize>,
+    links: &[InstructionObservationLink],
+) -> bool {
+    !links.is_empty()
+        || input.records.iter().enumerate().any(|(index, record)| {
+            record.origin == Origin::Human
+                && semantic_boundary.is_none_or(|boundary| index > boundary)
+        })
+}
 
 #[allow(dead_code)]
 pub(super) async fn select_obsolete_instructions(

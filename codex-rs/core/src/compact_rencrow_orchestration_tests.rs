@@ -1220,3 +1220,46 @@ fn v2_completion_links_skip_pruned_humans_and_unattributed_tool_activity() {
         Ok(vec![])
     );
 }
+
+#[test]
+fn v2_selection_is_required_only_for_new_humans_or_completion_links() {
+    let originals = vec![
+        human("Earlier request.", "human-old"),
+        checkpoint_summary("state"),
+        message("assistant", "work after the summary", "work"),
+    ];
+    let input = candidate_input(&originals, &[]);
+    assert!(!super::selection_required(&input, Some(1), &[]));
+    assert!(super::selection_required(&input, None, &[]));
+
+    let mut unverified = originals.clone();
+    unverified.push(message("user", "Unverified request.", "user-unverified"));
+    assert!(!super::selection_required(
+        &candidate_input(&unverified, &[]),
+        Some(1),
+        &[]
+    ));
+
+    let mut with_new_human = originals.clone();
+    with_new_human.push(human("New request.", "human-new"));
+    assert!(super::selection_required(
+        &candidate_input(&with_new_human, &[]),
+        Some(1),
+        &[]
+    ));
+
+    let link = InstructionObservationLink {
+        instruction: whole_ref(&input, 0),
+        call: whole_ref(&input, 2),
+        output: whole_ref(&input, 2),
+        terminal: ArchiveReference::new(
+            THREAD_ID,
+            "call",
+            content_sha256("output"),
+            ArchiveTerminalStatus::Completed,
+            0,
+            None,
+        ),
+    };
+    assert!(super::selection_required(&input, Some(1), &[link]));
+}
