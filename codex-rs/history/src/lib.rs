@@ -1,4 +1,5 @@
-// Modified by RenCrow Switch Core, 2026-09-22: separate original-input intake.
+// Modified by RenCrow Switch Core, 2026-09-22: separate original-input intake;
+// 2026-09-24: V2 observation marker metadata.
 //! Model-history and persisted-rollout domain types.
 
 // RenCrow fork: derived-context validation, not rollout mutation.
@@ -86,6 +87,11 @@ pub struct CodexHarnessMetadata {
     /// Host proof that a text-only terminal output was replaced by a rollout reference.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rencrow_archive_reference: Option<archive_reference::ArchiveReference>,
+
+    /// Host proof that a tool output body was replaced by a V2 observation marker. Kept apart
+    /// from the V1 exec-only `rencrow_archive_reference`, which V2 markers never reuse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rencrow_observation_projection: Option<observation_projection::ObservationCoverage>,
 
     /// RenCrow accepted original-input reference; never sent as model instructions.
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -4787,7 +4787,7 @@ RenCrow Switch Core Compaction V2の役割は、
 
 # 第3部 現在の実装状態（2026-09-24）
 
-第2部 §70のPhase 1（項目1〜13、下記「Phase 1の進捗」）を実装した。Phase 2〜6は未着手。本部は第4部「第2版の実装契約」の8責務とsourceの対応だけを示す。工程別の検査・証拠・未解決の指摘は私有の`target/fork-bootstrap/compaction-check-plan.json`（`v2`）が正本であり、ここへ複製しない。
+第2部 §70のPhase 1（項目1〜13、下記「Phase 1の進捗」）とPhase 2（Level 2 schema、下記「Phase 2の進捗」）を実装した。Phase 3〜6は未着手。本部は第4部「第2版の実装契約」の8責務とsourceの対応だけを示す。工程別の検査・証拠・未解決の指摘は私有の`target/fork-bootstrap/compaction-check-plan.json`（`v2`）が正本であり、ここへ複製しない。
 
 `rencrow_compaction = true`で実行されるのは、項目13で置き換えたNormal V2の`compact::rencrow::run`（`codex-rs/core/src/compact_rencrow.rs`、付属A F01の処理順）である。model requestは必要時だけのSelectionと要約の最大2回で、既存の`commit_rencrow_checkpoint`だけが履歴を置き換える。旧Fork経路のplan・plan review・要約の3要求と完了済みexecの独自投影は除去し、fallbackとして残していない。Level 2（Emergency）と失敗時の振分けは未実装で、Normalが失敗した場合は履歴を変えずにエラーを返す（Phase 3）。
 
@@ -4825,7 +4825,21 @@ RenCrow Switch Core Compaction V2の役割は、
   - 結合試験（第2部 §71の一部）: `core/tests/suite/compact_rencrow.rs`をV2向けに書き直した。mockは要求を選別・要約・通常に分類し、応答item IDを連番にした（旧fixtureの`"answer"`重複IDによる`InvalidSnapshot`を解消）。manual/automaticの2件は、ModelSelectionで撤回文だけが消えること、要約入力と置換後履歴に撤回文が残らないこと、再起動後の2回目がSelectionなし（NoCandidates）で要約1回だけになることを確認する。非Humanの1件はSelectionを送らないこと、exec組の1件は検証済みの組が要約入力に上限つきObservation 1件としてだけ現れ、置換後履歴とcold resume後の入力に元のcallが戻らないことを確認する。
   - 検査: `just test --cargo-profile dev-small -p codex-core --lib -E "test(compact)"`で153件全成功（うち`compact::rencrow`は63件、追加3件）、`-p codex-rollout`で171件全成功、`-p codex-core --test all -E "test(suite::compact)"`で72件全成功（`suite::compact_rencrow`の4件を含む。Fork無効の上流試験も通る）。上流のremote compaction試験2件（`compact_remote::remote_compact_v2_charges_retained_images_to_token_budget`）は1回目が約49秒で失敗し再試行で成功した。Fork経路を通らない試験で、今回の変更とは無関係と判断した。`just fix -p codex-core`・`-p codex-rollout`を実行し、項目13の変更ファイルへの修正だけを残した（他ファイルへの既存指摘の修正は別単位とし、取り込んでいない）。
 - 既存の失敗の解消: 以前記録した結合試験4件中3件の失敗（manual/automaticの重複ID、完了済みexec組）は、上記の書き直しと正本照合の修正で解消した。
-- 未完了: `ServerReasoningIncluded`のdrain分岐を実際に通す回帰、付属AのI15（preflight失敗）とI16（自動再試行抑止）の結合試験は未作成（判定関数は単体試験済み）。Phase 2（schema確定）は初回共有配備の前提であり、HEADはまだ配備しない。
+- 未完了: `ServerReasoningIncluded`のdrain分岐を実際に通す回帰、付属AのI15（preflight失敗）とI16（自動再試行抑止）の結合試験は未作成（判定関数は単体試験済み）。Phase 2（schema確定）は下記のとおり実装した。Level 2 runtime（Phase 3）以降が未実装のため、HEADはまだ配備しない。
+
+### Phase 2の進捗（2026-09-24）
+
+第2部 §70 Phase 2（Level 2 schema、§21・§31・§34・§43〜46・§50〜51）を、初回共有配備の前に確定した。V2 metadataはまだ配備・保存されていないため、旧形式との読取互換は設けず、新しい欄を必須とした。Emergencyの生成・marker適用・失敗の振分けはPhase 3で、本Phaseでは型と検査だけを決めた。
+
+- `CompactionSelectionMode::DeterministicEmergency`（保存名`deterministic_emergency`）を追加した。model request・receipt・presentation・plan・resultsを持たない（§43〜44、§48〜49）。
+- `model`を`Option<String>`にした。NoCandidatesとModelSelectionは空でない名前が必須で、Emergencyは`None`、`effort`も`None`に限る（§45）。
+- `semantic_summary_hash: Option<String>`を追加した。NoCandidatesとModelSelectionは最終要約本文の`summary_hash`と一致する値が必須で、Emergencyは前回要約をそのまま引き継ぐ場合に一致する値、host固定文の場合は`None`とする（§31・§47）。引き継いだ本文はcheckpointの最終要約本文と同一なので、値があれば常に`summary_hash`と一致する。
+- `summary_covered_observations: Vec<ObservationReference>`を必須欄として追加した。同じthreadで、重複がなく、`observations`（保存済みinventory）に含まれる参照に限る。inventoryの全件を含む必要はない（§20〜21）。
+- 処理済みObservationの判定を`observations`から`summary_covered_observations`へ切り替えた。Normalは前回の集合に今回要約へ提示した参照を足して記録する（`summary_covered_after_normal`、§22）。inventoryにあるだけで要約へ提示されていないObservationは、次のNormalで再び提示される（§41、第2部 §72のE06の前提）。
+- `RenCrowCheckpoint.response_id`を`Option<String>`にし、`commit_rencrow_checkpoint`は`compaction_response_id: candidate.response_id`をそのまま保存する（§50〜51の承認済み例外。commitの安全境界は変えていない）。Normalは要約responseのIDを渡す。
+- `CodexHarnessMetadata`へV2 marker専用の`rencrow_observation_projection: Option<ObservationCoverage>`を追加した（§34、上流`history/src/lib.rs`へ変更注記）。V1の`rencrow_archive_reference`とは別の欄で、`None`の間は保存されない。このmetadataを持つ出力は、Phase 3のmarker検証（§38〜40）が入るまで検証済みの組として扱われず、保護される。`CodexHarnessMetadata`の`JsonSchema`に合わせて、`ObservationCoverage`・`ObservationPartCoverage`・`ByteRange`へ`JsonSchema`を加えた。
+- 検査: `just test --cargo-profile dev-small -p codex-history`で134件全成功（追加3件、既存のfixtureを新しい欄へ更新）。`-p codex-rollout`171件、`-p codex-core --lib -E "test(compact) | test(session::)"`523件、`-p codex-core --test all -E "test(suite::compact)"`72件が全成功。exec組の結合試験で、要約へ提示したObservationが`summary_covered_observations`へ記録されることも確認した。上流の`compact_remote::remote_compact_v2_rewrites_multiple_trailing_function_call_outputs`（manual・automatic）は、並列の全体実行でだけ断続的に失敗する（単独実行は24回全成功）。全体実行3回ずつの比較で、本Phase適用後・項目13 commit（`a6553137b`）・項目13より前（`30850fe40`、`suite::compact_remote::`のみ）のいずれでも同じ頻度で失敗したため、本Phaseと項目13の変更による退行ではない。原因は未調査で、Fork無効の上流経路の既存の不安定試験として扱う。
+- 未完了: 旧production binaryがV2の保存状態を読めるかの確認（§77）は配備前のPhase 6で行う。
 
 稼働binaryはHEADより前のsource（`bf9d00a6a`＋当時の未commit差分）からbuildした。`~/.local/bin/rencrow-switch-core`はSHA-256 `3f6d6d61bd176ee08e65c0a486a4dfc3a9aceb7c6cbbcfc7024305ea87ad03b9`、`~/.local/bin/rencrow-compaction`は`ea38850361a312927227cb90f63fe73589afe8d8b1631801f0add61e8624acb1`（記録は私有の`compaction-runtime-deploy/candidate.json`）。HEADのV2部品と、usage・resume関連の後続修正は未配備。
 

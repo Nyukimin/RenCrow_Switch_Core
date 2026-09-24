@@ -76,10 +76,12 @@ fn checkpoint_summary(text: &str) -> ResponseItemEnvelope {
         "version": 2,
         "snapshot_hash": "a".repeat(64),
         "summary_hash": content_sha256(&summary_body),
+        "semantic_summary_hash": content_sha256(&summary_body),
         "selection_mode": "no_candidates",
         "applied_refs": [],
         "results": [],
         "observations": [],
+        "summary_covered_observations": [],
         "important_refs": [],
         "model": "orchestration-test-model",
         "responses": [{
@@ -992,6 +994,64 @@ fn v2_observation_handling_projects_only_uncovered_identities() {
     );
     assert!(projections[0].2.coverage.output.partial);
     assert!(projections[1].2.coverage.output.partial);
+}
+
+#[test]
+fn v2_handled_set_is_summary_coverage_not_stored_inventory() {
+    // An observation stored only in inventory (for example by an emergency marker) was never
+    // presented to an accepted summary, so the next Normal presents it and then covers it.
+    let call = r#"{"cmd":"cat build.log"}"#;
+    let output = "build log body";
+    let reference = ObservationReference::new(THREAD_ID, "stored-call", content_sha256(output));
+    let inventory_only =
+        codex_history::project_observation(&reference, "exec_command", call, output)
+            .unwrap()
+            .coverage;
+    let summary = with_compaction_metadata(checkpoint_summary("state"), |metadata| {
+        metadata["observations"] = json!([inventory_only]);
+    });
+    let originals = vec![
+        summary,
+        function_call("stored-call", call),
+        function_output("stored-call", output),
+    ];
+    let adopted = super::summary::find_adopted_v2_checkpoint(&originals, THREAD_ID)
+        .unwrap()
+        .unwrap();
+    assert!(adopted.metadata.summary_covered_observations.is_empty());
+    let prepared = PreparedCompactionSources {
+        pairs: vec![prepared_pair(
+            1,
+            reference.clone(),
+            PreparedCompactionReferenceKind::Fresh,
+            Some((call, output)),
+            output.len(),
+        )],
+        protected_indices: vec![],
+    };
+
+    let projections = super::observation::project_unhandled_observations(
+        &originals,
+        &prepared,
+        &adopted.metadata.summary_covered_observations,
+    )
+    .unwrap();
+    assert_eq!(projections.len(), 1);
+    let covered = super::observation::summary_covered_after_normal(
+        &adopted.metadata.summary_covered_observations,
+        &projections,
+    );
+    assert_eq!(covered, vec![reference]);
+
+    // Once an accepted summary covered it, the same identity is handled and never re-presented.
+    assert_eq!(
+        super::observation::project_unhandled_observations(&originals, &prepared, &covered),
+        Ok(vec![])
+    );
+    assert_eq!(
+        super::observation::summary_covered_after_normal(&covered, &projections),
+        covered
+    );
 }
 
 #[test]

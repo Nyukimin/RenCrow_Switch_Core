@@ -36,6 +36,7 @@ fn metadata(summary: &str, observations: Vec<ObservationCoverage>) -> RenCrowCom
         snapshot_hash: "a".repeat(64),
         presentation_hash: None,
         summary_hash: content_sha256(summary),
+        semantic_summary_hash: Some(content_sha256(summary)),
         selection_mode: CompactionSelectionMode::NoCandidates,
         plan_hash: None,
         applied_refs: Vec::new(),
@@ -45,8 +46,12 @@ fn metadata(summary: &str, observations: Vec<ObservationCoverage>) -> RenCrowCom
             .map(|observation| observation.reference.clone())
             .take(1)
             .collect(),
+        summary_covered_observations: observations
+            .iter()
+            .map(|observation| observation.reference.clone())
+            .collect(),
         observations,
-        model: "qwen-test".into(),
+        model: Some("qwen-test".into()),
         effort: None,
         responses: vec![CompactionModelResponseReceipt {
             stage: CheckpointResponseStage::Summary,
@@ -193,7 +198,7 @@ fn inventory_excludes_uncommitted_and_legacy_but_rejects_raw_claimed_commit_hash
     let observations = inventory_observations(1);
     let prepared = prepared_checkpoint(summary, metadata(summary, observations.clone()), None);
     let uncommitted = vec![
-        prepared.clone(),
+        prepared,
         RolloutItem::WorldState(WorldStateItem::full(serde_json::Map::new())),
     ];
     std::assert!(

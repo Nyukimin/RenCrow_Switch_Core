@@ -98,6 +98,24 @@ pub(super) fn cumulative_observation_coverage(
     Ok(merged)
 }
 
+/// Extend the handled set with the observations presented to an accepted Normal summary.
+///
+/// Only an accepted Normal summary adds references (Part 2 §21–22); the caller passes exactly the
+/// projections it presented. A deterministic emergency checkpoint carries the previous set.
+pub(super) fn summary_covered_after_normal(
+    previous: &[ObservationReference],
+    presented: &[(usize, usize, ObservationProjection)],
+) -> Vec<ObservationReference> {
+    let mut covered = previous.to_vec();
+    for (_, _, projection) in presented {
+        let reference = &projection.coverage.reference;
+        if !covered.contains(reference) {
+            covered.push(reference.clone());
+        }
+    }
+    covered
+}
+
 /// Build host completion-candidate links, at most one per unambiguous turn.
 ///
 /// A link only allows semantic review to consider completion; it never proves success. A turn

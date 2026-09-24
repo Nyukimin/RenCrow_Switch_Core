@@ -3,13 +3,14 @@
 use crate::archive_reference::ObservationReference;
 use crate::archive_reference::content_sha256;
 use crate::compaction_plan::ByteRange;
+use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
 
 pub const OBSERVATION_PART_FULL_LIMIT_BYTES: usize = 2_048;
 pub const OBSERVATION_PART_EDGE_BYTES: usize = 1_024;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ObservationPartCoverage {
     pub sha256: String,
@@ -38,7 +39,7 @@ pub struct ObservationSummaryExcerpt {
 /// Validation checks digest shape, reference binding, range partition, and the derived
 /// `partial` flag. It cannot prove that a digest matches unavailable source bytes; the
 /// producer hashes the original text, while rollout owners re-check raw bytes on retrieval.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ObservationCoverage {
     pub reference: ObservationReference,

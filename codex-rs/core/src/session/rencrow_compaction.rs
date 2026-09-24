@@ -31,7 +31,8 @@ pub(crate) struct RenCrowCheckpoint {
     pub reference_context: Option<TurnContextItem>,
     pub world_state: Option<Arc<WorldState>>,
     pub summary: String,
-    pub response_id: String,
+    /// Summary response of a Normal checkpoint; a deterministic emergency sends none.
+    pub response_id: Option<String>,
     pub expected_turn: String,
     pub expected_base_text: String,
     pub expected_world: Option<WorldStateItem>,
@@ -199,7 +200,7 @@ impl Session {
                 first_window_id: Some(ids.first_window_id.to_string()),
                 previous_window_id: ids.previous_window_id.map(|id| id.to_string()),
                 window_id: Some(ids.window_id.to_string()),
-                compaction_response_id: Some(candidate.response_id),
+                compaction_response_id: candidate.response_id,
                 latest_token_usage_record: state.latest_token_usage_record.clone(),
             };
             let mut batch = vec![RolloutItem::Compacted(checkpoint)];

@@ -549,6 +549,19 @@ async fn rencrow_completed_unified_exec_pair_is_summarized_after_terminal_receip
     );
     let replacement = replacement_history_from_rollout(&rollout_path)?;
     assert!(!replacement.iter().any(|item| item["call_id"] == call_id));
+    let checkpoints = checkpoint_rows(&rollout_path)?;
+    let covered = checkpoints[0]["payload"]["replacement_history_metadata"]
+        .as_array()
+        .expect("replacement metadata")
+        .iter()
+        .find_map(|metadata| {
+            metadata["rencrow_compaction"]["summary_covered_observations"].as_array()
+        })
+        .expect("checkpoint metadata")
+        .iter()
+        .map(|reference| reference["call_id"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(covered, vec![json!(call_id)]);
     assert!(
         !replacement
             .iter()

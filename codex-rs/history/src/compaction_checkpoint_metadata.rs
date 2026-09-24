@@ -19,6 +19,8 @@ use std::collections::HashSet;
 pub enum CompactionSelectionMode {
     NoCandidates,
     ModelSelection,
+    /// Host-only emergency checkpoint: no model request, selection, or new semantic summary.
+    DeterministicEmergency,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,14 +50,23 @@ pub struct RenCrowCompactionMetadataV2 {
     /// SHA-256 of the exact final summary message text, including its format prefix.
     /// Checkpoint validation must compare this value with the separately available message body.
     pub summary_hash: String,
+    /// SHA-256 of the accepted semantic summary body carried by this checkpoint. Normal summaries
+    /// carry their own body; an emergency checkpoint carries the previous one or none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_summary_hash: Option<String>,
     pub selection_mode: CompactionSelectionMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_hash: Option<String>,
     pub applied_refs: Vec<SourceRef>,
     pub results: Vec<DerivedResult>,
+    /// Stored observation inventory; presence here does not mean a summary covered it.
     pub observations: Vec<ObservationCoverage>,
+    /// Observations actually presented to an accepted Normal summary; the handled set.
+    pub summary_covered_observations: Vec<ObservationReference>,
     pub important_refs: Vec<ObservationReference>,
-    pub model: String,
+    /// Model of a model-generated summary; absent for a deterministic emergency checkpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<ReasoningEffort>,
     pub responses: Vec<CompactionModelResponseReceipt>,
@@ -96,13 +107,31 @@ impl RenCrowCompactionMetadataV2 {
         if content_sha256(summary_text) != self.summary_hash {
             return Err("checkpoint summary hash does not match its message body".into());
         }
-        if self.model.trim().is_empty()
-            || self
-                .effort
-                .as_ref()
-                .is_some_and(|effort| effort.as_str().trim().is_empty())
+        let emergency = self.selection_mode == CompactionSelectionMode::DeterministicEmergency;
+        match self.model.as_deref() {
+            Some(model) if !emergency && !model.trim().is_empty() => {}
+            None if emergency => {}
+            _ => {
+                return Err(
+                    "checkpoint model must be named exactly for model-generated summaries".into(),
+                );
+            }
+        }
+        if self
+            .effort
+            .as_ref()
+            .is_some_and(|effort| emergency || effort.as_str().trim().is_empty())
         {
-            return Err("checkpoint model and any specified effort must be nonempty".into());
+            return Err("checkpoint effort must be nonempty and accompany a model".into());
+        }
+        match self.semantic_summary_hash.as_deref() {
+            Some(hash) if hash == self.summary_hash => {}
+            None if emergency => {}
+            _ => {
+                return Err(
+                    "checkpoint semantic summary hash must bind the carried summary body".into(),
+                );
+            }
         }
 
         let expected_stages = match self.selection_mode {
@@ -132,6 +161,18 @@ impl RenCrowCompactionMetadataV2 {
                     CheckpointResponseStage::InstructionSelection,
                     CheckpointResponseStage::Summary,
                 ]
+            }
+            CompactionSelectionMode::DeterministicEmergency => {
+                if self.presentation_hash.is_some()
+                    || self.plan_hash.is_some()
+                    || !self.results.is_empty()
+                {
+                    return Err(
+                        "emergency checkpoint cannot carry selection presentation, plan, or results"
+                            .into(),
+                    );
+                }
+                Vec::new()
             }
         };
         if self.responses.len() != expected_stages.len()
@@ -184,6 +225,18 @@ impl RenCrowCompactionMetadataV2 {
                 return Err("checkpoint observation is cross-thread or duplicated".into());
             }
             inventory_refs.insert(observation_ref_key(reference));
+        }
+        let mut covered_refs = HashSet::with_capacity(self.summary_covered_observations.len());
+        for reference in &self.summary_covered_observations {
+            let key = observation_ref_key(reference);
+            if reference.thread_id != current_thread_id
+                || !inventory_refs.contains(&key)
+                || !covered_refs.insert(key)
+            {
+                return Err(
+                    "checkpoint summary-covered observation is absent or duplicated".into(),
+                );
+            }
         }
         let mut important_refs = HashSet::with_capacity(self.important_refs.len());
         for reference in &self.important_refs {

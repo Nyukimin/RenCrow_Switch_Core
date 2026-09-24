@@ -315,21 +315,19 @@ async fn compact_normal(
         &history::verified_pair_projections(&prepared),
     )
     .map_err(invalid)?;
-    let (known_refs, previous_observations) = adopted
+    let (known_refs, previous_observations, covered) = adopted
         .as_ref()
         .map(|adopted| {
             (
                 adopted.metadata.applied_refs.as_slice(),
                 adopted.metadata.observations.as_slice(),
+                adopted.metadata.summary_covered_observations.as_slice(),
             )
         })
         .unwrap_or_default();
     let pruning = prune_known_obsolete(&input, known_refs).map_err(invalid)?;
-    let covered = previous_observations
-        .iter()
-        .map(|coverage| coverage.reference.clone())
-        .collect::<Vec<_>>();
-    let projections = observation::project_unhandled_observations(originals, &prepared, &covered)
+    // Handled means presented to an accepted Normal summary, not merely stored (Part 2 §21).
+    let projections = observation::project_unhandled_observations(originals, &prepared, covered)
         .map_err(invalid)?;
     let inventory = observation::cumulative_observation_coverage(
         previous_observations,
@@ -422,6 +420,7 @@ async fn compact_normal(
         presentation_hash,
         &application,
         inventory,
+        observation::summary_covered_after_normal(covered, &projections),
         important.refs,
         receipts,
         model.clone(),
@@ -466,7 +465,7 @@ async fn compact_normal(
             reference_context,
             world_state,
             summary: summary_text,
-            response_id,
+            response_id: Some(response_id),
             expected_turn: ctx.sub_id.clone(),
             expected_base_text: base.text,
             expected_world,

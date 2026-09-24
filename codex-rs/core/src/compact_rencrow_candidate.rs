@@ -98,12 +98,13 @@ pub(super) fn validate_compaction_candidate(
     check_context_budget(original, base, candidate.to_vec(), scope, limits)
 }
 
-/// Create fresh checkpoint metadata for the final V2 summary body (Annex A F25).
+/// Create fresh Normal checkpoint metadata for the final V2 summary body (Annex A F25).
 ///
 /// The selection mode follows the actual receipts: an instruction-selection receipt means
 /// `ModelSelection`, otherwise `NoCandidates`, and only a model selection keeps its presentation
 /// hash. The applied refs, results, and plan hash come from the one application shared by summary
-/// input and replacement. Transaction lifecycle fields stay empty for a fresh candidate.
+/// input and replacement. A Normal summary is its own semantic summary. Transaction lifecycle
+/// fields stay empty for a fresh candidate.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn fresh_checkpoint_metadata(
     summary_text: &str,
@@ -111,6 +112,7 @@ pub(super) fn fresh_checkpoint_metadata(
     presentation_hash: Option<String>,
     application: &InstructionSelectionApplication,
     observations: Vec<ObservationCoverage>,
+    summary_covered_observations: Vec<ObservationReference>,
     important_refs: Vec<ObservationReference>,
     responses: Vec<CompactionModelResponseReceipt>,
     model: String,
@@ -119,11 +121,13 @@ pub(super) fn fresh_checkpoint_metadata(
     let model_selection = responses
         .iter()
         .any(|receipt| receipt.stage == CheckpointResponseStage::InstructionSelection);
+    let summary_hash = content_sha256(summary_text);
     RenCrowCompactionMetadataV2 {
         version: 2,
         snapshot_hash,
         presentation_hash: presentation_hash.filter(|_| model_selection),
-        summary_hash: content_sha256(summary_text),
+        semantic_summary_hash: Some(summary_hash.clone()),
+        summary_hash,
         selection_mode: if model_selection {
             CompactionSelectionMode::ModelSelection
         } else {
@@ -133,8 +137,9 @@ pub(super) fn fresh_checkpoint_metadata(
         applied_refs: application.pruning.applied.clone(),
         results: application.results.clone(),
         observations,
+        summary_covered_observations,
         important_refs,
-        model,
+        model: Some(model),
         effort,
         responses,
         transaction_following_items: None,

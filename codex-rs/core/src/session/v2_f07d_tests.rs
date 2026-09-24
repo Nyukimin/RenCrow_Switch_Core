@@ -527,10 +527,12 @@ async fn committed_v2_checkpoint_with_history(
         "version": 2,
         "snapshot_hash": "a".repeat(64),
         "summary_hash": codex_history::archive_reference::content_sha256(&summary_text),
+        "semantic_summary_hash": codex_history::archive_reference::content_sha256(&summary_text),
         "selection_mode": "no_candidates",
         "applied_refs": [],
         "results": [],
         "observations": [],
+        "summary_covered_observations": [],
         "important_refs": [],
         "model": "test-model",
         "responses": [{
@@ -637,7 +639,7 @@ fn native_pair_and_summary_history() -> Vec<ResponseItem> {
             output: FunctionCallOutputPayload::from_text("tool output body".to_string()),
             internal_chat_message_metadata_passthrough: None,
         },
-        ContextualUserFragment::into(CompactionSummary::new(&format!(
+        ContextualUserFragment::into(CompactionSummary::new(format!(
             "{SUMMARY_PREFIX}\nNative call and output are retained by the checkpoint."
         ))),
     ]
