@@ -815,3 +815,199 @@ fn v2_adopted_checkpoint_selects_the_latest_v2_and_ignores_legacy_summaries() {
         Ok(None)
     );
 }
+
+fn function_call(call_id: &str, arguments: &str) -> ResponseItemEnvelope {
+    ResponseItemEnvelope::new(
+        serde_json::from_value(json!({
+            "type": "function_call",
+            "id": format!("{call_id}-item"),
+            "call_id": call_id,
+            "name": "exec_command",
+            "arguments": arguments,
+        }))
+        .unwrap(),
+    )
+}
+
+fn function_output(call_id: &str, output: &str) -> ResponseItemEnvelope {
+    ResponseItemEnvelope::new(ResponseItem::FunctionCallOutput {
+        id: Some(ResponseItemId::from_server(format!(
+            "{call_id}-output-item"
+        ))),
+        call_id: Some(call_id.into()),
+        name: Some("exec_command".into()),
+        namespace: None,
+        output: FunctionCallOutputPayload::from_text(output.into()),
+        internal_chat_message_metadata_passthrough: None,
+    })
+}
+
+fn prepared_pair<'a>(
+    call_index: usize,
+    reference: ObservationReference,
+    reference_kind: PreparedCompactionReferenceKind,
+    texts: Option<(&'a str, &'a str)>,
+    output_total_bytes: usize,
+) -> PreparedCompactionSourcePair<'a> {
+    PreparedCompactionSourcePair {
+        call_index,
+        output_index: call_index + 1,
+        reference,
+        reference_kind,
+        output_total_bytes,
+        tool_name: "exec_command",
+        canonical_call_input: texts.map(|(call, _)| call),
+        canonical_output_text: texts.map(|(_, output)| output),
+        terminal_reference: None,
+    }
+}
+
+#[test]
+fn v2_observation_handling_projects_only_uncovered_identities() {
+    let covered_call = r#"{"cmd":"cargo test"}"#;
+    let covered_output = "test result: ok";
+    let fresh_call = r#"{"cmd":"cat large.txt"}"#;
+    let fresh_output = format!("HEAD:{}:TAIL", "x".repeat(5_000));
+    let existing_call = r#"{"cmd":"cat archived.txt"}"#;
+    let existing_output = "archived output body";
+    // Position does not decide handling: the uncovered pair at index 0 was active at the previous
+    // checkpoint and completed later, so it is still projected.
+    let originals = vec![
+        function_call("fresh-call", fresh_call),
+        function_output("fresh-call", "[truncated in live history]"),
+        function_call("covered-call", covered_call),
+        function_output("covered-call", covered_output),
+        function_call("existing-call", existing_call),
+        function_output("existing-call", "[archived reference marker]"),
+    ];
+    let reference = |call_id: &str, output: &str| {
+        ObservationReference::new(THREAD_ID, call_id, content_sha256(output))
+    };
+    let prepared = PreparedCompactionSources {
+        pairs: vec![
+            prepared_pair(
+                0,
+                reference("fresh-call", &fresh_output),
+                PreparedCompactionReferenceKind::Fresh,
+                Some((fresh_call, fresh_output.as_str())),
+                fresh_output.len(),
+            ),
+            prepared_pair(
+                2,
+                reference("covered-call", covered_output),
+                PreparedCompactionReferenceKind::Fresh,
+                Some((covered_call, covered_output)),
+                covered_output.len(),
+            ),
+            prepared_pair(
+                4,
+                reference("existing-call", existing_output),
+                PreparedCompactionReferenceKind::Existing,
+                None,
+                existing_output.len(),
+            ),
+        ],
+        protected_indices: vec![],
+    };
+
+    let projections = super::observation::project_unhandled_observations(
+        &originals,
+        &prepared,
+        &[reference("covered-call", covered_output)],
+    )
+    .unwrap();
+
+    assert_eq!(
+        projections,
+        vec![
+            (
+                0,
+                1,
+                codex_history::project_observation(
+                    &reference("fresh-call", &fresh_output),
+                    "exec_command",
+                    fresh_call,
+                    &fresh_output,
+                )
+                .unwrap(),
+            ),
+            (
+                4,
+                5,
+                codex_history::project_existing_observation(
+                    &reference("existing-call", existing_output),
+                    "exec_command",
+                    existing_call,
+                    existing_output.len(),
+                )
+                .unwrap(),
+            ),
+        ]
+    );
+    assert!(projections[0].2.coverage.output.partial);
+    assert!(projections[1].2.coverage.output.partial);
+}
+
+#[test]
+fn v2_observation_handling_rejects_a_recorded_call_id_with_a_different_digest() {
+    let call = r#"{"cmd":"cat file"}"#;
+    let output = "current output";
+    let originals = vec![
+        function_call("same-call", call),
+        function_output("same-call", output),
+    ];
+    let prepared = PreparedCompactionSources {
+        pairs: vec![prepared_pair(
+            0,
+            ObservationReference::new(THREAD_ID, "same-call", content_sha256(output)),
+            PreparedCompactionReferenceKind::Fresh,
+            Some((call, output)),
+            output.len(),
+        )],
+        protected_indices: vec![],
+    };
+
+    assert!(
+        super::observation::project_unhandled_observations(
+            &originals,
+            &prepared,
+            &[ObservationReference::new(
+                THREAD_ID,
+                "same-call",
+                content_sha256("a different recorded output"),
+            )],
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn v2_cumulative_observation_coverage_deduplicates_identity_and_rejects_digest_conflicts() {
+    let coverage = |call_id: &str, output: &str| {
+        codex_history::project_observation(
+            &ObservationReference::new(THREAD_ID, call_id, content_sha256(output)),
+            "exec_command",
+            "{}",
+            output,
+        )
+        .unwrap()
+        .coverage
+    };
+    let first = coverage("first-call", "first output");
+    let second = coverage("second-call", "second output");
+
+    assert_eq!(
+        super::observation::cumulative_observation_coverage(
+            std::slice::from_ref(&first),
+            &[first.clone(), second.clone()],
+        ),
+        Ok(vec![first.clone(), second])
+    );
+    assert!(
+        super::observation::cumulative_observation_coverage(
+            std::slice::from_ref(&first),
+            &[coverage("first-call", "changed output")],
+        )
+        .is_err()
+    );
+}

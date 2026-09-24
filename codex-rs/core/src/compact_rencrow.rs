@@ -21,6 +21,8 @@ mod candidate;
 mod history;
 #[path = "compact_rencrow_native.rs"]
 mod native;
+#[path = "compact_rencrow_observation.rs"]
+mod observation;
 #[path = "compact_rencrow_summary.rs"]
 mod summary;
 
