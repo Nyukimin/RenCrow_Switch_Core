@@ -13,12 +13,16 @@ use codex_history::archive_reference::content_sha256;
 use codex_history::compaction_candidate::CandidateInput;
 use codex_history::compaction_candidate::Origin;
 use codex_history::compaction_checkpoint_metadata::RenCrowCompactionMetadataV2;
+use codex_history::compaction_pipeline::InstructionSelection;
+use codex_history::compaction_pipeline::ProposedOperation;
+use codex_history::compaction_pipeline::ProposedPlan;
 use codex_history::compaction_plan::ByteRange;
 use codex_history::compaction_preprocess::InstructionObservationLink;
 use codex_history::compaction_preprocess::InstructionPruning;
 use codex_history::compaction_preprocess::collect_instruction_candidates;
 use codex_history::compaction_preprocess::prune_known_obsolete;
 use codex_history::compaction_selection::InstructionSelectionApplication;
+use codex_history::compaction_selection::validate_and_apply_selection;
 use codex_protocol::ResponseItemId;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ContentItemKind;
@@ -1262,4 +1266,138 @@ fn v2_selection_is_required_only_for_new_humans_or_completion_links() {
         ),
     };
     assert!(super::selection_required(&input, Some(1), &[link]));
+}
+
+fn host_selection(
+    payload: &serde_json::Value,
+    operations: Vec<ProposedOperation>,
+) -> InstructionSelection {
+    InstructionSelection::from_host(
+        payload["snapshot_hash"].as_str().unwrap().into(),
+        payload["presentation_hash"].as_str().unwrap().into(),
+        ProposedPlan { operations },
+    )
+}
+
+fn human_texts<'a>(items: &'a [ResponseItemEnvelope]) -> Vec<(Option<&'a str>, String)> {
+    items
+        .iter()
+        .filter(|item| {
+            item.metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.rencrow_input.is_some())
+        })
+        .map(|item| (item_id(item), item_text(item)))
+        .collect()
+}
+
+#[test]
+fn v2_model_selection_shares_one_application_between_summary_and_replacement() {
+    let originals = vec![
+        human("Keep Japanese. Use obsolete-label.", "human-a"),
+        message("assistant", "Using obsolete-label for now.", "work"),
+        human("Use current-label instead.", "human-b"),
+    ];
+    let input = candidate_input(&originals, &[]);
+    let pruning = prune_known_obsolete(&input, &[]).unwrap();
+    let payload = collect_instruction_candidates(&input, &pruning, &[])
+        .unwrap()
+        .unwrap();
+    let selection = host_selection(
+        &payload,
+        vec![ProposedOperation::DropSuperseded {
+            source: "human-a".into(),
+            source_text: Some("Use obsolete-label.".into()),
+            correction: "human-b".into(),
+            correction_text: Some("Use current-label instead.".into()),
+        }],
+    );
+
+    let application = validate_and_apply_selection(&input, &pruning, &[], Some(selection)).unwrap();
+    assert_eq!(application.pruning.applied.len(), 1);
+    let native =
+        super::native::filter_retained_instructions(&originals, &input, application).unwrap();
+    let summary_items =
+        super::summary::build_summary_history(&originals, &input, &native, &[], None).unwrap();
+    let candidate = super::native::build_native_replacement(&native, "summary", vec![]).unwrap();
+
+    let expected = vec![
+        (Some("human-a"), "Keep Japanese. ".to_string()),
+        (Some("human-b"), "Use current-label instead.".to_string()),
+    ];
+    assert_eq!(human_texts(&summary_items), expected);
+    assert_eq!(human_texts(&candidate), expected);
+    for items in [&summary_items, &candidate] {
+        let humans = serde_json::to_string(
+            &items
+                .iter()
+                .filter(|item| {
+                    item.metadata
+                        .as_ref()
+                        .is_some_and(|metadata| metadata.rencrow_input.is_some())
+                })
+                .map(|item| &item.item)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert!(!humans.contains("Use obsolete-label."));
+    }
+}
+
+#[test]
+fn v2_completion_selection_removes_the_completed_request_and_keeps_only_its_result() {
+    let call = r#"{"cmd":"cargo test"}"#;
+    let output = "test result: ok";
+    let originals = vec![
+        in_turn(human("Run the tests.", "human-a"), "turn-a"),
+        in_turn(function_call("call-a", call), "turn-a"),
+        in_turn(function_output("call-a", output), "turn-a"),
+        in_turn(human("Then update the notes.", "human-b"), "turn-b"),
+    ];
+    let prepared = PreparedCompactionSources {
+        pairs: vec![terminal_exec_pair(1, "call-a", call, output)],
+        protected_indices: vec![],
+    };
+    let input = candidate_input(
+        &originals,
+        &super::history::verified_pair_projections(&prepared),
+    );
+    let pruning = prune_known_obsolete(&input, &[]).unwrap();
+    let links = super::observation::build_completion_links(&originals, &input, &pruning, &prepared)
+        .unwrap();
+    assert_eq!(links.len(), 1);
+    let payload = collect_instruction_candidates(&input, &pruning, &links)
+        .unwrap()
+        .unwrap();
+    let selection = host_selection(
+        &payload,
+        vec![ProposedOperation::ReplaceCompleted {
+            source: "human-a".into(),
+            source_text: None,
+            evidence: "call-a-output-item".into(),
+            result: "The test suite passed.".into(),
+        }],
+    );
+
+    let application =
+        validate_and_apply_selection(&input, &pruning, &links, Some(selection)).unwrap();
+    assert_eq!(
+        application
+            .results
+            .iter()
+            .map(|result| result.text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["The test suite passed."]
+    );
+    let native =
+        super::native::filter_retained_instructions(&originals, &input, application).unwrap();
+    let candidate = super::native::build_native_replacement(&native, "summary", vec![]).unwrap();
+
+    assert_eq!(
+        human_texts(&candidate),
+        vec![(Some("human-b"), "Then update the notes.".to_string())]
+    );
+    let ids = candidate.iter().filter_map(item_id).collect::<Vec<_>>();
+    assert!(!ids.contains(&"call-a-item"));
+    assert!(!ids.contains(&"call-a-output-item"));
 }
