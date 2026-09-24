@@ -311,6 +311,22 @@ pub fn is_ordinary_passthrough(metadata: Option<&InternalChatMessageMetadataPass
 ///
 /// The persisted fallback token limit is execution-budget metadata and must be
 /// retained. Archive-reference metadata is validated separately for markers.
+/// Compare harness metadata as persisted: an absent value equals the default value.
+///
+/// A checkpoint stores replacement-history metadata per item, so an item whose live metadata was
+/// absent reads back as the default value after a restart. Identity checks must not treat that
+/// replay normalization as a different item.
+pub fn same_harness_metadata(
+    left: Option<&CodexHarnessMetadata>,
+    right: Option<&CodexHarnessMetadata>,
+) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => left == right,
+        (Some(only), None) | (None, Some(only)) => *only == CodexHarnessMetadata::default(),
+        (None, None) => true,
+    }
+}
+
 pub fn is_ordinary_harness_metadata(metadata: Option<&CodexHarnessMetadata>) -> bool {
     metadata.is_none_or(|metadata| {
         if metadata.rencrow_archive_reference.is_some() {

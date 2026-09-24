@@ -195,3 +195,53 @@ fn marker_mismatches_are_integrity_errors_not_protected_raw_output() {
     );
     assert!(prepare(vec![function_call("orphan-call"), orphan], &[]).is_err());
 }
+
+#[test]
+fn replay_normalized_absent_metadata_still_verifies_markers_and_fresh_pairs() {
+    // A restart reads replacement-history metadata back as the default value.
+    let thread = ThreadId::from_u128(52_003);
+    let raw = raw();
+    let normalized = |mut item: ResponseItemEnvelope| {
+        item.metadata.get_or_insert_default();
+        item
+    };
+    let call = function_call("marker-call");
+    let output = custom_output("marker-call", &raw);
+    let custom_call = custom_call("marker-call");
+    for (canonical_call, selected_call, canonical_output) in [
+        (
+            call.clone(),
+            normalized(call),
+            function_output("marker-call", &raw),
+        ),
+        (custom_call.clone(), normalized(custom_call), output),
+    ] {
+        let marker = marker_for(&thread, "marker-call", &canonical_output, &raw);
+        let canonical = vec![
+            RolloutItem::ResponseItem(canonical_call),
+            RolloutItem::ResponseItem(canonical_output.clone()),
+        ];
+        let prepared = prepare_compaction_sources(
+            &[selected_call.clone(), marker],
+            &canonical,
+            &thread,
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            prepared.pairs[0].reference_kind,
+            PreparedCompactionReferenceKind::ObservationMarker
+        );
+
+        // The same normalization on a fresh pair keeps it verified instead of protected.
+        let prepared = prepare_compaction_sources(
+            &[selected_call, normalized(canonical_output)],
+            &canonical,
+            &thread,
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert_eq!(prepared.pairs.len(), 1);
+        assert!(prepared.protected_indices.is_empty());
+    }
+}

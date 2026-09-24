@@ -4787,7 +4787,7 @@ RenCrow Switch Core Compaction V2の役割は、
 
 # 第3部 現在の実装状態（2026-09-24）
 
-第2部 §70のPhase 1（項目1〜13、下記「Phase 1の進捗」）、Phase 2（Level 2 schema、下記「Phase 2の進捗」）、Phase 3（Level 2 runtime、下記「Phase 3の進捗」）、Phase 4（Level 5 / Integrity、下記「Phase 4の進捗」）を実装した。Phase 5〜6は未着手。本部は第4部「第2版の実装契約」の8責務とsourceの対応だけを示す。工程別の検査・証拠・未解決の指摘は私有の`target/fork-bootstrap/compaction-check-plan.json`（`v2`）が正本であり、ここへ複製しない。
+第2部 §70のPhase 1（項目1〜13、下記「Phase 1の進捗」）、Phase 2（Level 2 schema、下記「Phase 2の進捗」）、Phase 3（Level 2 runtime、下記「Phase 3の進捗」）、Phase 4（Level 5 / Integrity、下記「Phase 4の進捗」）を実装し、Phase 5（実QwenのE2E、下記「Phase 5の進捗」）を実施した。Phase 6は未着手。本部は第4部「第2版の実装契約」の8責務とsourceの対応だけを示す。工程別の検査・証拠・未解決の指摘は私有の`target/fork-bootstrap/compaction-check-plan.json`（`v2`）が正本であり、ここへ複製しない。
 
 `rencrow_compaction = true`で実行されるのは、項目13で置き換えたNormal V2の`compact::rencrow::run`（`codex-rs/core/src/compact_rencrow.rs`、付属A F01の処理順）である。model requestは必要時だけのSelectionと要約の最大2回で、既存の`commit_rencrow_checkpoint`だけが履歴を置き換える。旧Fork経路のplan・plan review・要約の3要求と完了済みexecの独自投影は除去し、fallbackとして残していない。Normalが意味・モデルの理由で失敗した場合は決定的なEmergency（Level 2）へ進み、容量不足はCapacityBlocked、決定的な不整合はIntegrityBlockedとして履歴を変えずに明示エラーを返す（Phase 3、下記）。
 
@@ -4800,7 +4800,7 @@ RenCrow Switch Core Compaction V2の役割は、
 |5|`history/src/compaction_selection.rs::validate_and_apply_selection`|単体受入。runtime接続済み（項目13）|
 |6|`core/src/compact_rencrow_native.rs::filter_retained_instructions`、`build_native_replacement`|単体受入。runtime接続済み（項目13）。旧V1の`history::replacement`は削除した|
 |7|`core/src/compact_rencrow_candidate.rs::validate_compaction_candidate`|candidate検証は単体受入・runtime接続済み（項目13、commit直前）。usage由来の区別、window採用、resume/fork時の再計数はsessionへ実装済みで、現行Fork経路でも`rencrow_compaction = true`時に有効（下記の⑦・例外2〜4の各節）|
-|8|`rollout/src/evidence/observation_index.rs::ObservationIndex::resolve_range`、`rollout/src/evidence/compaction_inventory.rs::inventory_compaction_from_items`|rollout libraryに実装、受入未完了。`read_observation`という名前の関数はない。CLIの範囲取得引数と`inventory`は未追加（`cli/src/bin/rencrow_compaction/f08_cli_tests.rs`は未登録）|
+|8|`rollout/src/evidence/observation_index.rs::ObservationIndex::resolve_range`、`rollout/src/evidence/compaction_inventory.rs::inventory_compaction_from_items`|rollout libraryに実装。`read_observation`という名前の関数はない。CLIの`evidence`の範囲取得（`--part`・`--start`・`--end`・`--part-sha256`）と`inventory`をPhase 5で接続し、実データで受入した|
 
 統合部分の`core/src/compact_rencrow_summary.rs`（`build_summary_history`、`summary_suffix_from_staged_output`、`important_refs_from_summary`、`should_apply_server_reasoning_included`）は、2026-09-24にPhase 1 Step 1として実装し、項目13でruntimeへ接続した（下記「Phase 1の進捗」）。
 
@@ -4825,7 +4825,7 @@ RenCrow Switch Core Compaction V2の役割は、
   - 結合試験（第2部 §71の一部）: `core/tests/suite/compact_rencrow.rs`をV2向けに書き直した。mockは要求を選別・要約・通常に分類し、応答item IDを連番にした（旧fixtureの`"answer"`重複IDによる`InvalidSnapshot`を解消）。manual/automaticの2件は、ModelSelectionで撤回文だけが消えること、要約入力と置換後履歴に撤回文が残らないこと、再起動後の2回目がSelectionなし（NoCandidates）で要約1回だけになることを確認する。非Humanの1件はSelectionを送らないこと、exec組の1件は検証済みの組が要約入力に上限つきObservation 1件としてだけ現れ、置換後履歴とcold resume後の入力に元のcallが戻らないことを確認する。
   - 検査: `just test --cargo-profile dev-small -p codex-core --lib -E "test(compact)"`で153件全成功（うち`compact::rencrow`は63件、追加3件）、`-p codex-rollout`で171件全成功、`-p codex-core --test all -E "test(suite::compact)"`で72件全成功（`suite::compact_rencrow`の4件を含む。Fork無効の上流試験も通る）。上流のremote compaction試験2件（`compact_remote::remote_compact_v2_charges_retained_images_to_token_budget`）は1回目が約49秒で失敗し再試行で成功した。Fork経路を通らない試験で、今回の変更とは無関係と判断した。`just fix -p codex-core`・`-p codex-rollout`を実行し、項目13の変更ファイルへの修正だけを残した（他ファイルへの既存指摘の修正は別単位とし、取り込んでいない）。
 - 既存の失敗の解消: 以前記録した結合試験4件中3件の失敗（manual/automaticの重複ID、完了済みexec組）は、上記の書き直しと正本照合の修正で解消した。
-- 未完了: `ServerReasoningIncluded`のdrain分岐を実際に通す回帰、付属AのI15（preflight失敗）とI16（自動再試行抑止）の結合試験は未作成（判定関数は単体試験済み）。Phase 2（schema確定）は下記のとおり実装した。Phase 5（実QwenのE2E）とPhase 6（共有配備）が未実施のため、HEADはまだ配備しない。
+- 未完了: `ServerReasoningIncluded`のdrain分岐を実際に通す回帰、付属AのI15（preflight失敗）とI16（自動再試行抑止）の結合試験は未作成（判定関数は単体試験済み）。Phase 2（schema確定）は下記のとおり実装した。Phase 6（共有配備と§77の旧binary互換確認）が未実施のため、HEADはまだ配備しない。
 
 ### Phase 2の進捗（2026-09-24）
 
@@ -4862,6 +4862,17 @@ RenCrow Switch Core Compaction V2の役割は、
 - Integrity（§73 G01〜G03）: 同じcall IDの別digest、壊れた採用済みV2 metadata、metadataと本文が一致しないV2 markerは、Phase 3で準備段階の`Integrity`に分類済み（検出は各単体試験、振分けと診断文は`compact_rencrow_tests.rs`）。
 - 検査: `just test --cargo-profile dev-small -p codex-history` 137件、`-p codex-rollout` 173件、`-p codex-thread-store` 260件、`-p codex-core --lib -E "test(compact) | test(session::) | test(agent::control)"` 597件、`-p codex-core --test all -E "test(suite::compact)"` 79件（新規の持続性試験4件を含む）がすべて成功した。上流の既存の不安定試験1件は再試行で成功。持続性試験4件は5回連続で全成功した（初回は失敗した圧縮turnの完了前に次のturnを始めて入力が合流する試験側の競合があり、完了を待つよう直した）。`just fmt`・`just fix`を実行し、無関係なファイルへの修正は取り込んでいない。
 - 決定待ち: replayで、commit markerが所定の位置にあり付随行も揃っているのにhashが一致しないcheckpointは、現行の`committed_items`では未commitと同様に黙って捨て、後続行を残す（既存試験`mismatch_and_missing_marker_preserve_later_records`）。中断したappendではこの形は生じないため、これは保存データの破損に当たる。捨てた場合、そのcheckpointで採用済みの本人指示の削除が元に戻り（第1部の復活禁止に反する）、contextも増える。一方、IntegrityBlockedにすると、hashが型付きの値を再serializeして計算されているため、binaryの更新で直列化が変わった場合に正常なcheckpointまで一致しなくなり、threadの再開がすべて止まるおそれがある。hashを保存済みの行の内容から計算する方式にするかを含め、利用者の判断を待つ。
+
+### Phase 5の進捗（2026-09-24）
+
+第2部 §70 Phase 5（実QwenのE2E）を、§76に従う隔離環境で実施した。CODEX_HOMEはGit外の私有directory（0700）で、認証情報は複製せず、起動時に`OPENAI_API_KEY`・`CODEX_API_KEY`を外し、本番のwriterとは別のthreadで行った。TUIをtmuxで操作し、RenCrow Gateway（`worker/high`、Qwen3.8-flash-Mac）へ接続した。私有の受入記録は`target/fork-bootstrap/compaction-v2-e2e/phase5-acceptance.json`、binaryのhashは同directoryの`binaries*.sha256`。
+
+- 原文取得のCLI（付属A F29、§59〜61）: `rencrow-compaction evidence`へ範囲取得（4引数を全部指定するかどれも指定しない）を、`inventory`コマンド（最新のcommit済みV2 checkpointの参照一覧を原文なしでpage単位に返す）を追加し、未登録だった引数試験を登録した。実データで、要約へ提示していない中央の範囲を正本と照合して取得でき、part hashの不一致と2,048 bytesを超える範囲は拒否された。
+- 実Qwenで見つけて直した不具合1（要約要求の末尾、第2部 §80の実Qwen failure）: Gatewayは`single_leading_instruction`の接続先で全developer messageを先頭のsystem messageへまとめるため、末尾に置いた要約指示が先頭へ移り、会話の最後が完了結果の断片になっていた。Qwenはそれに返答し、要約本文が「完了結果を確認しました。」だけになった（作業状態が失われる）。要約指示（developer）は維持し、その後に要約を求めるuserの依頼を最後のitemとして置いた（`compact_rencrow_request.rs`）。修正後の要約は、現在の条件・検証済みの結果・部分提示の注意・作業状態・安全上の境界を保持した。
+- 実Qwenで見つけて直した不具合2（cold resume後のmarker照合、第2部 §80のコード矛盾）: checkpointは置換後履歴のmetadataをitemごとに保存するため、metadataのなかった呼出しitemは再起動後に既定値として読み戻される。正本照合がmetadataを厳密に比べていたため、Emergencyで作ったmarkerが再起動後のNormalでIntegrityBlockedになった（同じ比較で、再起動をまたいだfreshの組も黙って未検証になっていた）。`archive_reference::same_harness_metadata`で「なし」と既定値を同一とみなすようにし、marker・freshの組の回帰試験を追加し、mockの結合試験（E06）へcold resumeを挟んだ。修正を外すとこの結合試験は実Qwenと同じ文面で失敗することを確認した。
+- シナリオと結果: Normal（ModelSelectionで撤回済みの合言葉だけを除き、完了した依頼を結果へ置換し、Observationを処理済みにした）。原文取得（上記）。Normal失敗からEmergency（実Qwenの選別が提示していないsource IDを返し、LLM要求なしのEmergencyでcommit、本人入力は原文のまま、大きな出力はmarker、response IDなし）。cold resume（Emergency後もNormal後も、現在の合言葉と日本語を正しく答え、コマンドを再実行しない）。Emergency後のNormal（修正後、markerを正本から再提示して処理済みにし、要約が`observation:"…"`で2件を重要参照に選んだ）。永続化の再起動（最後のcommit markerを除くとreplayがそのcheckpointを捨て、再開後の要求はEmergencyの固定文を含みNormalの要約を含まなかった）。IntegrityBlocked（commit hashを壊すと再開がIntegrityBlockedの診断文で止まり、再起動を求めない。戻すと正常に再開）。marker経由のObservationの原文取得も成功した。
+- 検査: `just test --cargo-profile dev-small -p codex-history` 137件、`-p codex-rollout` 174件、`-p codex-thread-store` 260件、`-p codex-core --lib -E "test(compact) | test(session::) | test(agent::control)"` 597件、`-p codex-core --test all -E "test(suite::compact)"` 79件、`-p codex-cli -E "binary_id(codex-cli::bin/rencrow-compaction)"` 15件がすべて成功した（上流の既存の不安定試験1件は再試行で成功）。`just fmt`・`just fix`を実行し、無関係なファイルへの修正は取り込んでいない。
+- 未完了: 自動圧縮（token上限による起動）の実Qwen試験、CapacityBlockedの実Qwen試験は未実施。実Qwenの選別は1回目に成功、2回目に不正なIDで失敗しており、選別の安定性は保証しない（失敗時はEmergencyで安全に継続する）。
 
 稼働binaryはHEADより前のsource（`bf9d00a6a`＋当時の未commit差分）からbuildした。`~/.local/bin/rencrow-switch-core`はSHA-256 `3f6d6d61bd176ee08e65c0a486a4dfc3a9aceb7c6cbbcfc7024305ea87ad03b9`、`~/.local/bin/rencrow-compaction`は`ea38850361a312927227cb90f63fe73589afe8d8b1631801f0add61e8624acb1`（記録は私有の`compaction-runtime-deploy/candidate.json`）。HEADのV2部品と、usage・resume関連の後続修正は未配備。
 

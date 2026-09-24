@@ -969,8 +969,40 @@ async fn rencrow_emergency_marker_is_presented_and_covered_by_the_next_normal() 
     assert_eq!(marker_body["call_id"], call_id);
     assert!(marker_body["total_bytes"].as_u64().expect("total bytes") > 4_000);
 
-    test.submit_text_turn("continue").await?;
-    compact_without_error(&test.codex).await?;
+    // Restart from the rollout: replay reads replacement metadata back, and the marker must
+    // still verify against its canonical source.
+    test.codex.shutdown_and_wait().await?;
+    let context = test
+        .thread_store
+        .load_latest_model_context(LoadThreadHistoryParams {
+            thread_id: test.session_configured.thread_id,
+            include_archived: false,
+        })
+        .await?;
+    let resumed = test
+        .thread_manager
+        .resume_thread_with_history(
+            test.config.clone(),
+            InitialHistory::Resumed(ResumedHistory {
+                conversation_id: context.thread_id,
+                history: Arc::new(context.items),
+                rollout_path: Some(path.clone()),
+            }),
+            test.thread_manager.auth_manager(),
+            /*parent_trace*/ None,
+            ClientMcpExtensions::default(),
+        )
+        .await?
+        .thread;
+    resumed
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "continue".into(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    wait_for_event(&resumed, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    compact_without_error(&resumed).await?;
+    resumed.flush_rollout().await?;
 
     let checkpoints = checkpoint_rows(&path)?;
     assert_eq!(checkpoints.len(), 2);

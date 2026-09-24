@@ -5,6 +5,7 @@ use codex_history::ObservationReference;
 use codex_history::ResponseItemEnvelope;
 use codex_history::archive_reference::is_ordinary_harness_metadata;
 use codex_history::archive_reference::is_ordinary_passthrough;
+use codex_history::archive_reference::same_harness_metadata;
 use codex_protocol::ThreadId;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::TruncationPolicy;
@@ -428,18 +429,21 @@ pub fn prepare_compaction_sources<'a>(
                 } else {
                     None
                 };
-                if canonical_observation.call.metadata != selected_call.metadata
-                    || canonical_observation.output.metadata != selected[output_index].metadata
-                    || !fresh_output_matches(
-                        &canonical_observation.output.item,
-                        &selected_observation.output.item,
-                        canonical_observation
-                            .output
-                            .metadata
-                            .as_ref()
-                            .and_then(|metadata| metadata.history_truncation_token_limit),
-                    )
-                {
+                if !same_harness_metadata(
+                    canonical_observation.call.metadata.as_ref(),
+                    selected_call.metadata.as_ref(),
+                ) || !same_harness_metadata(
+                    canonical_observation.output.metadata.as_ref(),
+                    selected[output_index].metadata.as_ref(),
+                ) || !fresh_output_matches(
+                    &canonical_observation.output.item,
+                    &selected_observation.output.item,
+                    canonical_observation
+                        .output
+                        .metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.history_truncation_token_limit),
+                ) {
                     continue;
                 }
                 let Some(canonical_call_input) = call_input(&canonical_observation.call.item)
@@ -530,7 +534,7 @@ fn prepare_observation_marker<'a>(
     }
     .ok_or_else(|| "V2 observation marker body is not text".to_owned())?;
     if !same_persisted_item(&observation.call.item, &call.item)
-        || observation.call.metadata != call.metadata
+        || !same_harness_metadata(observation.call.metadata.as_ref(), call.metadata.as_ref())
         || !same_fresh_output_except_text_body(&output.item, &observation.output.item)
     {
         return Err("V2 observation marker identity differs from its canonical source".into());

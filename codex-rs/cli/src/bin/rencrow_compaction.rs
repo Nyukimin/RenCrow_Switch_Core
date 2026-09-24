@@ -1,4 +1,4 @@
-// Modified by RenCrow Switch Core, 2026-09-22.
+// Modified by RenCrow Switch Core, 2026-09-22; V2 range retrieval and inventory 2026-09-24.
 //! Separate candidate builder. Never opens a live Codex session for writing.
 use anyhow::Context;
 use anyhow::Result;
@@ -7,6 +7,8 @@ use anyhow::ensure;
 use clap::Parser;
 use clap::Subcommand;
 use codex_core::config::find_codex_home;
+use codex_history::ObservationReference;
+use codex_history::RolloutItem;
 use codex_history::compaction_candidate::CandidateBundle;
 use codex_history::compaction_candidate::CandidateInput;
 use codex_history::compaction_candidate::digest;
@@ -26,12 +28,18 @@ use codex_http_client::HttpClientBuilder;
 use codex_http_client::HttpClientFactory;
 use codex_http_client::OutboundProxyPolicy;
 use codex_protocol::ThreadId;
+use codex_rollout::InventoryQuery;
+use codex_rollout::ObservationIndex;
+use codex_rollout::ObservationPart;
+use codex_rollout::RolloutRecorder;
 use codex_rollout::find_archived_thread_path_by_id_str;
 use codex_rollout::find_thread_path_by_id_str;
+use codex_rollout::inventory_compaction_from_items;
 use codex_rollout::resolve_archive_evidence;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use serde_json::json;
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
@@ -40,6 +48,9 @@ use std::time::Instant;
 
 #[path = "rencrow_compaction/capture.rs"]
 mod capture;
+#[cfg(test)]
+#[path = "rencrow_compaction/f08_cli_tests.rs"]
+mod f08_cli_tests;
 #[path = "rencrow_compaction/intake.rs"]
 mod intake;
 
@@ -100,7 +111,10 @@ enum Command {
         #[arg(long)]
         output: PathBuf,
     },
-    /// Retrieve one host-verified terminal result from the owning rollout.
+    /// Retrieve host-verified original data from the owning rollout.
+    ///
+    /// Without range flags this returns one archived terminal result. With all four range flags
+    /// it returns at most 2048 verified bytes of one part of a referenced observation.
     Evidence {
         #[arg(long)]
         thread: String,
@@ -108,10 +122,68 @@ enum Command {
         call_id: String,
         #[arg(long)]
         sha256: String,
+        /// Original text part to read: `call` or `output`.
+        #[arg(long, requires_all = ["start", "end", "part_sha256"])]
+        part: Option<ObservationPart>,
+        /// Inclusive byte offset of the range.
+        #[arg(long, requires_all = ["part", "end", "part_sha256"])]
+        start: Option<usize>,
+        /// Exclusive byte offset of the range.
+        #[arg(long, requires_all = ["part", "start", "part_sha256"])]
+        end: Option<usize>,
+        /// SHA-256 of the whole original part, as recorded in the observation coverage.
+        #[arg(long, requires_all = ["part", "start", "end"])]
+        part_sha256: Option<String>,
         /// Explicit owning CODEX_HOME; otherwise use the canonical resolver.
         #[arg(long)]
         codex_home: Option<PathBuf>,
     },
+    /// List observation references of the latest committed V2 checkpoint without source text.
+    Inventory {
+        #[arg(long)]
+        thread: String,
+        /// Look up one call instead of listing a page.
+        #[arg(long, conflicts_with_all = ["checkpoint_hash", "offset"])]
+        call_id: Option<String>,
+        /// Checkpoint returned by the previous page; required to continue.
+        #[arg(long, requires = "offset")]
+        checkpoint_hash: Option<String>,
+        #[arg(long, requires = "checkpoint_hash")]
+        offset: Option<usize>,
+        /// Explicit owning CODEX_HOME; otherwise use the canonical resolver.
+        #[arg(long)]
+        codex_home: Option<PathBuf>,
+    },
+}
+
+/// Resolve the owning rollout of a thread from an explicit or canonical CODEX_HOME.
+async fn thread_rollout(thread: &str, codex_home: Option<PathBuf>) -> Result<PathBuf> {
+    let codex_home = match codex_home {
+        Some(path) => path
+            .canonicalize()
+            .context("explicit CODEX_HOME does not resolve")?,
+        None => find_codex_home()
+            .context("failed to resolve CODEX_HOME")?
+            .to_path_buf(),
+    };
+    find_thread_path_by_id_str(&codex_home, thread, None)
+        .await?
+        .or(find_archived_thread_path_by_id_str(&codex_home, thread, None).await?)
+        .context("thread rollout not found")
+}
+
+/// Load raw persisted rows of the thread's own rollout, rejecting parse errors.
+async fn thread_rollout_items(path: &Path, thread_id: &ThreadId) -> Result<Vec<RolloutItem>> {
+    let (items, rollout_thread, parse_errors) = RolloutRecorder::load_rollout_items(path).await?;
+    ensure!(
+        parse_errors == 0,
+        "rollout contains {parse_errors} parse errors"
+    );
+    ensure!(
+        rollout_thread == Some(*thread_id),
+        "rollout header thread does not match requested thread"
+    );
+    Ok(items)
 }
 
 fn read<T: DeserializeOwned>(path: &Path) -> Result<T> {
@@ -352,21 +424,40 @@ async fn run(args: Args) -> Result<()> {
             thread,
             call_id,
             sha256,
+            part: Some(part),
+            start: Some(start),
+            end: Some(end),
+            part_sha256: Some(part_sha256),
             codex_home,
         } => {
             let thread_id = ThreadId::from_string(&thread).context("invalid thread UUID")?;
-            let codex_home = match codex_home {
-                Some(path) => path
-                    .canonicalize()
-                    .context("explicit CODEX_HOME does not resolve")?,
-                None => find_codex_home()
-                    .context("failed to resolve CODEX_HOME")?
-                    .to_path_buf(),
-            };
-            let rollout_path = find_thread_path_by_id_str(&codex_home, &thread, None)
-                .await?
-                .or(find_archived_thread_path_by_id_str(&codex_home, &thread, None).await?)
-                .context("thread rollout not found")?;
+            let rollout_path = thread_rollout(&thread, codex_home).await?;
+            let items = thread_rollout_items(&rollout_path, &thread_id).await?;
+            let range = ObservationIndex::new(&items, &thread_id)
+                .resolve_range(
+                    &ObservationReference::new(thread.clone(), call_id, sha256),
+                    &HashSet::new(),
+                    part,
+                    start,
+                    end,
+                    &part_sha256,
+                )
+                .map_err(|error| anyhow::anyhow!("observation range rejected: {error}"))?;
+            println!(
+                "{}",
+                json!({"archived_data": true, "version": 2, "range": range})
+            );
+            return Ok(());
+        }
+        Command::Evidence {
+            thread,
+            call_id,
+            sha256,
+            codex_home,
+            ..
+        } => {
+            let thread_id = ThreadId::from_string(&thread).context("invalid thread UUID")?;
+            let rollout_path = thread_rollout(&thread, codex_home).await?;
             let evidence = resolve_archive_evidence(&rollout_path, &thread_id, &call_id, &sha256)
                 .await
                 .context("archive evidence rejected")?;
@@ -386,6 +477,28 @@ async fn run(args: Args) -> Result<()> {
                     "result": evidence.result,
                 })
             );
+            return Ok(());
+        }
+        Command::Inventory {
+            thread,
+            call_id,
+            checkpoint_hash,
+            offset,
+            codex_home,
+        } => {
+            let thread_id = ThreadId::from_string(&thread).context("invalid thread UUID")?;
+            let rollout_path = thread_rollout(&thread, codex_home).await?;
+            let items = thread_rollout_items(&rollout_path, &thread_id).await?;
+            let query = match call_id {
+                Some(call_id) => InventoryQuery::CallId(call_id),
+                None => InventoryQuery::Page {
+                    checkpoint_hash,
+                    offset: offset.unwrap_or_default(),
+                },
+            };
+            let page = inventory_compaction_from_items(&items, &thread, query)
+                .map_err(|error| anyhow::anyhow!("observation inventory rejected: {error}"))?;
+            println!("{}", json!({"archived_data": true, "inventory": page}));
             return Ok(());
         }
     }

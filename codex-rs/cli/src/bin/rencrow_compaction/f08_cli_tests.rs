@@ -1,4 +1,4 @@
-//! Unwired F08 CLI parser regressions. Register after the rollout owner releases Cargo.
+//! V2 range retrieval and inventory CLI argument regressions (Annex A F29, Part 2 §59–61).
 
 use super::*;
 use clap::Parser;
