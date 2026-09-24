@@ -19,7 +19,6 @@ use std::collections::HashSet;
 const IMPORTANT_REF_MARKER: &str = "observation:\"";
 
 /// The latest adopted V2 compaction summary in the current selected history.
-#[allow(dead_code)]
 #[derive(Debug, PartialEq)]
 pub(super) struct AdoptedV2Checkpoint {
     pub(super) index: usize,
@@ -35,7 +34,6 @@ pub(super) struct AdoptedV2Checkpoint {
 /// the live prepared count or the replayed committed hash; the fresh-candidate rule that both are
 /// absent does not apply. Summaries without V2 metadata are not boundaries. V2 metadata on an item
 /// that is not a valid typed summary fails closed instead of falling back to an older checkpoint.
-#[allow(dead_code)]
 pub(super) fn find_adopted_v2_checkpoint(
     items: &[ResponseItemEnvelope],
     thread_id: &str,
@@ -79,12 +77,25 @@ pub(super) fn find_adopted_v2_checkpoint(
     Ok(None)
 }
 
+/// Choose the one previous summary shown to the V2 summary request (Part 2 §18, Annex A F20).
+///
+/// The adopted V2 summary is used when present. Before the first V2 checkpoint, the latest
+/// owner-adopted legacy summary is the only record of earlier summarized work, so it is shown once
+/// instead of being dropped. It is not a selection or observation boundary.
+pub(super) fn previous_summary_index(
+    items: &[ResponseItemEnvelope],
+    adopted: Option<&AdoptedV2Checkpoint>,
+) -> Option<usize> {
+    adopted
+        .map(|adopted| adopted.index)
+        .or_else(|| items.iter().rposition(is_user_summary))
+}
+
 /// Build the model-visible history for the single V2 summary request.
 ///
 /// Humans and protected items come from the native projection, so the summary sees exactly what
 /// the replacement retains. Ordinary Work before the adopted summary is already represented by
 /// that summary and is omitted. Each verified observation pair becomes one bounded host item.
-#[allow(dead_code)]
 pub(super) fn build_summary_history(
     originals: &[ResponseItemEnvelope],
     input: &CandidateInput,
@@ -185,7 +196,6 @@ pub(super) fn build_summary_history(
 }
 
 /// Accept only reasoning plus exactly one assistant text message from a staged summary response.
-#[allow(dead_code)]
 pub(super) fn summary_suffix_from_staged_output(output: &[ResponseItem]) -> Result<String, String> {
     let mut summary = None;
     for item in output {
@@ -224,7 +234,6 @@ pub(super) fn summary_suffix_from_staged_output(output: &[ResponseItem]) -> Resu
 }
 
 /// Important references resolved from explicit summary markers, plus the ignored marker count.
-#[allow(dead_code)]
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(super) struct ImportantRefResolution {
     pub(super) refs: Vec<ObservationReference>,
@@ -235,7 +244,6 @@ pub(super) struct ImportantRefResolution {
 ///
 /// Malformed, unknown, or ambiguous markers are ignored and counted; ordinary prose such as
 /// `key observation: ...` is not a marker. Resolved references are deduplicated in first order.
-#[allow(dead_code)]
 pub(super) fn important_refs_from_summary(
     summary_text: &str,
     inventory: &[ObservationReference],

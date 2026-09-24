@@ -31,17 +31,9 @@ struct RetainedItem {
 pub(super) struct NativeProjection {
     retained: Vec<RetainedItem>,
     user_messages: Vec<CompactedUserMessage>,
-    human_positions: Vec<usize>,
 }
 
 impl NativeProjection {
-    /// Borrow the exact Human envelopes projected into both summary and retained history.
-    pub(super) fn summary_human_messages(&self) -> impl Iterator<Item = &ResponseItemEnvelope> {
-        self.human_positions
-            .iter()
-            .map(|index| &self.retained[*index].envelope)
-    }
-
     /// Borrow each retained native item with its index in the original selected history.
     pub(super) fn retained_by_original_index(
         &self,
@@ -53,8 +45,7 @@ impl NativeProjection {
 
     pub(super) fn retained_native_items(
         &self,
-    ) -> impl Iterator<Item = &ResponseItemEnvelope> + DoubleEndedIterator + ExactSizeIterator + '_
-    {
+    ) -> impl DoubleEndedIterator<Item = &ResponseItemEnvelope> + ExactSizeIterator + '_ {
         self.retained.iter().map(|item| &item.envelope)
     }
 
@@ -63,7 +54,7 @@ impl NativeProjection {
         &'a self,
         initial_context: &'a [ResponseItemEnvelope],
         summary: &'a ResponseItemEnvelope,
-    ) -> impl Iterator<Item = &'a ResponseItemEnvelope> + DoubleEndedIterator + 'a {
+    ) -> impl DoubleEndedIterator<Item = &'a ResponseItemEnvelope> + 'a {
         let insertion_index =
             host_insertion_index(self.retained_native_items().chain(std::iter::once(summary)))
                 .unwrap_or(self.retained.len())
@@ -164,7 +155,6 @@ pub(super) fn filter_retained_instructions(
         None => digest(&application.pruning.applied)?,
     };
     let mut retained = Vec::new();
-    let mut human_positions = Vec::new();
     for (original_index, (record, original)) in input.records.iter().zip(originals).enumerate() {
         if is_user_summary(original) && record.origin != Origin::Human {
             continue;
@@ -226,10 +216,6 @@ pub(super) fn filter_retained_instructions(
             }
             Origin::Work | Origin::Host | Origin::Unknown => original.clone(),
         };
-        let retained_index = retained.len();
-        if record.origin == Origin::Human {
-            human_positions.push(retained_index);
-        }
         retained.push(RetainedItem {
             original_index,
             envelope,
@@ -240,7 +226,6 @@ pub(super) fn filter_retained_instructions(
     Ok(NativeProjection {
         retained,
         user_messages,
-        human_positions,
     })
 }
 

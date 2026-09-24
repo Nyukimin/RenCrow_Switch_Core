@@ -1,4 +1,5 @@
-// Modified by RenCrow Switch Core, 2026-09-22: halt after an uncertain checkpoint write.
+// Modified by RenCrow Switch Core, 2026-09-22: halt after an uncertain checkpoint write;
+// 2026-09-24: do not repeat a failed automatic compaction of an unchanged history.
 //! Session-wide mutable state.
 
 use codex_protocol::models::AdditionalPermissionProfile;
@@ -77,6 +78,8 @@ impl ReasoningEffortPin {
 /// Persistent, session-scoped state previously stored directly on `Session`.
 pub(crate) struct SessionState {
     pub(crate) rencrow_checkpoint_failed: bool,
+    /// History digest whose automatic RenCrow compaction already failed in this session.
+    pub(crate) rencrow_auto_compaction_failed_hash: Option<String>,
     pub(crate) session_configuration: SessionConfiguration,
     /// Plugin selection of the last admitted task; settings updates take effect on the next task.
     pub(crate) active_disabled_plugin_ids: Vec<String>,
@@ -156,6 +159,7 @@ impl SessionState {
             granted_permissions_by_environment_id: HashMap::new(),
             next_turn_is_first: true,
             rencrow_checkpoint_failed: false,
+            rencrow_auto_compaction_failed_hash: None,
         }
     }
 

@@ -1,4 +1,4 @@
-// Modified by RenCrow Switch Core, 2026-09-22.
+// Modified by RenCrow Switch Core, 2026-09-22; Normal V2 compaction 2026-09-24.
 use super::compact::non_openai_model_provider;
 use anyhow::Result;
 use codex_core::TurnInputRequest;
@@ -45,6 +45,61 @@ use wiremock::ResponseTemplate;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
 
+/// Developer instruction prefix of the single V2 summary request.
+const SUMMARY_REQUEST: &str = "This is a read-only compaction summary request.";
+/// Developer instruction prefix of the JSON-dataset instruction selection request.
+const SELECTION_STAGE: &str = "This is a read-only compaction stage.";
+
+enum Stage {
+    Selection(Value),
+    Summary,
+    Ordinary,
+}
+
+fn item_texts(item: &Value) -> Vec<&str> {
+    item["content"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|part| part["text"].as_str())
+        .collect()
+}
+
+fn stage(body: &Value) -> Stage {
+    let input = body["input"].as_array().expect("input array");
+    let developer = input
+        .iter()
+        .filter(|item| item["role"] == "developer")
+        .flat_map(item_texts)
+        .collect::<String>();
+    if developer.contains(SUMMARY_REQUEST) {
+        return Stage::Summary;
+    }
+    if developer.contains(SELECTION_STAGE) {
+        let dataset = input
+            .iter()
+            .filter(|item| item["role"] == "user")
+            .flat_map(item_texts)
+            .collect::<String>();
+        return Stage::Selection(serde_json::from_str(&dataset).expect("selection dataset"));
+    }
+    Stage::Ordinary
+}
+
+fn assistant_reply(id: &str, text: &str, completed: Value) -> ResponseTemplate {
+    ResponseTemplate::new(200)
+        .insert_header("content-type", "text/event-stream")
+        .set_body_string(sse(vec![ev_assistant_message(id, text), completed]))
+}
+
+fn checkpoint_rows(path: &std::path::Path) -> Result<Vec<Value>> {
+    Ok(fs::read_to_string(path)?
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|row| row["type"] == "compacted")
+        .collect())
+}
+
 #[test_case::test_case(false; "manual")]
 #[test_case::test_case(true; "automatic")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -55,30 +110,68 @@ async fn rencrow_compaction_keeps_one_selected_history_through_resume_and_recomp
     let server = start_mock_server().await;
     let seen = Arc::new(Mutex::new(Vec::<Value>::new()));
     let captured = Arc::clone(&seen);
-    Mock::given(method("POST")).and(path("/v1/responses")).respond_with(move |request: &Request| {
-        let body: Value = request.body_json().unwrap();
-        captured.lock().unwrap().push(body.clone());
-        let joined = body["input"].as_array().unwrap().iter().filter(|item| item["role"] == "user").filter_map(|item| item["content"][0]["text"].as_str()).collect::<String>();
-        let data = serde_json::from_str::<Value>(&joined).ok();
-        let trigger_auto = automatic && data.is_none() && body["input"].as_array().unwrap().iter().rev()
-            .find(|item| item["role"] == "user").is_some_and(|item| item["content"][0]["text"] == "Use current-label instead.");
-        let completed = if trigger_auto { ev_completed_with_tokens("response-fixture", 110_000) } else { ev_completed("response-fixture") };
-        let reply = if let Some(data) = data {
-            if data.get("plan").is_some() {
-                json!({"accepted_operations": (0..data["plan"]["operations"].as_array().unwrap().len()).collect::<Vec<_>>()})
-            } else if data.get("view_hash").is_some() { json!({"text":"Continue using the current label; preserve Japanese output."})
-            } else {
-                let sources = data["sources"].as_array().unwrap();
-                let old = sources.iter().find(|source| source["text"].as_str().is_some_and(|text| text.contains("Use obsolete-label.")));
-                let new = sources.iter().find(|source| source["text"] == "Use current-label instead.");
-                match (old,new) {
-                    (Some(old),Some(new)) => json!({"operations":[{"action":"drop_superseded","source":old["id"],"source_text":"Use obsolete-label.","correction":new["id"]}]}),
-                    _ => json!({"operations":[]}),
+    let responses = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(move |request: &Request| {
+            let body: Value = request.body_json().expect("request JSON");
+            captured.lock().expect("requests lock").push(body.clone());
+            // Each response item needs its own ID, as in real model output.
+            let id = format!("answer-{}", responses.fetch_add(1, Ordering::SeqCst));
+            match stage(&body) {
+                Stage::Selection(data) => {
+                    let sources = data["sources"].as_array().expect("sources");
+                    let old = sources.iter().find(|source| {
+                        source["text"]
+                            .as_str()
+                            .is_some_and(|text| text.contains("Use obsolete-label."))
+                    });
+                    let new = sources
+                        .iter()
+                        .find(|source| source["text"] == "Use current-label instead.");
+                    let operations = match (old, new) {
+                        (Some(old), Some(new)) => json!([{
+                            "action": "drop_superseded",
+                            "source": old["id"],
+                            "source_text": "Use obsolete-label.",
+                            "correction": new["id"],
+                            "correction_text": "Use current-label instead.",
+                        }]),
+                        _ => json!([]),
+                    };
+                    assistant_reply(
+                        &id,
+                        &json!({ "operations": operations }).to_string(),
+                        ev_completed("selection-response"),
+                    )
                 }
-            }.to_string()
-        } else { "acknowledged".into() };
-        ResponseTemplate::new(200).insert_header("content-type","text/event-stream").set_body_string(sse(vec![ev_assistant_message("answer", &reply), completed]))
-    }).mount(&server).await;
+                Stage::Summary => assistant_reply(
+                    &id,
+                    "Continue using the current label; preserve Japanese output.",
+                    ev_completed("summary-response"),
+                ),
+                Stage::Ordinary => {
+                    let trigger_auto = automatic
+                        && body["input"]
+                            .as_array()
+                            .expect("input array")
+                            .iter()
+                            .rev()
+                            .find(|item| item["role"] == "user")
+                            .is_some_and(|item| {
+                                item["content"][0]["text"] == "Use current-label instead."
+                            });
+                    let completed = if trigger_auto {
+                        ev_completed_with_tokens("response-fixture", 110_000)
+                    } else {
+                        ev_completed("response-fixture")
+                    };
+                    assistant_reply(&id, "acknowledged", completed)
+                }
+            }
+        })
+        .mount(&server)
+        .await;
     let provider = non_openai_model_provider(&server);
     let mut builder = test_codex().with_config(move |config| {
         config.model_provider = provider;
@@ -139,16 +232,12 @@ async fn rencrow_compaction_keeps_one_selected_history_through_resume_and_recomp
     }
     test.submit_text_turn("continue before restart").await?;
     let path = test.codex.rollout_path().unwrap();
-    let persisted = fs::read_to_string(&path)?;
-    let checkpoints: Vec<Value> = persisted
-        .lines()
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .filter(|row| row["type"] == "compacted")
-        .collect();
+    let checkpoints = checkpoint_rows(&path)?;
     assert_eq!(checkpoints.len(), 1);
     let replacement_metadata =
         checkpoints[0]["payload"]["replacement_history_metadata"].to_string();
-    assert!(replacement_metadata.contains("\"summary_review\":null"));
+    assert!(replacement_metadata.contains("\"version\":2"));
+    assert!(replacement_metadata.contains("\"selection_mode\":\"model_selection\""));
     // Original text remains in the append-only audit log, not replacement content.
     let codex_history::RolloutItem::Compacted(checkpoint) =
         serde_json::from_value(checkpoints[0].clone())?
@@ -182,13 +271,36 @@ async fn rencrow_compaction_keeps_one_selected_history_through_resume_and_recomp
     resumed
         .submit_text_turn("continue after second compact")
         .await?;
+    let checkpoints = checkpoint_rows(&path)?;
+    assert_eq!(checkpoints.len(), 2);
+    // The second checkpoint has no new Human, so it sends no selection request.
+    assert!(
+        checkpoints[1]["payload"]["replacement_history_metadata"]
+            .to_string()
+            .contains("\"selection_mode\":\"no_candidates\"")
+    );
     let requests = seen.lock().unwrap();
+    let selections = requests
+        .iter()
+        .filter(|body| matches!(stage(body), Stage::Selection(_)))
+        .count();
+    let summaries = requests
+        .iter()
+        .filter(|body| matches!(stage(body), Stage::Summary))
+        .map(|body| body["input"].to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(selections, 1);
+    assert_eq!(summaries.len(), 2);
+    for summary in &summaries {
+        assert!(!summary.contains("Use obsolete-label."));
+        assert!(summary.contains("Keep Japanese."));
+    }
     let last = requests.last().unwrap()["input"].to_string();
     assert!(!last.contains("Use obsolete-label."));
-    assert!(!last.contains("accepted_operations"));
     assert!(last.contains("Keep Japanese."));
     assert!(last.contains("Continue using the current label"));
-    assert_eq!(requests.len(), 11); // Five normal turns and two three-request compactions.
+    // Five ordinary turns, one selection, and one summary for each of two compactions.
+    assert_eq!(requests.len(), 8);
     Ok(())
 }
 
@@ -198,25 +310,20 @@ async fn rencrow_non_human_history_skips_only_selection_inference() -> Result<()
     let server = start_mock_server().await;
     let seen = Arc::new(Mutex::new(Vec::<Value>::new()));
     let captured = Arc::clone(&seen);
+    let responses = Arc::new(AtomicUsize::new(0));
     Mock::given(method("POST"))
         .and(path("/v1/responses"))
         .respond_with(move |request: &Request| {
             let body: Value = request.body_json().expect("request JSON");
             captured.lock().expect("requests lock").push(body.clone());
-            let joined = body["input"].as_array().expect("input array").iter()
-                .filter(|item| item["role"] == "user")
-                .filter_map(|item| item["content"][0]["text"].as_str())
-                .collect::<String>();
-            let reply = match serde_json::from_str::<Value>(&joined) {
-                Ok(data) if data.get("view_hash").is_some() => json!({
-                    "text":"Prior response was acknowledged; preserve unattributed input separately."
-                }).to_string(),
-                Ok(_) => panic!("selection inference must not run without human provenance"),
-                Err(_) => "acknowledged".into(),
+            let id = format!("answer-{}", responses.fetch_add(1, Ordering::SeqCst));
+            let reply = match stage(&body) {
+                Stage::Summary => {
+                    "Prior response was acknowledged; preserve unattributed input separately."
+                }
+                Stage::Selection(_) | Stage::Ordinary => "acknowledged",
             };
-            ResponseTemplate::new(200)
-                .insert_header("content-type", "text/event-stream")
-                .set_body_string(sse(vec![ev_assistant_message("answer", &reply), ev_completed("response-fixture")]))
+            assistant_reply(&id, reply, ev_completed("response-fixture"))
         })
         .mount(&server)
         .await;
@@ -238,14 +345,25 @@ async fn rencrow_non_human_history_skips_only_selection_inference() -> Result<()
     .await;
     test.submit_text_turn("continue").await?;
     let requests = seen.lock().expect("requests lock");
+    assert!(
+        !requests
+            .iter()
+            .any(|body| matches!(stage(body), Stage::Selection(_))),
+        "selection inference must not run without human provenance"
+    );
     assert_eq!(requests.len(), 3); // Two ordinary requests and one summary request.
     assert!(
         requests.last().expect("last request")["input"]
             .to_string()
             .contains("unknown-origin-marker")
     );
-    let persisted = fs::read_to_string(test.codex.rollout_path().expect("rollout path"))?;
-    assert!(persisted.contains("deterministic_no_human_input"));
+    let checkpoints = checkpoint_rows(&test.codex.rollout_path().expect("rollout path"))?;
+    assert_eq!(checkpoints.len(), 1);
+    assert!(
+        checkpoints[0]["payload"]["replacement_history_metadata"]
+            .to_string()
+            .contains("\"selection_mode\":\"no_candidates\"")
+    );
     Ok(())
 }
 
@@ -302,91 +420,44 @@ async fn rencrow_completed_unified_exec_pair_is_summarized_after_terminal_receip
         .respond_with(move |request: &Request| {
             let body: Value = request.body_json().expect("request JSON");
             captured.lock().expect("requests lock").push(body.clone());
-            let summary = body["input"].as_array().into_iter().flatten().flat_map(|item| {
-                item["content"].as_array().into_iter().flatten()
-                    .filter_map(|part| part["text"].as_str())
-            }).find_map(|text| {
-                serde_json::from_str::<Value>(text).ok()
-                    .filter(|value| value.get("view_hash").is_some())
-            });
-            if let Some(summary) = summary {
+            if matches!(stage(&body), Stage::Summary) {
                 let count = summary_state.fetch_add(1, Ordering::SeqCst);
-                if count == 0 {
-                    let retained = summary["view"]["retained"].as_array().expect("retained array");
-                    let records = retained
-                        .iter()
-                        .filter_map(|record| record["text"].as_str())
-                        .filter_map(|text| serde_json::from_str::<Value>(text).ok())
-                        .collect::<Vec<_>>();
-                    let call = records
-                        .iter()
-                        .find(|record| record["call_id"] == call_id && record.get("arguments").is_some())
-                        .expect("summary-visible verified call");
-                    assert_eq!(call["arguments"].as_str(), Some(call_arguments.as_str()));
-                    assert_eq!(call["status"], "completed");
-                    assert_eq!(call["exit_code"], 0);
-                    let result = records
-                        .iter()
-                        .find(|record| record["call_id"] == call_id && record.get("result").is_some())
-                        .expect("summary-visible verified result");
-                    assert_eq!(result["tool"], "exec_command");
-                    assert_eq!(result["status"], "completed");
-                    assert_eq!(result["exit_code"], 0);
-                    assert!(result["result"].as_str().is_some_and(|text| text.contains(tool_result)));
-                } else {
-                    let retained = summary["view"]["retained"].as_array().expect("retained array");
-                    let retained_text =
-                        serde_json::to_string(retained).expect("retained view JSON");
-                    assert!(!retained_text.contains(call_id), "cold resume revived the previous call");
-                    let records = retained
-                        .iter()
-                        .filter_map(|record| record["text"].as_str())
-                        .filter_map(|text| serde_json::from_str::<Value>(text).ok())
-                        .collect::<Vec<_>>();
-                    let call = records
-                        .iter()
-                        .find(|record| record["call_id"] == cold_resume_call_id && record.get("arguments").is_some())
-                        .expect("cold-resume call should be summary-visible");
-                    assert_eq!(call["arguments"].as_str(), Some(cold_resume_arguments.as_str()));
-                    assert_eq!(call["status"], "completed");
-                    assert_eq!(call["exit_code"], 0);
-                    let result = records
-                        .iter()
-                        .find(|record| record["call_id"] == cold_resume_call_id && record.get("result").is_some())
-                        .expect("cold-resume result should be summary-visible");
-                    assert_eq!(result["status"], "completed");
-                    assert_eq!(result["exit_code"], 0);
-                    assert!(result["result"].as_str().is_some_and(|text| text.contains(cold_resume_result)));
-                }
-                let reply = json!({"text":"A verified command completed; continue from its recorded result."}).to_string();
-                return ResponseTemplate::new(200)
-                    .insert_header("content-type", "text/event-stream")
-                    .set_body_string(sse(vec![ev_assistant_message("summary", &reply), ev_completed("summary-response")]));
+                return assistant_reply(
+                    &format!("summary-{count}"),
+                    "A verified command completed; continue from its recorded result.",
+                    ev_completed("summary-response"),
+                );
             }
 
             let input_text = body["input"].to_string();
             if input_text.contains(cold_resume_prompt)
                 && !cold_call_state.swap(true, Ordering::SeqCst)
             {
-                assert!(
-                    !input_text.contains(call_id),
-                    "ordinary cold-resume input revived the compacted command"
-                );
                 return ResponseTemplate::new(200)
                     .insert_header("content-type", "text/event-stream")
                     .set_body_string(sse(vec![
                         ev_response_created("cold-tool-response"),
-                        ev_function_call(cold_resume_call_id, "exec_command", &cold_resume_arguments),
+                        ev_function_call(
+                            cold_resume_call_id,
+                            "exec_command",
+                            &cold_resume_arguments,
+                        ),
                         ev_completed("cold-tool-response"),
                     ]));
             }
 
             if body["input"].as_array().is_some_and(|items| {
-                items.iter().any(|item| item["type"] == "function_call_output")
-            }) || tool_call_state.load(Ordering::SeqCst) {
+                items
+                    .iter()
+                    .any(|item| item["type"] == "function_call_output")
+            }) || tool_call_state.load(Ordering::SeqCst)
+            {
                 return ResponseTemplate::new(200)
                     .insert_header("content-type", "text/event-stream")
-                    .set_body_string(sse(vec![ev_assistant_message("ack", "command completed"), ev_completed("normal-response")]));
+                    .set_body_string(sse(vec![
+                        ev_assistant_message("ack", "command completed"),
+                        ev_completed("normal-response"),
+                    ]));
             }
 
             tool_call_state.store(true, Ordering::SeqCst);
@@ -562,6 +633,56 @@ async fn rencrow_completed_unified_exec_pair_is_summarized_after_terminal_receip
             && (item["call_id"] == call_id || item["call_id"] == cold_resume_call_id)
     }));
     assert_eq!(summary_count.load(Ordering::SeqCst), 2);
-    assert_eq!(seen.lock().expect("requests lock").len(), 6);
+    let requests = seen.lock().expect("requests lock");
+    assert_eq!(requests.len(), 6);
+    let summaries = requests
+        .iter()
+        .filter(|body| matches!(stage(body), Stage::Summary))
+        .collect::<Vec<_>>();
+    assert_eq!(summaries.len(), 2);
+    // Each verified pair reaches the summary once as a bounded observation, never as raw items.
+    for (summary, (expected_call, expected_result, earlier_call)) in summaries.iter().zip([
+        (call_id, tool_result, None),
+        (cold_resume_call_id, cold_resume_result, Some(call_id)),
+    ]) {
+        let input = summary["input"].as_array().expect("summary input");
+        assert!(!input.iter().any(|item| {
+            matches!(
+                item["type"].as_str(),
+                Some("function_call" | "function_call_output")
+            )
+        }));
+        let observations = input
+            .iter()
+            .flat_map(item_texts)
+            .filter(|text| text.starts_with("{\"observation\":"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            observations.len(),
+            1,
+            "summary observations: {observations:?}"
+        );
+        let observation: Value = serde_json::from_str(observations[0])?;
+        assert_eq!(
+            observation["observation"]["reference"]["call_id"],
+            expected_call
+        );
+        assert_eq!(observation["observation"]["tool_name"], "exec_command");
+        assert!(observation.to_string().contains(expected_result));
+        if let Some(earlier_call) = earlier_call {
+            assert!(
+                !summary["input"].to_string().contains(earlier_call),
+                "cold resume revived the previous call"
+            );
+        }
+    }
+    let cold_resume_turn = requests
+        .iter()
+        .find(|body| body["input"].to_string().contains(cold_resume_prompt))
+        .expect("cold-resume request");
+    assert!(
+        !cold_resume_turn["input"].to_string().contains(call_id),
+        "ordinary cold-resume input revived the compacted command"
+    );
     Ok(())
 }

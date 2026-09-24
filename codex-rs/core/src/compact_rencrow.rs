@@ -1,20 +1,20 @@
-// Modified by RenCrow Switch Core, 2026-09-22.
-//! Validated compaction using one summary request and deterministic host checks.
+// Modified by RenCrow Switch Core, 2026-09-22; Normal V2 orchestration 2026-09-24.
+//! Normal V2 compaction: optional instruction selection, one summary request, host checks.
 use super::*;
-use codex_history::archive_reference::ArchiveOutputDecision;
-use codex_history::archive_reference::ArchiveReference;
-use codex_history::compaction_candidate::CandidateBundle;
 use codex_history::compaction_candidate::CandidateInput;
 use codex_history::compaction_candidate::Origin;
 use codex_history::compaction_candidate::digest;
 use codex_history::compaction_candidate::history_digest;
 use codex_history::compaction_checkpoint_metadata::CheckpointResponseStage;
 use codex_history::compaction_checkpoint_metadata::CompactionModelResponseReceipt;
-use codex_history::compaction_pipeline::*;
-use codex_history::compaction_plan::SemanticReview;
+use codex_history::compaction_pipeline::InstructionSelection;
+use codex_history::compaction_pipeline::ProposedOperation;
+use codex_history::compaction_pipeline::ProposedPlan;
 use codex_history::compaction_preprocess::InstructionObservationLink;
+use codex_history::compaction_preprocess::collect_instruction_candidates;
+use codex_history::compaction_preprocess::prune_known_obsolete;
+use codex_history::compaction_selection::validate_and_apply_selection;
 use codex_rollout::RolloutRecorder;
-use serde::de::DeserializeOwned;
 use serde_json::Value;
 use serde_json::json;
 use std::collections::HashSet;
@@ -38,7 +38,6 @@ pub(super) use summary::should_apply_server_reasoning_included;
 #[path = "compact_rencrow_orchestration_tests.rs"]
 mod orchestration_tests;
 
-#[allow(dead_code)]
 const INSTRUCTION_SELECTION_PROMPT: &str = "Select only explicit obsolete Human instructions from candidate:true Human sources. Candidate:false Human sources are context only; never remove them. Use completion_links only for the Human identified by instruction_id; a link is a candidate and does not prove success. Preserve failed, pending, ambiguous, protected, opaque, and continuing work. Do not infer completion from unrelated sources. For drop_superseded, correction_text is required and must be the exact unique correction passage that remains current; corrections must remain. source_text is optional only when the entire source is safe to remove; for a mixed instruction provide the exact unique source passage. Never remove protected portions or an entire partly protected source. For replace_completed, evidence must be the linked output_source_id; use it as factual grounding and do not claim more than the output and terminal status/exit establish. A successful command that inspects another job (such as ls or tail) does not prove that job succeeded. Keep unresolved conditions and uncertainty. Return only {\"operations\":[{\"action\":\"drop_superseded\",\"source\":\"<Human id>\",\"source_text\":\"<optional exact unique passage>\",\"correction\":\"<later Human id>\",\"correction_text\":\"<exact unique passage>\"},{\"action\":\"replace_completed\",\"source\":\"<Human id>\",\"source_text\":\"<optional exact unique passage>\",\"evidence\":\"<linked output_source_id>\",\"result\":\"<brief factual result supported by the output>\"}]}. Use only the fields shown for the chosen action. Omit source_text only when the whole source is safe to remove. Do not return a snapshot hash or extra keys. JSON only.";
 
 /// Decide whether instruction selection is needed at all (Annex A F13).
@@ -47,7 +46,6 @@ const INSTRUCTION_SELECTION_PROMPT: &str = "Select only explicit obsolete Human 
 /// the semantic boundary. Humans before the boundary were already considered by an accepted
 /// selection; when a new Human arrives, the candidate payload still presents every active Human.
 /// Without a boundary every verified Human is new.
-#[allow(dead_code)]
 pub(super) fn selection_required(
     input: &CandidateInput,
     semantic_boundary: Option<usize>,
@@ -60,7 +58,6 @@ pub(super) fn selection_required(
         })
 }
 
-#[allow(dead_code)]
 pub(super) async fn select_obsolete_instructions(
     sess: &Session,
     ctx: &TurnContext,
@@ -140,6 +137,40 @@ pub(super) async fn select_obsolete_instructions(
     )))
 }
 
+/// Error returned when an automatic compaction would repeat a failure on an unchanged history.
+const AUTO_RETRY_SUPPRESSED: &str = "RenCrow automatic compaction was not retried because the same unchanged history already failed compaction. The history was not changed; run /compact to retry manually.";
+
+/// Decide whether an automatic compaction stops before any model request (Annex A F03).
+///
+/// Manual compaction is always allowed, even for a history whose automatic compaction failed.
+pub(super) fn auto_retry_suppressed(
+    trigger: CompactionTrigger,
+    failed_hash: Option<&str>,
+    history_hash: &str,
+) -> bool {
+    matches!(trigger, CompactionTrigger::Auto) && failed_hash == Some(history_hash)
+}
+
+/// Decide whether a failed compaction records the automatic-retry fingerprint (Annex A F03).
+///
+/// Cancellation and races where the history or settings changed before the failure do not
+/// describe the unchanged snapshot, so they never suppress the next automatic attempt.
+pub(super) fn records_auto_failure(
+    trigger: CompactionTrigger,
+    error: &CodexErr,
+    cancelled: bool,
+    snapshot_unchanged: bool,
+) -> bool {
+    matches!(trigger, CompactionTrigger::Auto)
+        && !cancelled
+        && snapshot_unchanged
+        && !matches!(
+            error.details(),
+            CodexErrorDetails::Interrupted | CodexErrorDetails::TurnAborted
+        )
+}
+
+/// Run one Normal V2 compaction (Annex A F01) and commit it through the session owner.
 pub(super) async fn run(
     sess: Arc<Session>,
     ctx: Arc<TurnContext>,
@@ -172,145 +203,261 @@ pub(super) async fn run(
         ));
     }
     let snapshot = sess.clone_history().await;
-    let originals = snapshot.annotated_items();
-    let history_hash = history_digest(originals).map_err(CodexErr::InvalidRequest)?;
-    let completed_work = prepare_completed_work(&sess, originals).await?;
+    let history_hash =
+        history_digest(snapshot.annotated_items()).map_err(CodexErr::InvalidRequest)?;
     let settings = sess.thread_settings_snapshot().await;
-    let base = sess.get_prompt_base_instructions().await;
-    let expected_base_text = sess.get_base_instructions().await.text;
+    let trigger = metadata.trigger();
+    if auto_retry_suppressed(
+        trigger,
+        sess.rencrow_auto_compaction_failed_hash().await.as_deref(),
+        &history_hash,
+    ) {
+        return Err(CodexErr::InvalidRequest(AUTO_RETRY_SUPPRESSED.into()));
+    }
+
+    let result = compact_normal(
+        &sess,
+        &ctx,
+        injection,
+        metadata,
+        &cancellation,
+        &activity,
+        &snapshot,
+        history_hash.clone(),
+        settings.clone(),
+    )
+    .await;
+    let outcome = match result {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let snapshot_unchanged = history_digest(sess.clone_history().await.annotated_items())
+                .is_ok_and(|current| current == history_hash)
+                && sess.thread_settings_snapshot().await == settings;
+            if records_auto_failure(
+                trigger,
+                &error,
+                cancellation.is_cancelled(),
+                snapshot_unchanged,
+            ) {
+                sess.set_rencrow_auto_compaction_failed_hash(Some(history_hash))
+                    .await;
+            }
+            return Err(error);
+        }
+    };
+    sess.set_rencrow_auto_compaction_failed_hash(/*hash*/ None)
+        .await;
+    sess.recompute_token_usage(&ctx).await;
+    sess.emit_turn_item_completed(&ctx, item).await;
+    sess.send_event(
+        &ctx,
+        EventMsg::Warning(WarningEvent {
+            message: format!(
+                "RenCrow compaction applied: {} instruction removals, {} completed results, {} new observations, {} model requests. Model {}.",
+                outcome.removals, outcome.results, outcome.observations, outcome.requests, outcome.model
+            ),
+        }),
+    )
+    .await;
+    Ok(outcome.summary)
+}
+
+/// Facts about one committed Normal compaction, reported after the durable commit.
+struct NormalOutcome {
+    summary: String,
+    removals: usize,
+    results: usize,
+    observations: usize,
+    requests: usize,
+    model: String,
+}
+
+/// Prepare, select, preflight, summarize, validate, and commit one Normal V2 candidate.
+///
+/// At most two model requests are sent: an optional instruction selection and one summary. Every
+/// failure leaves the live history unchanged; only `commit_rencrow_checkpoint` replaces it.
+#[allow(clippy::too_many_arguments)]
+async fn compact_normal(
+    sess: &Session,
+    ctx: &TurnContext,
+    injection: InitialContextInjection,
+    metadata: CompactionTurnMetadata,
+    cancellation: &tokio_util::sync::CancellationToken,
+    activity: &tokio::sync::watch::Receiver<crate::session::InputQueueActivity>,
+    snapshot: &crate::context_manager::ContextManager,
+    history_hash: String,
+    settings: codex_protocol::protocol::ThreadSettingsSnapshot,
+) -> CodexResult<NormalOutcome> {
+    let invalid = CodexErr::InvalidRequest;
+    let originals = snapshot.annotated_items();
+    let thread_id = sess.thread_id().to_string();
+
+    // Prepare.
+    let adopted = summary::find_adopted_v2_checkpoint(originals, &thread_id).map_err(invalid)?;
+    let (canonical, source_thread, active_call_ids) = load_canonical_rollout(sess).await?;
+    let prepared = codex_rollout::prepare_compaction_sources(
+        originals,
+        &canonical,
+        &source_thread,
+        &active_call_ids,
+    )
+    .map_err(|error| invalid(format!("RenCrow compaction blocked: {error}")))?;
+    let prompt_base = sess.get_prompt_base_instructions().await;
+    let base = sess.get_base_instructions().await;
     let expected_world = snapshot.world_state_checkpoint();
-    let (initial_context, world_state) = build_compaction_initial_context(&sess, &injection).await;
-    let binding = digest(&json!({"thread":sess.thread_id(),"turn":ctx.sub_id,"history":history_hash,"settings":settings,"base":expected_base_text,"world":expected_world})).map_err(CodexErr::InvalidRequest)?;
+    let (initial_context, world_state) = build_compaction_initial_context(sess, &injection).await;
+    let binding = digest(&json!({"thread":thread_id,"turn":ctx.sub_id,"history":history_hash,"settings":settings,"base":base.text,"world":expected_world})).map_err(invalid)?;
     let input = history::capture(
         originals,
         binding,
-        &sess.thread_id().to_string(),
-        vec![json!({"base":base,"settings":settings,"injection":initial_context.iter().map(|i| &i.item).collect::<Vec<_>>()})],
-        &completed_work,
+        &thread_id,
+        vec![json!({"base":prompt_base,"settings":settings,"injection":initial_context.iter().map(|i| &i.item).collect::<Vec<_>>()})],
+        &history::verified_pair_projections(&prepared),
     )
-    .map_err(CodexErr::InvalidRequest)?;
+    .map_err(invalid)?;
+    let (known_refs, previous_observations) = adopted
+        .as_ref()
+        .map(|adopted| {
+            (
+                adopted.metadata.applied_refs.as_slice(),
+                adopted.metadata.observations.as_slice(),
+            )
+        })
+        .unwrap_or_default();
+    let pruning = prune_known_obsolete(&input, known_refs).map_err(invalid)?;
+    let covered = previous_observations
+        .iter()
+        .map(|coverage| coverage.reference.clone())
+        .collect::<Vec<_>>();
+    let projections = observation::project_unhandled_observations(originals, &prepared, &covered)
+        .map_err(invalid)?;
+    let inventory = observation::cumulative_observation_coverage(
+        previous_observations,
+        &projections
+            .iter()
+            .map(|(_, _, projection)| projection.coverage.clone())
+            .collect::<Vec<_>>(),
+    )
+    .map_err(invalid)?;
+    let links = observation::build_completion_links(originals, &input, &pruning, &prepared)
+        .map_err(invalid)?;
+
+    // Select.
     let mut receipts = Vec::new();
-    let semantic_plan = requires_plan_inference(&input);
-    let proposed: ProposedPlan = if semantic_plan {
-        request(
-            &sess,
-            &ctx,
-            metadata,
-            "plan",
-            PLAN_PROMPT,
-            sources(&input),
-            &mut receipts,
-            &cancellation,
-        )
-        .await?
+    let (selection, presentation_hash) = if selection_required(
+        &input,
+        adopted.as_ref().map(|adopted| adopted.index),
+        &links,
+    ) {
+        let payload = collect_instruction_candidates(&input, &pruning, &links).map_err(invalid)?;
+        let selection =
+            select_obsolete_instructions(sess, ctx, metadata, payload, &mut receipts, cancellation)
+                .await?;
+        let presentation_hash = selection
+            .as_ref()
+            .map(|selection| selection.presentation_hash().to_owned());
+        (selection, presentation_hash)
     } else {
-        ProposedPlan { operations: vec![] }
+        (None, None)
     };
-    let plan = bind_plan(&input, proposed).map_err(CodexErr::InvalidRequest)?;
-    let plan_hash = plan
-        .hash()
-        .map_err(|error| CodexErr::InvalidRequest(format!("{error:?}")))?;
-    input
-        .view(
-            &plan,
-            &SemanticReview {
-                plan_hash: plan_hash.clone(),
-                accepted_operations: vec![],
-            },
-        )
-        .map_err(CodexErr::InvalidRequest)?;
-    let proposed: ProposedReview = if semantic_plan {
-        request(
-            &sess,
-            &ctx,
-            metadata,
-            "plan_review",
-            PLAN_REVIEW_PROMPT,
-            review_input(&input, &plan).map_err(CodexErr::InvalidRequest)?,
-            &mut receipts,
-            &cancellation,
-        )
-        .await?
-    } else {
-        ProposedReview {
-            accepted_operations: vec![],
-        }
-    };
-    let plan_review = SemanticReview {
-        plan_hash,
-        accepted_operations: proposed.accepted_operations,
-    };
-    let view = input
-        .view(&plan, &plan_review)
-        .map_err(CodexErr::InvalidRequest)?;
-    let summary_input = input
-        .summary_input(&view, &plan)
-        .map_err(CodexErr::InvalidRequest)?;
-    let proposed: ProposedSummary = request(
-        &sess,
-        &ctx,
+    let application =
+        validate_and_apply_selection(&input, &pruning, &links, selection).map_err(invalid)?;
+    let native = native::filter_retained_instructions(originals, &input, application.clone())
+        .map_err(invalid)?;
+
+    // Preflight.
+    let scope = ctx.config.model_auto_compact_token_limit_scope;
+    let limits = crate::session::context_window::context_window_token_status(sess, ctx).await;
+    candidate::preflight_compaction_floor(
+        snapshot,
+        &base,
+        &native,
+        &initial_context,
+        scope,
+        &limits,
+    )
+    .map_err(|error| invalid(format!("RenCrow compaction preflight failed: {error}")))?;
+
+    // Summarize.
+    let excerpts = projections
+        .iter()
+        .map(|(call_index, output_index, projection)| {
+            (*call_index, *output_index, projection.summary.clone())
+        })
+        .collect::<Vec<_>>();
+    let summary_history = summary::build_summary_history(
+        originals,
+        &input,
+        &native,
+        &excerpts,
+        summary::previous_summary_index(originals, adopted.as_ref()),
+    )
+    .map_err(invalid)?;
+    let (summary_suffix, response_id) = model_request::request_compaction_summary(
+        sess,
+        ctx,
         metadata,
-        "summary",
-        SUMMARY_PROMPT,
-        summary_input,
+        summary_history,
+        &application.results,
         &mut receipts,
-        &cancellation,
+        cancellation,
     )
     .await?;
-    let summary = input
-        .bind_summary(&view, proposed.text)
-        .map_err(CodexErr::InvalidRequest)?;
+    let summary_text = format!("{SUMMARY_PREFIX}\n{summary_suffix}");
+    let inventory_refs = inventory
+        .iter()
+        .map(|coverage| coverage.reference.clone())
+        .collect::<Vec<_>>();
+    let important = summary::important_refs_from_summary(&summary_suffix, &inventory_refs);
+
+    // Validate and commit.
+    let requests = receipts.len();
+    let model = ctx.model_info().slug.clone();
     let effort = sess
         .reasoning_effort_for_request(&ctx.initial_settings, RequestEffortUsage::Compaction)
         .await;
-    let invalidated_instructions = input
-        .invalidations(&plan, &view)
-        .map_err(CodexErr::InvalidRequest)?;
-    let summary_hash = digest(&summary).map_err(CodexErr::InvalidRequest)?;
-    let bundle = CandidateBundle {
-        version: 2,
-        input_hash: digest(&input).map_err(CodexErr::InvalidRequest)?,
-        plan,
-        plan_review,
-        summary_review: None,
-        summary,
-        summary_hash: Some(summary_hash),
-        model: ctx.model_info().slug.clone(),
-        effort: serde_json::to_string(&effort)
-            .map_err(|e| CodexErr::InvalidRequest(e.to_string()))?,
-        responses: receipts,
-    };
+    let checkpoint_metadata = candidate::fresh_checkpoint_metadata(
+        &summary_text,
+        input.snapshot().map_err(invalid)?.hash().to_owned(),
+        presentation_hash,
+        &application,
+        inventory,
+        important.refs,
+        receipts,
+        model.clone(),
+        effort,
+    );
     let mut replacement =
-        history::replacement(&input, &bundle, originals).map_err(CodexErr::InvalidRequest)?;
-    let summary_text = format!("{SUMMARY_PREFIX}\n{}", bundle.summary.text);
-    let mut summary_item = ResponseItemEnvelope::new(ContextualUserFragment::into(
-        CompactionSummary::new(&summary_text),
-    ));
+        native::build_native_replacement(&native, &summary_text, initial_context.clone())
+            .map_err(invalid)?;
+    let summary_item = replacement
+        .last_mut()
+        .ok_or_else(|| invalid("compaction replacement has no summary".into()))?;
     summary_item.set_turn_id_if_missing(&ctx.sub_id);
     summary_item
         .metadata
         .get_or_insert_default()
         .rencrow_compaction = Some(
-        json!({"version":1,"input_hash":bundle.input_hash,"view_hash":bundle.summary.view_hash,"invalidated_instructions":invalidated_instructions,"selection_mode":if semantic_plan { "model_review" } else { "deterministic_no_human_input" },"bundle":bundle}),
+        serde_json::to_value(&checkpoint_metadata)
+            .map_err(|error| invalid(format!("failed to encode compaction metadata: {error}")))?,
     );
-    replacement.push(summary_item);
-    if !initial_context.is_empty() {
-        replacement =
-            insert_initial_context_before_last_real_user_or_summary(replacement, initial_context);
-    }
+    candidate::validate_compaction_candidate(
+        snapshot,
+        &base,
+        &native,
+        &initial_context,
+        &replacement,
+        &thread_id,
+        scope,
+        &limits,
+    )
+    .map_err(|error| invalid(format!("RenCrow compaction candidate rejected: {error}")))?;
     let reference_context = match injection {
         InitialContextInjection::DoNotInject => None,
         InitialContextInjection::BeforeLastUserMessage { step_context, .. } => {
             Some(step_context.to_turn_context_item())
         }
     };
-    let response_id = bundle
-        .responses
-        .last()
-        .and_then(|value| value["response_id"].as_str())
-        .ok_or_else(|| CodexErr::InvalidRequest("missing compaction response receipt".into()))?
-        .to_owned();
-    validate_completed_work(&sess, originals, &completed_work).await?;
     sess.commit_rencrow_checkpoint(
         crate::session::RenCrowCheckpoint {
             items: replacement,
@@ -321,303 +468,51 @@ pub(super) async fn run(
             summary: summary_text,
             response_id,
             expected_turn: ctx.sub_id.clone(),
-            expected_base_text,
+            expected_base_text: base.text,
             expected_world,
         },
-        &activity,
+        activity,
     )
     .await?;
-    sess.recompute_token_usage(&ctx).await;
-    sess.emit_turn_item_completed(&ctx, item).await;
-    sess.send_event(&ctx, EventMsg::Warning(WarningEvent { message: format!("RenCrow compaction applied: {} approved removals/results; {} protected records retained. Model {}.", view.applied_operations.len(), input.records.iter().filter(|r| r.opaque.is_some()).count(), bundle.model) })).await;
-    Ok(bundle.summary.text)
-}
-
-async fn prepare_completed_work(
-    sess: &Session,
-    originals: &[ResponseItemEnvelope],
-) -> CodexResult<Vec<history::CompletedWorkProjection>> {
-    let mut pending = Vec::new();
-    let mut references = Vec::new();
-    let expected_thread = sess.thread_id().to_string();
-    for index in 0..originals.len() {
-        match codex_history::archive_reference::classify_output(originals, index)
-            .map_err(CodexErr::InvalidRequest)?
-        {
-            ArchiveOutputDecision::Ineligible => {}
-            ArchiveOutputDecision::Existing(reference) => {
-                validate_existing_archive_marker(&originals[index], &expected_thread, &reference)
-                    .map_err(CodexErr::InvalidRequest)?;
-                references.push((index, reference.clone()));
-                if let Some(call_index) =
-                    unique_selected_call_index(originals, index, &reference.call_id)
-                {
-                    pending.push((call_index, index, Some(reference)));
-                }
-            }
-            ArchiveOutputDecision::Eligible(candidate) => {
-                if let Some(call_index) =
-                    unique_selected_call_index(originals, candidate.index, &candidate.call_id)
-                {
-                    pending.push((call_index, candidate.index, None));
-                }
-            }
-        }
-    }
-    if pending.is_empty() && references.is_empty() {
-        return Ok(Vec::new());
-    }
-    let rollout_path = sess.current_rollout_path().await.map_err(|error| {
-        CodexErr::InvalidRequest(format!("archive source unavailable: {error}"))
-    })?;
-    if rollout_path.is_none() && references.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let (items, source_thread, active_call_ids) = load_archive_source(sess).await?;
-    for (index, reference) in &references {
-        validate_existing_archive_marker(&originals[*index], &expected_thread, reference)
-            .map_err(CodexErr::InvalidRequest)?;
-        codex_rollout::resolve_archive_evidence_from_items(
-            &items,
-            &source_thread,
-            &reference.call_id,
-            None,
-            Some(reference),
-            &active_call_ids,
-        )
-        .map_err(blocked_archive_error)?;
-    }
-
-    let mut projections = Vec::new();
-    for (call_index, output_index, reference) in pending {
-        let call = &originals[call_index];
-        let output = &originals[output_index];
-        let call_id = match &call.item {
-            ResponseItem::FunctionCall { call_id, .. } => call_id.as_str(),
-            _ => continue,
-        };
-        let evidence = codex_rollout::evidence::resolve_completed_work_evidence_from_items(
-            &items,
-            &source_thread,
-            call_id,
-            call,
-            reference.is_none().then_some(output),
-            reference.as_ref(),
-            &active_call_ids,
-        );
-        let evidence = match evidence {
-            Ok(evidence) => evidence,
-            Err(codex_rollout::evidence::ArchiveEvidenceError::Ineligible(_)) => continue,
-            Err(error) => return Err(blocked_archive_error(error)),
-        };
-        let output_text = match &output.item {
-            ResponseItem::FunctionCallOutput { output, .. } => output.body.to_text(),
-            _ => None,
-        };
-        let Some(output_text) = output_text else {
-            continue;
-        };
-        let call_text = completed_work_call_text(call, &evidence, reference.is_some())
-            .map_err(CodexErr::InvalidRequest)?;
-        let output_text = completed_work_output_text(call, &evidence, &output_text)
-            .map_err(CodexErr::InvalidRequest)?;
-        projections.push(history::CompletedWorkProjection {
-            call_index,
-            output_index,
-            call_text,
-            output_text,
-        });
-    }
-    Ok(projections)
-}
-
-fn unique_selected_call_index(
-    originals: &[ResponseItemEnvelope],
-    output_index: usize,
-    call_id: &str,
-) -> Option<usize> {
-    let matching_outputs = originals
-        .iter()
-        .filter(|envelope| {
-            matches!(
-                &envelope.item,
-                ResponseItem::FunctionCallOutput {
-                    call_id: Some(candidate),
-                    ..
-                } if candidate == call_id
-            )
-        })
-        .count();
-    if matching_outputs != 1 {
-        return None;
-    }
-    let mut matching_call_index = None;
-    for (index, envelope) in originals.iter().enumerate() {
-        if matches!(&envelope.item, ResponseItem::FunctionCall { call_id: candidate, .. } if candidate == call_id)
-        {
-            if matching_call_index.replace(index).is_some() {
-                return None;
-            }
-        }
-    }
-    matching_call_index.filter(|index| {
-        output_index < originals.len()
-            && matches!(
-                &originals[*index].item,
-                ResponseItem::FunctionCall { name, .. } if name == "exec_command"
-            )
+    Ok(NormalOutcome {
+        summary: summary_suffix,
+        removals: application
+            .pruning
+            .applied
+            .len()
+            .saturating_sub(pruning.applied.len()),
+        results: application.results.len(),
+        observations: projections.len(),
+        requests,
+        model,
     })
 }
 
-fn completed_work_call_text(
-    call: &ResponseItemEnvelope,
-    evidence: &codex_rollout::evidence::ArchiveEvidence,
-    existing_reference: bool,
-) -> Result<String, String> {
-    let ResponseItem::FunctionCall {
-        call_id,
-        name,
-        arguments,
-        ..
-    } = &call.item
-    else {
-        return Err("completed work call changed type".into());
-    };
-    let mut record = json!({
-        "call_id": call_id,
-        "tool": name,
-        "arguments": arguments,
-        "status": evidence.reference.status,
-        "exit_code": evidence.reference.exit_code,
-    });
-    if existing_reference {
-        record["retrieval_argv"] = json!(evidence.reference.retrieval_argv());
-    }
-    serde_json::to_string(&record).map_err(|_| "failed to encode completed work call".into())
-}
-
-fn completed_work_output_text(
-    call: &ResponseItemEnvelope,
-    evidence: &codex_rollout::evidence::ArchiveEvidence,
-    result: &str,
-) -> Result<String, String> {
-    let ResponseItem::FunctionCall { call_id, name, .. } = &call.item else {
-        return Err("completed work call changed type".into());
-    };
-    serde_json::to_string(&json!({
-        "call_id": call_id,
-        "tool": name,
-        "status": evidence.reference.status,
-        "exit_code": evidence.reference.exit_code,
-        "result": result,
-    }))
-    .map_err(|_| "failed to encode completed work output".into())
-}
-
-async fn validate_completed_work(
-    sess: &Session,
-    originals: &[ResponseItemEnvelope],
-    completed_work: &[history::CompletedWorkProjection],
-) -> CodexResult<()> {
-    let references = originals
-        .iter()
-        .enumerate()
-        .filter_map(|(index, envelope)| {
-            envelope
-                .metadata
-                .as_ref()
-                .and_then(|metadata| metadata.rencrow_archive_reference.as_ref())
-                .map(|reference| (index, reference))
-        })
-        .collect::<Vec<_>>();
-    if references.is_empty() && completed_work.is_empty() {
-        return Ok(());
-    }
-    let (items, source_thread, active_call_ids) = load_archive_source(sess).await?;
-    for (index, reference) in &references {
-        validate_existing_archive_marker(
-            &originals[*index],
-            &sess.thread_id().to_string(),
-            reference,
-        )
-        .map_err(CodexErr::InvalidRequest)?;
-        codex_rollout::resolve_archive_evidence_from_items(
-            &items,
-            &source_thread,
-            &reference.call_id,
-            None,
-            Some(reference),
-            &active_call_ids,
-        )
-        .map_err(blocked_archive_error)?;
-    }
-    for pair in completed_work {
-        let call = originals
-            .get(pair.call_index)
-            .ok_or_else(|| CodexErr::InvalidRequest("completed work call disappeared".into()))?;
-        let output = originals
-            .get(pair.output_index)
-            .ok_or_else(|| CodexErr::InvalidRequest("completed work output disappeared".into()))?;
-        let call_id = match &call.item {
-            ResponseItem::FunctionCall { call_id, .. } => call_id,
-            _ => {
-                return Err(CodexErr::InvalidRequest(
-                    "completed work call changed type".into(),
-                ));
-            }
-        };
-        let reference = output
-            .metadata
-            .as_ref()
-            .and_then(|metadata| metadata.rencrow_archive_reference.as_ref());
-        let evidence = codex_rollout::evidence::resolve_completed_work_evidence_from_items(
-            &items,
-            &source_thread,
-            call_id,
-            call,
-            reference.is_none().then_some(output),
-            reference,
-            &active_call_ids,
-        )
-        .map_err(blocked_archive_error)?;
-        let result_text = match &output.item {
-            ResponseItem::FunctionCallOutput { output, .. } => output.body.to_text(),
-            _ => None,
-        }
-        .ok_or_else(|| CodexErr::InvalidRequest("completed work output changed type".into()))?;
-        if completed_work_call_text(call, &evidence, reference.is_some())
-            .map_err(CodexErr::InvalidRequest)?
-            != pair.call_text
-            || completed_work_output_text(call, &evidence, &result_text)
-                .map_err(CodexErr::InvalidRequest)?
-                != pair.output_text
-        {
-            return Err(CodexErr::InvalidRequest(
-                "completed work evidence changed before checkpoint".into(),
-            ));
-        }
-    }
-    Ok(())
-}
-
-async fn load_archive_source(
+/// Load the canonical rollout once for this compaction (Annex A F04).
+///
+/// Without persisted rollout storage no pair can be verified, so every tool item stays protected;
+/// existing archive references then fail closed in `prepare_compaction_sources`.
+async fn load_canonical_rollout(
     sess: &Session,
 ) -> CodexResult<(
     Vec<codex_history::RolloutItem>,
     codex_protocol::ThreadId,
     HashSet<String>,
 )> {
-    let path = sess
-        .current_rollout_path()
+    let active_call_ids = sess
+        .list_background_terminals()
         .await
-        .map_err(|error| CodexErr::InvalidRequest(format!("archive source unavailable: {error}")))?
-        .ok_or_else(|| {
-            CodexErr::InvalidRequest(
-                "RenCrow compaction blocked: archive references require persisted rollout storage"
-                    .into(),
-            )
-        })?;
+        .into_iter()
+        .map(|terminal| terminal.item_id)
+        .collect();
+    let Some(path) = sess.current_rollout_path().await.map_err(|error| {
+        CodexErr::InvalidRequest(format!(
+            "RenCrow compaction blocked: rollout unavailable: {error}"
+        ))
+    })?
+    else {
+        return Ok((Vec::new(), sess.thread_id(), active_call_ids));
+    };
     sess.flush_rollout().await.map_err(|error| {
         CodexErr::InvalidRequest(format!(
             "RenCrow compaction blocked: rollout flush failed: {error}"
@@ -645,53 +540,7 @@ async fn load_archive_source(
             "RenCrow compaction blocked: rollout thread does not match live session".into(),
         ));
     }
-    let active_call_ids = sess
-        .list_background_terminals()
-        .await
-        .into_iter()
-        .map(|terminal| terminal.item_id)
-        .collect();
     Ok((items, thread_id, active_call_ids))
-}
-
-fn validate_existing_archive_marker(
-    envelope: &ResponseItemEnvelope,
-    expected_thread: &str,
-    reference: &ArchiveReference,
-) -> Result<(), String> {
-    codex_history::archive_reference::validate_marker(envelope, expected_thread, reference)
-}
-
-fn blocked_archive_error(error: codex_rollout::evidence::ArchiveEvidenceError) -> CodexErr {
-    CodexErr::InvalidRequest(format!("RenCrow compaction blocked: {error}"))
-}
-
-async fn request<T: DeserializeOwned>(
-    sess: &Session,
-    ctx: &TurnContext,
-    metadata: CompactionTurnMetadata,
-    stage: &str,
-    instruction: &str,
-    data: Value,
-    receipts: &mut Vec<Value>,
-    cancellation: &tokio_util::sync::CancellationToken,
-) -> CodexResult<T> {
-    let (response, seconds) = model_request::drain_compaction_stage(
-        sess,
-        ctx,
-        metadata,
-        stage,
-        model_request::json_stage_input(instruction, &data),
-        cancellation,
-    )
-    .await?;
-    let text = model_request::json_stage_text(response.output)?;
-    let rate = response
-        .token_usage
-        .as_ref()
-        .map(|usage| usage.output_tokens as f64 / seconds);
-    receipts.push(json!({"stage":stage,"response_id":response.response_id,"seconds":seconds,"usage":response.token_usage,"output_tok_per_wall_second":rate}));
-    model_request::parse_json_stage(stage, &text)
 }
 
 #[cfg(test)]

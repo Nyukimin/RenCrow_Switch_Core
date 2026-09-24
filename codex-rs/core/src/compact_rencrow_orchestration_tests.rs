@@ -136,7 +136,10 @@ fn model_items(envelopes: &[ResponseItemEnvelope]) -> Vec<&ResponseItem> {
 }
 
 fn item_id(envelope: &ResponseItemEnvelope) -> Option<&str> {
-    envelope.item.id().map(|id| id.as_str())
+    envelope
+        .item
+        .id()
+        .map(codex_protocol::ResponseItemId::as_str)
 }
 
 #[test]
@@ -161,6 +164,41 @@ fn v2_summary_projection_uses_one_adopted_summary_and_only_later_ordinary_work()
     assert!(!ids.contains(&"old-work"));
     assert!(projected.iter().any(|item| item == &request));
     assert!(projected.iter().any(|item| item == &later_work));
+}
+
+#[test]
+fn v2_first_compaction_shows_the_latest_legacy_summary_once() {
+    let legacy_body = format!("{SUMMARY_PREFIX}\nlegacy verified state");
+    let mut legacy = message("user", &legacy_body, "legacy-summary");
+    legacy.metadata.get_or_insert_default().rencrow_compaction =
+        Some(json!({"version": 1, "invalidated_instructions": []}));
+    let request = human("keep this request", "human-request");
+    let later_work = message("assistant", "new work after legacy checkpoint", "new-work");
+    let originals = vec![legacy, request, later_work];
+    assert_eq!(
+        super::summary::find_adopted_v2_checkpoint(&originals, THREAD_ID),
+        Ok(None)
+    );
+    let previous = super::summary::previous_summary_index(&originals, /*adopted*/ None);
+    assert_eq!(previous, Some(0));
+    let input = candidate_input(&originals, &[]);
+    let native =
+        super::native::filter_retained_instructions(&originals, &input, application(&input))
+            .unwrap();
+
+    let projected =
+        super::summary::build_summary_history(&originals, &input, &native, &[], previous).unwrap();
+
+    assert_eq!(
+        projected.iter().filter_map(item_id).collect::<Vec<_>>(),
+        vec!["legacy-summary", "human-request", "new-work"]
+    );
+    let replacement = super::native::build_native_replacement(&native, "summary", vec![]).unwrap();
+    assert!(
+        !replacement
+            .iter()
+            .any(|item| item_id(item) == Some("legacy-summary"))
+    );
 }
 
 #[test]
@@ -676,7 +714,7 @@ fn v2_important_refs_do_not_promote_an_inventory_without_explicit_markers() {
             let call_id = format!("call-{index}");
             ObservationReference::new(
                 THREAD_ID,
-                call_id.clone(),
+                call_id,
                 content_sha256(&format!("output-{index}")),
             )
         })
@@ -1046,7 +1084,7 @@ fn v2_known_pruning_applies_adopted_refs_only_while_their_source_text_is_unchang
         first_application,
     )
     .unwrap();
-    let pruned = native.summary_human_messages().next().unwrap().clone();
+    let pruned = native.retained_native_items().next().unwrap().clone();
     let summary = with_compaction_metadata(checkpoint_summary("state"), |metadata| {
         metadata["applied_refs"] = json!([source]);
     });
@@ -1211,7 +1249,7 @@ fn v2_completion_links_skip_pruned_humans_and_unattributed_tool_activity() {
         Ok(vec![])
     );
 
-    let mut unattributed = linked.clone();
+    let mut unattributed = linked;
     unattributed.push(function_call("call-without-turn", call));
     let input = candidate_input(&unattributed, &completed);
     assert_eq!(
@@ -1244,7 +1282,7 @@ fn v2_selection_is_required_only_for_new_humans_or_completion_links() {
         &[]
     ));
 
-    let mut with_new_human = originals.clone();
+    let mut with_new_human = originals;
     with_new_human.push(human("New request.", "human-new"));
     assert!(super::selection_required(
         &candidate_input(&with_new_human, &[]),
@@ -1279,7 +1317,7 @@ fn host_selection(
     )
 }
 
-fn human_texts<'a>(items: &'a [ResponseItemEnvelope]) -> Vec<(Option<&'a str>, String)> {
+fn human_texts(items: &[ResponseItemEnvelope]) -> Vec<(Option<&str>, String)> {
     items
         .iter()
         .filter(|item| {

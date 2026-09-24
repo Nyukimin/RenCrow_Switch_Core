@@ -596,8 +596,62 @@ fn completed_command_terminal<'a>(
     Ok(terminals[0])
 }
 
+/// Compare two items as persisted in rollout.
+///
+/// `FunctionCallOutputPayload::success` is internal metadata that rollout never serializes, so a
+/// live output and its canonical copy may differ only there. Every persisted field stays bound; the
+/// output fields are listed exhaustively so a new field must be classified here.
 pub(super) fn same_persisted_item(actual: &ResponseItem, expected: &ResponseItem) -> bool {
-    actual == expected
+    match (actual, expected) {
+        (
+            ResponseItem::FunctionCallOutput {
+                id: actual_id,
+                call_id: actual_call_id,
+                name: actual_name,
+                namespace: actual_namespace,
+                output: actual_output,
+                internal_chat_message_metadata_passthrough: actual_passthrough,
+            },
+            ResponseItem::FunctionCallOutput {
+                id: expected_id,
+                call_id: expected_call_id,
+                name: expected_name,
+                namespace: expected_namespace,
+                output: expected_output,
+                internal_chat_message_metadata_passthrough: expected_passthrough,
+            },
+        ) => {
+            actual_id == expected_id
+                && actual_call_id == expected_call_id
+                && actual_name == expected_name
+                && actual_namespace == expected_namespace
+                && actual_output.body == expected_output.body
+                && actual_passthrough == expected_passthrough
+        }
+        (
+            ResponseItem::CustomToolCallOutput {
+                id: actual_id,
+                call_id: actual_call_id,
+                name: actual_name,
+                output: actual_output,
+                internal_chat_message_metadata_passthrough: actual_passthrough,
+            },
+            ResponseItem::CustomToolCallOutput {
+                id: expected_id,
+                call_id: expected_call_id,
+                name: expected_name,
+                output: expected_output,
+                internal_chat_message_metadata_passthrough: expected_passthrough,
+            },
+        ) => {
+            actual_id == expected_id
+                && actual_call_id == expected_call_id
+                && actual_name == expected_name
+                && actual_output.body == expected_output.body
+                && actual_passthrough == expected_passthrough
+        }
+        _ => actual == expected,
+    }
 }
 
 pub(super) fn same_output_identity_ignoring_body(
@@ -633,8 +687,9 @@ pub(super) fn same_output_identity_ignoring_body(
     }
 }
 
-/// Compare a fresh text output after allowing only its text body to differ. Success, identity,
-/// passthrough, and every other typed field remain bound to the canonical rollout item.
+/// Compare a fresh text output after allowing only its text body to differ. Identity,
+/// passthrough, and every other persisted typed field remain bound to the canonical rollout item;
+/// the unpersisted `success` flag is not compared (see `same_persisted_item`).
 pub(super) fn same_fresh_output_except_text_body(
     actual: &ResponseItem,
     expected: &ResponseItem,
@@ -668,7 +723,6 @@ pub(super) fn same_fresh_output_except_text_body(
                 && actual_call_id == expected_call_id
                 && actual_name == expected_name
                 && actual_namespace == expected_namespace
-                && actual_output.success == expected_output.success
                 && actual_passthrough == expected_passthrough
         }
         (
@@ -696,7 +750,6 @@ pub(super) fn same_fresh_output_except_text_body(
             ) && actual_id == expected_id
                 && actual_call_id == expected_call_id
                 && actual_name == expected_name
-                && actual_output.success == expected_output.success
                 && actual_passthrough == expected_passthrough
         }
         _ => false,

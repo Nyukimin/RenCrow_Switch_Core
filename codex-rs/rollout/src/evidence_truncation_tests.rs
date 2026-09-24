@@ -180,6 +180,55 @@ fn fresh_custom_pair_accepts_exact_live_truncation_and_keeps_raw_reference() {
 }
 
 #[test]
+fn fresh_pairs_ignore_the_unpersisted_success_flag_of_live_outputs() {
+    // Rollout never serializes `success`, so every canonical output reads back as `None` while a
+    // live output keeps the flag set by the tool runtime.
+    let thread = ThreadId::from_u128(41_013);
+    let budget = 128;
+    let raw = "output whose center is removed by history truncation ".repeat(700);
+    for (call_id, custom, success, truncated) in [
+        ("exact-success", false, Some(true), false),
+        ("exact-failure", false, Some(false), false),
+        ("truncated-success", false, Some(true), true),
+        ("custom-truncated-failure", true, Some(false), true),
+    ] {
+        let (call, written) = if custom {
+            (custom_call(call_id), custom_output(call_id, &raw))
+        } else {
+            (function_call(call_id), function_output(call_id, &raw))
+        };
+        let written = with_history_budget(written, Some(budget));
+        let mut canonical_output = ResponseItemEnvelope::new(
+            serde_json::from_value(serde_json::to_value(&written.item).unwrap()).unwrap(),
+        );
+        canonical_output.metadata = written.metadata.clone();
+        let mut live_output = if truncated {
+            truncate_live_output(written, budget)
+        } else {
+            written
+        };
+        match &mut live_output.item {
+            ResponseItem::FunctionCallOutput { output, .. }
+            | ResponseItem::CustomToolCallOutput { output, .. } => output.success = success,
+            _ => unreachable!(),
+        }
+        let selected = vec![call.clone(), live_output];
+        let canonical = vec![
+            RolloutItem::ResponseItem(call),
+            RolloutItem::ResponseItem(canonical_output),
+        ];
+
+        let prepared =
+            super::prepare_compaction_sources(&selected, &canonical, &thread, &HashSet::new())
+                .unwrap();
+
+        assert_eq!(prepared.pairs.len(), 1, "{call_id}");
+        assert_eq!(prepared.pairs[0].reference.sha256, content_sha256(&raw));
+        assert!(prepared.protected_indices.is_empty(), "{call_id}");
+    }
+}
+
+#[test]
 fn fresh_pairs_reject_missing_budget_and_any_noncanonical_change() {
     let thread = ThreadId::from_u128(41_012);
     let budget = 128;
@@ -235,39 +284,10 @@ fn fresh_pairs_reject_missing_budget_and_any_noncanonical_change() {
         canonical_output,
     );
 
-    let canonical_call = function_call("changed-success");
-    let canonical_output =
-        with_history_budget(function_output("changed-success", &raw), Some(budget));
-    let mut live_output = truncate_live_output(canonical_output.clone(), budget);
-    if let ResponseItem::FunctionCallOutput { output, .. } = &mut live_output.item {
-        output.success = Some(false);
-    }
-    assert_protected(
-        &thread,
-        canonical_call.clone(),
-        canonical_call,
-        live_output,
-        canonical_output,
-    );
-
     let canonical_call = function_call("invented-body");
     let canonical_output =
         with_history_budget(function_output("invented-body", &raw), Some(budget));
     let selected_output = function_output("invented-body", "invented replacement");
-    assert_protected(
-        &thread,
-        canonical_call.clone(),
-        canonical_call,
-        selected_output,
-        canonical_output,
-    );
-
-    let canonical_call = custom_call("custom-success");
-    let canonical_output = with_history_budget(custom_output("custom-success", &raw), Some(budget));
-    let mut selected_output = truncate_live_output(canonical_output.clone(), budget);
-    if let ResponseItem::CustomToolCallOutput { output, .. } = &mut selected_output.item {
-        output.success = Some(false);
-    }
     assert_protected(
         &thread,
         canonical_call.clone(),

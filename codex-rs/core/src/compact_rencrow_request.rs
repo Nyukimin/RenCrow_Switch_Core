@@ -134,7 +134,6 @@ pub(super) fn parse_json_stage<T: DeserializeOwned>(stage: &str, text: &str) -> 
 /// The summary history is normalized by the original `for_prompt` and executed-tool attachment,
 /// followed by host-validated completed results and the summary instruction. The result item is
 /// request-only input and never enters replacement history.
-#[allow(dead_code)]
 pub(super) async fn request_compaction_summary(
     sess: &Session,
     ctx: &TurnContext,

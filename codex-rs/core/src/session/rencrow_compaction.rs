@@ -45,6 +45,19 @@ impl Session {
         Ok(())
     }
 
+    /// History digest whose automatic compaction already failed in this session (Annex A F03).
+    pub(crate) async fn rencrow_auto_compaction_failed_hash(&self) -> Option<String> {
+        self.state
+            .lock()
+            .await
+            .rencrow_auto_compaction_failed_hash
+            .clone()
+    }
+
+    pub(crate) async fn set_rencrow_auto_compaction_failed_hash(&self, hash: Option<String>) {
+        self.state.lock().await.rencrow_auto_compaction_failed_hash = hash;
+    }
+
     pub(super) async fn bind_rencrow_intake(
         &self,
         ctx: &TurnContext,

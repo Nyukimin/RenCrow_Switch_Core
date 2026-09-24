@@ -52,6 +52,17 @@ fn application(
     }
 }
 
+/// Retained envelopes whose captured record is a verified Human.
+fn human_envelopes<'a>(
+    projection: &'a NativeProjection,
+    captured: &'a CandidateInput,
+) -> impl Iterator<Item = &'a ResponseItemEnvelope> {
+    projection
+        .retained_by_original_index()
+        .filter(|(index, _)| captured.records[*index].origin == Origin::Human)
+        .map(|(_, envelope)| envelope)
+}
+
 fn text(envelope: &ResponseItemEnvelope) -> Option<String> {
     let ResponseItem::Message { content, .. } = &envelope.item else {
         return None;
@@ -121,9 +132,9 @@ fn v2_native_projection_unicode_removal_spans_parts_and_borrows_the_same_human_p
     let projection =
         filter_retained_instructions(&items, &captured, application(&captured, &[source])).unwrap();
 
-    assert_eq!(projection.summary_human_messages().count(), 1);
+    assert_eq!(human_envelopes(&projection, &captured).count(), 1);
     assert_eq!(
-        text(projection.summary_human_messages().next().unwrap()).as_deref(),
+        text(human_envelopes(&projection, &captured).next().unwrap()).as_deref(),
         Some("keep🙂")
     );
     let rebuilt = build_native_replacement(&projection, "summary", vec![]).unwrap();
@@ -191,8 +202,7 @@ fn v2_native_projection_oversized_user_text_is_not_cut_by_the_original_fixed_bud
     let projection =
         filter_retained_instructions(&items, &captured, application(&captured, &[])).unwrap();
     assert_eq!(
-        projection
-            .summary_human_messages()
+        human_envelopes(&projection, &captured)
             .next()
             .unwrap()
             .item
@@ -246,7 +256,7 @@ fn v2_native_projection_summary_prefix_is_not_provenance_for_dropping_or_promoti
     assert_eq!(text(&rebuilt[1]).as_deref(), Some(human_prefix.as_str()));
     assert_eq!(rebuilt[0].item.id().unwrap().as_str(), "prefix-human");
     assert_eq!(rebuilt[1].item.id().unwrap().as_str(), "prefix-unknown");
-    assert_eq!(projection.summary_human_messages().count(), 1);
+    assert_eq!(human_envelopes(&projection, &captured).count(), 1);
 }
 
 #[test]
@@ -379,7 +389,7 @@ fn v2_native_projection_native_and_snapshot_mismatch_or_unstable_removal_ids_fai
     let item = human("old passage and current", "native-id");
     let mut captured = input(std::slice::from_ref(&item));
     captured.records[0].id = "item-0".into();
-    let err = filter_retained_instructions(&[item.clone()], &captured, application(&captured, &[]))
+    let err = filter_retained_instructions(&[item], &captured, application(&captured, &[]))
         .err()
         .expect("native/candidate identity mismatch must fail closed");
     assert!(err.contains("identity"));

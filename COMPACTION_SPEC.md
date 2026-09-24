@@ -4785,24 +4785,24 @@ RenCrow Switch Core Compaction V2の役割は、
 
 性能最適化と実装簡素化は、その目的を守れる範囲でのみ行う。
 
-# 第3部 現在の実装状態（2026-09-24、HEAD 458121d2f）
+# 第3部 現在の実装状態（2026-09-24）
 
-第2部 §70のPhase 1は項目1〜12（下記「Phase 1の進捗」）まで実装し、Phase 2〜6は未着手。本部は第4部「第2版の実装契約」の8責務とsourceの対応だけを示す。工程別の検査・証拠・未解決の指摘は私有の`target/fork-bootstrap/compaction-check-plan.json`（`v2`）が正本であり、ここへ複製しない。
+第2部 §70のPhase 1（項目1〜13、下記「Phase 1の進捗」）を実装した。Phase 2〜6は未着手。本部は第4部「第2版の実装契約」の8責務とsourceの対応だけを示す。工程別の検査・証拠・未解決の指摘は私有の`target/fork-bootstrap/compaction-check-plan.json`（`v2`）が正本であり、ここへ複製しない。
 
-`rencrow_compaction = true`で実行されるのは、現在も旧Fork経路の`compact::rencrow::run`（`codex-rs/core/src/compact_rencrow.rs`）である。owner復元済み履歴をcaptureし、本人入力がある場合だけplan・plan reviewを要求し、要約を1要求で生成し、既存の`commit_rencrow_checkpoint`で保存する。V2の①〜⑧はこの経路から呼ばれていない。上表の差込位置である元のlocal要約loopへの統合と、旧Fork経路の置換は未実装。
+`rencrow_compaction = true`で実行されるのは、項目13で置き換えたNormal V2の`compact::rencrow::run`（`codex-rs/core/src/compact_rencrow.rs`、付属A F01の処理順）である。model requestは必要時だけのSelectionと要約の最大2回で、既存の`commit_rencrow_checkpoint`だけが履歴を置き換える。旧Fork経路のplan・plan review・要約の3要求と完了済みexecの独自投影は除去し、fallbackとして残していない。Level 2（Emergency）と失敗時の振分けは未実装で、Normalが失敗した場合は履歴を変えずにエラーを返す（Phase 3）。
 
 |順序|実装位置（`codex-rs/`配下）|状態|
 |---|---|---|
-|1|`rollout/src/evidence.rs::prepare_compaction_sources`、共有索引`ObservationIndex`|実装済み・受入再開中（`encrypted_function_args`保護の独立検証待ち）。runtime未接続。現行runtimeの完了済みexec投影は、選択履歴と正本の完全一致だけを受理する`resolve_completed_work_evidence_from_items`を使い、下記「通常履歴の切詰めと原文照合」の照合は通らない|
-|2|`history/src/compaction_preprocess.rs::prune_known_obsolete`、`history/src/observation_projection.rs::project_observation`|単体受入。runtime未接続|
-|3|`history/src/compaction_preprocess.rs::collect_instruction_candidates`|hostが検証した明示link（`InstructionObservationLink`）だけを受け取る方式で単体受入。同scope・後続順によるtool本文の追加はしない。linkを作るcore側の処理（同turnのHuman 1件・exec 1組の判定）は未実装|
-|4|`core/src/compact_rencrow.rs::select_obsolete_instructions`|単体受入。呼出し元なし（`dead_code`）|
-|5|`history/src/compaction_selection.rs::validate_and_apply_selection`|単体受入。runtime未接続|
-|6|`core/src/compact_rencrow_native.rs::filter_retained_instructions`、`build_native_replacement`|単体受入。runtime未接続|
-|7|`core/src/compact_rencrow_candidate.rs::validate_compaction_candidate`|candidate検証は単体受入・未接続。usage由来の区別、window採用、resume/fork時の再計数はsessionへ実装済みで、現行Fork経路でも`rencrow_compaction = true`時に有効（下記の⑦・例外2〜4の各節）|
+|1|`rollout/src/evidence.rs::prepare_compaction_sources`、共有索引`ObservationIndex`|実装済み・受入再開中（`encrypted_function_args`保護の独立検証待ち）。runtime接続済み（項目13、1回の圧縮で正本rolloutを1回だけ読む）。保存されない`success`欄の照合を項目13で修正した（下記）|
+|2|`history/src/compaction_preprocess.rs::prune_known_obsolete`、`history/src/observation_projection.rs::project_observation`|単体受入。runtime接続済み（項目13）|
+|3|`history/src/compaction_preprocess.rs::collect_instruction_candidates`|hostが検証した明示link（`InstructionObservationLink`）だけを受け取る方式で単体受入。同scope・後続順によるtool本文の追加はしない。linkを作るcore側の処理は`build_completion_links`（項目7）。runtime接続済み（項目13）|
+|4|`core/src/compact_rencrow.rs::select_obsolete_instructions`|単体受入。runtime接続済み（項目13、`selection_required`の場合だけ）|
+|5|`history/src/compaction_selection.rs::validate_and_apply_selection`|単体受入。runtime接続済み（項目13）|
+|6|`core/src/compact_rencrow_native.rs::filter_retained_instructions`、`build_native_replacement`|単体受入。runtime接続済み（項目13）。旧V1の`history::replacement`は削除した|
+|7|`core/src/compact_rencrow_candidate.rs::validate_compaction_candidate`|candidate検証は単体受入・runtime接続済み（項目13、commit直前）。usage由来の区別、window採用、resume/fork時の再計数はsessionへ実装済みで、現行Fork経路でも`rencrow_compaction = true`時に有効（下記の⑦・例外2〜4の各節）|
 |8|`rollout/src/evidence/observation_index.rs::ObservationIndex::resolve_range`、`rollout/src/evidence/compaction_inventory.rs::inventory_compaction_from_items`|rollout libraryに実装、受入未完了。`read_observation`という名前の関数はない。CLIの範囲取得引数と`inventory`は未追加（`cli/src/bin/rencrow_compaction/f08_cli_tests.rs`は未登録）|
 
-統合部分の`core/src/compact_rencrow_summary.rs`（`build_summary_history`、`summary_suffix_from_staged_output`、`important_refs_from_summary`、`should_apply_server_reasoning_included`）は、2026-09-24にPhase 1 Step 1として実装した（下記「Phase 1の進捗」）。runtime（`compact::rencrow::run`）からはまだ呼ばれていない。
+統合部分の`core/src/compact_rencrow_summary.rs`（`build_summary_history`、`summary_suffix_from_staged_output`、`important_refs_from_summary`、`should_apply_server_reasoning_included`）は、2026-09-24にPhase 1 Step 1として実装し、項目13でruntimeへ接続した（下記「Phase 1の進捗」）。
 
 ### Phase 1の進捗（2026-09-24）
 
@@ -4818,8 +4818,14 @@ RenCrow Switch Core Compaction V2の役割は、
 - 項目10（要約前の事前判定、付属A F19、第2部 §15）: `compact_rencrow_candidate.rs`に`preflight_compaction_floor`を追加した。保持するnative itemと正規のinitial contextに最小の要約（`SUMMARY_PREFIX + "\n."`）を置いた下限を、最終検査と同じ推定器で見積もり、context が縮まない場合や設定上限に収まらない場合は要約requestの前に失敗する（失敗時の`CapacityBlocked`への遷移はPhase 3）。縮小・上限の判定は最終検査`validate_compaction_candidate`から非公開の`check_context_budget`へ切り出して共有し、同じ判定を二重に持たない。事前判定の成功は最終候補の合格を意味せず、最終検査は独立に行う。検査: `compact::rencrow`の単体57件全成功（追加2件）。
 - 項目11（要約request、付属A F21〜F23、第2部 §18・§63）: `core/src/compact_rencrow_request.rs`を追加した。`drain_compaction_stage`がPrompt組立て・`drain_to_completed`・取消し・時間計測・Warning表示を共通化し、旧`request()`、`select_obsolete_instructions`、新しい`request_compaction_summary`が使う。`request_compaction_summary`は要約入力を一時的な`ContextManager`へ入れて`for_prompt`を通し、host検証済みの完了結果（`core/src/context/compaction_results.rs`、種別`compaction.result`、要約request専用）とV2要約promptを末尾に足してから`attach_to_compaction_prompt`を呼び、要約requestを1回だけ送り、出力を`summary_suffix_from_staged_output`で検査してtyped receipt（`Summary`）を記録する。Selectionもtyped receipt（`InstructionSelection`）を記録するようにした（付属A F15）。旧`request()`のreceipt JSONと失敗時の検査順は変えていない。上流の圧縮にある「context超過時に古いitemを黙って削る」再試行はV2の禁止事項（情報を黙って失う）に当たるため使わず、通信失敗の扱いはPhase 3（Level 2）で決める。検査: `compact::rencrow`の単体58件全成功（追加1件、Selectionのreceipt検査を追加）。旧経路の結合試験は以前と同じ1件成功・3件失敗（同じ理由）で、旧経路の要約requestを通る1件は引き続き成功した。
 - 項目12（最終検査、付属A F25〜F27）: `compact_rencrow_candidate.rs`に`fresh_checkpoint_metadata`を追加した。modeは実際のreceiptで決め（Selectionのreceiptがあれば`ModelSelection`、なければ`NoCandidates`）、`presentation_hash`は`ModelSelection`のときだけ残し、`summary_hash`はprefixを含む最終要約本文から計算し、`plan_hash`・`applied_refs`・`results`は要約入力と置換後履歴で共有する同じ選別結果から取り、lifecycle欄は空にする。置換後履歴の組立て（`build_native_replacement`）と最終検査（`validate_compaction_candidate`）は既存のまま使う。検査: `compact::rencrow`の単体60件全成功（追加2件）。両modeで組み立てた候補が最終検査を通ること、Selectionのreceiptが欠けてplanと食い違う候補と、inventoryにない重要参照を持つ候補が最終検査で拒否されることを確認した。
-- 既存の失敗（WIP commit由来）: 現行Fork経路の結合テスト`core/tests/suite/compact_rencrow.rs`は4件中3件が失敗する。`458121d2f`、`d26fbb457`、項目4適用後のいずれでも同じ3件が同じ理由で失敗するため、本Phase 1の変更による退行ではない。manual/automaticの2件は、WIPのcaptureがrecord IDに`ResponseItem.id`を使う一方、mockが毎回同じitem ID（`"answer"`）を返すため`CompactionSnapshot::capture`の重複ID検査で`InvalidSnapshot`になる。実rollout（共有thread、response item 2,820件、replacement 55件）にID重複は0件で、fixtureの問題と判断した。完了済みexec組の1件はmock側で検証済みcallが要約入力に見つからず失敗しており、原因は未調査。これらは現行Fork経路の試験であり、V2接続時に第2部 §71の結合試験へ置き換える。HEADのsourceは現行Fork経路の結合試験が通らないため、そのままbuild・配備しない。
-- 未完了: `ServerReasoningIncluded`はwebsocketのmetadataでsession内部状態に作用するため、drain分岐を実際に通す回帰はPhase 1の結合段階で扱う。`just fix -p codex-core`は未実行。
+- 項目13（commit、付属A F01・F03・F04・F28）: `compact::rencrow::run`をNormal V2の取りまとめに置き換えた。処理順は付属A F01のとおりで、checkpoint健全性・取消し・保留入力を確認し、履歴digestを取り、自動再試行の抑止を判定し、採用済みV2 checkpointを探し、正本rolloutを1回だけ読み、項目1〜12の部品を順に通し、最終検査後に既存の`commit_rencrow_checkpoint`で保存する。`commit_rencrow_checkpoint`は変更していない（`response_id`は要約requestのもの。`Option`化は第2部 §51・Phase 2）。旧Fork経路（`request()`、完了済みexecの独自投影と保存前再検証、旧V1の`history::replacement`）は削除し、それに依存していた単体テストはV2の`NativeProjection`による保持判定へ書き換えた。本番で使われなくなった`NativeProjection::summary_human_messages`は、テスト側で保持itemとcaptureの由来から同じ判定を行う形にして削除した。
+  - 自動再試行の抑止（付属A F03・§14）: session内だけの`rencrow_auto_compaction_failed_hash`を`state/session.rs`へ追加した（`session/rencrow_compaction.rs`経由で読み書きする）。同じ履歴digestで自動圧縮が失敗済みなら、model requestを送らず明示エラーでturnを終える。手動`/compact`は同じ履歴でも実行できる。取消し・中断と、失敗時点で履歴または設定が変わっていた場合は記録しない。成功で消去する。
+  - 前回要約の扱い（第2部 §18、付属A F20）: V2 checkpointがまだない履歴（旧V1または上流の要約だけがある履歴）では、最新の旧要約を「前回要約×1」として要約入力へ1回だけ含める（`previous_summary_index`）。これを含めないと、V2初回の圧縮で旧要約にしかない過去の作業状態が失われるため（第2部 §80のデータ損失に当たる）。旧要約はSelectionとObservationの境界にはしない（項目3・8の判定は変えない）。
+  - 正本照合の修正（付属A F05、第2部 §80のコード矛盾）: `FunctionCallOutputPayload::success`はrolloutへ保存されず、読込時は常に`None`になる。一方でlive履歴のtool出力は値を持つため、`same_persisted_item`（`==`比較）と`same_fresh_output_except_text_body`（`success`も比較）では、再開前のlive sessionで完了したtool組が全て未検証（保護）になっていた。旧経路の結合試験で原因未調査だった完了済みexec組の失敗も同じ原因である。比較を保存される欄だけに改め、`FunctionCallOutput`と`CustomToolCallOutput`の欄は列挙して比べる（欄が増えたらcompile errorになる）。この誤った前提で「`success`の違いは保護する」としていた既存テスト2件は削除し、rollout経由で読み直した正本と`success`つきlive出力が照合できる受理テスト（exact・truncated、function・custom）に置き換えた。
+  - 結合試験（第2部 §71の一部）: `core/tests/suite/compact_rencrow.rs`をV2向けに書き直した。mockは要求を選別・要約・通常に分類し、応答item IDを連番にした（旧fixtureの`"answer"`重複IDによる`InvalidSnapshot`を解消）。manual/automaticの2件は、ModelSelectionで撤回文だけが消えること、要約入力と置換後履歴に撤回文が残らないこと、再起動後の2回目がSelectionなし（NoCandidates）で要約1回だけになることを確認する。非Humanの1件はSelectionを送らないこと、exec組の1件は検証済みの組が要約入力に上限つきObservation 1件としてだけ現れ、置換後履歴とcold resume後の入力に元のcallが戻らないことを確認する。
+  - 検査: `just test --cargo-profile dev-small -p codex-core --lib -E "test(compact)"`で153件全成功（うち`compact::rencrow`は63件、追加3件）、`-p codex-rollout`で171件全成功、`-p codex-core --test all -E "test(suite::compact)"`で72件全成功（`suite::compact_rencrow`の4件を含む。Fork無効の上流試験も通る）。上流のremote compaction試験2件（`compact_remote::remote_compact_v2_charges_retained_images_to_token_budget`）は1回目が約49秒で失敗し再試行で成功した。Fork経路を通らない試験で、今回の変更とは無関係と判断した。`just fix -p codex-core`・`-p codex-rollout`を実行し、項目13の変更ファイルへの修正だけを残した（他ファイルへの既存指摘の修正は別単位とし、取り込んでいない）。
+- 既存の失敗の解消: 以前記録した結合試験4件中3件の失敗（manual/automaticの重複ID、完了済みexec組）は、上記の書き直しと正本照合の修正で解消した。
+- 未完了: `ServerReasoningIncluded`のdrain分岐を実際に通す回帰、付属AのI15（preflight失敗）とI16（自動再試行抑止）の結合試験は未作成（判定関数は単体試験済み）。Phase 2（schema確定）は初回共有配備の前提であり、HEADはまだ配備しない。
 
 稼働binaryはHEADより前のsource（`bf9d00a6a`＋当時の未commit差分）からbuildした。`~/.local/bin/rencrow-switch-core`はSHA-256 `3f6d6d61bd176ee08e65c0a486a4dfc3a9aceb7c6cbbcfc7024305ea87ad03b9`、`~/.local/bin/rencrow-compaction`は`ea38850361a312927227cb90f63fe73589afe8d8b1631801f0add61e8624acb1`（記録は私有の`compaction-runtime-deploy/candidate.json`）。HEADのV2部品と、usage・resume関連の後続修正は未配備。
 

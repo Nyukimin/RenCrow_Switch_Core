@@ -2,9 +2,13 @@
 use super::*;
 use codex_history::CodexHarnessMetadata;
 use codex_history::SenderUserMessages;
+use codex_history::compaction_pipeline::InstructionSelection;
+use codex_history::compaction_pipeline::ProposedOperation;
 use codex_history::compaction_pipeline::ProposedPlan;
-use codex_history::compaction_pipeline::bind_plan;
-use codex_history::compaction_plan::SemanticReview;
+use codex_history::compaction_preprocess::collect_instruction_candidates;
+use codex_history::compaction_preprocess::prune_known_obsolete;
+use codex_history::compaction_selection::validate_and_apply_selection;
+use codex_protocol::ResponseItemId;
 use codex_protocol::mcp::McpAttribution;
 use codex_protocol::mcp::McpAttributionSource;
 use codex_protocol::mcp::McpAttributionStatus;
@@ -63,37 +67,34 @@ fn reasoning_item(
         internal_chat_message_metadata_passthrough,
     })
 }
-fn bundle(input: &CandidateInput, proposed: Value) -> CandidateBundle {
-    let proposed: ProposedPlan = serde_json::from_value(proposed).unwrap();
-    let plan = bind_plan(input, proposed).unwrap();
-    let review = SemanticReview {
-        plan_hash: plan.hash().unwrap(),
-        accepted_operations: (0..plan.operations.len()).collect(),
+fn with_id(mut envelope: ResponseItemEnvelope, native_id: &str) -> ResponseItemEnvelope {
+    let ResponseItem::Message { id, .. } = &mut envelope.item else {
+        panic!("only messages get fixture IDs");
     };
-    let view = input.view(&plan, &review).unwrap();
-    let summary = input
-        .bind_summary(
-            &view,
-            "No completed actions; continue active instructions.".into(),
-        )
-        .unwrap();
-    let summary_hash = digest(&summary).unwrap();
-    CandidateBundle {
-        version: 2,
-        input_hash: digest(input).unwrap(),
-        plan,
-        plan_review: review,
-        summary,
-        summary_hash: Some(summary_hash),
-        summary_review: None,
-        model: "worker".into(),
-        effort: "high".into(),
-        responses: vec![],
-    }
+    *id = Some(ResponseItemId::from_server(native_id.into()));
+    envelope
+}
+/// Project retained native items for an accepted selection without operations.
+fn native_without_selection(
+    input: &CandidateInput,
+    items: &[ResponseItemEnvelope],
+) -> Result<super::super::native::NativeProjection, String> {
+    let application =
+        validate_and_apply_selection(input, &prune_known_obsolete(input, &[])?, &[], None)?;
+    super::super::native::filter_retained_instructions(items, input, application)
+}
+fn retained(
+    input: &CandidateInput,
+    items: &[ResponseItemEnvelope],
+) -> Result<Vec<ResponseItemEnvelope>, String> {
+    Ok(native_without_selection(input, items)?
+        .retained_native_items()
+        .cloned()
+        .collect())
 }
 
 #[test]
-fn plaintext_reasoning_is_summary_visible_and_removed_only_after_valid_coverage() {
+fn plaintext_reasoning_is_summary_visible_and_not_retained() {
     let mut item = reasoning_item(
         vec![ReasoningItemReasoningSummary::SummaryText {
             text: "summary: ".into(),
@@ -130,22 +131,11 @@ fn plaintext_reasoning_is_summary_visible_and_removed_only_after_valid_coverage(
     assert_eq!(input.records[0].text, "summary: reasoning: continued");
     assert_eq!(input.records[0].opaque, None);
 
-    let candidate = bundle(&input, json!({"operations":[]}));
-    let view = input.view(&candidate.plan, &candidate.plan_review).unwrap();
-    let summary_input = input.summary_input(&view, &candidate.plan).unwrap();
-    assert_eq!(
-        summary_input["view"]["retained"][0]["text"],
-        json!("summary: reasoning: continued")
-    );
-
-    let mut incomplete = candidate.clone();
-    incomplete.summary.source_ids.clear();
-    incomplete.summary_hash = Some(digest(&incomplete.summary).unwrap());
-    let error = replacement(&input, &incomplete, &items).unwrap_err();
-    assert_eq!(error, "summary source coverage mismatch");
-    assert_eq!(items, original);
-
-    assert!(replacement(&input, &candidate, &items).unwrap().is_empty());
+    let native = native_without_selection(&input, &items).unwrap();
+    let summary_items =
+        super::super::summary::build_summary_history(&items, &input, &native, &[], None).unwrap();
+    assert_eq!(summary_items, items);
+    assert!(retained(&input, &items).unwrap().is_empty());
     assert_eq!(items, original);
 }
 
@@ -236,18 +226,15 @@ fn protected_reasoning_variants_remain_opaque_and_are_retained() {
             .iter()
             .all(|record| record.origin == Origin::Unknown && record.opaque.is_some())
     );
-    assert_eq!(
-        replacement(&input, &bundle(&input, json!({"operations":[]})), &items).unwrap(),
-        items
-    );
+    assert_eq!(retained(&input, &items).unwrap(), items);
     assert_eq!(items, original);
 }
 
 #[test]
 fn partial_selection_preserves_identity_and_survives_second_capture() {
     let items = vec![
-        human("Keep Japanese. Use old-label."),
-        human("Use new-label instead of old-label."),
+        with_id(human("Keep Japanese. Use old-label."), "human-a"),
+        with_id(human("Use new-label instead of old-label."), "human-b"),
     ];
     let input = capture(
         &items,
@@ -257,11 +244,28 @@ fn partial_selection_preserves_identity_and_survives_second_capture() {
         &[],
     )
     .unwrap();
-    let candidate = bundle(
-        &input,
-        json!({"operations":[{"action":"drop_superseded","source":"item-0","source_text":"Use old-label.","correction":"item-1"}]}),
+    let pruning = prune_known_obsolete(&input, &[]).unwrap();
+    let payload = collect_instruction_candidates(&input, &pruning, &[])
+        .unwrap()
+        .unwrap();
+    let selection = InstructionSelection::from_host(
+        payload["snapshot_hash"].as_str().unwrap().into(),
+        payload["presentation_hash"].as_str().unwrap().into(),
+        ProposedPlan {
+            operations: vec![ProposedOperation::DropSuperseded {
+                source: "human-a".into(),
+                source_text: Some("Use old-label.".into()),
+                correction: "human-b".into(),
+                correction_text: Some("Use new-label instead of old-label.".into()),
+            }],
+        },
     );
-    let selected = replacement(&input, &candidate, &items).unwrap();
+    let application = validate_and_apply_selection(&input, &pruning, &[], Some(selection)).unwrap();
+    let selected = super::super::native::filter_retained_instructions(&items, &input, application)
+        .unwrap()
+        .retained_native_items()
+        .cloned()
+        .collect::<Vec<_>>();
     let second = capture(
         &selected,
         "second".into(),
@@ -324,19 +328,12 @@ fn unknown_automation_and_attachments_are_not_prunable_human_text() {
         input.records.iter().map(|r| &r.origin).collect::<Vec<_>>(),
         vec![&Origin::Unknown, &Origin::Unknown, &Origin::Human]
     );
-    let selected = replacement(&input, &bundle(&input, json!({"operations":[]})), &items).unwrap();
-    assert_eq!(selected, items);
-    let plan = bind_plan(&input, serde_json::from_value(json!({"operations":[{"action":"drop_superseded","source":"item-2","correction":"item-2"}]})).unwrap()).unwrap();
-    assert!(
-        input
-            .view(
-                &plan,
-                &SemanticReview {
-                    plan_hash: plan.hash().unwrap(),
-                    accepted_operations: vec![0]
-                }
-            )
-            .is_err()
+    assert_eq!(retained(&input, &items).unwrap(), items);
+    // Neither unknown or automated input nor attachment-bearing Human text is offered for removal.
+    let pruning = prune_known_obsolete(&input, &[]).unwrap();
+    assert_eq!(
+        collect_instruction_candidates(&input, &pruning, &[]),
+        Ok(None)
     );
 }
 
@@ -373,10 +370,7 @@ fn unannotated_developer_is_not_guessed_to_be_current_host_context() {
     )
     .unwrap();
     assert_eq!(input.records[0].origin, Origin::Unknown);
-    assert_eq!(
-        replacement(&input, &bundle(&input, json!({"operations":[]})), &items).unwrap(),
-        items
-    );
+    assert_eq!(retained(&input, &items).unwrap(), items);
 }
 
 #[test]
@@ -397,7 +391,7 @@ fn owner_annotated_legacy_summary_is_work_without_human_promotion() {
 }
 
 #[test]
-fn completed_nonadjacent_pair_is_summary_visible_and_removed_as_work_only() {
+fn completed_nonadjacent_pair_is_work_and_removed_from_retained_history() {
     let items = vec![
         command_call("call-1", "{\"cmd\":\"printf done\"}"),
         message("developer", "intervening unknown context"),
@@ -408,22 +402,8 @@ fn completed_nonadjacent_pair_is_summary_visible_and_removed_as_work_only() {
     let projection = CompletedWorkProjection {
         call_index: 0,
         output_index: 2,
-        call_text: json!({
-            "call_id":"call-1",
-            "tool":"exec_command",
-            "arguments":"{\"cmd\":\"printf done\"}",
-            "status":"completed",
-            "exit_code":0
-        })
-        .to_string(),
-        output_text: json!({
-            "call_id":"call-1",
-            "tool":"exec_command",
-            "status":"completed",
-            "exit_code":0,
-            "result":"done\n"
-        })
-        .to_string(),
+        call_text: "{\"cmd\":\"printf done\"}".into(),
+        output_text: "done\n".into(),
     };
     let input = capture(
         &items,
@@ -441,34 +421,10 @@ fn completed_nonadjacent_pair_is_summary_visible_and_removed_as_work_only() {
     assert!(input.records[2].execution_evidence);
     assert_eq!(input.records[3].origin, Origin::Human);
 
-    let candidate = bundle(&input, json!({"operations":[]}));
-    let view = input.view(&candidate.plan, &candidate.plan_review).unwrap();
-    let summary_input = input.summary_input(&view, &candidate.plan).unwrap();
-    let retained = summary_input["view"]["retained"].as_array().unwrap();
-    let call_text = retained
-        .iter()
-        .find(|record| record["id"] == "item-0")
-        .unwrap()["text"]
-        .as_str()
-        .unwrap();
-    let output_text = retained
-        .iter()
-        .find(|record| record["id"] == "item-2")
-        .unwrap()["text"]
-        .as_str()
-        .unwrap();
-    let call_json: Value = serde_json::from_str(call_text).unwrap();
-    let output_json: Value = serde_json::from_str(output_text).unwrap();
-    assert_eq!(call_json["arguments"], "{\"cmd\":\"printf done\"}");
-    assert_eq!(output_json["call_id"], "call-1");
-    assert_eq!(output_json["result"], "done\n");
-    assert!(
-        summary_input
-            .to_string()
-            .contains("Keep Japanese and preserve the attachment.")
-    );
+    assert_eq!(input.records[0].text, "{\"cmd\":\"printf done\"}");
+    assert_eq!(input.records[2].text, "done\n");
 
-    let replacement = replacement(&input, &candidate, &items).unwrap();
+    let replacement = retained(&input, &items).unwrap();
     assert_eq!(replacement, vec![items[1].clone(), items[3].clone()]);
     assert_eq!(items, original);
 
@@ -485,7 +441,7 @@ fn completed_nonadjacent_pair_is_summary_visible_and_removed_as_work_only() {
 }
 
 #[test]
-fn existing_v1_pair_summarizes_marker_and_call_without_expanding_archived_output() {
+fn existing_v1_pair_is_removed_as_work_without_expanding_archived_output() {
     let huge_original = "archived command output ".repeat(20_000);
     let reference = codex_history::ArchiveReference::new(
         "test-thread",
@@ -505,53 +461,27 @@ fn existing_v1_pair_summarizes_marker_and_call_without_expanding_archived_output
         "binding".into(),
         "test-thread",
         vec![json!({"current":true})],
+        // Existing references keep empty CandidateInput text; the archived body stays in rollout.
         &[CompletedWorkProjection {
             call_index: 0,
             output_index: 1,
-            call_text: json!({
-                "call_id":"call-archive",
-                "tool":"exec_command",
-                "arguments":"{\"cmd\":\"long-running-task\"}",
-                "status":"failed",
-                "exit_code":7,
-                "retrieval_argv":reference.retrieval_argv()
-            })
-            .to_string(),
-            output_text: json!({
-                "call_id":"call-archive",
-                "tool":"exec_command",
-                "status":"failed",
-                "exit_code":7,
-                "result":marker
-            })
-            .to_string(),
+            call_text: String::new(),
+            output_text: String::new(),
         }],
     )
     .unwrap();
-    let candidate = bundle(&input, json!({"operations":[]}));
-    let view = input.view(&candidate.plan, &candidate.plan_review).unwrap();
-    let summary_input = input.summary_input(&view, &candidate.plan).unwrap();
-    let retained = summary_input["view"]["retained"].as_array().unwrap();
-    let call_text = retained
-        .iter()
-        .find(|record| record["id"] == "item-0")
-        .unwrap()["text"]
-        .as_str()
-        .unwrap();
-    let output_text = retained
-        .iter()
-        .find(|record| record["id"] == "item-1")
-        .unwrap()["text"]
-        .as_str()
-        .unwrap();
-    let call_json: Value = serde_json::from_str(call_text).unwrap();
-    let output_json: Value = serde_json::from_str(output_text).unwrap();
-    assert_eq!(call_json["status"], "failed");
-    assert_eq!(call_json["exit_code"], 7);
-    assert_eq!(call_json["retrieval_argv"][0], "rencrow-compaction");
-    assert_eq!(output_json["result"], marker);
-    assert!(!summary_input.to_string().contains(&huge_original));
-    assert!(replacement(&input, &candidate, &items).unwrap().is_empty());
+    assert!(
+        input
+            .records
+            .iter()
+            .all(|record| record.origin == Origin::Work && record.opaque.is_none())
+    );
+    assert!(
+        !serde_json::to_string(&input)
+            .unwrap()
+            .contains(&huge_original)
+    );
+    assert!(retained(&input, &items).unwrap().is_empty());
 }
 
 #[test]
@@ -595,8 +525,5 @@ fn unverified_pending_media_and_provenance_variants_stay_opaque() {
             .iter()
             .any(|record| record.origin == Origin::Unknown)
     );
-    assert_eq!(
-        replacement(&input, &bundle(&input, json!({"operations":[]})), &items).unwrap(),
-        items
-    );
+    assert_eq!(retained(&input, &items).unwrap(), items);
 }

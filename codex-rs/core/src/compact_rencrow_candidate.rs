@@ -22,6 +22,7 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort;
 
 /// Validate a fully assembled V2 history candidate without changing the live session.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn validate_compaction_candidate(
     original: &ContextManager,
     base: &BaseInstructions,
@@ -103,7 +104,7 @@ pub(super) fn validate_compaction_candidate(
 /// `ModelSelection`, otherwise `NoCandidates`, and only a model selection keeps its presentation
 /// hash. The applied refs, results, and plan hash come from the one application shared by summary
 /// input and replacement. Transaction lifecycle fields stay empty for a fresh candidate.
-#[allow(dead_code, clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub(super) fn fresh_checkpoint_metadata(
     summary_text: &str,
     snapshot_hash: String,
@@ -147,7 +148,6 @@ pub(super) fn fresh_checkpoint_metadata(
 /// summary body. If even this floor does not shrink the context or fit the configured limits, no
 /// generated summary can make the candidate valid (Part 2 §15). Passing does not accept the final
 /// candidate; `validate_compaction_candidate` still checks it independently.
-#[allow(dead_code)]
 pub(super) fn preflight_compaction_floor(
     original: &ContextManager,
     base: &BaseInstructions,

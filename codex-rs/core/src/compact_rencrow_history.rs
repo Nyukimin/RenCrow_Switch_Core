@@ -2,11 +2,9 @@
 //! Adapt owner-reconstructed history without guessing human provenance.
 use codex_history::CodexHarnessMetadata;
 use codex_history::ResponseItemEnvelope;
-use codex_history::compaction_candidate::CandidateBundle;
 use codex_history::compaction_candidate::CandidateInput;
 use codex_history::compaction_candidate::CandidateRecord;
 use codex_history::compaction_candidate::Origin;
-use codex_history::compaction_candidate::digest;
 use codex_history::observation_projection::OBSERVATION_PART_FULL_LIMIT_BYTES;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::InternalChatMessageMetadataPassthrough;
@@ -30,7 +28,6 @@ pub(super) struct CompletedWorkProjection {
 ///
 /// CandidateInput keeps full text only when both call and output fit the completion-link bound;
 /// larger raw bodies stay in the rollout and reach the summary through bounded observations.
-#[allow(dead_code)]
 pub(super) fn verified_pair_projections(
     prepared: &PreparedCompactionSources<'_>,
 ) -> Vec<CompletedWorkProjection> {
@@ -292,68 +289,6 @@ pub(super) fn capture(
     };
     input.snapshot()?;
     Ok(input)
-}
-
-pub(super) fn replacement(
-    input: &CandidateInput,
-    bundle: &CandidateBundle,
-    originals: &[ResponseItemEnvelope],
-) -> Result<Vec<ResponseItemEnvelope>, String> {
-    input.assemble(bundle)?;
-    if input.records.len() != originals.len() {
-        return Err("history mapping mismatch".into());
-    }
-    let view = input.view(&bundle.plan, &bundle.plan_review)?;
-    let mut output = Vec::new();
-    for ((record, selected), original) in input
-        .records
-        .iter()
-        .zip(view.retained.iter())
-        .zip(originals)
-    {
-        match record.origin {
-            Origin::Human => {
-                if selected.text.is_empty() && record.opaque.is_none() {
-                    continue;
-                }
-                let mut envelope = original.clone();
-                if selected.text != record.text {
-                    let ResponseItem::Message { content, .. } = &mut envelope.item else {
-                        return Err("human item changed type".into());
-                    };
-                    // Preserve item count, annotations and identity. This is original text
-                    // selection, never a generated paraphrase presented as user testimony.
-                    let mut remaining = selected.text.clone();
-                    for item in content {
-                        match item {
-                            ContentItem::InputText { text } | ContentItem::OutputText { text } => {
-                                *text = std::mem::take(&mut remaining)
-                            }
-                            _ => return Err("attachment-bearing input cannot be rewritten".into()),
-                        }
-                    }
-                    if let Some(intake) = envelope
-                        .metadata
-                        .get_or_insert_default()
-                        .rencrow_input
-                        .as_mut()
-                    {
-                        intake["selected_text"] = json!(selected.text);
-                        intake["selection_hash"] = json!(digest(&bundle.plan)?);
-                    }
-                }
-                output.push(envelope);
-            }
-            Origin::Unknown => output.push(original.clone()),
-            Origin::Work | Origin::Host
-                if record.opaque.is_some() || !record.protected.is_empty() =>
-            {
-                output.push(original.clone())
-            }
-            Origin::Work | Origin::Host => {}
-        }
-    }
-    Ok(output)
 }
 
 #[cfg(test)]

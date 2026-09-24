@@ -5,6 +5,7 @@ use codex_analytics::CompactionImplementation;
 use codex_analytics::CompactionPhase;
 use codex_analytics::CompactionReason;
 use codex_analytics::CompactionTrigger;
+use codex_history::compaction_pipeline::PLAN_PROMPT;
 use codex_history::compaction_plan::ByteRange;
 use codex_history::compaction_plan::DerivedResult;
 use codex_history::compaction_plan::SourceRef;
@@ -538,4 +539,66 @@ async fn v2_summary_request_normalizes_history_and_records_one_typed_receipt() {
     let developer_text = request.message_input_texts("developer").join("");
     assert!(developer_text.contains("authoritative exact text"));
     assert!(developer_text.contains("observation:\"<call_id>\""));
+}
+
+#[test]
+fn v2_auto_retry_is_suppressed_only_for_the_same_failed_history() {
+    assert!(auto_retry_suppressed(
+        CompactionTrigger::Auto,
+        Some("history-a"),
+        "history-a"
+    ));
+    assert!(!auto_retry_suppressed(
+        CompactionTrigger::Auto,
+        Some("history-a"),
+        "history-b"
+    ));
+    assert!(!auto_retry_suppressed(
+        CompactionTrigger::Auto,
+        /*failed_hash*/ None,
+        "history-a"
+    ));
+    // Manual /compact stays available for the same history.
+    assert!(!auto_retry_suppressed(
+        CompactionTrigger::Manual,
+        Some("history-a"),
+        "history-a"
+    ));
+}
+
+#[test]
+fn v2_auto_failure_fingerprint_skips_manual_cancelled_and_changed_snapshots() {
+    let rejected = CodexErr::InvalidRequest("summary rejected".into());
+    assert!(records_auto_failure(
+        CompactionTrigger::Auto,
+        &rejected,
+        /*cancelled*/ false,
+        /*snapshot_unchanged*/ true
+    ));
+    assert!(!records_auto_failure(
+        CompactionTrigger::Manual,
+        &rejected,
+        /*cancelled*/ false,
+        /*snapshot_unchanged*/ true
+    ));
+    assert!(!records_auto_failure(
+        CompactionTrigger::Auto,
+        &rejected,
+        /*cancelled*/ true,
+        /*snapshot_unchanged*/ true
+    ));
+    assert!(!records_auto_failure(
+        CompactionTrigger::Auto,
+        &rejected,
+        /*cancelled*/ false,
+        /*snapshot_unchanged*/ false
+    ));
+    for aborted in [CodexErr::TurnAborted, CodexErr::Interrupted] {
+        assert!(!records_auto_failure(
+            CompactionTrigger::Auto,
+            &aborted,
+            /*cancelled*/ false,
+            /*snapshot_unchanged*/ true
+        ));
+    }
 }

@@ -25,7 +25,6 @@ use std::collections::BTreeMap;
 /// call ID with a different output digest is a stored-data conflict and fails closed. Existing
 /// references project the current call text and the canonical output length without rehydrating
 /// the archived output body.
-#[allow(dead_code)]
 pub(super) fn project_unhandled_observations(
     originals: &[ResponseItemEnvelope],
     prepared: &PreparedCompactionSources<'_>,
@@ -75,7 +74,6 @@ pub(super) fn project_unhandled_observations(
 ///
 /// The same identity is kept once in first order. The same thread and call ID with a different
 /// output digest fails closed. The result is host-side inventory and is never sent to the model.
-#[allow(dead_code)]
 pub(super) fn cumulative_observation_coverage(
     previous: &[ObservationCoverage],
     current: &[ObservationCoverage],
@@ -107,7 +105,6 @@ pub(super) fn cumulative_observation_coverage(
 /// protected or already pruned text, and its only tool activity is one verified terminal
 /// `exec_command` pair whose call and output are fully present in CandidateInput. Any tool item
 /// without a turn ID cannot be attributed, so it disables linking for the whole history.
-#[allow(dead_code)]
 pub(super) fn build_completion_links(
     originals: &[ResponseItemEnvelope],
     input: &CandidateInput,
