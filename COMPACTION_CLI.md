@@ -71,6 +71,7 @@ CLI captureは圧縮・巻き戻し済み履歴の復元を行わない。runtim
 2026-09-22、Ubuntuで`~/.local/bin/rencrow-compaction`へ独立binaryを配置し、`--help`の4subcommandを確認した。
 SHA-256: `b9fee2400128deec357c6648ef0047f772c8d112403b039ec618eccb3457ae77`。
 稼働中の`rencrow-switch-core`は変更していない（SHA-256 `04159684a80c3751fa0903b81a04fa3d9b4b20550a4b86e927bf73b5b0e53c1d`を確認）。
+上記は2026-09-22時点の記録。2026-09-23の完了履歴削減版の配備で、`~/.local/bin/rencrow-compaction`はSHA-256 `ea38850361a312927227cb90f63fe73589afe8d8b1631801f0add61e8624acb1`、`rencrow-switch-core`は`3f6d6d61bd176ee08e65c0a486a4dfc3a9aceb7c6cbbcfc7024305ea87ad03b9`に更新された（記録は私有の`target/fork-bootstrap/compaction-runtime-deploy/candidate.json`）。
 CLI配置の取消しはこの独立binaryを除くことで行える。候補ファイルの削除は元sessionの復旧操作にはならず、元sessionは本経路で更新していない。
 試験結果・観測した不具合と修正・未完了境界は[仕様の実装記録](COMPACTION_SPEC.md)を参照。
 Windows/macOSの実機動作は未確認。local Compactionの実装・配備と共有sessionの受入状況は[仕様](COMPACTION_SPEC.md)を参照。
@@ -125,6 +126,8 @@ rencrow-compaction evidence --thread <thread-UUID> --call-id <call-ID> --sha256 
 
 既定の`CODEX_HOME`から対象threadを解決する。別homeを明示する場合は`--codex-home <directory>`を使う。任意のrolloutファイルを直接指定する機能ではない。読み取り専用で、同threadの完了receipt・call/output・内容hashを照合する。欠落、破損、thread/hash不一致は非zero終了となる。
 
-成功時のJSONは`archived_data`, `thread_id`, `call_id`, `sha256`, `tool`, `status`, `exit_code`, `process_id`, `retrieval_argv`, `result`を返す。`result`は過去に保存した出力原文であり、新しいコマンド実行や現在の稼働状態の証明ではない。初期対象は完了証拠のある`exec_command`のテキスト出力、取得上限は1 MiB。上限超過や対象外の出力は圧縮時に参照へ置換せず原文を保持する。
+成功時のJSONは`archived_data`, `version`, `thread_id`, `call_id`, `sha256`, `tool`, `status`, `exit_code`, `process_id`, `retrieval_argv`, `result`を返す。`result`は過去に保存した出力原文であり、新しいコマンド実行や現在の稼働状態の証明ではない。初期対象は完了証拠のある`exec_command`のテキスト出力、取得上限は1 MiB。上限超過や対象外の出力は圧縮時に参照へ置換せず原文を保持する。
 
 このv1取得CLIのcontractと旧rolloutの`capture`動作は維持する。通常Compactionでは新規完了済みpairを要約入力へ直接渡し、圧縮前にv1 markerへ変換しない。既存v1 markerはcanonical raw proofと現在のcallを検証し、marker本文とcall argumentsを要約へ渡す。詳細は[完了済みexec_commandのsummary projection](COMPACTION_SPEC.md#完了済みexec_commandのsummary-projection)を参照。
+
+現行CLIのsubcommandは`capture`、`inspect`、`prepare`、`select`、`evidence`の5つ。仕様⑧の範囲取得引数（`--part --start --end --part-sha256`）と`inventory`はrollout libraryに実装済みだが、CLIには未追加。
