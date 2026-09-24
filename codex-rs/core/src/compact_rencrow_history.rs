@@ -262,11 +262,11 @@ pub(super) fn capture(
             // Preserve the original structured envelope, including media. Only its
             // textual evidence goes to semantic review; binary media is not JSON text.
             record.origin = Origin::Work;
-            record.execution_evidence = envelope
-                .metadata
-                .as_ref()
-                .and_then(|metadata| metadata.rencrow_archive_reference.as_ref())
-                .is_none();
+            // Archived references and V2 observation markers are host data, not execution output.
+            record.execution_evidence = envelope.metadata.as_ref().is_none_or(|metadata| {
+                metadata.rencrow_archive_reference.is_none()
+                    && metadata.rencrow_observation_projection.is_none()
+            });
             record.text = output.body.to_text().unwrap_or_default();
         }
         if let Some((text, is_call)) = completed_work_records.get(&index) {

@@ -602,3 +602,56 @@ fn v2_auto_failure_fingerprint_skips_manual_cancelled_and_changed_snapshots() {
         ));
     }
 }
+
+#[test]
+fn v2_automatic_compaction_skips_normal_only_after_it_failed_on_the_same_history() {
+    assert!(normal_skipped(
+        CompactionTrigger::Auto,
+        Some("history-a"),
+        "history-a"
+    ));
+    assert!(!normal_skipped(
+        CompactionTrigger::Auto,
+        Some("history-a"),
+        "history-b"
+    ));
+    assert!(!normal_skipped(
+        CompactionTrigger::Auto,
+        /*normal_failed_hash*/ None,
+        "history-a"
+    ));
+    // Manual /compact retries Normal after a temporary model failure.
+    assert!(!normal_skipped(
+        CompactionTrigger::Manual,
+        Some("history-a"),
+        "history-a"
+    ));
+}
+
+#[test]
+fn v2_blocked_diagnostics_state_that_no_source_data_was_replaced_or_discarded() {
+    let capacity = super::stages::StageFailure::Capacity(
+        "compaction candidate reaches the full context window limit (9 >= 8 tokens)".into(),
+    )
+    .into_error()
+    .to_string();
+    assert!(capacity.contains("capacity-blocked"));
+    assert!(capacity.contains("No source data was discarded."));
+    assert!(capacity.contains("(9 >= 8 tokens)"));
+
+    let integrity = super::stages::StageFailure::Integrity(
+        "observation call ID was recorded with a different output digest".into(),
+    )
+    .into_error()
+    .to_string();
+    assert!(integrity.contains("deterministic integrity conflict"));
+    assert!(integrity.contains("The current state was not replaced."));
+
+    // Model and abort errors pass through unchanged.
+    assert!(matches!(
+        super::stages::StageFailure::Abort(CodexErr::TurnAborted)
+            .into_error()
+            .details(),
+        CodexErrorDetails::TurnAborted
+    ));
+}

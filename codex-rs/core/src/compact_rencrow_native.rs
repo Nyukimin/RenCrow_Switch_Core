@@ -376,7 +376,7 @@ fn collect_user_slots(retained: &[RetainedItem]) -> Result<Vec<CompactedUserMess
     Ok(user_messages)
 }
 
-fn content_text(content: &[ContentItem]) -> String {
+pub(super) fn content_text(content: &[ContentItem]) -> String {
     content
         .iter()
         .filter_map(|item| match item {
@@ -512,7 +512,7 @@ fn helper_insertion_index(history: &[ResponseItemEnvelope]) -> Option<usize> {
     })
 }
 
-fn host_insertion_index<'a, I>(mut history: I) -> Option<usize>
+pub(super) fn host_insertion_index<'a, I>(mut history: I) -> Option<usize>
 where
     I: Iterator<Item = &'a ResponseItemEnvelope> + DoubleEndedIterator,
 {

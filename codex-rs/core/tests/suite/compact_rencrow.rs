@@ -29,6 +29,7 @@ use core_test_support::responses::ev_response_created;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
+use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use serde_json::Value;
@@ -98,6 +99,68 @@ fn checkpoint_rows(path: &std::path::Path) -> Result<Vec<Value>> {
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .filter(|row| row["type"] == "compacted")
         .collect())
+}
+
+/// Submit a turn whose text has an accepted Human intake receipt.
+async fn submit_human_turn(test: &TestCodex, client: &str, text: &str) -> Result<()> {
+    let thread = test.session_configured.session_id.to_string();
+    let directory = test
+        .codex_home_path()
+        .join("rencrow/input-intake")
+        .join(&thread);
+    fs::create_dir_all(&directory)?;
+    let receipt = SubmissionIntake::new(
+        thread,
+        client.into(),
+        OriginalInput {
+            author: InputAuthor::Human,
+            text: text.into(),
+            attachments: vec![],
+        },
+        text,
+    )
+    .map_err(anyhow::Error::msg)?;
+    fs::write(
+        directory.join(format!("{client}.json")),
+        serde_json::to_vec(&receipt)?,
+    )?;
+    test.codex
+        .start_or_steer_turn(TurnInputRequest::new(TurnInput::UserInput {
+            content: vec![UserInput::Text {
+                text: text.into(),
+                text_elements: vec![],
+            }],
+            client_id: Some(client.into()),
+        }))
+        .await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    Ok(())
+}
+
+/// Run a manual compaction and fail the test on any error event.
+async fn compact_without_error(codex: &codex_core::CodexThread) -> Result<()> {
+    codex.submit(Op::Compact).await?;
+    wait_for_event(codex, |event| {
+        if let EventMsg::Error(error) = event {
+            panic!("compaction error: {error:?}");
+        }
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    Ok(())
+}
+
+/// The RenCrow metadata stored on the checkpoint summary of one compacted rollout row.
+fn checkpoint_metadata(row: &Value) -> Value {
+    row["payload"]["replacement_history_metadata"]
+        .as_array()
+        .expect("replacement metadata")
+        .iter()
+        .find_map(|metadata| metadata.get("rencrow_compaction").cloned())
+        .expect("checkpoint metadata")
 }
 
 #[test_case::test_case(false; "manual")]
@@ -185,50 +248,10 @@ async fn rencrow_compaction_keeps_one_selected_history_through_resume_and_recomp
         ("first", "Keep Japanese. Use obsolete-label."),
         ("second", "Use current-label instead."),
     ] {
-        let thread = test.session_configured.session_id.to_string();
-        let directory = test
-            .codex_home_path()
-            .join("rencrow/input-intake")
-            .join(&thread);
-        fs::create_dir_all(&directory)?;
-        let receipt = SubmissionIntake::new(
-            thread,
-            client.into(),
-            OriginalInput {
-                author: InputAuthor::Human,
-                text: text.into(),
-                attachments: vec![],
-            },
-            text,
-        )
-        .map_err(anyhow::Error::msg)?;
-        fs::write(
-            directory.join(format!("{client}.json")),
-            serde_json::to_vec(&receipt)?,
-        )?;
-        test.codex
-            .start_or_steer_turn(TurnInputRequest::new(TurnInput::UserInput {
-                content: vec![UserInput::Text {
-                    text: text.into(),
-                    text_elements: vec![],
-                }],
-                client_id: Some(client.into()),
-            }))
-            .await?;
-        wait_for_event(&test.codex, |event| {
-            matches!(event, EventMsg::TurnComplete(_))
-        })
-        .await;
+        submit_human_turn(&test, client, text).await?;
     }
     if !automatic {
-        test.codex.submit(Op::Compact).await?;
-        wait_for_event(&test.codex, |event| {
-            if let EventMsg::Error(error) = event {
-                panic!("compaction error: {error:?}");
-            }
-            matches!(event, EventMsg::TurnComplete(_))
-        })
-        .await;
+        compact_without_error(&test.codex).await?;
     }
     test.submit_text_turn("continue before restart").await?;
     let path = test.codex.rollout_path().unwrap();
@@ -697,5 +720,310 @@ async fn rencrow_completed_unified_exec_pair_is_summarized_after_terminal_receip
         !cold_resume_turn["input"].to_string().contains(call_id),
         "ordinary cold-resume input revived the compacted command"
     );
+    Ok(())
+}
+
+/// Placeholder body of an emergency checkpoint without a previous semantic summary.
+const EMERGENCY_PLACEHOLDER: &str = "No semantic summary has been accepted.";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rencrow_malformed_summary_commits_emergency_and_next_normal_summarizes_its_work()
+-> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = start_mock_server().await;
+    let seen = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let captured = Arc::clone(&seen);
+    let responses = Arc::new(AtomicUsize::new(0));
+    let summaries = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(move |request: &Request| {
+            let body: Value = request.body_json().expect("request JSON");
+            captured.lock().expect("requests lock").push(body.clone());
+            let id = format!("answer-{}", responses.fetch_add(1, Ordering::SeqCst));
+            match stage(&body) {
+                // An empty summary is malformed; Normal fails and Emergency must not retry it.
+                Stage::Summary if summaries.fetch_add(1, Ordering::SeqCst) == 0 => {
+                    assistant_reply(&id, " ", ev_completed("bad-summary"))
+                }
+                Stage::Summary => assistant_reply(
+                    &id,
+                    "Both tasks progressed; continue with the second task.",
+                    ev_completed("summary-response"),
+                ),
+                Stage::Selection(_) | Stage::Ordinary => {
+                    let input = body["input"].to_string();
+                    let reply = if input.contains("second task") {
+                        "WORK-TWO-RESULT"
+                    } else {
+                        "WORK-ONE-RESULT"
+                    };
+                    assistant_reply(&id, reply, ev_completed("response-fixture"))
+                }
+            }
+        })
+        .mount(&server)
+        .await;
+    let provider = non_openai_model_provider(&server);
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider = provider;
+        config.rencrow_compaction = true;
+    });
+    let test = builder.build(&server).await?;
+    test.submit_text_turn("first task").await?;
+    compact_without_error(&test.codex).await?;
+
+    let path = test.codex.rollout_path().expect("rollout path");
+    let checkpoints = checkpoint_rows(&path)?;
+    assert_eq!(checkpoints.len(), 1);
+    assert!(
+        checkpoints[0]["payload"]
+            .get("compaction_response_id")
+            .is_none_or(Value::is_null)
+    );
+    let emergency = checkpoint_metadata(&checkpoints[0]);
+    assert_eq!(emergency["selection_mode"], "deterministic_emergency");
+    assert!(emergency.get("model").is_none());
+    assert!(emergency.get("semantic_summary_hash").is_none());
+    assert_eq!(emergency["responses"], json!([]));
+    let replacement = serde_json::to_string(&replacement_history_from_rollout(&path)?)?;
+    assert!(replacement.contains("WORK-ONE-RESULT"));
+    assert!(replacement.contains(EMERGENCY_PLACEHOLDER));
+    // One ordinary turn and the single failed summary request; Emergency adds none.
+    assert_eq!(seen.lock().expect("requests lock").len(), 2);
+
+    test.submit_text_turn("second task").await?;
+    compact_without_error(&test.codex).await?;
+
+    let checkpoints = checkpoint_rows(&path)?;
+    assert_eq!(checkpoints.len(), 2);
+    assert_eq!(
+        checkpoint_metadata(&checkpoints[1])["selection_mode"],
+        "no_candidates"
+    );
+    let requests = seen.lock().expect("requests lock");
+    assert_eq!(requests.len(), 4);
+    let summary = requests
+        .iter()
+        .filter(|body| matches!(stage(body), Stage::Summary))
+        .nth(1)
+        .expect("second summary request")["input"]
+        .to_string();
+    // Work retained by Emergency is still unsummarized, and the placeholder is not a summary.
+    assert!(summary.contains("WORK-ONE-RESULT"));
+    assert!(summary.contains("WORK-TWO-RESULT"));
+    assert!(!summary.contains(EMERGENCY_PLACEHOLDER));
+    let replacement = serde_json::to_string(&replacement_history_from_rollout(&path)?)?;
+    assert!(!replacement.contains("WORK-ONE-RESULT"));
+    assert!(!replacement.contains(EMERGENCY_PLACEHOLDER));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rencrow_malformed_selection_keeps_every_human_exactly_in_emergency() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = start_mock_server().await;
+    let seen = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let captured = Arc::clone(&seen);
+    let responses = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(move |request: &Request| {
+            let body: Value = request.body_json().expect("request JSON");
+            captured.lock().expect("requests lock").push(body.clone());
+            let id = format!("answer-{}", responses.fetch_add(1, Ordering::SeqCst));
+            let reply = match stage(&body) {
+                Stage::Selection(_) => "not a selection",
+                Stage::Summary => "unexpected summary",
+                Stage::Ordinary => "acknowledged",
+            };
+            assistant_reply(&id, reply, ev_completed("response-fixture"))
+        })
+        .mount(&server)
+        .await;
+    let provider = non_openai_model_provider(&server);
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider = provider;
+        config.rencrow_compaction = true;
+    });
+    let test = builder.build(&server).await?;
+    submit_human_turn(&test, "first", "Keep Japanese. Use obsolete-label.").await?;
+    submit_human_turn(&test, "second", "Use current-label instead.").await?;
+    compact_without_error(&test.codex).await?;
+
+    let requests = seen.lock().expect("requests lock");
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|body| matches!(stage(body), Stage::Selection(_)))
+            .count(),
+        1
+    );
+    assert!(
+        !requests
+            .iter()
+            .any(|body| matches!(stage(body), Stage::Summary))
+    );
+    assert_eq!(requests.len(), 3);
+    let path = test.codex.rollout_path().expect("rollout path");
+    let checkpoints = checkpoint_rows(&path)?;
+    assert_eq!(checkpoints.len(), 1);
+    assert_eq!(
+        checkpoint_metadata(&checkpoints[0])["selection_mode"],
+        "deterministic_emergency"
+    );
+    // Without an accepted selection nothing is removed; both instructions stay verbatim.
+    let replacement = serde_json::to_string(&replacement_history_from_rollout(&path)?)?;
+    assert!(replacement.contains("Keep Japanese. Use obsolete-label."));
+    assert!(replacement.contains("Use current-label instead."));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rencrow_emergency_marker_is_presented_and_covered_by_the_next_normal() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = start_mock_server().await;
+    let seen = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let captured = Arc::clone(&seen);
+    let responses = Arc::new(AtomicUsize::new(0));
+    let summaries = Arc::new(AtomicUsize::new(0));
+    let tool_call_issued = Arc::new(AtomicBool::new(false));
+    let call_id = "emergency-marker-call";
+    let call_arguments =
+        json!({"cmd":"yes emergency-marker-line | head -n 400","yield_time_ms":5_000}).to_string();
+    let marker_arguments = call_arguments.clone();
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(move |request: &Request| {
+            let body: Value = request.body_json().expect("request JSON");
+            captured.lock().expect("requests lock").push(body.clone());
+            let id = format!("answer-{}", responses.fetch_add(1, Ordering::SeqCst));
+            match stage(&body) {
+                Stage::Summary if summaries.fetch_add(1, Ordering::SeqCst) == 0 => {
+                    assistant_reply(&id, " ", ev_completed("bad-summary"))
+                }
+                Stage::Summary => assistant_reply(
+                    &id,
+                    "The marker command printed repeated lines.",
+                    ev_completed("summary-response"),
+                ),
+                Stage::Selection(_) => {
+                    assistant_reply(&id, "{\"operations\":[]}", ev_completed("selection"))
+                }
+                Stage::Ordinary if !tool_call_issued.swap(true, Ordering::SeqCst) => {
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/event-stream")
+                        .set_body_string(sse(vec![
+                            ev_response_created("tool-response"),
+                            ev_function_call(call_id, "exec_command", &marker_arguments),
+                            ev_completed("tool-response"),
+                        ]))
+                }
+                Stage::Ordinary => {
+                    assistant_reply(&id, "command completed", ev_completed("normal-response"))
+                }
+            }
+        })
+        .mount(&server)
+        .await;
+    let provider = non_openai_model_provider(&server);
+    let mut builder = test_codex()
+        .with_history_mode(ThreadHistoryMode::Paginated)
+        .with_config(move |config| {
+            config.model_provider = provider;
+            config.rencrow_compaction = true;
+            config.experimental_thread_store = ThreadStoreConfig::Local;
+            config
+                .features
+                .enable(Feature::UnifiedExec)
+                .expect("marker fixture must enable UnifiedExec");
+        });
+    let test = builder.build(&server).await?;
+    test.submit_text_turn("Run the marker fixture command.")
+        .await?;
+    compact_without_error(&test.codex).await?;
+
+    let path = test.codex.rollout_path().expect("rollout path");
+    let checkpoints = checkpoint_rows(&path)?;
+    assert_eq!(checkpoints.len(), 1);
+    let emergency = checkpoint_metadata(&checkpoints[0]);
+    assert_eq!(emergency["selection_mode"], "deterministic_emergency");
+    assert_eq!(
+        emergency["observations"][0]["reference"]["call_id"],
+        call_id
+    );
+    assert_eq!(emergency["summary_covered_observations"], json!([]));
+    let replacement = replacement_history_from_rollout(&path)?;
+    // The call stays; only the output body became a verified marker.
+    assert!(replacement.iter().any(|item| {
+        item["type"] == "function_call"
+            && item["call_id"] == call_id
+            && item["arguments"] == call_arguments.as_str()
+    }));
+    let marker = replacement
+        .iter()
+        .find(|item| item["type"] == "function_call_output" && item["call_id"] == call_id)
+        .expect("marker output");
+    let marker_body: Value = serde_json::from_str(marker["output"].as_str().expect("marker text"))?;
+    assert_eq!(marker_body["rencrow_observation"], json!(true));
+    assert_eq!(marker_body["call_id"], call_id);
+    assert!(marker_body["total_bytes"].as_u64().expect("total bytes") > 4_000);
+
+    test.submit_text_turn("continue").await?;
+    compact_without_error(&test.codex).await?;
+
+    let checkpoints = checkpoint_rows(&path)?;
+    assert_eq!(checkpoints.len(), 2);
+    // The live marker keeps the tool-output shape the model accepts in an ordinary turn.
+    let continued = seen
+        .lock()
+        .expect("requests lock")
+        .iter()
+        .find(|body| {
+            matches!(stage(body), Stage::Ordinary) && body["input"].to_string().contains("continue")
+        })
+        .cloned()
+        .expect("ordinary request after emergency");
+    assert!(
+        continued["input"]
+            .as_array()
+            .expect("input")
+            .iter()
+            .any(|item| {
+                item["type"] == "function_call_output"
+                    && item["call_id"] == call_id
+                    && item["output"]
+                        .as_str()
+                        .is_some_and(|output| output.contains("\"rencrow_observation\":true"))
+            })
+    );
+    let normal = checkpoint_metadata(&checkpoints[1]);
+    assert_eq!(normal["selection_mode"], "no_candidates");
+    assert_eq!(
+        normal["summary_covered_observations"][0]["call_id"],
+        call_id
+    );
+    let requests = seen.lock().expect("requests lock");
+    let summary = requests
+        .iter()
+        .filter(|body| matches!(stage(body), Stage::Summary))
+        .nth(1)
+        .expect("second summary request");
+    let input = summary["input"].as_array().expect("summary input");
+    assert!(!input.iter().any(|item| {
+        matches!(
+            item["type"].as_str(),
+            Some("function_call" | "function_call_output")
+        )
+    }));
+    let observation = input
+        .iter()
+        .flat_map(item_texts)
+        .find(|text| text.starts_with("{\"observation\":"))
+        .expect("marker re-presented as an observation");
+    let observation: Value = serde_json::from_str(observation)?;
+    assert_eq!(observation["observation"]["reference"]["call_id"], call_id);
+    let replacement = replacement_history_from_rollout(&path)?;
+    assert!(!replacement.iter().any(|item| item["call_id"] == call_id));
     Ok(())
 }

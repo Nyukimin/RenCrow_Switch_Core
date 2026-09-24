@@ -1,9 +1,9 @@
-// Modified by RenCrow Switch Core, 2026-09-22; Normal V2 orchestration 2026-09-24.
-//! Normal V2 compaction: optional instruction selection, one summary request, host checks.
+// Modified by RenCrow Switch Core, 2026-09-22; V2 orchestration 2026-09-24.
+//! V2 compaction: Normal with optional selection and one summary, deterministic Emergency
+//! fallback, and explicit blocked states.
 use super::*;
 use codex_history::compaction_candidate::CandidateInput;
 use codex_history::compaction_candidate::Origin;
-use codex_history::compaction_candidate::digest;
 use codex_history::compaction_candidate::history_digest;
 use codex_history::compaction_checkpoint_metadata::CheckpointResponseStage;
 use codex_history::compaction_checkpoint_metadata::CompactionModelResponseReceipt;
@@ -11,9 +11,6 @@ use codex_history::compaction_pipeline::InstructionSelection;
 use codex_history::compaction_pipeline::ProposedOperation;
 use codex_history::compaction_pipeline::ProposedPlan;
 use codex_history::compaction_preprocess::InstructionObservationLink;
-use codex_history::compaction_preprocess::collect_instruction_candidates;
-use codex_history::compaction_preprocess::prune_known_obsolete;
-use codex_history::compaction_selection::validate_and_apply_selection;
 use codex_rollout::RolloutRecorder;
 use serde_json::Value;
 use serde_json::json;
@@ -21,6 +18,8 @@ use std::collections::HashSet;
 
 #[path = "compact_rencrow_candidate.rs"]
 mod candidate;
+#[path = "compact_rencrow_emergency.rs"]
+mod emergency;
 #[path = "compact_rencrow_history.rs"]
 mod history;
 #[path = "compact_rencrow_request.rs"]
@@ -29,8 +28,12 @@ mod model_request;
 mod native;
 #[path = "compact_rencrow_observation.rs"]
 mod observation;
+#[path = "compact_rencrow_stages.rs"]
+mod stages;
 #[path = "compact_rencrow_summary.rs"]
 mod summary;
+
+use stages::StageFailure;
 
 pub(super) use summary::should_apply_server_reasoning_included;
 
@@ -138,7 +141,11 @@ pub(super) async fn select_obsolete_instructions(
 }
 
 /// Error returned when an automatic compaction would repeat a failure on an unchanged history.
-const AUTO_RETRY_SUPPRESSED: &str = "RenCrow automatic compaction was not retried because the same unchanged history already failed compaction. The history was not changed; run /compact to retry manually.";
+/// A blocked state is not offered manual retry as its recovery (Part 2 §65).
+const AUTO_RETRY_SUPPRESSED: &str = "RenCrow automatic compaction was not retried because the same unchanged history already failed compaction. The history was not changed.";
+
+/// Shown when Normal failed for a semantic or model reason and Emergency committed (Part 2 §66).
+const EMERGENCY_TRANSITION: &str = "Normal semantic compaction was unavailable. RenCrow continued with deterministic compaction. No source data was discarded.";
 
 /// Decide whether an automatic compaction stops before any model request (Annex A F03).
 ///
@@ -149,6 +156,18 @@ pub(super) fn auto_retry_suppressed(
     history_hash: &str,
 ) -> bool {
     matches!(trigger, CompactionTrigger::Auto) && failed_hash == Some(history_hash)
+}
+
+/// Decide whether Normal is skipped because it already failed on this history (Part 2 §56).
+///
+/// An automatic compaction goes straight to Emergency; a manual `/compact` retries Normal, which
+/// is how a temporary model failure is retried (§65).
+pub(super) fn normal_skipped(
+    trigger: CompactionTrigger,
+    normal_failed_hash: Option<&str>,
+    history_hash: &str,
+) -> bool {
+    matches!(trigger, CompactionTrigger::Auto) && normal_failed_hash == Some(history_hash)
 }
 
 /// Decide whether a failed compaction records the automatic-retry fingerprint (Annex A F03).
@@ -170,7 +189,10 @@ pub(super) fn records_auto_failure(
         )
 }
 
-/// Run one Normal V2 compaction (Annex A F01) and commit it through the session owner.
+/// Run one V2 compaction and commit it through the session owner (Part 2 §3).
+///
+/// Normal is tried first. A semantic or model failure continues with deterministic Emergency;
+/// capacity and integrity failures end in an explicit blocked error without changing history.
 pub(super) async fn run(
     sess: Arc<Session>,
     ctx: Arc<TurnContext>,
@@ -214,8 +236,13 @@ pub(super) async fn run(
     ) {
         return Err(CodexErr::InvalidRequest(AUTO_RETRY_SUPPRESSED.into()));
     }
+    let skip_normal = normal_skipped(
+        trigger,
+        sess.rencrow_normal_failed_hash().await.as_deref(),
+        &history_hash,
+    );
 
-    let result = compact_normal(
+    let result = compact_v2(
         &sess,
         &ctx,
         injection,
@@ -225,6 +252,7 @@ pub(super) async fn run(
         &snapshot,
         history_hash.clone(),
         settings.clone(),
+        skip_normal,
     )
     .await;
     let outcome = match result {
@@ -247,37 +275,42 @@ pub(super) async fn run(
     };
     sess.set_rencrow_auto_compaction_failed_hash(/*hash*/ None)
         .await;
+    sess.set_rencrow_normal_failed_hash(/*hash*/ None).await;
     sess.recompute_token_usage(&ctx).await;
     sess.emit_turn_item_completed(&ctx, item).await;
-    sess.send_event(
-        &ctx,
-        EventMsg::Warning(WarningEvent {
-            message: format!(
-                "RenCrow compaction applied: {} instruction removals, {} completed results, {} new observations, {} model requests. Model {}.",
-                outcome.removals, outcome.results, outcome.observations, outcome.requests, outcome.model
-            ),
-        }),
-    )
-    .await;
-    Ok(outcome.summary)
+    let message = match &outcome.model {
+        Some(model) => format!(
+            "RenCrow compaction applied: {} instruction removals, {} completed results, {} new observations, {} model requests. Model {model}.",
+            outcome.removals, outcome.results, outcome.observations, outcome.requests
+        ),
+        None => format!(
+            "{EMERGENCY_TRANSITION} {} observation markers.",
+            outcome.observations
+        ),
+    };
+    sess.send_event(&ctx, EventMsg::Warning(WarningEvent { message }))
+        .await;
+    Ok(outcome
+        .summary_text
+        .strip_prefix(&format!("{SUMMARY_PREFIX}\n"))
+        .unwrap_or(&outcome.summary_text)
+        .to_owned())
 }
 
-/// Facts about one committed Normal compaction, reported after the durable commit.
-struct NormalOutcome {
-    summary: String,
+/// Facts about one committed checkpoint, reported after the durable commit.
+struct CommittedOutcome {
+    summary_text: String,
     removals: usize,
     results: usize,
     observations: usize,
     requests: usize,
-    model: String,
+    /// `None` for a deterministic emergency checkpoint.
+    model: Option<String>,
 }
 
-/// Prepare, select, preflight, summarize, validate, and commit one Normal V2 candidate.
-///
-/// At most two model requests are sent: an optional instruction selection and one summary. Every
-/// failure leaves the live history unchanged; only `commit_rencrow_checkpoint` replaces it.
+/// Prepare once, try Normal unless it is skipped, fall back to Emergency, and commit.
 #[allow(clippy::too_many_arguments)]
-async fn compact_normal(
+async fn compact_v2(
     sess: &Session,
     ctx: &TurnContext,
     injection: InitialContextInjection,
@@ -287,185 +320,63 @@ async fn compact_normal(
     snapshot: &crate::context_manager::ContextManager,
     history_hash: String,
     settings: codex_protocol::protocol::ThreadSettingsSnapshot,
-) -> CodexResult<NormalOutcome> {
-    let invalid = CodexErr::InvalidRequest;
-    let originals = snapshot.annotated_items();
-    let thread_id = sess.thread_id().to_string();
-
-    // Prepare.
-    let adopted = summary::find_adopted_v2_checkpoint(originals, &thread_id).map_err(invalid)?;
-    let (canonical, source_thread, active_call_ids) = load_canonical_rollout(sess).await?;
-    let prepared = codex_rollout::prepare_compaction_sources(
-        originals,
+    skip_normal: bool,
+) -> CodexResult<CommittedOutcome> {
+    let (canonical, source_thread, active_call_ids) = load_canonical_rollout(sess)
+        .await
+        .map_err(StageFailure::into_error)?;
+    let expected_world = snapshot.world_state_checkpoint();
+    let (initial_context, world_state) = build_compaction_initial_context(sess, &injection).await;
+    let prepared = stages::prepare_v2(
+        sess,
+        ctx,
+        snapshot,
         &canonical,
         &source_thread,
         &active_call_ids,
+        &history_hash,
+        &settings,
+        initial_context,
     )
-    .map_err(|error| invalid(format!("RenCrow compaction blocked: {error}")))?;
-    let prompt_base = sess.get_prompt_base_instructions().await;
-    let base = sess.get_base_instructions().await;
-    let expected_world = snapshot.world_state_checkpoint();
-    let (initial_context, world_state) = build_compaction_initial_context(sess, &injection).await;
-    let binding = digest(&json!({"thread":thread_id,"turn":ctx.sub_id,"history":history_hash,"settings":settings,"base":base.text,"world":expected_world})).map_err(invalid)?;
-    let input = history::capture(
-        originals,
-        binding,
-        &thread_id,
-        vec![json!({"base":prompt_base,"settings":settings,"injection":initial_context.iter().map(|i| &i.item).collect::<Vec<_>>()})],
-        &history::verified_pair_projections(&prepared),
-    )
-    .map_err(invalid)?;
-    let (known_refs, previous_observations, covered) = adopted
-        .as_ref()
-        .map(|adopted| {
-            (
-                adopted.metadata.applied_refs.as_slice(),
-                adopted.metadata.observations.as_slice(),
-                adopted.metadata.summary_covered_observations.as_slice(),
-            )
-        })
-        .unwrap_or_default();
-    let pruning = prune_known_obsolete(&input, known_refs).map_err(invalid)?;
-    // Handled means presented to an accepted Normal summary, not merely stored (Part 2 §21).
-    let projections = observation::project_unhandled_observations(originals, &prepared, covered)
-        .map_err(invalid)?;
-    let inventory = observation::cumulative_observation_coverage(
-        previous_observations,
-        &projections
-            .iter()
-            .map(|(_, _, projection)| projection.coverage.clone())
-            .collect::<Vec<_>>(),
-    )
-    .map_err(invalid)?;
-    let links = observation::build_completion_links(originals, &input, &pruning, &prepared)
-        .map_err(invalid)?;
+    .await
+    .map_err(StageFailure::into_error)?;
 
-    // Select.
-    let mut receipts = Vec::new();
-    let (selection, presentation_hash) = if selection_required(
-        &input,
-        adopted.as_ref().map(|adopted| adopted.index),
-        &links,
-    ) {
-        let payload = collect_instruction_candidates(&input, &pruning, &links).map_err(invalid)?;
-        let selection =
-            select_obsolete_instructions(sess, ctx, metadata, payload, &mut receipts, cancellation)
-                .await?;
-        let presentation_hash = selection
-            .as_ref()
-            .map(|selection| selection.presentation_hash().to_owned());
-        (selection, presentation_hash)
+    let normal = if skip_normal {
+        None
     } else {
-        (None, None)
+        match stages::normal_candidate(sess, ctx, metadata, cancellation, snapshot, &prepared).await
+        {
+            Ok(candidate) => Some(candidate),
+            Err(StageFailure::Semantic(error)) => {
+                tracing::warn!(%error, "RenCrow Normal compaction failed; using Emergency");
+                sess.set_rencrow_normal_failed_hash(Some(history_hash.clone()))
+                    .await;
+                None
+            }
+            Err(failure) => return Err(failure.into_error()),
+        }
     };
-    let application =
-        validate_and_apply_selection(&input, &pruning, &links, selection).map_err(invalid)?;
-    let native = native::filter_retained_instructions(originals, &input, application.clone())
-        .map_err(invalid)?;
-
-    // Preflight.
-    let scope = ctx.config.model_auto_compact_token_limit_scope;
-    let limits = crate::session::context_window::context_window_token_status(sess, ctx).await;
-    candidate::preflight_compaction_floor(
-        snapshot,
-        &base,
-        &native,
-        &initial_context,
-        scope,
-        &limits,
-    )
-    .map_err(|error| invalid(format!("RenCrow compaction preflight failed: {error}")))?;
-
-    // Summarize.
-    let excerpts = projections
-        .iter()
-        .map(|(call_index, output_index, projection)| {
-            (*call_index, *output_index, projection.summary.clone())
-        })
-        .collect::<Vec<_>>();
-    let summary_history = summary::build_summary_history(
-        originals,
-        &input,
-        &native,
-        &excerpts,
-        summary::previous_summary_index(originals, adopted.as_ref()),
-    )
-    .map_err(invalid)?;
-    let (summary_suffix, response_id) = model_request::request_compaction_summary(
-        sess,
-        ctx,
-        metadata,
-        summary_history,
-        &application.results,
-        &mut receipts,
-        cancellation,
-    )
-    .await?;
-    let summary_text = format!("{SUMMARY_PREFIX}\n{summary_suffix}");
-    let inventory_refs = inventory
-        .iter()
-        .map(|coverage| coverage.reference.clone())
-        .collect::<Vec<_>>();
-    let important = summary::important_refs_from_summary(&summary_suffix, &inventory_refs);
-
-    // Validate and commit.
-    let requests = receipts.len();
-    let model = ctx.model_info().slug.clone();
-    let effort = sess
-        .reasoning_effort_for_request(&ctx.initial_settings, RequestEffortUsage::Compaction)
-        .await;
-    let checkpoint_metadata = candidate::fresh_checkpoint_metadata(
-        &summary_text,
-        input.snapshot().map_err(invalid)?.hash().to_owned(),
-        presentation_hash,
-        &application,
-        inventory,
-        observation::summary_covered_after_normal(covered, &projections),
-        important.refs,
-        receipts,
-        model.clone(),
-        effort,
-    );
-    let mut replacement =
-        native::build_native_replacement(&native, &summary_text, initial_context.clone())
-            .map_err(invalid)?;
-    let summary_item = replacement
-        .last_mut()
-        .ok_or_else(|| invalid("compaction replacement has no summary".into()))?;
-    summary_item.set_turn_id_if_missing(&ctx.sub_id);
-    summary_item
-        .metadata
-        .get_or_insert_default()
-        .rencrow_compaction = Some(
-        serde_json::to_value(&checkpoint_metadata)
-            .map_err(|error| invalid(format!("failed to encode compaction metadata: {error}")))?,
-    );
-    candidate::validate_compaction_candidate(
-        snapshot,
-        &base,
-        &native,
-        &initial_context,
-        &replacement,
-        &thread_id,
-        scope,
-        &limits,
-    )
-    .map_err(|error| invalid(format!("RenCrow compaction candidate rejected: {error}")))?;
+    let candidate = match normal {
+        Some(candidate) => candidate,
+        None => stages::emergency_candidate(ctx, snapshot, &prepared)
+            .map_err(StageFailure::into_error)?,
+    };
     let reference_context = match injection {
         InitialContextInjection::DoNotInject => None,
         InitialContextInjection::BeforeLastUserMessage { step_context, .. } => {
             Some(step_context.to_turn_context_item())
         }
     };
+    let base = sess.get_base_instructions().await;
     sess.commit_rencrow_checkpoint(
         crate::session::RenCrowCheckpoint {
-            items: replacement,
+            items: candidate.items,
             expected_history_hash: history_hash,
             expected_settings: settings,
             reference_context,
             world_state,
-            summary: summary_text,
-            response_id: Some(response_id),
+            summary: candidate.summary_text.clone(),
+            response_id: candidate.response_id,
             expected_turn: ctx.sub_id.clone(),
             expected_base_text: base.text,
             expected_world,
@@ -473,31 +384,32 @@ async fn compact_normal(
         activity,
     )
     .await?;
-    Ok(NormalOutcome {
-        summary: summary_suffix,
-        removals: application
-            .pruning
-            .applied
-            .len()
-            .saturating_sub(pruning.applied.len()),
-        results: application.results.len(),
-        observations: projections.len(),
-        requests,
-        model,
+    Ok(CommittedOutcome {
+        summary_text: candidate.summary_text,
+        removals: candidate.removals,
+        results: candidate.results,
+        observations: candidate.observations,
+        requests: candidate.requests,
+        model: candidate.model,
     })
 }
 
 /// Load the canonical rollout once for this compaction (Annex A F04).
 ///
 /// Without persisted rollout storage no pair can be verified, so every tool item stays protected;
-/// existing archive references then fail closed in `prepare_compaction_sources`.
+/// existing archive references and markers then fail closed in `prepare_compaction_sources`.
+/// Unreadable storage aborts; a malformed or foreign rollout is an integrity conflict.
 async fn load_canonical_rollout(
     sess: &Session,
-) -> CodexResult<(
-    Vec<codex_history::RolloutItem>,
-    codex_protocol::ThreadId,
-    HashSet<String>,
-)> {
+) -> Result<
+    (
+        Vec<codex_history::RolloutItem>,
+        codex_protocol::ThreadId,
+        HashSet<String>,
+    ),
+    StageFailure,
+> {
+    let unavailable = |error: String| StageFailure::Abort(CodexErr::InvalidRequest(error));
     let active_call_ids = sess
         .list_background_terminals()
         .await
@@ -505,7 +417,7 @@ async fn load_canonical_rollout(
         .map(|terminal| terminal.item_id)
         .collect();
     let Some(path) = sess.current_rollout_path().await.map_err(|error| {
-        CodexErr::InvalidRequest(format!(
+        unavailable(format!(
             "RenCrow compaction blocked: rollout unavailable: {error}"
         ))
     })?
@@ -513,30 +425,27 @@ async fn load_canonical_rollout(
         return Ok((Vec::new(), sess.thread_id(), active_call_ids));
     };
     sess.flush_rollout().await.map_err(|error| {
-        CodexErr::InvalidRequest(format!(
+        unavailable(format!(
             "RenCrow compaction blocked: rollout flush failed: {error}"
         ))
     })?;
     let (items, thread_id, parse_errors) = RolloutRecorder::load_rollout_items(&path)
         .await
         .map_err(|error| {
-            CodexErr::InvalidRequest(format!(
+            unavailable(format!(
                 "RenCrow compaction blocked: rollout read failed: {error}"
             ))
         })?;
     if parse_errors != 0 {
-        return Err(CodexErr::InvalidRequest(format!(
-            "RenCrow compaction blocked: rollout contains {parse_errors} parse errors"
+        return Err(StageFailure::Integrity(format!(
+            "rollout contains {parse_errors} parse errors"
         )));
     }
-    let thread_id = thread_id.ok_or_else(|| {
-        CodexErr::InvalidRequest(
-            "RenCrow compaction blocked: rollout has no canonical thread header".into(),
-        )
-    })?;
+    let thread_id = thread_id
+        .ok_or_else(|| StageFailure::Integrity("rollout has no canonical thread header".into()))?;
     if thread_id != sess.thread_id() {
-        return Err(CodexErr::InvalidRequest(
-            "RenCrow compaction blocked: rollout thread does not match live session".into(),
+        return Err(StageFailure::Integrity(
+            "rollout thread does not match live session".into(),
         ));
     }
     Ok((items, thread_id, active_call_ids))

@@ -8,6 +8,7 @@ use codex_history::ResponseItemEnvelope;
 use codex_history::archive_reference::ObservationReference;
 use codex_history::compaction_candidate::CandidateInput;
 use codex_history::compaction_candidate::Origin;
+use codex_history::compaction_checkpoint_metadata::CompactionSelectionMode;
 use codex_history::compaction_checkpoint_metadata::RenCrowCompactionMetadataV2;
 use codex_history::observation_projection::ObservationSummaryExcerpt;
 use codex_protocol::models::ContentItem;
@@ -77,41 +78,83 @@ pub(super) fn find_adopted_v2_checkpoint(
     Ok(None)
 }
 
-/// Choose the one previous summary shown to the V2 summary request (Part 2 §18, Annex A F20).
+/// Positions that separate already summarized state from unsummarized state (Part 2 §18, §29–32).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct SemanticContext {
+    /// The previous accepted semantic summary, shown once to Summary and carried by Emergency.
+    pub(super) previous_summary: Option<usize>,
+    /// Ordinary Work before this index is already represented by the previous summary.
+    pub(super) work_boundary: Option<usize>,
+    /// Humans before this index were already considered by an accepted selection.
+    pub(super) selection_boundary: Option<usize>,
+}
+
+/// Locate the semantic boundary, which differs from the durable checkpoint boundary.
 ///
-/// The adopted V2 summary is used when present. Before the first V2 checkpoint, the latest
-/// owner-adopted legacy summary is the only record of earlier summarized work, so it is shown once
-/// instead of being dropped. It is not a selection or observation boundary.
-pub(super) fn previous_summary_index(
+/// A Normal V2 checkpoint is all three positions. An Emergency checkpoint is durable but not
+/// semantic: every ordinary Work item it retained is unsummarized, its Humans need a new
+/// selection, and only a carried semantic summary is shown again; a host placeholder is not.
+/// Before the first V2 checkpoint, the latest owner-adopted legacy summary is the only record of
+/// earlier summarized work, so it is shown once and bounds ordinary Work, but not selection.
+pub(super) fn semantic_context(
     items: &[ResponseItemEnvelope],
     adopted: Option<&AdoptedV2Checkpoint>,
-) -> Option<usize> {
-    adopted
-        .map(|adopted| adopted.index)
-        .or_else(|| items.iter().rposition(is_user_summary))
+) -> SemanticContext {
+    match adopted {
+        Some(adopted)
+            if adopted.metadata.selection_mode
+                == CompactionSelectionMode::DeterministicEmergency =>
+        {
+            SemanticContext {
+                previous_summary: adopted
+                    .metadata
+                    .semantic_summary_hash
+                    .is_some()
+                    .then_some(adopted.index),
+                work_boundary: None,
+                selection_boundary: None,
+            }
+        }
+        Some(adopted) => SemanticContext {
+            previous_summary: Some(adopted.index),
+            work_boundary: Some(adopted.index),
+            selection_boundary: Some(adopted.index),
+        },
+        None => {
+            let legacy = items.iter().rposition(is_user_summary);
+            SemanticContext {
+                previous_summary: legacy,
+                work_boundary: legacy,
+                selection_boundary: None,
+            }
+        }
+    }
 }
 
 /// Build the model-visible history for the single V2 summary request.
 ///
 /// Humans and protected items come from the native projection, so the summary sees exactly what
-/// the replacement retains. Ordinary Work before the adopted summary is already represented by
-/// that summary and is omitted. Each verified observation pair becomes one bounded host item.
+/// the replacement retains. The previous semantic summary is shown once; ordinary Work before the
+/// work boundary is already represented by it and is omitted. Other summaries, including an
+/// emergency placeholder, are not shown. Each verified observation pair becomes one bounded host
+/// item.
 pub(super) fn build_summary_history(
     originals: &[ResponseItemEnvelope],
     input: &CandidateInput,
     native: &NativeProjection,
     observations: &[(usize, usize, ObservationSummaryExcerpt)],
-    adopted_summary_index: Option<usize>,
+    previous_summary: Option<usize>,
+    work_boundary: Option<usize>,
 ) -> Result<Vec<ResponseItemEnvelope>, String> {
     if input.records.len() != originals.len() {
         return Err("summary history and candidate record counts differ".into());
     }
-    if let Some(index) = adopted_summary_index
+    if let Some(index) = previous_summary
         && originals
             .get(index)
             .is_none_or(|item| !is_user_summary(item))
     {
-        return Err("adopted summary index does not identify a compaction summary".into());
+        return Err("previous summary index does not identify a compaction summary".into());
     }
     let retained = native
         .retained_by_original_index()
@@ -172,7 +215,7 @@ pub(super) fn build_summary_history(
 
     let mut projected = Vec::new();
     for (index, (record, original)) in input.records.iter().zip(originals).enumerate() {
-        if adopted_summary_index == Some(index) {
+        if previous_summary == Some(index) {
             projected.push(original.clone());
         } else if let Some(excerpt) = observation_calls.get(&index) {
             let body = serde_json::to_string(excerpt)
@@ -186,7 +229,7 @@ pub(super) fn build_summary_history(
         } else if let Some(envelope) = retained.get(&index) {
             projected.push((*envelope).clone());
         } else if record.origin == Origin::Work
-            && adopted_summary_index.is_none_or(|boundary| index > boundary)
+            && work_boundary.is_none_or(|boundary| index > boundary)
             && !is_user_summary(original)
         {
             projected.push(original.clone());

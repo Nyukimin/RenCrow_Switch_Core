@@ -231,6 +231,9 @@ pub fn resolve_completed_work_evidence_from_items(
 pub enum PreparedCompactionReferenceKind {
     Fresh,
     Existing,
+    /// A V2 observation marker verified against its canonical raw observation. The canonical
+    /// texts are borrowed like a fresh pair; the live body is the host marker, never raw data.
+    ObservationMarker,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -365,6 +368,20 @@ pub fn prepare_compaction_sources<'a>(
         ) {
             continue;
         }
+        if is_observation_marker(&selected[output_index]) {
+            pairs.push(prepare_observation_marker(
+                &canonical_index,
+                selected,
+                call_index,
+                output_index,
+                call_id,
+                expected_thread,
+                active_call_ids,
+            )?);
+            paired_indices[call_index] = true;
+            paired_indices[output_index] = true;
+            continue;
+        }
         let reference_kind = if existing_references[output_index].is_some() {
             PreparedCompactionReferenceKind::Existing
         } else {
@@ -454,6 +471,17 @@ pub fn prepare_compaction_sources<'a>(
         });
     }
 
+    // A marker replaced raw data, so it must never fall back to protected raw output (§39).
+    if selected
+        .iter()
+        .enumerate()
+        .any(|(index, envelope)| is_observation_marker(envelope) && !paired_indices[index])
+    {
+        return Err(
+            "V2 observation marker could not be verified as a unique inactive call and output"
+                .into(),
+        );
+    }
     let protected_indices = paired_indices
         .iter()
         .enumerate()
@@ -463,6 +491,81 @@ pub fn prepare_compaction_sources<'a>(
     Ok(PreparedCompactionSources {
         pairs,
         protected_indices,
+    })
+}
+
+fn is_observation_marker(envelope: &ResponseItemEnvelope) -> bool {
+    envelope
+        .metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.rencrow_observation_projection.is_some())
+}
+
+/// Verify an existing V2 observation marker against its canonical raw observation (§39–40).
+///
+/// The marker body and metadata must be exactly regenerated from the canonical call and output,
+/// and the call and output identity must match. Any mismatch is a deterministic integrity
+/// conflict; the marker is never reinterpreted as raw output.
+fn prepare_observation_marker<'a>(
+    canonical_index: &ObservationIndex<'a>,
+    selected: &[ResponseItemEnvelope],
+    call_index: usize,
+    output_index: usize,
+    call_id: &str,
+    expected_thread: &ThreadId,
+    active_call_ids: &HashSet<String>,
+) -> Result<PreparedCompactionSourcePair<'a>, String> {
+    let (reference, observation) = canonical_index
+        .reference(call_id, expected_thread, active_call_ids)
+        .map_err(|error| {
+            format!("V2 observation marker has no verifiable canonical source: {error}")
+        })?;
+    let call_text = call_input(&observation.call.item)
+        .ok_or_else(|| "V2 observation marker call has no text input".to_owned())?;
+    let (call, output) = (&selected[call_index], &selected[output_index]);
+    let marker_body = match &output.item {
+        ResponseItem::FunctionCallOutput { output, .. }
+        | ResponseItem::CustomToolCallOutput { output, .. } => output.text_content(),
+        _ => None,
+    }
+    .ok_or_else(|| "V2 observation marker body is not text".to_owned())?;
+    if !same_persisted_item(&observation.call.item, &call.item)
+        || observation.call.metadata != call.metadata
+        || !same_fresh_output_except_text_body(&output.item, &observation.output.item)
+    {
+        return Err("V2 observation marker identity differs from its canonical source".into());
+    }
+    let regenerated = codex_history::project_observation(
+        &reference,
+        observation.tool_name,
+        call_text,
+        observation.body,
+    )?;
+    codex_history::observation_marker::verify_observation_marker(
+        &regenerated,
+        observation.output.metadata.as_ref(),
+        output.metadata.as_ref(),
+        marker_body,
+    )?;
+    let terminal_reference = if observation.tool_name == "exec_command" {
+        match canonical_index.terminal_reference_for_observation(&reference, observation) {
+            Ok(reference) => Some(reference),
+            Err(ArchiveEvidenceError::Invalid(reason)) => return Err(reason.into()),
+            Err(ArchiveEvidenceError::Ineligible(_)) => None,
+        }
+    } else {
+        None
+    };
+    Ok(PreparedCompactionSourcePair {
+        call_index,
+        output_index,
+        reference,
+        reference_kind: PreparedCompactionReferenceKind::ObservationMarker,
+        output_total_bytes: observation.body.len(),
+        tool_name: observation.tool_name,
+        canonical_call_input: Some(call_text),
+        canonical_output_text: Some(observation.body),
+        terminal_reference,
     })
 }
 
@@ -625,3 +728,7 @@ mod f08_range_tests;
 #[cfg(test)]
 #[path = "evidence/f08_inventory_tests.rs"]
 mod f08_inventory_tests;
+
+#[cfg(test)]
+#[path = "evidence/v2_marker_tests.rs"]
+mod v2_marker_tests;

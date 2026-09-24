@@ -157,7 +157,8 @@ fn v2_summary_projection_uses_one_adopted_summary_and_only_later_ordinary_work()
             .unwrap();
 
     let projected =
-        super::summary::build_summary_history(&originals, &input, &native, &[], Some(1)).unwrap();
+        super::summary::build_summary_history(&originals, &input, &native, &[], Some(1), Some(1))
+            .unwrap();
 
     let ids = projected.iter().filter_map(item_id).collect::<Vec<_>>();
     assert_eq!(ids.iter().filter(|id| **id == "old-summary").count(), 1);
@@ -181,15 +182,29 @@ fn v2_first_compaction_shows_the_latest_legacy_summary_once() {
         super::summary::find_adopted_v2_checkpoint(&originals, THREAD_ID),
         Ok(None)
     );
-    let previous = super::summary::previous_summary_index(&originals, /*adopted*/ None);
-    assert_eq!(previous, Some(0));
+    let context = super::summary::semantic_context(&originals, /*adopted*/ None);
+    assert_eq!(
+        context,
+        super::summary::SemanticContext {
+            previous_summary: Some(0),
+            work_boundary: Some(0),
+            selection_boundary: None,
+        }
+    );
     let input = candidate_input(&originals, &[]);
     let native =
         super::native::filter_retained_instructions(&originals, &input, application(&input))
             .unwrap();
 
-    let projected =
-        super::summary::build_summary_history(&originals, &input, &native, &[], previous).unwrap();
+    let projected = super::summary::build_summary_history(
+        &originals,
+        &input,
+        &native,
+        &[],
+        context.previous_summary,
+        context.work_boundary,
+    )
+    .unwrap();
 
     assert_eq!(
         projected.iter().filter_map(item_id).collect::<Vec<_>>(),
@@ -287,6 +302,7 @@ fn v2_summary_projection_replaces_both_verified_pair_slots_with_one_bounded_obse
         &input,
         &native,
         &[(3, 4, observation)],
+        Some(1),
         Some(1),
     )
     .unwrap();
@@ -405,6 +421,7 @@ fn v2_generic_capture_projects_large_custom_tool_input_from_canonical_raw_pair()
         &input,
         &native,
         &[(1, 2, observation)],
+        None,
         None,
     )
     .unwrap();
@@ -541,7 +558,8 @@ fn v2_summary_projection_reuses_the_same_pruned_human_envelope_as_native_replace
     let native =
         super::native::filter_retained_instructions(&originals, &input, application).unwrap();
     let summary_items =
-        super::summary::build_summary_history(&originals, &input, &native, &[], None).unwrap();
+        super::summary::build_summary_history(&originals, &input, &native, &[], None, None)
+            .unwrap();
     let candidate = super::native::build_native_replacement(&native, "summary", vec![]).unwrap();
     let summary_human = summary_items
         .iter()
@@ -1416,7 +1434,8 @@ fn v2_model_selection_shares_one_application_between_summary_and_replacement() {
     let native =
         super::native::filter_retained_instructions(&originals, &input, application).unwrap();
     let summary_items =
-        super::summary::build_summary_history(&originals, &input, &native, &[], None).unwrap();
+        super::summary::build_summary_history(&originals, &input, &native, &[], None, None)
+            .unwrap();
     let candidate = super::native::build_native_replacement(&native, "summary", vec![]).unwrap();
 
     let expected = vec![

@@ -133,7 +133,8 @@ fn plaintext_reasoning_is_summary_visible_and_not_retained() {
 
     let native = native_without_selection(&input, &items).unwrap();
     let summary_items =
-        super::super::summary::build_summary_history(&items, &input, &native, &[], None).unwrap();
+        super::super::summary::build_summary_history(&items, &input, &native, &[], None, None)
+            .unwrap();
     assert_eq!(summary_items, items);
     assert!(retained(&input, &items).unwrap().is_empty());
     assert_eq!(items, original);

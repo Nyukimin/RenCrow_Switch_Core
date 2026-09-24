@@ -24,6 +24,7 @@ pub use compaction_preprocess::prune_known_obsolete;
 pub mod compaction_plan;
 pub mod compaction_transaction;
 pub mod input_intake;
+pub mod observation_marker;
 pub mod observation_projection;
 pub use observation_projection::ObservationCoverage;
 pub use observation_projection::ObservationPartCoverage;

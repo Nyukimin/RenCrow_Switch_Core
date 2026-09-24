@@ -173,7 +173,9 @@ pub(super) fn preflight_compaction_floor(
 }
 
 /// Require a candidate history to shrink the estimated context and fit the configured limits.
-fn check_context_budget(
+///
+/// The error names the estimated tokens and the limit so a capacity diagnostic can report them.
+pub(super) fn check_context_budget(
     original: &ContextManager,
     base: &BaseInstructions,
     candidate: Vec<ResponseItemEnvelope>,
@@ -189,26 +191,30 @@ fn check_context_budget(
         .estimate_token_count_with_base_instructions(base)
         .ok_or_else(|| "candidate compaction context estimate is unavailable".to_owned())?;
     if after >= before {
-        return Err("compaction candidate does not shrink the estimated context".into());
+        return Err(format!(
+            "compaction candidate does not shrink the estimated context ({after} >= {before} tokens)"
+        ));
     }
 
     let candidate_scope_tokens = match scope {
         AutoCompactTokenLimitScope::Total => after,
         AutoCompactTokenLimitScope::BodyAfterPrefix => 0,
     };
-    if limits
+    if let Some(limit) = limits
         .auto_compact_scope_limit
-        .is_some_and(|limit| candidate_scope_tokens >= limit)
+        .filter(|limit| candidate_scope_tokens >= *limit)
     {
-        return Err(
-            "compaction candidate reaches the configured auto-compaction scope limit".into(),
-        );
+        return Err(format!(
+            "compaction candidate reaches the configured auto-compaction scope limit ({candidate_scope_tokens} >= {limit} tokens)"
+        ));
     }
-    if limits
+    if let Some(limit) = limits
         .full_context_window_limit
-        .is_some_and(|limit| after >= limit)
+        .filter(|limit| after >= *limit)
     {
-        return Err("compaction candidate reaches the full context window limit".into());
+        return Err(format!(
+            "compaction candidate reaches the full context window limit ({after} >= {limit} tokens)"
+        ));
     }
 
     Ok(())

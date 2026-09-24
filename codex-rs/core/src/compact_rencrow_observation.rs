@@ -43,7 +43,9 @@ pub(super) fn project_unhandled_observations(
             continue;
         }
         let projection = match pair.reference_kind {
-            PreparedCompactionReferenceKind::Fresh => {
+            // A verified V2 marker is re-projected from its canonical raw text, like a fresh pair.
+            PreparedCompactionReferenceKind::Fresh
+            | PreparedCompactionReferenceKind::ObservationMarker => {
                 let (Some(call_text), Some(output_text)) =
                     (pair.canonical_call_input, pair.canonical_output_text)
                 else {

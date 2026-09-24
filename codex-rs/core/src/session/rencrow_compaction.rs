@@ -59,6 +59,15 @@ impl Session {
         self.state.lock().await.rencrow_auto_compaction_failed_hash = hash;
     }
 
+    /// History digest whose Normal stage already failed semantically (Part 2 §56).
+    pub(crate) async fn rencrow_normal_failed_hash(&self) -> Option<String> {
+        self.state.lock().await.rencrow_normal_failed_hash.clone()
+    }
+
+    pub(crate) async fn set_rencrow_normal_failed_hash(&self, hash: Option<String>) {
+        self.state.lock().await.rencrow_normal_failed_hash = hash;
+    }
+
     pub(super) async fn bind_rencrow_intake(
         &self,
         ctx: &TurnContext,
