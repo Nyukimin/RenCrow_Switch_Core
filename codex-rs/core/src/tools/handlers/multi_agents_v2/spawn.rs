@@ -165,7 +165,7 @@ async fn handle_spawn_agent(
         .session_source
         .get_agent_path()
         .unwrap_or_else(AgentPath::root);
-    let communication = agent_message_from_tool(message, &source).into_communication(
+    let communication = agent_message_from_tool(message, &source, &turn).into_communication(
         author,
         new_agent_path.clone(),
         MessageDeliveryMode::TriggerTurn,

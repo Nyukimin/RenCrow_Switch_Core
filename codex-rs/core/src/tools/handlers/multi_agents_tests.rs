@@ -1079,6 +1079,89 @@ async fn multi_agent_v2_spawn_returns_path_and_send_message_accepts_relative_pat
 }
 
 #[tokio::test]
+async fn multi_agent_v2_messages_from_non_openai_provider_are_plaintext() {
+    let (mut session, mut turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    let root = manager
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .await
+        .expect("root thread should start");
+    session.services.agent_control = manager.agent_control();
+    session.thread_id = root.thread_id;
+    let provider_info = built_in_model_providers(/*openai_base_url*/ None)["ollama"].clone();
+    let mut config = (*turn.config).clone();
+    config.model_provider_id = "ollama".to_string();
+    config.model_provider = provider_info.clone();
+    config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("test config should allow feature update");
+    set_turn_config(&mut turn, config);
+    turn.provider = create_model_provider(provider_info, turn.auth_manager.clone());
+
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    SpawnAgentHandlerV2::default()
+        .handle(invocation(
+            session.clone(),
+            turn.clone(),
+            "spawn_agent",
+            function_payload(json!({
+                "message": "inspect this repo",
+                "task_name": "test_process"
+            })),
+        ))
+        .await
+        .expect("spawn_agent should succeed");
+    SendMessageHandlerV2
+        .handle(invocation(
+            session.clone(),
+            turn.clone(),
+            "send_message",
+            function_payload(json!({
+                "target": "test_process",
+                "message": "check the tests"
+            })),
+        ))
+        .await
+        .expect("send_message should succeed");
+
+    let child_thread_id = session
+        .services
+        .agent_control
+        .resolve_agent_reference(session.thread_id, &turn.session_source, "test_process")
+        .await
+        .expect("relative path should resolve");
+    let delivered: Vec<(Option<String>, String, bool)> = manager
+        .captured_ops()
+        .into_iter()
+        .filter_map(|(id, op)| match op {
+            Op::InterAgentCommunication { communication, .. } if id == child_thread_id => Some((
+                communication.encrypted_content,
+                communication.content,
+                communication.trigger_turn,
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        delivered,
+        vec![
+            (
+                None,
+                "Message Type: NEW_TASK\nTask name: /root/test_process\nSender: /root\nPayload:\ninspect this repo".to_string(),
+                true,
+            ),
+            (
+                None,
+                "Message Type: MESSAGE\nTask name: /root/test_process\nSender: /root\nPayload:\ncheck the tests".to_string(),
+                false,
+            ),
+        ]
+    );
+}
+
+#[tokio::test]
 async fn multi_agent_v2_spawn_rejects_legacy_fork_context() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();

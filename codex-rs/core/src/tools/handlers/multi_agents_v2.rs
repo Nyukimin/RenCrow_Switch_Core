@@ -51,14 +51,18 @@ pub(crate) async fn emit_sub_agent_activity(
     session.emit_turn_item_completed(turn, item).await;
 }
 
+/// Only OpenAI encrypts collaboration tool arguments; any other provider returns the model's
+/// plaintext, which must not be forwarded to the recipient as encrypted content.
 fn agent_message_from_tool(
     message: String,
     source: &crate::tools::context::ToolCallSource,
+    turn: &crate::session::turn_context::TurnContext,
 ) -> AgentMessage {
     if matches!(
         source,
         crate::tools::context::ToolCallSource::DirectPlaintextMessage
-    ) {
+    ) || !turn.provider.info().is_openai()
+    {
         AgentMessage::Plaintext(message)
     } else {
         AgentMessage::Encrypted(message)
