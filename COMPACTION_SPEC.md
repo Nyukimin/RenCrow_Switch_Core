@@ -4901,6 +4901,14 @@ RenCrow Switch Core Compaction V2の役割は、
 - 検査: `just test --cargo-profile dev-small -p codex-core --lib -E "test(compact) | test(session::) | test(agent::control)"` 597件が全成功、`-p codex-core --test all -E "test(suite::compact)"` 79件のうち78件が成功した。失敗は上流の既存の不安定試験`compact_remote::remote_compact_v2_rewrites_multiple_trailing_function_call_outputs`だけで、単独実行でも3回中1回は再試行で成功した。
 - 配備: `7c97c8e53`からbuildしたbinary（E2Eで受入したbuildとSHA-256一致）を`~/.local/bin`へ原子的に差し替えた。`rencrow-switch-core`は`ba3dfa013a51e93c47e7f4e33f1e73b933fba186fc5469b9d60cabd9ecac067c`、`rencrow-compaction`は`ae2cea4ca8a1e512b44e093b03826652cbbf25bd8ab97196b3f537b67abe1449`。稼働中の共有threadとID変更作業のthreadは次の起動から使う。旧binaryは`compaction-runtime-deploy/before-gateway-fix/`、記録は私有の`gateway-fix-deploy.json`。checkpointの形式は変えていないため、差し戻しはbinaryだけでよい。Gateway側の修正を外す場合は先にこのbinaryを戻す（外すと要約指示が先頭へ移り、要約が崩れる）。
 
+#### Failure Knowledge: toolの記法が要約として採用され、Gatewayの注意が末尾へ移った（2026-09-25）
+
+- 事象: ID変更作業の実threadの4回目のcompaction（01:16:42、自動、旧binary`5f3fc14d…`）で、Qwenが要約本文の代わりに`<tool_call><function=update_plan>…`の記法を本文として返し、それが要約として採用された。置換後の要約は計画の一覧だけになり、作業状態が失われた。toolを宣言しない要求でQwen（MLX-Serve）が記法を本文に残す現象は、RenCrow_LLMの既存の検証記録（2026-09-21、26回中2回）でも起きており、「記法を成功した要約として扱わない」ことが境界条件として書かれていた。
+- 寄与した変更: RenCrow_LLM `0ee8ef5`が、Gatewayが変換時に加えるtoolなし履歴の注意（「最新のuser依頼へtextで答える」）まで末尾のuser messageにしていた。失敗した要求をそのまま再送すると、記法は出なかったが要約ではなく作業の続きを答えた（757文字）。隔離環境のE2Eは要約入力にtool呼出しを含まず、この注意が付く経路を通っていなかった。
+- 対処（RenCrow_LLM）: `cf1c19f`で、本文の先頭が`<tool_call>`の応答を本文として送らず、同じ要求を1回だけ再送し、再送も記法ならエラーにする（Switch CoreはStageFailure::SemanticからEmergencyへ進み、記法を要約にしない）。`ad60555`で、末尾のuser messageにするのはclientが入力の末尾に置いたdeveloper messageだけに限り、Gatewayの注意は先頭のsystem messageへ統合する。どちらも配備済み。
+- 確認: 同じ失敗要求を配備後に再送すると、旧binaryの形（末尾がuserの要約依頼）で6,942文字・`observation:"…"`12件、`7c97c8e53`の形（末尾が要約指示）で8,517文字・10件の要約になり、送信内容は注意を先頭のsystem messageに含み、最後が要約指示のuser messageだった。各1回の再送で、失敗率は推定しない。
+- 本人threadへの対処: 観察者が01:00の正常な要約と01:00〜01:16のコマンド記録を私有のscratchpadへ置き、その場所だけを本人threadへ入力した（入力はhumanとして記録される）。Qwenは01:23に読み、作業へ戻った。
+
 # 第4部 部品契約・Failure Knowledge・実測・旧仕様（2026-09-24以前の記録）
 
 旧題: RenCrow Fork Compaction 新仕様案 第2版。第1〜2部と矛盾する記述は第1〜2部が優先する。承認済み例外1〜4（「元関数への例外と必要理由」）など、第1〜2部と矛盾しない部品契約は引き続き有効。Failure Knowledgeと実測記録は削除しない。
