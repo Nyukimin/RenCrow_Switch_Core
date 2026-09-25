@@ -528,17 +528,9 @@ async fn v2_summary_request_normalizes_history_and_records_one_typed_receipt() {
 
     let request = mock.single_request();
     let input = request.body_json()["input"].as_array().unwrap().clone();
-    // The request ends with the summary request itself, after the developer instruction, so a
-    // gateway that hoists developer messages still leaves the request as the last message.
-    let last = &input[input.len() - 1];
-    assert_eq!(last["role"], "user");
-    assert!(
-        last["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .starts_with("Write the compaction summary now")
-    );
-    assert_eq!(input[input.len() - 2]["role"], "developer");
+    // The summary instruction stays last; a backend that merges developer messages into its
+    // leading system message keeps this trailing one last (RenCrow_LLM).
+    assert_eq!(input.last().unwrap()["role"], "developer");
     assert!(input.iter().any(|item| {
         item["type"] == "function_call_output" && item["call_id"] == "pending-call"
     }));
