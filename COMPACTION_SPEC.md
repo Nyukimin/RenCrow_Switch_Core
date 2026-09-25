@@ -4785,7 +4785,7 @@ RenCrow Switch Core Compaction V2の役割は、
 
 性能最適化と実装簡素化は、その目的を守れる範囲でのみ行う。
 
-# 第3部 現在の実装状態（2026-09-24）
+# 第3部 現在の実装状態（2026-09-25）
 
 第2部 §70のPhase 1（項目1〜13、下記「Phase 1の進捗」）、Phase 2（Level 2 schema、下記「Phase 2の進捗」）、Phase 3（Level 2 runtime、下記「Phase 3の進捗」）、Phase 4（Level 5 / Integrity、下記「Phase 4の進捗」）を実装し、Phase 5（実QwenのE2E、下記「Phase 5の進捗」）とPhase 6（共有配備、下記「Phase 6の進捗」）を実施した。本部は第4部「第2版の実装契約」の8責務とsourceの対応だけを示す。工程別の検査・証拠・未解決の指摘は私有の`target/fork-bootstrap/compaction-check-plan.json`（`v2`）が正本であり、ここへ複製しない。
 
@@ -4868,7 +4868,7 @@ RenCrow Switch Core Compaction V2の役割は、
 第2部 §70 Phase 5（実QwenのE2E）を、§76に従う隔離環境で実施した。CODEX_HOMEはGit外の私有directory（0700）で、認証情報は複製せず、起動時に`OPENAI_API_KEY`・`CODEX_API_KEY`を外し、本番のwriterとは別のthreadで行った。TUIをtmuxで操作し、RenCrow Gateway（`worker/high`、Qwen3.8-flash-Mac）へ接続した。私有の受入記録は`target/fork-bootstrap/compaction-v2-e2e/phase5-acceptance.json`、binaryのhashは同directoryの`binaries*.sha256`。
 
 - 原文取得のCLI（付属A F29、§59〜61）: `rencrow-compaction evidence`へ範囲取得（4引数を全部指定するかどれも指定しない）を、`inventory`コマンド（最新のcommit済みV2 checkpointの参照一覧を原文なしでpage単位に返す）を追加し、未登録だった引数試験を登録した。実データで、要約へ提示していない中央の範囲を正本と照合して取得でき、part hashの不一致と2,048 bytesを超える範囲は拒否された。
-- 実Qwenで見つけて直した不具合1（要約要求の末尾、第2部 §80の実Qwen failure）: Gatewayは`single_leading_instruction`の接続先で全developer messageを先頭のsystem messageへまとめるため、末尾に置いた要約指示が先頭へ移り、会話の最後が完了結果の断片になっていた。Qwenはそれに返答し、要約本文が「完了結果を確認しました。」だけになった（作業状態が失われる）。要約指示（developer）は維持し、その後に要約を求めるuserの依頼を最後のitemとして置いた（`compact_rencrow_request.rs`）。修正後の要約は、現在の条件・検証済みの結果・部分提示の注意・作業状態・安全上の境界を保持した。
+- 実Qwenで見つけて直した不具合1（要約要求の末尾、第2部 §80の実Qwen failure）: Gatewayは`single_leading_instruction`の接続先で全developer messageを先頭のsystem messageへまとめるため、末尾に置いた要約指示が先頭へ移り、会話の最後が完了結果の断片になっていた。Qwenはそれに返答し、要約本文が「完了結果を確認しました。」だけになった（作業状態が失われる）。要約指示（developer）は維持し、その後に要約を求めるuserの依頼を最後のitemとして置いた（`compact_rencrow_request.rs`）。この対処は2026-09-25にRenCrow_LLMの正規化へ移して外した（下記「要約要求の末尾指示をGatewayへ移した記録」）。修正後の要約は、現在の条件・検証済みの結果・部分提示の注意・作業状態・安全上の境界を保持した。
 - 実Qwenで見つけて直した不具合2（cold resume後のmarker照合、第2部 §80のコード矛盾）: checkpointは置換後履歴のmetadataをitemごとに保存するため、metadataのなかった呼出しitemは再起動後に既定値として読み戻される。正本照合がmetadataを厳密に比べていたため、Emergencyで作ったmarkerが再起動後のNormalでIntegrityBlockedになった（同じ比較で、再起動をまたいだfreshの組も黙って未検証になっていた）。`archive_reference::same_harness_metadata`で「なし」と既定値を同一とみなすようにし、marker・freshの組の回帰試験を追加し、mockの結合試験（E06）へcold resumeを挟んだ。修正を外すとこの結合試験は実Qwenと同じ文面で失敗することを確認した。
 - シナリオと結果: Normal（ModelSelectionで撤回済みの合言葉だけを除き、完了した依頼を結果へ置換し、Observationを処理済みにした）。原文取得（上記）。Normal失敗からEmergency（実Qwenの選別が提示していないsource IDを返し、LLM要求なしのEmergencyでcommit、本人入力は原文のまま、大きな出力はmarker、response IDなし）。cold resume（Emergency後もNormal後も、現在の合言葉と日本語を正しく答え、コマンドを再実行しない）。Emergency後のNormal（修正後、markerを正本から再提示して処理済みにし、要約が`observation:"…"`で2件を重要参照に選んだ）。永続化の再起動（最後のcommit markerを除くとreplayがそのcheckpointを捨て、再開後の要求はEmergencyの固定文を含みNormalの要約を含まなかった）。IntegrityBlocked（commit hashを壊すと再開がIntegrityBlockedの診断文で止まり、再起動を求めない。戻すと正常に再開）。marker経由のObservationの原文取得も成功した。
 - 検査: `just test --cargo-profile dev-small -p codex-history` 137件、`-p codex-rollout` 174件、`-p codex-thread-store` 260件、`-p codex-core --lib -E "test(compact) | test(session::) | test(agent::control)"` 597件、`-p codex-core --test all -E "test(suite::compact)"` 79件、`-p codex-cli -E "binary_id(codex-cli::bin/rencrow-compaction)"` 15件がすべて成功した（上流の既存の不安定試験1件は再試行で成功）。`just fmt`・`just fix`を実行し、無関係なファイルへの修正は取り込んでいない。
@@ -4889,6 +4889,17 @@ RenCrow Switch Core Compaction V2の役割は、
 - 戻し方: backup-only。sessionを止め、binaryとあわせてrollout・sqliteを`before-v2/`から戻す（binaryだけを戻すと、markerを含むEmergencyのcheckpointを旧binaryが黙って捨てうるため）。
 
 2026-09-24に`5020bd39b`からbuildしたV2のbinaryを共有配備した。`~/.local/bin/rencrow-switch-core`はSHA-256 `5f3fc14ddf39927fa8bd4778661861376e10612f0eb3b5b3997d9da712dd5169`、`~/.local/bin/rencrow-compaction`は`a562dd444f2f4086492e2bce5ebc4b56d3de673046ba75ded75986888a35fc3e`（記録は私有の`compaction-runtime-deploy/phase6-deploy.json`）。それ以前の稼働binary（`bf9d00a6a`＋当時の未commit差分、`3f6d6d61…`・`ea388503…`）は`before-v2/`に保存した。
+2026-09-25に`7c97c8e53`のbuildへ差し替えた（下記）。
+
+### 要約要求の末尾指示をGatewayへ移した記録（2026-09-25）
+
+- 判断: Phase 5の不具合1の原因は、Gatewayの`single_leading_instruction`が末尾のdeveloper指示を先頭のsystem messageへ移すことにあった。末尾のdeveloper指示はResponses APIとして正しい形であり、Model固有の補正はRenCrow_LLMが所有するため、Switch Coreの対処（要約要求の最後に置いたuserの依頼）を外し（`7c97c8e53`）、RenCrow_LLM `0ee8ef5`で正規化を直した。会話の最後のmessageより後ろにあるdeveloper messageは、元の順序のまま末尾の単一user messageとして送る。system messageと会話途中のdeveloper messageの統合は変えない。
+- markerの翻訳: ID変更作業の実thread（`01a0d5ad-ed73-7173-8426-ed72553f3a67`、入力の作者は`human`）の1回目・2回目のcompactionは、どちらもNoCandidatesで要約要求1回、提示したObservationを全件処理済みにし、要約は目標・作業状態・未確定の事項・再開手順を保持した（2回目は60.3k→8.2k tokens、131件）。ただし日本語の会話でQwenが`observation:"<call_id>"`を「観測」と訳し、重要参照が0件になった。要約指示は変えず、RenCrow_LLMのtarget別`model_instructions`（正規化後の先頭system messageの末尾へ追記、4096 byte以下）をshiro_workerだけに設定し、marker・識別子・call ID・path・code・commandを訳さずに写すよう指示した。
+- Gatewayの配備: 稼働中のGateway binaryが当時のworktreeのbuildとbyte一致することを確認してから、`0ee8ef5`を含むbuild（`cbda56fd…`）と`llm.json`を同時に差し替えた（旧binaryは新しい設定欄を拒否する）。ID変更作業のthreadがtoolを実行していてmodel要求のない間に再起動し、streamは切れていない。prompt debugの送信内容で、通常turnは先頭のsystem message 1件の末尾にmodel_instructionsが付き、developer messageが残らないこと、同じ経路の翻訳clientの応答が変わらないことを確認した。
+- 実QwenのE2E（§76の隔離環境、thread `01a0d5f4-db76-71e1-8f73-06de3011fd9e`、Phase 5のA1と同じ手順）: 手動compactはModelSelectionと要約の2要求（計350.1秒、ID変更作業のthreadと同じQwenを共有）で、撤回済みの合言葉だけを除き、完了した依頼を結果へ置換した（applied refs 2件）。Qwenへの要約要求は最後が要約指示のuser messageで、要約はObservation 2件を`observation:"call_…"`の形のまま重要参照に選び、全範囲の提示と部分提示を区別した（Phase 5で要約が一文になった不具合は再発しない）。V2の要約入力はtool呼出しをObservationの断片へ変えるため、Gatewayのno-tool履歴指示は付かなかった。圧縮後はコマンドを再実行せずに出力の最初と最後の行を答えた。同じ問いの合言葉と回答言語は答えが漏れたが、要求には保持したHumanの原文があり、別に問うと`cobalt-current-5826`と日本語を正しく答えた（Qwenの複数設問への回答漏れで、圧縮による欠落ではない）。
+- 要約要求の先頭system messageは、Codexの基本指示だけで通常turnのもの（権限・AGENTS.md等のdeveloper指示を統合したもの）と異なる。この変更で要約要求にprompt cacheが効くわけではない。
+- 検査: `just test --cargo-profile dev-small -p codex-core --lib -E "test(compact) | test(session::) | test(agent::control)"` 597件が全成功、`-p codex-core --test all -E "test(suite::compact)"` 79件のうち78件が成功した。失敗は上流の既存の不安定試験`compact_remote::remote_compact_v2_rewrites_multiple_trailing_function_call_outputs`だけで、単独実行でも3回中1回は再試行で成功した。
+- 配備: `7c97c8e53`からbuildしたbinary（E2Eで受入したbuildとSHA-256一致）を`~/.local/bin`へ原子的に差し替えた。`rencrow-switch-core`は`ba3dfa013a51e93c47e7f4e33f1e73b933fba186fc5469b9d60cabd9ecac067c`、`rencrow-compaction`は`ae2cea4ca8a1e512b44e093b03826652cbbf25bd8ab97196b3f537b67abe1449`。稼働中の共有threadとID変更作業のthreadは次の起動から使う。旧binaryは`compaction-runtime-deploy/before-gateway-fix/`、記録は私有の`gateway-fix-deploy.json`。checkpointの形式は変えていないため、差し戻しはbinaryだけでよい。Gateway側の修正を外す場合は先にこのbinaryを戻す（外すと要約指示が先頭へ移り、要約が崩れる）。
 
 # 第4部 部品契約・Failure Knowledge・実測・旧仕様（2026-09-24以前の記録）
 
