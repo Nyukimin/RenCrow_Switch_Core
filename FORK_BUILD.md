@@ -24,6 +24,22 @@ CMake等の`usr/bin`をPATH、`usr/lib/x86_64-linux-gnu`をbuild時のLD_LIBRARY
 これらはホスト固有のbuild依存解決であり、配布binaryの実行時設定ではない。
 bootstrap、binary、会話・認証情報はcommitしない。
 
+## 配備用build（2026-09-26から）
+
+配備する`rencrow-switch-core`（`codex`）と`rencrow-compaction`は`fork-deploy` profileでbuildする。
+`dev-small`と同じく最適化なし・debug情報なしで、`debug-assertions`だけを切る。
+`dev-small`の配備binaryでは、上流の本番buildならerrorとして記録するだけの`error_or_panic`
+（`core/src`内12箇所）や`debug_assert!`がpanicし、sessionが応答しなくなった
+（2026-09-25 23:45、`94523a2f6`の原因）。試験は従来どおり`dev-small`（debug-assertions有効）で行い、
+不整合は試験で検出する。
+
+```sh
+cd codex-rs
+cargo +1.95.0 build --locked --profile fork-deploy -j 2 -p codex-cli --bin codex --bin rencrow-compaction
+```
+
+成果物は`target/fork-build/fork-deploy/`。未梱包binaryとしての起動条件（`--no-daemon`等）は`dev-small`と同じ。
+
 ## 接続と復旧
 
 1. build成果物の`--version`、`--help`、動的依存関係を確認し、source SHAとbinary SHA256を記録する。

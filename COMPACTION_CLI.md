@@ -6,7 +6,7 @@
 ## 実行
 
 ```sh
-cargo build --manifest-path codex-rs/Cargo.toml --locked --profile dev-small -p codex-cli --bin rencrow-compaction
+cargo build --manifest-path codex-rs/Cargo.toml --locked --profile fork-deploy -p codex-cli --bin rencrow-compaction
 # 対象ファイルは入力として固定し、出力先は既存ファイルと別にする。
 rencrow-compaction inspect --input input.json --output references.json
 rencrow-compaction prepare --input input.json --output candidate.json --model worker --effort high

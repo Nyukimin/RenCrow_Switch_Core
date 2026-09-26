@@ -602,6 +602,12 @@ opt-level = 0
 debug = "none"
 strip = "symbols"
 
+# Modified by RenCrow Switch Core, 2026-09-26: the locally deployed fork binary keeps the
+# dev-small build cost, but like release it logs `error_or_panic` instead of ending the session.
+[profile.fork-deploy]
+inherits = "dev-small"
+debug-assertions = false
+
 [profile.release]
 lto = "thin"
 debug = "line-tables-only"
