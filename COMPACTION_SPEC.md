@@ -4909,6 +4909,38 @@ RenCrow Switch Core Compaction V2の役割は、
 - 確認: 同じ失敗要求を配備後に再送すると、旧binaryの形（末尾がuserの要約依頼）で6,942文字・`observation:"…"`12件、`7c97c8e53`の形（末尾が要約指示）で8,517文字・10件の要約になり、送信内容は注意を先頭のsystem messageに含み、最後が要約指示のuser messageだった。各1回の再送で、失敗率は推定しない。
 - 本人threadへの対処: 観察者が01:00の正常な要約と01:00〜01:16のコマンド記録を私有のscratchpadへ置き、その場所だけを本人threadへ入力した（入力はhumanとして記録される）。Qwenは01:23に読み、作業へ戻った。
 
+### Human メッセージ保持方式の変更（2026-09-26、利用者判断「保守的」）
+
+#### 解析（ID変更作業の thread `01a0d697-46d9-78e2-a8a4-21a9dc7b42b3`、compaction 53 回）
+
+- 置換後履歴の user message は、#1 の 3 件から最後（#53）の 19 件・約 31,000 字へ単調に増えた。内訳は goal の継続指示（`<codex_internal_context source="goal">`、同じ本文 6,687 字）3 件、観察者メモ 13 件（約 5,800 字）、AGENTS.md 1 件、最初の依頼 1 件、要約 1 件。圧縮後の input tokens は約 1.2 万から 2.1〜2.4 万へ上がり、compaction の間隔は約 30 分から約 20 分へ縮んだ。
+- どの user message にも `rencrow_input` が無かった。この thread の TUI は `--rencrow-input-author` を指定せずに起動されたため（観察者の起動手順の誤り。前 thread `01a0d5ad` は `human` を指定していた）、全件が `Origin::Unknown` になった。Unknown は削除できないため無期限に原文で残り、Human が無いので Selection（`drop_superseded`・`replace_completed`）は一度も動かなかった（Normal はすべて NoCandidates、ほかは Emergency 4 回）。
+- goal の継続指示は `content_item_kinds` が `goal.internal_context` で、`history::capture` の host kind 一覧に無いため Unknown になった。そのため置換後履歴に毎回残り、要約要求の入力にも本文が毎回入った。
+- 置換後履歴は受信時刻・経緯を持たないため、古いメモが「今の指示」に見えた。#38 の直後（21:03 UTC）に 07:00 のメモを現在の問題として再調査し、存在しない commit を前提にした。#48 の直後（01:52）に存在しない commit を前提に `git reset --hard` と rebase を実行し 23 秒後に自ら戻した。#52 の直後（03:21）に前日 14:14 のメモを「最後の観測メモ」と読んだ。受信時刻は各 message の `internal_chat_message_metadata_passthrough.create_time` に保存されている。
+- 同じ thread で見つかった保持方式以外の事象（本節では変更しない）: plain text 再送で成功した要約は observation marker が 0 個で短い（7 回、中央値 2,711 字）。要約要求は reasoning effort high のまま（出力中央値 6,603 tokens）。compaction 実行中に届いた入力で要約候補が stale になり、ターンがエラーで終わった（2026-09-26 04:08）。
+
+#### 修正仕様
+
+利用者の判断（2026-09-26）は「保守的」: Human と Unknown の本文は削除も要約への吸収もしない。変更は次の 4 点に限る。
+
+1. host 内部コンテキストの分類: `content_item_kinds` がすべて `<source>.internal_context`（`InternalModelContextFragment` の kind）の user message は、`client_authored` でない限り `Origin::Host` とする。第2部 §11 のとおり内部生成は本人枠へ昇格せず、kind を host が付与するため出どころは不明ではない。既存の Host と同じく、要約の入力へ本文を渡さない。
+2. 置換後履歴での内部コンテキスト: source ごとに最新の 1 件だけを原文で残す（goal の継続指示は最新 1 件）。source が `compaction` のもの（下の注記）は残さず、毎回作り直す。
+3. 残した user message の時系列注記: Normal の置換後履歴で、要約の直前に `InternalModelContextFragment`（source `compaction`）を 1 件置く（Emergency は前回要約を引き継ぐ経路のため対象外）。initial context の差込み位置は注記を除いて従来どおり決め、その後に注記を入れる。candidate 検証の期待列にも同じ位置で含める。本文は、置換後履歴に残した user message（Human と Unknown の本文 message。内部コンテキストと host の文脈 fragment を除く）を古い順に、受信時刻（`create_time` の UTC、分まで。無ければ「時刻不明」）と冒頭 60 文字で列挙し、「これらは下の要約より前に受信した。書かれた状況は解決済み・置換済みの可能性がある。行動の前に現在の状態を確かめる」と明示する。対象が 0 件なら置かない。user message の本文・順序・ID は変えない。
+4. 入力元の申告を必須にする（利用者指示 2026-09-26「Human メッセージの Author は常時必須」）: TUI（通常起動・`resume`・`fork`）は `--rencrow-input-author human|automation` が無ければ起動せず、指定方法を示すエラーで終了する。本人が直接入力する TUI は `human`、観察者などの代理入力の TUI は `automation` を指定する。`exec` と app-server は本文を本人入力として受け付ける経路を持たず、起動引数の prompt は本人枠へ昇格しない（既存どおり）ため、対象外とする。
+
+変えないもの: Human・Unknown の本文保持、Selection、Emergency、要約本文と `summary_hash`。
+
+#### 受入条件
+
+- goal の内部コンテキスト 3 件を含む履歴を置換すると、最新の 1 件だけが原文で残る。
+- 前回の compaction 注記は残らず、新しい注記が要約の直前に 1 件だけある。
+- 注記は残した user message を古い順に、受信時刻と冒頭で列挙する。対象が無ければ注記を置かない。
+- 残した user message の本文・ID・順序は変わらない。initial context の差込み位置も変わらない。
+- Host に分類した内部コンテキストの本文は要約の入力に含まれない。
+- `--rencrow-input-author` を指定しない TUI の起動（通常・`resume`・`fork`）は、端末を初期化する前にエラーで終わる。`human`・`automation` を指定した起動は従来どおり。
+
+互換性: 旧 binary が注記を含む置換後履歴を読むと、注記は Unknown の user message として残る（読戻しは失敗しない）。戻し方: 本変更の commit を revert する。
+
 # 第4部 部品契約・Failure Knowledge・実測・旧仕様（2026-09-24以前の記録）
 
 旧題: RenCrow Fork Compaction 新仕様案 第2版。第1〜2部と矛盾する記述は第1〜2部が優先する。承認済み例外1〜4（「元関数への例外と必要理由」）など、第1〜2部と矛盾しない部品契約は引き続き有効。Failure Knowledgeと実測記録は削除しない。

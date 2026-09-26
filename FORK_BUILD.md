@@ -48,7 +48,7 @@ bootstrap、binary、会話・認証情報はcommitしない。
 ## 別系統の入力記録を試験する場合
 
 `codex-cli`の`codex`と`rencrow-compaction`を同じrevisionからbuildする。
-TUIの`--rencrow-input-author human|automation`は、送信本文・添付の別記録だけを有効にする。
+TUIの`--rencrow-input-author human|automation`は必須（未指定では起動しない）で、送信本文・添付の別記録を有効にする。
 通常Compactionの切替フラグではない。利用と制限はCOMPACTION_CLI.mdを参照。
 稼働中の旧binaryはこのフラグに対応しない。既存writerの差替えや再起動を伴わない試験は、
 新binary・独立CODEX_HOME・独立sessionを使用し、同じ既存Gateway/model契約を維持する。
@@ -77,7 +77,7 @@ rencrow_compaction = true
 remote V2 / TokenBudgetとの併用は拒否し、旧方式へ暗黙fallbackしない。
 sourceにあるV2（8工程）の部品はこの経路にまだ接続されていない。この設定で動くのは上記の現行経路である。
 `--rencrow-input-author human`は利用者による直接投稿の受付を申告する設定。
-Astra等による代理操作は`automation`を指定する。未指定・旧記録・照合不一致を本人入力と推定しない。
+Astra等による代理操作は`automation`を指定する。旧記録・照合不一致を本人入力と推定しない。
 
 各段階の表示は出力token数 / request全体のwall秒（prefill・待ち時間込み）であり、
 Backendの純粋なdecode速度ではない。実行したplan提案・plan review・要約要求のusageはcheckpointに残り、summary reviewが通過したと偽装しない。

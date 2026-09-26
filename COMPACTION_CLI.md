@@ -79,7 +79,7 @@ Windows/macOSの実機動作は未確認。local Compactionの実装・配備と
 
 ## 送信本文・添付の別記録（2026-09-22）
 
-新しいForkのTUIを起動するときに入力元を一度指定する。
+新しいForkのTUI（通常起動・`resume`・`fork`）は、起動時に入力元の指定が必須（2026-09-26、利用者指示）。指定しないと端末を初期化する前にエラーで終わる。
 
 ```sh
 rencrow-switch-core --no-daemon --rencrow-input-author human
@@ -89,7 +89,7 @@ rencrow-switch-core --no-daemon --rencrow-input-author automation
 
 `--no-daemon`は未梱包の開発binaryを単独起動する上流のオプション。Gatewayの迂回や権限変更は行わない。
 この指定は操作者による入力経路の申告であり、物理的に人間がキーを押した証明ではない。
-未指定は記録しない。LLM、role=user、client_id、受付順から本人性を推定しない。
+LLM、role=user、client_id、受付順から本人性を推定しない。`automation`の入力は記録するが本人枠へ昇格しない。
 起動引数のprompt、内部生成メッセージ、由来を保てない結合・本文変換は本人枠へ昇格しない。
 本機能は新binaryが必要であり、既に起動中の旧binaryには有効にならない。
 
