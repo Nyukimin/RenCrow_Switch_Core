@@ -61,6 +61,7 @@ async fn tmux_split_preserves_fresh_session_composer_row_after_resize_reflow() -
             .arg("-c")
             .arg("analytics.enabled=false")
             .arg("--no-alt-screen")
+            .args(["--rencrow-input-author", "automation"])
             .arg("-C")
             .arg(&repo_root)
             .arg(prompt),
@@ -225,6 +226,7 @@ async fn tmux_width_resize_restore_keeps_visible_content_anchored() -> Result<()
             .arg("-c")
             .arg("analytics.enabled=false")
             .arg("--no-alt-screen")
+            .args(["--rencrow-input-author", "automation"])
             .arg("-C")
             .arg(&repo_root)
             .arg(prompt),
@@ -353,6 +355,7 @@ async fn tmux_scrolled_composer_resize_preserves_visible_draft_text() -> Result<
             .arg("-c")
             .arg("analytics.enabled=false")
             .arg("--no-alt-screen")
+            .args(["--rencrow-input-author", "automation"])
             .arg("-C")
             .arg(&repo_root),
     )?;
@@ -476,6 +479,7 @@ async fn run_repeated_resize_smoke() -> Result<()> {
             .arg("-c")
             .arg("analytics.enabled=false")
             .arg("--no-alt-screen")
+            .args(["--rencrow-input-author", "automation"])
             .arg("-C")
             .arg(&repo_root)
             .arg(prompt),

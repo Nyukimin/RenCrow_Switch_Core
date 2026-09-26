@@ -163,20 +163,23 @@ pub(super) fn capture(
                 !kinds.is_empty()
                     && kinds.len() == content.len()
                     && kinds.iter().all(|kind| {
-                        matches!(
-                            kind.0.as_str(),
-                            "agents_md.instructions"
-                                | "environments.environment_context"
-                                | "host_skills.instructions"
-                                | "permissions.instructions"
-                                | "multi_agent.usage_hint"
-                                | "generic.developer_instructions"
-                                | "managed_config.developer_instructions"
-                                | "collaboration_mode.instructions"
-                                | "persistent_mode.instructions"
-                                | "multi_agent.mode_instructions"
-                                | "apps.instructions"
-                        )
+                        // Runtime-owned `<codex_internal_context>` fragments (goal steering and
+                        // the compaction timeline) are host context, never user input.
+                        kind.0.ends_with(".internal_context")
+                            || matches!(
+                                kind.0.as_str(),
+                                "agents_md.instructions"
+                                    | "environments.environment_context"
+                                    | "host_skills.instructions"
+                                    | "permissions.instructions"
+                                    | "multi_agent.usage_hint"
+                                    | "generic.developer_instructions"
+                                    | "managed_config.developer_instructions"
+                                    | "collaboration_mode.instructions"
+                                    | "persistent_mode.instructions"
+                                    | "multi_agent.mode_instructions"
+                                    | "apps.instructions"
+                            )
                     })
             });
             let summary = role == "user"

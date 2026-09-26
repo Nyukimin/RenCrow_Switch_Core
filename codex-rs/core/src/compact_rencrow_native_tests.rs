@@ -38,7 +38,15 @@ fn human(text: &str, id: &str) -> ResponseItemEnvelope {
 }
 
 fn input(items: &[ResponseItemEnvelope]) -> CandidateInput {
-    super::super::history::capture(items, "binding".into(), "thread-native", vec![], &[]).unwrap()
+    // Production always passes the current owner context, which Host records require.
+    super::super::history::capture(
+        items,
+        "binding".into(),
+        "thread-native",
+        vec![json!({"owner":"test"})],
+        &[],
+    )
+    .unwrap()
 }
 
 fn application(
@@ -337,9 +345,14 @@ fn v2_native_projection_ordinary_work_is_not_readded_but_unknown_and_protected_n
     let projection =
         filter_retained_instructions(&items, &captured, application(&captured, &[])).unwrap();
     let rebuilt = build_native_replacement(&projection, "summary", vec![]).unwrap();
-    assert_eq!(rebuilt.len(), 2);
+    assert_eq!(rebuilt.len(), 3);
     assert_eq!(rebuilt[0], kept_human);
     assert_eq!(text(&rebuilt[0]).as_deref(), Some("keep me"));
+    assert!(
+        text(&rebuilt[1])
+            .unwrap()
+            .starts_with("<codex_internal_context source=\"compaction\">")
+    );
 
     let call = ResponseItemEnvelope::new(ResponseItem::FunctionCall {
         id: Some(ResponseItemId::from_server("tool-call-item".into())),
@@ -375,7 +388,8 @@ fn v2_native_projection_ordinary_work_is_not_readded_but_unknown_and_protected_n
     let projection =
         filter_retained_instructions(&pair, &captured, application(&captured, &[])).unwrap();
     let rebuilt = build_native_replacement(&projection, "summary", vec![]).unwrap();
-    assert_eq!(rebuilt.len(), 2);
+    // The retained Human, the timeline note that dates it, and the summary.
+    assert_eq!(rebuilt.len(), 3);
     assert_eq!(rebuilt[0], pair[1]);
     assert!(!rebuilt.iter().any(|item| {
         item.item
@@ -489,4 +503,153 @@ fn v2_native_projection_capture_prefers_existing_item_ids_and_fallback_ids_do_no
     let fallback = message("user", "no durable id", None);
     let captured = input(&[fallback]);
     assert_eq!(captured.records[0].id, "item-0");
+}
+
+fn user_at(text: &str, id: &str, create_time: f64) -> ResponseItemEnvelope {
+    let mut item = message("user", text, Some(id));
+    if let ResponseItem::Message {
+        internal_chat_message_metadata_passthrough,
+        ..
+    } = &mut item.item
+    {
+        *internal_chat_message_metadata_passthrough =
+            Some(InternalChatMessageMetadataPassthrough {
+                create_time: serde_json::Number::from_f64(create_time),
+                content_item_kinds: Some(vec![ContentItemKind("user.text".into())]),
+                ..Default::default()
+            });
+    }
+    item
+}
+
+fn internal_context(source: &'static str, body: &str, id: &str) -> ResponseItemEnvelope {
+    let mut item = crate::context::ContextualUserFragment::into(
+        crate::context::InternalModelContextFragment::new(
+            crate::context::InternalContextSource::from_static(source),
+            body,
+        ),
+    );
+    if let ResponseItem::Message { id: item_id, .. } = &mut item {
+        *item_id = Some(ResponseItemId::from_server(id.into()));
+    }
+    ResponseItemEnvelope::new(item)
+}
+
+fn retained_ids(projection: &NativeProjection) -> Vec<String> {
+    projection
+        .retained_native_items()
+        .filter_map(|envelope| envelope.item.id().map(|id| id.as_str().to_owned()))
+        .collect()
+}
+
+#[test]
+fn v2_native_projection_keeps_only_the_latest_internal_context_per_source() {
+    let items = vec![
+        user_at("start the task", "user-1", 1_790_306_659.4),
+        internal_context("goal", "first continuation", "goal-1"),
+        message("assistant", "work", Some("work-1")),
+        internal_context("goal", "second continuation", "goal-2"),
+        internal_context("compaction", "old timeline", "timeline-1"),
+        internal_context("goal", "third continuation", "goal-3"),
+    ];
+    let captured = input(&items);
+    for index in [1, 3, 4, 5] {
+        assert_eq!(captured.records[index].origin, Origin::Host);
+        assert_eq!(captured.records[index].text, "");
+    }
+
+    let projection =
+        filter_retained_instructions(&items, &captured, application(&captured, &[])).unwrap();
+
+    assert_eq!(retained_ids(&projection), vec!["user-1", "goal-3"]);
+}
+
+#[test]
+fn v2_native_replacement_lists_retained_user_messages_before_the_summary() {
+    let items = vec![
+        user_at("start the task\nwith  details", "user-1", 1_790_306_659.4),
+        user_at(
+            "observer note: the scheduled backup stopped CORE on purpose, do not restart it",
+            "user-2",
+            1_790_320_426.6,
+        ),
+        message("user", "no recorded time", Some("user-3")),
+        internal_context("goal", "continue", "goal-1"),
+    ];
+    let captured = input(&items);
+    let projection =
+        filter_retained_instructions(&items, &captured, application(&captured, &[])).unwrap();
+    let summary = format!("{}\nsummary", super::super::super::SUMMARY_PREFIX);
+
+    let rebuilt = build_native_replacement(&projection, &summary, vec![]).unwrap();
+
+    let note = ResponseItemEnvelope::new(crate::context::ContextualUserFragment::into(
+        crate::context::InternalModelContextFragment::new(
+            crate::context::InternalContextSource::from_static("compaction"),
+            "Earlier user messages kept verbatim above, oldest first:\n\
+             1. 2026-09-25 03:24 UTC: \"start the task with details\"\n\
+             2. 2026-09-25 07:13 UTC: \"observer note: the scheduled backup stopped CORE on purpose,…\"\n\
+             3. time unknown: \"no recorded time\"\n\
+             All of them were received before the work summary that follows, which records the \
+             latest known state. A situation an older message describes may already be resolved \
+             or superseded; check the current state before acting on it.",
+        ),
+    ));
+    assert_eq!(rebuilt.len(), 6);
+    assert_eq!(&rebuilt[..4], &items[..]);
+    assert_eq!(rebuilt[4], note);
+    assert_eq!(text(&rebuilt[5]).as_deref(), Some(summary.as_str()));
+    assert_eq!(
+        projection
+            .retained_native_items_with_initial_context(&[], &rebuilt[5])
+            .cloned()
+            .collect::<Vec<_>>(),
+        rebuilt
+    );
+}
+
+#[test]
+fn v2_native_replacement_has_no_timeline_without_retained_user_messages() {
+    let items = vec![
+        internal_context("goal", "continue", "goal-1"),
+        message("assistant", "work", Some("work-1")),
+    ];
+    let captured = input(&items);
+    let projection =
+        filter_retained_instructions(&items, &captured, application(&captured, &[])).unwrap();
+
+    let rebuilt = build_native_replacement(&projection, "summary", vec![]).unwrap();
+
+    assert_eq!(rebuilt.len(), 2);
+    assert_eq!(rebuilt[0], items[0]);
+    assert_eq!(text(&rebuilt[1]).as_deref(), Some("summary"));
+}
+
+#[test]
+fn v2_native_replacement_timeline_does_not_move_the_initial_context() {
+    let items = vec![user_at("current request", "user-1", 1_790_306_659.4)];
+    let captured = input(&items);
+    let projection =
+        filter_retained_instructions(&items, &captured, application(&captured, &[])).unwrap();
+    let context = message("user", "initial context", Some("initial-context"));
+    let summary = format!("{}\nsummary", super::super::super::SUMMARY_PREFIX);
+
+    let rebuilt = build_native_replacement(&projection, &summary, vec![context.clone()]).unwrap();
+
+    assert_eq!(rebuilt.len(), 4);
+    assert_eq!(rebuilt[0], context);
+    assert_eq!(rebuilt[1], items[0]);
+    assert!(
+        text(&rebuilt[2])
+            .unwrap()
+            .starts_with("<codex_internal_context source=\"compaction\">")
+    );
+    assert_eq!(text(&rebuilt[3]).as_deref(), Some(summary.as_str()));
+    assert_eq!(
+        projection
+            .retained_native_items_with_initial_context(std::slice::from_ref(&context), &rebuilt[3])
+            .cloned()
+            .collect::<Vec<_>>(),
+        rebuilt
+    );
 }

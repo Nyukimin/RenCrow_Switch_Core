@@ -6,6 +6,8 @@ use super::super::build_compacted_history_with_limit;
 use super::super::collect_annotated_user_messages;
 use super::super::insert_initial_context_before_last_real_user_or_summary;
 use super::super::is_summary_message;
+use super::timeline::TIMELINE_SOURCE;
+use super::timeline::internal_context_source;
 use codex_history::ResponseItemEnvelope;
 use codex_history::compaction_candidate::CandidateInput;
 use codex_history::compaction_candidate::Origin;
@@ -31,6 +33,8 @@ struct RetainedItem {
 pub(super) struct NativeProjection {
     retained: Vec<RetainedItem>,
     user_messages: Vec<CompactedUserMessage>,
+    /// Host note placed just before the summary; absent when no user message is retained.
+    timeline_note: Option<ResponseItemEnvelope>,
 }
 
 impl NativeProjection {
@@ -64,6 +68,7 @@ impl NativeProjection {
             .take(insertion_index)
             .chain(initial_context.iter())
             .chain(self.retained_native_items().skip(insertion_index))
+            .chain(self.timeline_note.iter())
             .chain(std::iter::once(summary))
     }
 }
@@ -154,6 +159,15 @@ pub(super) fn filter_retained_instructions(
         Some(plan_hash) => plan_hash,
         None => digest(&application.pruning.applied)?,
     };
+    // Host internal context is re-sent by its owner; keep only the newest one per source.
+    let mut latest_internal_context = HashMap::new();
+    for (index, original) in originals.iter().enumerate() {
+        if let Some(source) = internal_context_source(&original.item)
+            && source != TIMELINE_SOURCE
+        {
+            latest_internal_context.insert(source, index);
+        }
+    }
     let mut retained = Vec::new();
     for (original_index, (record, original)) in input.records.iter().zip(originals).enumerate() {
         if is_user_summary(original) && record.origin != Origin::Human {
@@ -209,6 +223,13 @@ pub(super) fn filter_retained_instructions(
                 }
                 envelope
             }
+            Origin::Host
+                if internal_context_source(&original.item).is_some_and(|source| {
+                    latest_internal_context.get(source) == Some(&original_index)
+                }) =>
+            {
+                original.clone()
+            }
             Origin::Work | Origin::Host
                 if record.opaque.is_none() && record.protected.is_empty() =>
             {
@@ -223,9 +244,11 @@ pub(super) fn filter_retained_instructions(
     }
 
     let user_messages = collect_user_slots(&retained)?;
+    let timeline_note = super::timeline::timeline_note(retained.iter().map(|item| &item.envelope));
     Ok(NativeProjection {
         retained,
         user_messages,
+        timeline_note,
     })
 }
 
@@ -289,6 +312,7 @@ pub(super) fn build_native_replacement(
         .iter()
         .map(|item| item.envelope.clone())
         .collect::<Vec<_>>();
+    let summary_item = summary.clone();
     history.push(summary);
 
     let history_len = history.len();
@@ -297,7 +321,7 @@ pub(super) fn build_native_replacement(
     let with_context =
         insert_initial_context_before_last_real_user_or_summary(history, initial_context.clone());
     if initial_context.is_empty() || helper_index == target_index {
-        return Ok(with_context);
+        return with_timeline_note(projection, with_context, &summary_item);
     }
 
     let from = helper_index.unwrap_or(history_len);
@@ -311,7 +335,23 @@ pub(super) fn build_native_replacement(
     corrected.drain(from..to);
     let insertion_index = target_index.unwrap_or(corrected.len());
     corrected.splice(insertion_index..insertion_index, initial_context);
-    Ok(corrected)
+    with_timeline_note(projection, corrected, &summary_item)
+}
+
+/// Place the timeline note directly before the summary, after initial context is positioned.
+fn with_timeline_note(
+    projection: &NativeProjection,
+    mut history: Vec<ResponseItemEnvelope>,
+    summary: &ResponseItemEnvelope,
+) -> Result<Vec<ResponseItemEnvelope>, String> {
+    let Some(note) = &projection.timeline_note else {
+        return Ok(history);
+    };
+    if history.last() != Some(summary) {
+        return Err("native replacement does not end with its summary item".into());
+    }
+    history.insert(history.len() - 1, note.clone());
+    Ok(history)
 }
 
 fn collect_user_slots(retained: &[RetainedItem]) -> Result<Vec<CompactedUserMessage>, String> {

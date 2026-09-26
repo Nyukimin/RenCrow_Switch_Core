@@ -32,6 +32,8 @@ mod observation;
 mod stages;
 #[path = "compact_rencrow_summary.rs"]
 mod summary;
+#[path = "compact_rencrow_timeline.rs"]
+mod timeline;
 
 use stages::StageFailure;
 

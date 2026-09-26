@@ -10,7 +10,7 @@ use codex_utils_cli::SharedCliOptions;
 #[derive(Parser, Clone, Debug)]
 #[command(version)]
 pub struct Cli {
-    /// Declare the operator of this input channel; omitted inputs retain unknown provenance.
+    /// Declare the operator of this input channel (required to start the TUI).
     #[arg(long, value_parser = ["human", "automation"])]
     pub rencrow_input_author: Option<String>,
 

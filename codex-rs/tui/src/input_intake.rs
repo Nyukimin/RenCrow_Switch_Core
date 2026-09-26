@@ -13,6 +13,20 @@ use std::sync::atomic::Ordering;
 
 static AUTHOR: AtomicU8 = AtomicU8::new(0);
 
+/// Shown when the TUI starts without declaring who types into it.
+pub(crate) const MISSING_AUTHOR_MESSAGE: &str = "--rencrow-input-author is required: pass `--rencrow-input-author human` when a person types into this TUI, or `--rencrow-input-author automation` when another program operates it";
+
+/// Refuse to start unless the operator of this input channel is declared.
+pub(crate) fn require_author(author: Option<&str>) -> std::io::Result<()> {
+    match author {
+        Some("human" | "automation") => Ok(()),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            MISSING_AUTHOR_MESSAGE,
+        )),
+    }
+}
+
 pub(crate) fn set_author(author: Option<&str>) {
     AUTHOR.store(
         match author {
@@ -128,5 +142,14 @@ mod tests {
         assert!(receipt.matches_accepted("thread-1", "client-1", "本人本文\nIDE context"));
         assert!(record(home.path(), "thread-1", "client-1", &original, &submitted).is_err());
         assert_eq!(std::fs::read(path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn startup_requires_a_declared_input_author() {
+        assert!(require_author(Some("human")).is_ok());
+        assert!(require_author(Some("automation")).is_ok());
+        let error = require_author(None).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(error.to_string(), MISSING_AUTHOR_MESSAGE);
     }
 }

@@ -343,6 +343,8 @@ impl PtyCodex {
         let stdout = slave.try_clone().context("clone pseudo-terminal stdout")?;
 
         let child = Command::new(codex)
+            // The fork's TUI refuses to start without declaring who types into it.
+            .args(["--rencrow-input-author", "automation"])
             .args(extra_args)
             .arg("-C")
             .arg(repo_root)
