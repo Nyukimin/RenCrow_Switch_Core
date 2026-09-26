@@ -580,7 +580,12 @@ impl ToolRegistry {
                 &tool_result_tags,
                 &extra_trace_fields,
             );
-            let err = FunctionCallError::Fatal(message);
+            // A model behind another provider can call a tool in the wrong shape; it can retry.
+            let err = if invocation.turn.provider.info().is_openai() {
+                FunctionCallError::Fatal(message)
+            } else {
+                FunctionCallError::RespondToModel(message)
+            };
             dispatch_trace.record_failed(&err);
             return Err(err);
         }

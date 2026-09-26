@@ -12373,6 +12373,57 @@ async fn fatal_tool_error_stops_turn_and_reports_error() {
     }
 }
 
+#[tokio::test]
+async fn incompatible_tool_payload_from_non_openai_provider_is_returned_to_model() {
+    let (session, mut turn_context, _rx) = make_session_and_context_with_rx().await;
+    let provider_info = built_in_model_providers(/*openai_base_url*/ None)["ollama"].clone();
+    Arc::get_mut(&mut turn_context)
+        .expect("turn context should be uniquely owned")
+        .provider = create_model_provider(provider_info, /*auth_manager*/ None);
+    let step_context = StepContext::for_test(Arc::clone(&turn_context));
+    let (registry, hosted_specs) = tool_registry_for_test_step(step_context.as_ref());
+    let router = ToolRouter::from_registry(
+        step_context.turn.as_ref(),
+        step_context.turn.model_info(),
+        registry,
+        hosted_specs,
+        &Default::default(),
+    );
+    let item = ResponseItem::CustomToolCall {
+        id: None,
+        status: None,
+        call_id: "call-1".to_string(),
+        name: "exec_command".to_string(),
+        namespace: None,
+        input: "{}".to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    };
+
+    let call = ToolRouter::build_tool_call(item)
+        .expect("build tool call")
+        .expect("tool call present");
+    let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
+    let err = router
+        .dispatch_tool_call_with_code_mode_result(
+            Arc::clone(&session),
+            step_context,
+            CancellationToken::new(),
+            tracker,
+            call,
+            ToolCallSource::Direct,
+        )
+        .await
+        .err()
+        .expect("expected a tool error");
+
+    assert_eq!(
+        err,
+        FunctionCallError::RespondToModel(
+            "tool exec_command invoked with incompatible payload".to_string()
+        )
+    );
+}
+
 async fn sample_rollout(
     session: &Session,
     _turn_context: &TurnContext,
