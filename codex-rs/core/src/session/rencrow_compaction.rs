@@ -120,10 +120,11 @@ impl Session {
         }
     }
 
+    /// Queued input that has not entered history does not make the candidate stale; the turn
+    /// records it after the checkpoint.
     pub(crate) async fn commit_rencrow_checkpoint(
         &self,
         mut candidate: RenCrowCheckpoint,
-        activity: &tokio::sync::watch::Receiver<super::input_queue::InputQueueActivity>,
     ) -> Result<()> {
         let cancellation = {
             let active = self.active_turn.lock().await;
@@ -146,7 +147,6 @@ impl Session {
                 .session_configuration
                 .thread_settings_snapshot(&state.session_configuration.environments);
             if state.rencrow_checkpoint_failed
-                || activity.has_changed().unwrap_or(true)
                 || history_digest(state.history.annotated_items())
                     .map_err(CodexErr::InvalidRequest)?
                     != candidate.expected_history_hash

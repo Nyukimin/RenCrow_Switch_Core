@@ -1059,3 +1059,134 @@ async fn rencrow_emergency_marker_is_presented_and_covered_by_the_next_normal() 
     assert!(!replacement.iter().any(|item| item["call_id"] == call_id));
     Ok(())
 }
+
+/// Input queued around a mid-turn compaction stays queued and follows the checkpoint.
+///
+/// It never entered the snapshot, so it neither discards the summary nor ends the turn.
+#[test_case::test_case(false; "queued before compaction")]
+#[test_case::test_case(true; "queued during summary")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rencrow_mid_turn_compaction_keeps_input_queued_around_it(
+    during_summary: bool,
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    const QUEUED: &str = "Also record the queued note.";
+    const SUMMARY: &str = "The tool ran once; continue the task.";
+    let server = start_mock_server().await;
+    let seen = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let captured = Arc::clone(&seen);
+    let responses = Arc::new(AtomicUsize::new(0));
+    let ordinary = Arc::new(AtomicUsize::new(0));
+    let reached = Arc::new(AtomicBool::new(false));
+    let reached_by_server = Arc::clone(&reached);
+    // The chosen request is held long enough for the test to queue input during it.
+    let hold = std::time::Duration::from_secs(2);
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(move |request: &Request| {
+            let body: Value = request.body_json().expect("request JSON");
+            captured.lock().expect("requests lock").push(body.clone());
+            let id = format!("answer-{}", responses.fetch_add(1, Ordering::SeqCst));
+            match stage(&body) {
+                Stage::Selection(_) => assistant_reply(
+                    &id,
+                    &json!({ "operations": [] }).to_string(),
+                    ev_completed("selection-response"),
+                ),
+                Stage::Summary => {
+                    let reply = assistant_reply(&id, SUMMARY, ev_completed("summary-response"));
+                    if during_summary {
+                        reached_by_server.store(true, Ordering::SeqCst);
+                        reply.set_delay(hold)
+                    } else {
+                        reply
+                    }
+                }
+                Stage::Ordinary => match ordinary.fetch_add(1, Ordering::SeqCst) {
+                    // Earlier work output gives the compaction something to shrink.
+                    0 => assistant_reply(
+                        &id,
+                        &"Checked one more log line. ".repeat(3_000),
+                        ev_completed("response-fixture"),
+                    ),
+                    1 => {
+                        let reply = ResponseTemplate::new(200)
+                            .insert_header("content-type", "text/event-stream")
+                            .set_body_string(sse(vec![
+                                ev_function_call("call-before-compact", "test_tool", "{}"),
+                                ev_completed_with_tokens("response-with-tool", 110_000),
+                            ]));
+                        if during_summary {
+                            reply
+                        } else {
+                            reached_by_server.store(true, Ordering::SeqCst);
+                            reply.set_delay(hold)
+                        }
+                    }
+                    _ => assistant_reply(&id, "acknowledged", ev_completed("response-fixture")),
+                },
+            }
+        })
+        .mount(&server)
+        .await;
+    let provider = non_openai_model_provider(&server);
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider = provider;
+        config.rencrow_compaction = true;
+        config.model_auto_compact_token_limit = Some(100_000);
+    });
+    let test = builder.build(&server).await?;
+    test.submit_text_turn("Check the logs.").await?;
+    test.codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "Run the tool.".into(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        while !reached.load(Ordering::SeqCst) {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await?;
+    test.codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: QUEUED.into(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    wait_for_event(&test.codex, |event| {
+        if let EventMsg::Error(error) = event {
+            panic!("turn error: {error:?}");
+        }
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    test.codex.flush_rollout().await?;
+
+    let checkpoints = checkpoint_rows(&test.codex.rollout_path().expect("rollout path"))?;
+    assert_eq!(checkpoints.len(), 1);
+    let requests = seen.lock().expect("requests lock");
+    let summary = requests
+        .iter()
+        .find(|body| matches!(stage(body), Stage::Summary))
+        .expect("summary request");
+    assert!(!summary["input"].to_string().contains(QUEUED));
+    // The queued input is recorded after the checkpoint, so the model reads it last.
+    let last = requests.last().expect("final request")["input"]
+        .as_array()
+        .expect("input")
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>();
+    let summary_at = last
+        .iter()
+        .position(|item| item.contains(SUMMARY))
+        .expect("summary in the next request");
+    let queued_at = last
+        .iter()
+        .position(|item| item.contains(QUEUED))
+        .expect("queued input in the next request");
+    assert!(summary_at < queued_at);
+    Ok(())
+}

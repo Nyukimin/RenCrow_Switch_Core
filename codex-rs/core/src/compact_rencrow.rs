@@ -213,19 +213,7 @@ pub(super) async fn run(
         .ok_or(CodexErr::TurnAborted)?;
     let item = TurnItem::ContextCompaction(ContextCompactionItem::new());
     sess.emit_turn_item_started(&ctx, &item).await;
-    let turn_state = sess
-        .input_queue
-        .turn_state_for_sub_id(&sess.active_turn, &ctx.sub_id)
-        .await;
-    let (activity, pending) = sess
-        .input_queue
-        .subscribe_activity(turn_state.as_deref())
-        .await;
-    if pending.is_some() {
-        return Err(CodexErr::InvalidRequest(
-            "RenCrow compaction deferred: pending input".into(),
-        ));
-    }
+    // Queued input is not in the snapshot; the turn records it after the checkpoint.
     let snapshot = sess.clone_history().await;
     let history_hash =
         history_digest(snapshot.annotated_items()).map_err(CodexErr::InvalidRequest)?;
@@ -250,7 +238,6 @@ pub(super) async fn run(
         injection,
         metadata,
         &cancellation,
-        &activity,
         &snapshot,
         history_hash.clone(),
         settings.clone(),
@@ -318,7 +305,6 @@ async fn compact_v2(
     injection: InitialContextInjection,
     metadata: CompactionTurnMetadata,
     cancellation: &tokio_util::sync::CancellationToken,
-    activity: &tokio::sync::watch::Receiver<crate::session::InputQueueActivity>,
     snapshot: &crate::context_manager::ContextManager,
     history_hash: String,
     settings: codex_protocol::protocol::ThreadSettingsSnapshot,
@@ -370,21 +356,18 @@ async fn compact_v2(
         }
     };
     let base = sess.get_base_instructions().await;
-    sess.commit_rencrow_checkpoint(
-        crate::session::RenCrowCheckpoint {
-            items: candidate.items,
-            expected_history_hash: history_hash,
-            expected_settings: settings,
-            reference_context,
-            world_state,
-            summary: candidate.summary_text.clone(),
-            response_id: candidate.response_id,
-            expected_turn: ctx.sub_id.clone(),
-            expected_base_text: base.text,
-            expected_world,
-        },
-        activity,
-    )
+    sess.commit_rencrow_checkpoint(crate::session::RenCrowCheckpoint {
+        items: candidate.items,
+        expected_history_hash: history_hash,
+        expected_settings: settings,
+        reference_context,
+        world_state,
+        summary: candidate.summary_text.clone(),
+        response_id: candidate.response_id,
+        expected_turn: ctx.sub_id.clone(),
+        expected_base_text: base.text,
+        expected_world,
+    })
     .await?;
     Ok(CommittedOutcome {
         summary_text: candidate.summary_text,

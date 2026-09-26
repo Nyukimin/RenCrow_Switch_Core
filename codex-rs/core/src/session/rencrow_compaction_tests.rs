@@ -17,23 +17,19 @@ async fn stale_history_rejects_before_persistence_or_replacement() {
         )
     };
     let before = session.clone_history().await;
-    let (activity, _) = session.input_queue.subscribe_activity(None).await;
     let result = session
-        .commit_rencrow_checkpoint(
-            RenCrowCheckpoint {
-                items: vec![],
-                expected_history_hash: "not-the-current-history".into(),
-                expected_settings: session.thread_settings_snapshot().await,
-                reference_context: None,
-                world_state: None,
-                summary: "unused".into(),
-                response_id: Some("unused".into()),
-                expected_turn: "unused".into(),
-                expected_base_text: session.get_base_instructions().await.text,
-                expected_world: before.world_state_checkpoint(),
-            },
-            &activity,
-        )
+        .commit_rencrow_checkpoint(RenCrowCheckpoint {
+            items: vec![],
+            expected_history_hash: "not-the-current-history".into(),
+            expected_settings: session.thread_settings_snapshot().await,
+            reference_context: None,
+            world_state: None,
+            summary: "unused".into(),
+            response_id: Some("unused".into()),
+            expected_turn: "unused".into(),
+            expected_base_text: session.get_base_instructions().await.text,
+            expected_world: before.world_state_checkpoint(),
+        })
         .await;
     assert!(result.unwrap_err().to_string().contains("stale"));
     assert_eq!(
@@ -89,23 +85,19 @@ async fn missing_active_task_rejects_before_persistence() {
         )
     };
     let before = session.clone_history().await;
-    let (activity, _) = session.input_queue.subscribe_activity(None).await;
     let result = session
-        .commit_rencrow_checkpoint(
-            RenCrowCheckpoint {
-                items: vec![],
-                expected_history_hash: history_digest(before.annotated_items()).unwrap(),
-                expected_settings: session.thread_settings_snapshot().await,
-                reference_context: None,
-                world_state: None,
-                summary: "unused".into(),
-                response_id: Some("unused".into()),
-                expected_turn: "unused".into(),
-                expected_base_text: session.get_base_instructions().await.text,
-                expected_world: before.world_state_checkpoint(),
-            },
-            &activity,
-        )
+        .commit_rencrow_checkpoint(RenCrowCheckpoint {
+            items: vec![],
+            expected_history_hash: history_digest(before.annotated_items()).unwrap(),
+            expected_settings: session.thread_settings_snapshot().await,
+            reference_context: None,
+            world_state: None,
+            summary: "unused".into(),
+            response_id: Some("unused".into()),
+            expected_turn: "unused".into(),
+            expected_base_text: session.get_base_instructions().await.text,
+            expected_world: before.world_state_checkpoint(),
+        })
         .await;
     assert!(matches!(
         result.unwrap_err().details(),

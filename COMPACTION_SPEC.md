@@ -3287,8 +3287,6 @@ check checkpoint health
 ↓
 resolve cancellation
 ↓
-reject pending input
-↓
 clone history
 ↓
 history digest
@@ -3417,9 +3415,10 @@ manual `/compact` は同一hashでも許可。
 
 fingerprintを設定しない失敗:
 
-* pending input
 * stale race
 * explicit cancellation
+
+（2026-09-26: 履歴へ未記録のキューの入力は compaction を拒否しない。第3部「compaction 中に届いた入力の扱い」）
 
 clear:
 
@@ -4941,6 +4940,31 @@ RenCrow Switch Core Compaction V2の役割は、
 
 互換性: 旧 binary が注記を含む置換後履歴を読むと、注記は Unknown の user message として残る（読戻しは失敗しない）。戻し方: 本変更の commit を revert する。
 
+### compaction 中に届いた入力の扱い（2026-09-26）
+
+#### 解析
+
+- ID変更作業の thread `01a0d697` で、実行中のターンの自動 compaction が 2 回、入力のためにターンごと失敗した。2026-09-25 14:22:50 は約 4 時間 13 分のターンが `RenCrow compaction deferred: pending input` で、2026-09-26 04:08:43 は約 2 時間 14 分のターンが `RenCrow compaction candidate is stale; history was not replaced` で終わった。どちらも観察者のメモ（実行中のターンへの追加入力）が compaction の開始前または要約要求の最中にキューへ入っていた。後者は約 4〜5 分かけた要約を捨てた。
+- 原因: `rencrow::run` は開始時にキューへ入力があると compaction を拒否し（第3部 F01 の「reject pending input」）、`commit_rencrow_checkpoint` は compaction 中にキューの活動があると候補を stale とした。キューの入力はまだ履歴へ記録されていない（ターンの loop が次に取り出すときに記録する）。候補は snapshot の履歴 digest と一致したままで、置換しても入力は失われない。ターン途中の compaction の失敗はターンのエラーとして扱われ、ターンが終わる。
+- ターン開始前の compaction も、そのターンの新しい入力を記録する前に要約する。キューの入力と同じ状態であり、こちらは拒否していない。
+- 拒否したときは履歴も設定も変わっていないため、自動 compaction の失敗 fingerprint（F03）が記録されていた。F03 は「pending input・stale race は fingerprint を設定しない」と定めている。
+
+#### 修正仕様
+
+1. 履歴へ未記録のキューの入力は、compaction の開始を拒否する理由にも、候補を stale にする理由にもしない。入力はターンの loop が従来どおり checkpoint の後に記録するため、要約より後に置かれ、model は最後に読む。
+2. stale の判定は、snapshot の履歴 digest・thread 設定・基本指示・world state の照合と cancellation に限る。第2部 §7 の「新しいuser訂正・tool結果・設定変更が入れば」は、snapshot の履歴へ入った場合を指す。
+3. 第3部 F01 の処理順から「reject pending input」を外す。F03 の「fingerprintを設定しない失敗」の pending input は、失敗として起きなくなる。
+
+変えないもの: 入力キューの compaction gate（commit と入力の受付の直列化）、stale 時に候補を捨てて履歴を置換しないこと、ターン途中の compaction 後に model・tool の続きを追加入力より先に処理すること。
+
+#### 受入条件
+
+- ターン途中の自動 compaction で、開始前にキューへ入った入力、要約要求の最中にキューへ入った入力のどちらでも、checkpoint が 1 件確定し、エラーなしでターンが終わる。
+- 要約要求の入力にはキューの入力が無く、次の model 要求ではキューの入力が要約より後にある。
+- 履歴 digest が一致しない候補は従来どおり stale として拒否し、履歴を置換しない。
+
+互換性: checkpoint と rollout の形式は変えない。戻し方: 本変更の commit を revert する。
+
 # 第4部 部品契約・Failure Knowledge・実測・旧仕様（2026-09-24以前の記録）
 
 旧題: RenCrow Fork Compaction 新仕様案 第2版。第1〜2部と矛盾する記述は第1〜2部が優先する。承認済み例外1〜4（「元関数への例外と必要理由」）など、第1〜2部と矛盾しない部品契約は引き続き有効。Failure Knowledgeと実測記録は削除しない。
@@ -5264,7 +5288,7 @@ CLIはpair適格性の検証とtext projection、LLMは同じ一要求の意味�
 ## 7. 競合・永続化・失敗
 
 候補作成中は現checkpointを有効とし、候補要約を通常履歴へ確定しない。
-commit直前にsnapshotと履歴revisionを照合する。新しいuser訂正・tool結果・設定変更が入れば候補をstaleとして棄却する。
+commit直前にsnapshotと履歴revisionを照合する。新しいuser訂正・tool結果・設定変更がsnapshotの履歴へ入れば候補をstaleとして棄却する。履歴へ未記録のキューの入力はstaleの理由にせず、checkpointの後に記録する（2026-09-26）。
 未確定の外部実行をcancel/再実行して整合を装わない。安全な区切りを待てなければ適用を延期する。
 
 最終接続までは既存`replace_compacted_history`とrolloutを変更しない。接続時は必要な保存/再開境界に絞って拡張し、原本はappend-onlyで保持する。
