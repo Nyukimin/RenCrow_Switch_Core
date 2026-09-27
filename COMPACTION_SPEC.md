@@ -5067,6 +5067,7 @@ RenCrow Switch Core Compaction V2の役割は、
 - 置換後履歴: Automation の本文は Human と同じく、削除された範囲だけを取り除いて原文で残す。Unknown は従来どおり削除しない。
 - 試験: automation の訂正で automation のメモが消える、human の訂正で automation のメモが消える、automation の訂正では human の指示を消せない、候補に origin が付く、thread の違う受付記録は Unknown のまま、の各単体試験。実際の compaction の流れで、automation の古いメモが後の automation の訂正で置換後履歴から消え、訂正と常設の制約が残る結合試験。
 - 未確認（配備後に観測）: 実 Qwen の選別で、監督メモがどれだけ消えるか、常設の制約を誤って消さないか。
+- 運用（2026-09-27）: 本規則は入力元の申告が正しいことを前提にする。監督用に `automation` で起動した TUI に利用者が直接入力したため、利用者の指示が automation として記録されていた（thread 01a0dc2c の 31 件中、09-27 の利用者の指示）。一つの TUI を利用者と監督者で共有しない。利用者が入力する TUI は `human`、監督者だけが入力する TUI は `automation` で起動する。thread 01a0dc2c は 2026-09-27 04:05 に `human` で再開した。
 
 # 第4部 部品契約・Failure Knowledge・実測・旧仕様（2026-09-24以前の記録）
 
