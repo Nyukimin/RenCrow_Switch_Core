@@ -2,7 +2,9 @@
 //!
 //! Retained user messages lose the turns that explained when and why they were sent, so an
 //! old correction can read like a current instruction. The note lists them oldest first with
-//! their receive time just before the summary, without changing their text.
+//! their receive time just before the summary, without changing their text. It also marks the
+//! newest one and says that one-time start-up steps were already done: a first message that said
+//! "read the handoff, then check the state" otherwise made Qwen redo them after every compaction.
 
 use super::super::is_summary_message;
 use crate::context::ContextualUserFragment;
@@ -83,17 +85,24 @@ pub(super) fn timeline_note<'a>(
             }
             Some((received, excerpt))
         })
-        .enumerate()
-        .map(|(index, (received, excerpt))| format!("{}. {received}: \"{excerpt}\"", index + 1))
         .collect::<Vec<_>>();
-    if lines.is_empty() {
-        return None;
-    }
+    let newest = lines.len().checked_sub(1)?;
+    let lines = lines
+        .into_iter()
+        .enumerate()
+        .map(|(index, (received, excerpt))| {
+            let mark = if index == newest { " (newest)" } else { "" };
+            format!("{}. {received}{mark}: \"{excerpt}\"", index + 1)
+        })
+        .collect::<Vec<_>>();
     let body = format!(
         "Earlier user messages kept verbatim above, oldest first:\n{}\nAll of them were received \
-         before the work summary that follows, which records the latest known state. A situation \
-         an older message describes may already be resolved or superseded; check the current \
-         state before acting on it.",
+         before the work summary that follows, which records the latest known state and the next \
+         steps. Where these messages conflict, the newer one wins. Steps they asked for when \
+         starting the work, such as reading a handoff document or checking the repository and \
+         running services, were already carried out before the summary unless it says otherwise; \
+         do not repeat them. Continue from the summary's next steps, and check only what the next \
+         step needs.",
         lines.join("\n")
     );
     Some(ResponseItemEnvelope::new(ContextualUserFragment::into(

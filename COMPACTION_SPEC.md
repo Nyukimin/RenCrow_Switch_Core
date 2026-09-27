@@ -4924,7 +4924,7 @@ RenCrow Switch Core Compaction V2の役割は、
 
 1. host 内部コンテキストの分類: `content_item_kinds` がすべて `<source>.internal_context`（`InternalModelContextFragment` の kind）の user message は、`client_authored` でない限り `Origin::Host` とする。第2部 §11 のとおり内部生成は本人枠へ昇格せず、kind を host が付与するため出どころは不明ではない。既存の Host と同じく、要約の入力へ本文を渡さない。
 2. 置換後履歴での内部コンテキスト: source ごとに最新の 1 件だけを原文で残す（goal の継続指示は最新 1 件）。source が `compaction` のもの（下の注記）は残さず、毎回作り直す。
-3. 残した user message の時系列注記: Normal の置換後履歴で、要約の直前に `InternalModelContextFragment`（source `compaction`）を 1 件置く（Emergency は前回要約を引き継ぐ経路のため対象外）。initial context の差込み位置は注記を除いて従来どおり決め、その後に注記を入れる。candidate 検証の期待列にも同じ位置で含める。本文は、置換後履歴に残した user message（Human と Unknown の本文 message。内部コンテキストと host の文脈 fragment を除く）を古い順に、受信時刻（`create_time` の UTC、分まで。無ければ「時刻不明」）と冒頭 60 文字で列挙し、「これらは下の要約より前に受信した。書かれた状況は解決済み・置換済みの可能性がある。行動の前に現在の状態を確かめる」と明示する。対象が 0 件なら置かない。user message の本文・順序・ID は変えない。
+3. 残した user message の時系列注記: Normal の置換後履歴で、要約の直前に `InternalModelContextFragment`（source `compaction`）を 1 件置く（Emergency は前回要約を引き継ぐ経路のため対象外）。initial context の差込み位置は注記を除いて従来どおり決め、その後に注記を入れる。candidate 検証の期待列にも同じ位置で含める。本文は、置換後履歴に残した user message（Human と Unknown の本文 message。内部コンテキストと host の文脈 fragment を除く）を古い順に、受信時刻（`create_time` の UTC、分まで。無ければ「時刻不明」）と冒頭 60 文字で列挙し、「これらは下の要約より前に受信した。書かれた状況は解決済み・置換済みの可能性がある。行動の前に現在の状態を確かめる」と明示する（2026-09-27 に文面を変更。第3部「圧縮後に現在地を見失う問題の対処」）。対象が 0 件なら置かない。user message の本文・順序・ID は変えない。
 4. 入力元の申告を必須にする（利用者指示 2026-09-26「Human メッセージの Author は常時必須」）: TUI（通常起動・`resume`・`fork`）は `--rencrow-input-author human|automation` が無ければ起動せず、指定方法を示すエラーで終了する。本人が直接入力する TUI は `human`、観察者などの代理入力の TUI は `automation` を指定する。`exec` と app-server は本文を本人入力として受け付ける経路を持たず、起動引数の prompt は本人枠へ昇格しない（既存どおり）ため、対象外とする。
 
 変えないもの: Human・Unknown の本文保持、Selection、Emergency、要約本文と `summary_hash`。
@@ -4964,6 +4964,30 @@ RenCrow Switch Core Compaction V2の役割は、
 - 履歴 digest が一致しない候補は従来どおり stale として拒否し、履歴を置換しない。
 
 互換性: checkpoint と rollout の形式は変えない。戻し方: 本変更の commit を revert する。
+
+### 圧縮後に現在地を見失う問題の対処（2026-09-27、利用者判断「注記の文面変更＋運用」）
+
+#### 解析（ID変更作業の thread `01a0dc2c-2ffc-7883-8d76-456d34e7e0ec`、compaction 11 回）
+
+- #6〜#10 の 5 回連続で、圧縮直後の Codex の最初の思考が同じだった（「Let me start by reading the handoff document and checking the current state. The user says: continue ID change implementation, TDD until Task20 … Push to identity/03-dci」）。古い引き継ぎ資料を計 7 回読み直し、現状（branch main、配備済み）との食い違いを突き合わせ、完了済みの確認をやり直した。#1〜#5 と #11 は状態確認から始めたが、引き継ぎ資料は読まなかった。
+- 読み直しで context が埋まり、compaction の間隔は #2〜#5 の 23〜45 分から #6〜#10 の 12〜22 分へ縮んだ。読み直しが圧縮を早め、圧縮が読み直しを呼ぶ循環になった。
+- 原因 1: 置換後履歴の先頭の user message が、観察者が thread 開始時に送った依頼で、一回限りの開始手順（「引き継ぎ資料を最初に読み、git status・実ファイル・稼働サービスの実測で照合してから始める」）を含んでいた。入力元が automation のため Unknown として原文で無期限に残り（保持方式「保守的」の仕様どおり）、Qwen は毎回これを「ユーザーの今の依頼」と読んだ。
+- 原因 2: 時系列注記の結びの「行動の前に現在の状態を確かめる」が、状態の再確認を指示する文として読まれた。
+- 原因 3: 後から届いた作業指示（A〜D）と最初の依頼は食い違うが、注記も要約もどれが現在の指示かを示していなかった。要約自身は「未了（この順）」を正しく書いていたが、Codex は先頭の依頼を優先した。
+
+#### 修正仕様
+
+1. 時系列注記の文面を変える。列挙の最後（最も新しい message）に「(newest)」を付ける。結びは次のとおり: 「これらは下の要約より前に受信した。要約は最新の状態と次の手順を記録する。これらの message が食い違うときは新しい方を優先する。作業開始時に求めた手順（引き継ぎ資料の読込み、repository や稼働サービスの確認など）は、要約に別段の記載が無い限り要約より前に実施済みで、繰り返さない。要約の次の手順から続け、確認はその手順に要るものだけにする」。
+2. 変えないもの: 注記の位置（要約の直前）・source・有無の条件、user message の本文・順序・ID、保持方式、要約。
+3. 運用: 観察者・監督者が Codex へ送る最初の依頼には、一回限りの開始手順（「最初に〜を読む」「〜を照合してから始める」）を書かない。依頼は目的と完了条件に限り、開始時の資料は別の message で渡す。
+
+#### 受入条件
+
+- 注記は残した user message を古い順に列挙し、最後の 1 件にだけ「(newest)」が付く。結びは上の文面になる。
+- 残す user message が 0 件なら注記を置かない（従来どおり）。
+- 実 thread で、圧縮直後に開始手順（引き継ぎ資料の読込み等）を繰り返さず、要約の次の手順から再開する（次の長時間作業で観測する）。
+
+互換性: 注記の文面だけの変更で、checkpoint・rollout の形式は変えない。戻し方: 本変更の commit を revert する。
 
 # 第4部 部品契約・Failure Knowledge・実測・旧仕様（2026-09-24以前の記録）
 

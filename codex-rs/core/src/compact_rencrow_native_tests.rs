@@ -589,10 +589,13 @@ fn v2_native_replacement_lists_retained_user_messages_before_the_summary() {
             "Earlier user messages kept verbatim above, oldest first:\n\
              1. 2026-09-25 03:24 UTC: \"start the task with details\"\n\
              2. 2026-09-25 07:13 UTC: \"observer note: the scheduled backup stopped CORE on purpose,…\"\n\
-             3. time unknown: \"no recorded time\"\n\
+             3. time unknown (newest): \"no recorded time\"\n\
              All of them were received before the work summary that follows, which records the \
-             latest known state. A situation an older message describes may already be resolved \
-             or superseded; check the current state before acting on it.",
+             latest known state and the next steps. Where these messages conflict, the newer one \
+             wins. Steps they asked for when starting the work, such as reading a handoff document \
+             or checking the repository and running services, were already carried out before the \
+             summary unless it says otherwise; do not repeat them. Continue from the summary's \
+             next steps, and check only what the next step needs.",
         ),
     ));
     assert_eq!(rebuilt.len(), 6);
