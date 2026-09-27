@@ -1190,3 +1190,107 @@ async fn rencrow_mid_turn_compaction_keeps_input_queued_around_it(
     assert!(summary_at < queued_at);
     Ok(())
 }
+
+/// A mid-turn summary extends the ordinary turn prompt so the Backend can reuse its prefix cache.
+///
+/// Manual compaction has no ordinary step to extend and keeps the projected, tool-free request.
+#[test_case::test_case(true; "mid-turn automatic")]
+#[test_case::test_case(false; "manual")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rencrow_mid_turn_summary_extends_the_ordinary_turn_prompt(automatic: bool) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = start_mock_server().await;
+    let seen = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let captured = Arc::clone(&seen);
+    let responses = Arc::new(AtomicUsize::new(0));
+    let ordinary = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(move |request: &Request| {
+            let body: Value = request.body_json().expect("request JSON");
+            captured.lock().expect("requests lock").push(body.clone());
+            let id = format!("answer-{}", responses.fetch_add(1, Ordering::SeqCst));
+            match stage(&body) {
+                Stage::Selection(_) => assistant_reply(
+                    &id,
+                    &json!({ "operations": [] }).to_string(),
+                    ev_completed("selection-response"),
+                ),
+                Stage::Summary => assistant_reply(
+                    &id,
+                    "The tool ran once; continue.",
+                    ev_completed("summary-response"),
+                ),
+                Stage::Ordinary => match ordinary.fetch_add(1, Ordering::SeqCst) {
+                    // Earlier work output gives the compaction something to shrink.
+                    0 => assistant_reply(
+                        &id,
+                        &"Checked one more log line. ".repeat(3_000),
+                        ev_completed("response-fixture"),
+                    ),
+                    1 if automatic => ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/event-stream")
+                        .set_body_string(sse(vec![
+                            ev_function_call("call-before-compact", "test_tool", "{}"),
+                            ev_completed_with_tokens("response-with-tool", 110_000),
+                        ])),
+                    _ => assistant_reply(&id, "acknowledged", ev_completed("response-fixture")),
+                },
+            }
+        })
+        .mount(&server)
+        .await;
+    let provider = non_openai_model_provider(&server);
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider = provider;
+        config.rencrow_compaction = true;
+        config.model_auto_compact_token_limit = Some(100_000);
+    });
+    let test = builder.build(&server).await?;
+    test.submit_text_turn("Check the logs.").await?;
+    if automatic {
+        test.submit_text_turn("Run the tool.").await?;
+    } else {
+        compact_without_error(&test.codex).await?;
+    }
+
+    let requests = seen.lock().expect("requests lock");
+    let summary = requests
+        .iter()
+        .find(|body| matches!(stage(body), Stage::Summary))
+        .expect("summary request");
+    let summary_input = summary["input"].as_array().expect("summary input");
+    if !automatic {
+        assert_eq!(summary["tools"].as_array().map_or(0, Vec::len), 0);
+        return Ok(());
+    }
+    // The ordinary request that triggered the compaction, sent just before the summary.
+    let ordinary = requests
+        .iter()
+        .take_while(|body| !matches!(stage(body), Stage::Summary))
+        .filter(|body| matches!(stage(body), Stage::Ordinary))
+        .last()
+        .expect("ordinary request before the summary");
+    assert!(
+        summary["tools"]
+            .as_array()
+            .is_some_and(|tools| !tools.is_empty())
+    );
+    assert_eq!(summary["tools"], ordinary["tools"]);
+    assert_eq!(summary["instructions"], ordinary["instructions"]);
+    assert_eq!(summary["tool_choice"], ordinary["tool_choice"]);
+    assert_eq!(
+        summary["parallel_tool_calls"],
+        ordinary["parallel_tool_calls"]
+    );
+    let ordinary_input = ordinary["input"].as_array().expect("ordinary input");
+    assert_eq!(&summary_input[..ordinary_input.len()], &ordinary_input[..]);
+    // The tool call and its output follow, then one instruction that names the call to cite.
+    let last = summary_input.last().expect("summary instruction");
+    assert_eq!(last["role"], "developer");
+    let instruction = item_texts(last).concat();
+    assert!(instruction.contains(SUMMARY_REQUEST));
+    assert!(instruction.contains("call-before-compact"));
+    assert_eq!(summary_input.len(), ordinary_input.len() + 3);
+    Ok(())
+}

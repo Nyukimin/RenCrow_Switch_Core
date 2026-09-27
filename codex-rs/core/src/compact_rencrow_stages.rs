@@ -37,6 +37,68 @@ use serde_json::json;
 use std::collections::HashSet;
 use tokio_util::sync::CancellationToken;
 
+/// Extend the ordinary turn prompt for the summary when it still leaves room for the response.
+fn turn_prefix<'a>(
+    snapshot: &ContextManager,
+    p: &PreparedV2<'_>,
+    step: &'a crate::session::step_context::StepContext,
+) -> Option<model_request::TurnPrefix<'a>> {
+    let mut citations = Vec::new();
+    let mut hidden_observations = Vec::new();
+    for (_, output_index, projection) in &p.projections {
+        let excerpt = &projection.summary;
+        let call = excerpt
+            .call
+            .excerpts
+            .first()
+            .map(|text| text.split_whitespace().collect::<Vec<_>>().join(" "))
+            .unwrap_or_default();
+        let call = call.chars().take(CITATION_CALL_CHARS).collect::<String>();
+        citations.push(format!(
+            "- {}: {} `{call}`",
+            excerpt.reference.call_id, excerpt.tool_name
+        ));
+        let shown_as_marker = p
+            .originals
+            .get(*output_index)
+            .and_then(|output| output.metadata.as_ref())
+            .is_some_and(|metadata| {
+                metadata.rencrow_observation_projection.is_some()
+                    || metadata.rencrow_archive_reference.is_some()
+            });
+        if shown_as_marker {
+            let body = serde_json::to_string(excerpt).ok()?;
+            hidden_observations.push(format!("{{\"observation\":{body}}}"));
+        }
+    }
+    // The instruction and citations are far smaller than the history; count bytes as tokens.
+    let added = citations
+        .iter()
+        .chain(&hidden_observations)
+        .map(String::len)
+        .sum::<usize>()
+        + 2_048;
+    let needed = p
+        .limits
+        .active_context_tokens
+        .saturating_add(i64::try_from(added).ok()?)
+        .saturating_add(SUMMARY_OUTPUT_RESERVE_TOKENS);
+    if p.limits
+        .full_context_window_limit
+        .is_some_and(|limit| needed > limit)
+    {
+        return None;
+    }
+    Some(model_request::TurnPrefix {
+        step_context: step,
+        input: snapshot
+            .clone()
+            .for_prompt(&step.settings.model_info.input_modalities),
+        citations,
+        hidden_observations,
+    })
+}
+
 /// Why a stage produced no committable candidate (Part 2 §3–7, §24).
 pub(super) enum StageFailure {
     /// Model, transport, response schema, or semantic rejection: continue with Emergency.
@@ -188,7 +250,15 @@ pub(super) async fn prepare_v2<'a>(
     })
 }
 
+/// Output the Gateway reserves for a summary response; the extended prompt must leave room for it.
+const SUMMARY_OUTPUT_RESERVE_TOKENS: i64 = 16_384;
+/// Characters of each tool call quoted in a summary citation line.
+const CITATION_CALL_CHARS: usize = 100;
+
 /// Build and validate a Normal candidate with at most two model requests (Part 2 §8–18).
+///
+/// `step_context` is the step of the ordinary request before a mid-turn compaction. When this
+/// compaction removes nothing, the summary request extends that prompt (Part 3 proposal A).
 pub(super) async fn normal_candidate(
     sess: &Session,
     ctx: &TurnContext,
@@ -196,6 +266,7 @@ pub(super) async fn normal_candidate(
     cancellation: &CancellationToken,
     snapshot: &ContextManager,
     prepared: &PreparedV2<'_>,
+    step_context: Option<&crate::session::step_context::StepContext>,
 ) -> Result<StageCandidate, StageFailure> {
     let p = prepared;
     let mut receipts = Vec::new();
@@ -261,12 +332,21 @@ pub(super) async fn normal_candidate(
         p.semantic.work_boundary,
     )
     .map_err(after_selection)?;
+    // The extended prompt shows removed passages verbatim, so it is used only when none were
+    // removed or replaced by this compaction.
+    let turn_prefix = step_context
+        .filter(|_| {
+            application.pruning.applied.len() == p.pruning.applied.len()
+                && application.results.is_empty()
+        })
+        .and_then(|step| turn_prefix(snapshot, p, step));
     let (summary_suffix, response_id) = model_request::request_compaction_summary(
         sess,
         ctx,
         metadata,
         summary_history,
         &application.results,
+        turn_prefix,
         &mut receipts,
         cancellation,
     )

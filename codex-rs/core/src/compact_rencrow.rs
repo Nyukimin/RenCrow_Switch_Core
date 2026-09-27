@@ -310,6 +310,13 @@ async fn compact_v2(
     settings: codex_protocol::protocol::ThreadSettingsSnapshot,
     skip_normal: bool,
 ) -> CodexResult<CommittedOutcome> {
+    // Only a mid-turn compaction has the step of the ordinary request its summary can extend.
+    let step_context = match &injection {
+        InitialContextInjection::BeforeLastUserMessage { step_context, .. } => {
+            Some(Arc::clone(step_context))
+        }
+        InitialContextInjection::DoNotInject => None,
+    };
     let (canonical, source_thread, active_call_ids) = load_canonical_rollout(sess)
         .await
         .map_err(StageFailure::into_error)?;
@@ -332,7 +339,16 @@ async fn compact_v2(
     let normal = if skip_normal {
         None
     } else {
-        match stages::normal_candidate(sess, ctx, metadata, cancellation, snapshot, &prepared).await
+        match stages::normal_candidate(
+            sess,
+            ctx,
+            metadata,
+            cancellation,
+            snapshot,
+            &prepared,
+            step_context.as_deref(),
+        )
+        .await
         {
             Ok(candidate) => Some(candidate),
             Err(StageFailure::Semantic(error)) => {

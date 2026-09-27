@@ -4989,7 +4989,7 @@ RenCrow Switch Core Compaction V2の役割は、
 
 互換性: 注記の文面だけの変更で、checkpoint・rollout の形式は変えない。戻し方: 本変更の commit を revert する。
 
-### 提案A: 要約要求を通常 turn の prefix cache に載せる（2026-09-27、仕様案・利用者判断待ち）
+### 提案A: 要約要求を通常 turn の prefix cache に載せる（2026-09-27、利用者判断「OK」で実装）
 
 #### 現状と実測
 
@@ -5018,6 +5018,16 @@ RenCrow Switch Core Compaction V2の役割は、
 - 実 thread の要約要求で、Backend の cache 再利用（mlx-serve の `reused N/P tokens`）と、最初の出力までの時間の短縮を実測する。
 - 同じ compaction 入力の現行形と新形の A/B で、要点の保持・marker の数・長さが現行形を下回らない。
 - tool 呼出しを要約として採用しない。window を超える場合は現行形へ戻る。
+
+#### 実装（2026-09-27）
+
+- 対象: ターン途中の自動 compaction（`InitialContextInjection::BeforeLastUserMessage` が直前の通常要求の step を持つ）で、この compaction が指示の削除も完了置換もしない場合だけ。ターン開始前・手動 `/compact`・削除や置換がある場合は、現行の変形済み入力（tool なし）を使う。変形前の履歴は削除した本文を含むため、削除がある compaction には使わない（撤回した指示を要約へ見せない原則を守る）。
+- 要求: 通常要求と同じ `build_prompt`（同じ基本指示・tool 宣言・`parallel_tool_calls`）と同じ `for_prompt` の履歴に、developer message 1 件を足す。本文は要約指示、「上は通常 turn と同じ context で tool 定義を含むが呼ばない。tool 呼出しは ID 無しで見えるので、下の一覧の call ID で引用する」、今回提示する observation の一覧（`- <call_id>: <tool> \`<呼出しの冒頭 100 文字>\``）、履歴に marker・保管参照としてしか見えない observation の断片（現行と同じ `{"observation":…}`）。
+- `tool_choice` は通常要求と同じ `auto` のままにする（`none` にすると Gateway が tool の履歴がある要求の先頭 system message に注意を足し、prefix が変わる）。
+- 容量: 現在の context 使用量＋足す本文（byte 数を token とみなす）＋要約の出力枠 16,384 tokens が context window を超える場合は現行形にする。
+- 応答に tool 呼出しがあれば現行どおり要約として採用せず Emergency へ進む。要求回数の上限（第2部 §5、最大 2 回）は変えない。
+- 試験: ターン途中の自動 compaction で、要約要求の tool 宣言・基本指示・`tool_choice`・`parallel_tool_calls` が直前の通常要求と同じで、通常要求の入力が要約要求の入力の先頭にそのまま含まれ、tool 呼出しと出力の後に call ID を含む要約指示が 1 件だけ続くこと。手動 `/compact` は tool なしのままであること。
+- 未確認（配備前に行う）: 実 Qwen で、Backend の cache 再利用（`reused N/P tokens`）と最初の出力までの時間、tool 呼出しの率、要約の要点と marker を現行形と比べる。
 
 ### 提案B: automation の入力を Selection（指示削除）の対象にする（2026-09-27、仕様案・利用者判断待ち）
 

@@ -509,6 +509,7 @@ async fn v2_summary_request_normalizes_history_and_records_one_typed_receipt() {
         compaction_metadata(CompactionPhase::MidTurn),
         summary_history,
         &results,
+        /*turn_prefix*/ None,
         &mut receipts,
         &CancellationToken::new(),
     )
