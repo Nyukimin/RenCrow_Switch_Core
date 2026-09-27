@@ -92,8 +92,10 @@ pub fn prune_known_obsolete(
         if overlaps_protection || record.opaque.is_some() || record.origin == Origin::Unknown {
             return Err("known instruction reference overlaps protected source content".into());
         }
-        if record.origin != Origin::Human || record.role != "user" {
-            return Err("known instruction reference does not target a Human user source".into());
+        if !record.origin.is_declared_input() || record.role != "user" {
+            return Err(
+                "known instruction reference does not target a declared user source".into(),
+            );
         }
 
         result.applied.push(reference.clone());
@@ -174,7 +176,7 @@ pub fn collect_instruction_candidates(
     for record in input
         .records
         .iter()
-        .filter(|record| record.origin == Origin::Human)
+        .filter(|record| record.origin.is_declared_input())
     {
         let text = pruning
             .retained_human_text
@@ -202,7 +204,7 @@ pub fn collect_instruction_candidates(
         candidate_humans.insert(record.id.clone(), is_candidate);
         human_sources.push(serde_json::json!({
             "id": record.id,
-            "origin": "human",
+            "origin": if record.origin == Origin::Human { "human" } else { "automation" },
             "role": record.role,
             "text": text,
             "protected": protected,
@@ -238,7 +240,7 @@ pub fn collect_instruction_candidates(
         let call = &input.records[call_index];
         let output = &input.records[output_index];
 
-        if instruction.origin != Origin::Human
+        if !instruction.origin.is_declared_input()
             || instruction.role != "user"
             || instruction.opaque.is_some()
             || pruning
@@ -315,7 +317,7 @@ pub fn collect_instruction_candidates(
     }
 
     let snapshot_hash = snapshot.hash();
-    let presentation_hash = instruction_presentation_hash(&snapshot_hash, &pruning.applied, links)?;
+    let presentation_hash = instruction_presentation_hash(snapshot_hash, &pruning.applied, links)?;
     Ok(Some(serde_json::json!({
         "schema_version": 1,
         "snapshot_hash": snapshot_hash,

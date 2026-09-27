@@ -156,8 +156,11 @@ pub(super) fn build_completion_links(
             | ResponseItem::CompactionTrigger { .. }
             | ResponseItem::ContextCompaction { .. } => false,
         };
-        let user =
-            record.role == "user" && matches!(record.origin, Origin::Human | Origin::Unknown);
+        let user = record.role == "user"
+            && matches!(
+                record.origin,
+                Origin::Human | Origin::Automation | Origin::Unknown
+            );
         if !tool && !user {
             continue;
         }
@@ -206,7 +209,7 @@ pub(super) fn build_completion_links(
             continue;
         };
         let record = &input.records[*human];
-        if record.origin != Origin::Human
+        if !record.origin.is_declared_input()
             || record.opaque.is_some()
             || !record.protected.is_empty()
             || record.text.is_empty()

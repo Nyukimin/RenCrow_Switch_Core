@@ -103,6 +103,16 @@ fn checkpoint_rows(path: &std::path::Path) -> Result<Vec<Value>> {
 
 /// Submit a turn whose text has an accepted Human intake receipt.
 async fn submit_human_turn(test: &TestCodex, client: &str, text: &str) -> Result<()> {
+    submit_declared_turn(test, client, text, InputAuthor::Human).await
+}
+
+/// Submit a turn whose text has an accepted intake receipt from the given author.
+async fn submit_declared_turn(
+    test: &TestCodex,
+    client: &str,
+    text: &str,
+    author: InputAuthor,
+) -> Result<()> {
     let thread = test.session_configured.session_id.to_string();
     let directory = test
         .codex_home_path()
@@ -113,7 +123,7 @@ async fn submit_human_turn(test: &TestCodex, client: &str, text: &str) -> Result
         thread,
         client.into(),
         OriginalInput {
-            author: InputAuthor::Human,
+            author,
             text: text.into(),
             attachments: vec![],
         },
@@ -1292,5 +1302,97 @@ async fn rencrow_mid_turn_summary_extends_the_ordinary_turn_prompt(automatic: bo
     assert!(instruction.contains(SUMMARY_REQUEST));
     assert!(instruction.contains("call-before-compact"));
     assert_eq!(summary_input.len(), ordinary_input.len() + 3);
+    Ok(())
+}
+
+/// A declared automation note is removed only by a later correction; standing notes remain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rencrow_automation_note_is_removed_only_by_a_later_correction() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    const OLD: &str = "Keep the old port 8080 for now.";
+    const STANDING: &str = "Stay on this host; do not operate another host.";
+    const CORRECTION: &str = "Port 8080 is withdrawn; use port 18790.";
+    let server = start_mock_server().await;
+    let seen = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let captured = Arc::clone(&seen);
+    let responses = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(move |request: &Request| {
+            let body: Value = request.body_json().expect("request JSON");
+            captured.lock().expect("requests lock").push(body.clone());
+            let id = format!("answer-{}", responses.fetch_add(1, Ordering::SeqCst));
+            match stage(&body) {
+                Stage::Selection(data) => {
+                    let sources = data["sources"].as_array().expect("sources");
+                    let find = |text: &str| {
+                        sources
+                            .iter()
+                            .find(|source| source["text"] == text)
+                            .map(|source| source["id"].clone())
+                    };
+                    let operations = match (find(OLD), find(CORRECTION)) {
+                        (Some(old), Some(correction)) => json!([{
+                            "action": "drop_superseded",
+                            "source": old,
+                            "correction": correction,
+                            "correction_text": CORRECTION,
+                        }]),
+                        _ => json!([]),
+                    };
+                    assistant_reply(
+                        &id,
+                        &json!({ "operations": operations }).to_string(),
+                        ev_completed("selection-response"),
+                    )
+                }
+                Stage::Summary => {
+                    assistant_reply(&id, "Use port 18790.", ev_completed("summary-response"))
+                }
+                Stage::Ordinary => {
+                    assistant_reply(&id, "acknowledged", ev_completed("response-fixture"))
+                }
+            }
+        })
+        .mount(&server)
+        .await;
+    let provider = non_openai_model_provider(&server);
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider = provider;
+        config.rencrow_compaction = true;
+    });
+    let test = builder.build(&server).await?;
+    for (client, text) in [
+        ("old", OLD),
+        ("standing", STANDING),
+        ("correction", CORRECTION),
+    ] {
+        submit_declared_turn(&test, client, text, InputAuthor::Automation).await?;
+    }
+    compact_without_error(&test.codex).await?;
+
+    let requests = seen.lock().expect("requests lock");
+    let selection = requests
+        .iter()
+        .find_map(|body| match stage(body) {
+            Stage::Selection(data) => Some(data),
+            _ => None,
+        })
+        .expect("selection request");
+    let origins = selection["sources"]
+        .as_array()
+        .expect("sources")
+        .iter()
+        .map(|source| source["origin"].as_str().unwrap_or_default().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(origins, vec!["automation"; 3]);
+    let replacement =
+        replacement_history_from_rollout(&test.codex.rollout_path().expect("rollout path"))?
+            .iter()
+            .map(Value::to_string)
+            .collect::<String>();
+    assert!(!replacement.contains(OLD));
+    assert!(replacement.contains(STANDING));
+    assert!(replacement.contains(CORRECTION));
     Ok(())
 }

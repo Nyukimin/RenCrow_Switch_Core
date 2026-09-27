@@ -15,6 +15,9 @@ use std::collections::BTreeSet;
 #[serde(rename_all = "snake_case")]
 pub enum SourceKind {
     UserInstruction,
+    /// An instruction from declared automation input; only removable like a user instruction,
+    /// and never a correction that removes one.
+    AutomationInstruction,
     ExecutionEvidence,
     Context,
 }
@@ -28,6 +31,23 @@ pub struct SourceFragment {
     pub text: String,
     /// Protected spans use UTF-8 byte offsets within this fragment.
     pub protected: Vec<ByteRange>,
+}
+
+/// Whether a correction of one kind may supersede a source of another.
+///
+/// A user instruction can be superseded only by the user; declared automation input can be
+/// superseded by later automation or by the user.
+fn may_supersede(correction: &SourceKind, source: &SourceKind) -> bool {
+    matches!(
+        (correction, source),
+        (
+            SourceKind::UserInstruction,
+            SourceKind::UserInstruction | SourceKind::AutomationInstruction
+        ) | (
+            SourceKind::AutomationInstruction,
+            SourceKind::AutomationInstruction
+        )
+    )
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -273,11 +293,13 @@ impl CompactionSnapshot {
             if matches!(operation, Operation::Keep { .. }) {
                 continue;
             }
-            if fragment.kind != SourceKind::UserInstruction
-                || fragment
-                    .protected
-                    .iter()
-                    .any(|p| overlaps(p, &source.range))
+            if !matches!(
+                fragment.kind,
+                SourceKind::UserInstruction | SourceKind::AutomationInstruction
+            ) || fragment
+                .protected
+                .iter()
+                .any(|p| overlaps(p, &source.range))
             {
                 return Err(PlanError::ProtectedSource);
             }
@@ -286,7 +308,7 @@ impl CompactionSnapshot {
                     let (index, correcting) = self.resolve(correction)?;
                     if index < source_index
                         || (index == source_index && correction.range.start < source.range.end)
-                        || correcting.kind != SourceKind::UserInstruction
+                        || !may_supersede(&correcting.kind, &fragment.kind)
                         || correcting.scope != fragment.scope
                     {
                         return Err(PlanError::InvalidEvidence);

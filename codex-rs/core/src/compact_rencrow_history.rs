@@ -194,12 +194,16 @@ pub(super) fn capture(
                 && metadata
                     .is_none_or(|m| !m.inherited_user_message && m.sender_user_messages.is_none())
                 && let Some(intake) = intake
-                && intake["author"] == "human"
+                && let Some(declared) = match intake["author"].as_str() {
+                    Some("human") => Some(Origin::Human),
+                    Some("automation") => Some(Origin::Automation),
+                    _ => None,
+                }
                 && intake["thread_id"].as_str() == Some(thread_id)
                 && intake["selected_text"].as_str() == Some(record.text.as_str())
                 && intake["receipt_hash"].as_str().is_some()
             {
-                record.origin = Origin::Human;
+                record.origin = declared;
                 record.intake_ref = intake["receipt_hash"].as_str().map(str::to_owned);
                 if text_only {
                     record.opaque = None;

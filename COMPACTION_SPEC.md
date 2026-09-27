@@ -4927,7 +4927,7 @@ RenCrow Switch Core Compaction V2の役割は、
 3. 残した user message の時系列注記: Normal の置換後履歴で、要約の直前に `InternalModelContextFragment`（source `compaction`）を 1 件置く（Emergency は前回要約を引き継ぐ経路のため対象外）。initial context の差込み位置は注記を除いて従来どおり決め、その後に注記を入れる。candidate 検証の期待列にも同じ位置で含める。本文は、置換後履歴に残した user message（Human と Unknown の本文 message。内部コンテキストと host の文脈 fragment を除く）を古い順に、受信時刻（`create_time` の UTC、分まで。無ければ「時刻不明」）と冒頭 60 文字で列挙し、「これらは下の要約より前に受信した。書かれた状況は解決済み・置換済みの可能性がある。行動の前に現在の状態を確かめる」と明示する（2026-09-27 に文面を変更。第3部「圧縮後に現在地を見失う問題の対処」）。対象が 0 件なら置かない。user message の本文・順序・ID は変えない。
 4. 入力元の申告を必須にする（利用者指示 2026-09-26「Human メッセージの Author は常時必須」）: TUI（通常起動・`resume`・`fork`）は `--rencrow-input-author human|automation` が無ければ起動せず、指定方法を示すエラーで終了する。本人が直接入力する TUI は `human`、観察者などの代理入力の TUI は `automation` を指定する。`exec` と app-server は本文を本人入力として受け付ける経路を持たず、起動引数の prompt は本人枠へ昇格しない（既存どおり）ため、対象外とする。
 
-変えないもの: Human・Unknown の本文保持、Selection、Emergency、要約本文と `summary_hash`。
+変えないもの: Human・Unknown の本文保持、Selection、Emergency、要約本文と `summary_hash`（2026-09-27 に、受付記録のある automation の入力は Selection の対象へ変更した。第3部 提案B）。
 
 #### 受入条件
 
@@ -5029,7 +5029,7 @@ RenCrow Switch Core Compaction V2の役割は、
 - 試験: ターン途中の自動 compaction で、要約要求の tool 宣言・基本指示・`tool_choice`・`parallel_tool_calls` が直前の通常要求と同じで、通常要求の入力が要約要求の入力の先頭にそのまま含まれ、tool 呼出しと出力の後に call ID を含む要約指示が 1 件だけ続くこと。手動 `/compact` は tool なしのままであること。
 - 未確認（配備前に行う）: 実 Qwen で、Backend の cache 再利用（`reused N/P tokens`）と最初の出力までの時間、tool 呼出しの率、要約の要点と marker を現行形と比べる。
 
-### 提案B: automation の入力を Selection（指示削除）の対象にする（2026-09-27、仕様案・利用者判断待ち）
+### 提案B: automation の入力を Selection（指示削除）の対象にする（2026-09-27、利用者判断「実施」）
 
 #### 現状
 
@@ -5058,6 +5058,15 @@ RenCrow Switch Core Compaction V2の役割は、
 - 訂正も完了証拠も無い Automation の source（常設の制約）は消えない。
 - Unknown は従来どおり消えない。
 - 記録済みの thread 01a0dc2c の入力で、消える件数と、残る制約を事前に確認する。
+
+#### 実装（2026-09-27）
+
+- 出どころ: `Origin::Automation` を追加した。受付記録の author が `automation` で、thread・本文・受付 hash が一致する user message は Automation（一致しなければ従来どおり Unknown）。`Origin::is_declared_input()`（Human または Automation）で、受付記録を要する・選別の候補になる・完了の結び付けの対象になる箇所を判定する。
+- 断片の種類: `SourceKind::AutomationInstruction` を追加した。削除計画の検証は、削除の対象を `UserInstruction` と `AutomationInstruction` に広げ、訂正の権限を `may_supersede` で強制する（human の対象は human の訂正だけ、automation の対象は human か automation の訂正）。選別の検証（`validate_presented_operations`）でも同じ規則を重ねて確かめる。
+- 候補の提示: 選別の dataset の各 source に `origin`（`human`／`automation`）を付ける。依頼文に、human と automation の違い、訂正の権限、常設の制約は後の訂正まで残すことを加えた。
+- 置換後履歴: Automation の本文は Human と同じく、削除された範囲だけを取り除いて原文で残す。Unknown は従来どおり削除しない。
+- 試験: automation の訂正で automation のメモが消える、human の訂正で automation のメモが消える、automation の訂正では human の指示を消せない、候補に origin が付く、thread の違う受付記録は Unknown のまま、の各単体試験。実際の compaction の流れで、automation の古いメモが後の automation の訂正で置換後履歴から消え、訂正と常設の制約が残る結合試験。
+- 未確認（配備後に観測）: 実 Qwen の選別で、監督メモがどれだけ消えるか、常設の制約を誤って消さないか。
 
 # 第4部 部品契約・Failure Knowledge・実測・旧仕様（2026-09-24以前の記録）
 

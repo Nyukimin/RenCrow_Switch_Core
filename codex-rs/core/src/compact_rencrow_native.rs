@@ -120,7 +120,7 @@ pub(super) fn filter_retained_instructions(
         {
             return Err("native exclusion targets an item without a stable native identity".into());
         }
-        if record.origin != Origin::Human
+        if !record.origin.is_declared_input()
             || record.role != "user"
             || record.opaque.is_some()
             || !matches!(&originals[index].item, ResponseItem::Message { role, .. } if role == "user")
@@ -170,11 +170,11 @@ pub(super) fn filter_retained_instructions(
     }
     let mut retained = Vec::new();
     for (original_index, (record, original)) in input.records.iter().zip(originals).enumerate() {
-        if is_user_summary(original) && record.origin != Origin::Human {
+        if is_user_summary(original) && !record.origin.is_declared_input() {
             continue;
         }
         let envelope = match record.origin {
-            Origin::Human => {
+            Origin::Human | Origin::Automation => {
                 let mut envelope = original.clone();
                 let ResponseItem::Message { role, content, .. } = &mut envelope.item else {
                     return Err("Human candidate no longer maps to a native message".into());

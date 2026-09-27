@@ -113,6 +113,11 @@ fn validate_presented_operations(
             ) => {
                 validate_human_reference(input, pruning, source, source_text.is_none())?;
                 validate_human_reference(input, pruning, correction, false)?;
+                if origin_of(input, &source.id) == Some(&Origin::Human)
+                    && origin_of(input, &correction.id) != Some(&Origin::Human)
+                {
+                    return Err("an automation correction cannot remove a Human instruction".into());
+                }
             }
             (
                 ProposedOperation::ReplaceCompleted { source_text, .. },
@@ -143,6 +148,14 @@ fn validate_presented_operations(
     Ok(())
 }
 
+fn origin_of<'a>(input: &'a CandidateInput, id: &str) -> Option<&'a Origin> {
+    input
+        .records
+        .iter()
+        .find(|record| record.id == id)
+        .map(|record| &record.origin)
+}
+
 fn validate_human_reference(
     input: &CandidateInput,
     pruning: &InstructionPruning,
@@ -154,7 +167,7 @@ fn validate_human_reference(
         .iter()
         .find(|record| record.id == reference.id)
         .ok_or_else(|| "selection references an unknown Human source".to_owned())?;
-    if record.origin != Origin::Human || record.role != "user" || record.opaque.is_some() {
+    if !record.origin.is_declared_input() || record.role != "user" || record.opaque.is_some() {
         return Err("selection source must be ordinary Human user text".into());
     }
     if whole_record_requested {

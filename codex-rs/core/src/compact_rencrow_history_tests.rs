@@ -298,7 +298,7 @@ fn partial_selection_preserves_identity_and_survives_second_capture() {
 }
 
 #[test]
-fn unknown_automation_and_attachments_are_not_prunable_human_text() {
+fn declared_automation_is_prunable_but_unknown_and_attachments_are_not() {
     let mut automation = human("automated input");
     automation
         .metadata
@@ -327,15 +327,47 @@ fn unknown_automation_and_attachments_are_not_prunable_human_text() {
     .unwrap();
     assert_eq!(
         input.records.iter().map(|r| &r.origin).collect::<Vec<_>>(),
-        vec![&Origin::Unknown, &Origin::Unknown, &Origin::Human]
+        vec![&Origin::Unknown, &Origin::Automation, &Origin::Human]
+    );
+    assert_eq!(
+        input.records[1].intake_ref.as_deref(),
+        Some("accepted-receipt")
     );
     assert_eq!(retained(&input, &items).unwrap(), items);
-    // Neither unknown or automated input nor attachment-bearing Human text is offered for removal.
+    // Declared automation is offered like Human text; unknown input and attachments are not.
     let pruning = prune_known_obsolete(&input, &[]).unwrap();
-    assert_eq!(
-        collect_instruction_candidates(&input, &pruning, &[]),
-        Ok(None)
-    );
+    let payload = collect_instruction_candidates(&input, &pruning, &[])
+        .unwrap()
+        .expect("declared automation is a candidate");
+    let sources = payload["sources"].as_array().unwrap();
+    assert_eq!(sources.len(), 2);
+    assert_eq!(sources[0]["origin"], "automation");
+    assert_eq!(sources[0]["candidate"], true);
+    assert_eq!(sources[1]["candidate"], false);
+}
+
+#[test]
+fn automation_with_another_thread_receipt_stays_unknown() {
+    let mut automation = human("automated input");
+    let intake = automation
+        .metadata
+        .as_mut()
+        .unwrap()
+        .rencrow_input
+        .as_mut()
+        .unwrap();
+    intake["author"] = json!("automation");
+    intake["thread_id"] = json!("another-thread");
+    let items = vec![automation];
+    let input = capture(
+        &items,
+        "binding".into(),
+        "test-thread",
+        vec![json!({"current":true})],
+        &[],
+    )
+    .unwrap();
+    assert_eq!(input.records[0].origin, Origin::Unknown);
 }
 
 #[test]

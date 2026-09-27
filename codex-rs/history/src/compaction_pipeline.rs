@@ -5,7 +5,6 @@
 //! immutable candidate snapshot and owns all byte ranges and hashes.
 
 use crate::compaction_candidate::CandidateInput;
-use crate::compaction_candidate::Origin;
 use crate::compaction_plan::ByteRange;
 use crate::compaction_plan::CompactionPlan;
 use crate::compaction_plan::Operation;
@@ -19,7 +18,7 @@ pub fn requires_plan_inference(input: &CandidateInput) -> bool {
     input
         .records
         .iter()
-        .any(|record| record.origin == Origin::Human)
+        .any(|record| record.origin.is_declared_input())
 }
 
 /// Prompt for the proposal stage.

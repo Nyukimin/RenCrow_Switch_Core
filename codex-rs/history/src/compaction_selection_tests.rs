@@ -16,11 +16,11 @@ use crate::compaction_preprocess::collect_instruction_candidates;
 use crate::compaction_preprocess::prune_known_obsolete;
 
 fn record(id: &str, origin: Origin, role: &str, text: &str) -> CandidateRecord {
-    let is_human = matches!(&origin, Origin::Human);
+    let declared = matches!(&origin, Origin::Human | Origin::Automation);
     CandidateRecord {
         id: id.into(),
         origin,
-        intake_ref: is_human.then(|| format!("intake/{id}")),
+        intake_ref: declared.then(|| format!("intake/{id}")),
         scope: "thread".into(),
         role: role.into(),
         text: text.into(),
@@ -235,7 +235,7 @@ fn v2_selection_apply_rejects_forged_maps_and_stale_snapshot_bindings() {
         .insert("old".into(), "forged".into());
     assert!(validate_and_apply_selection(&source, &forged, &[], None).is_err());
 
-    let mut changed = source.clone();
+    let mut changed = source;
     changed.records[0].text.push_str(" changed");
     assert!(validate_and_apply_selection(&changed, &pruning, &[], Some(selection)).is_err());
 }
@@ -563,4 +563,92 @@ fn v2_selection_apply_rejects_non_human_and_unknown_sources() {
         },
     );
     assert!(validate_and_apply_selection(&source, &pruning, &[], Some(unknown_source)).is_err());
+}
+
+fn superseded(
+    old: (Origin, &str),
+    correction: (Origin, &str),
+) -> Result<InstructionSelectionApplication, String> {
+    let source = input(vec![
+        record("old", old.0, "user", old.1),
+        record("correction", correction.0, "user", correction.1),
+    ]);
+    let pruning = InstructionPruning::default();
+    let selection = bound_selection(
+        &source,
+        &pruning,
+        &[],
+        ProposedPlan {
+            operations: vec![drop("old", None, "correction", Some(correction.1))],
+        },
+    );
+    validate_and_apply_selection(&source, &pruning, &[], Some(selection))
+}
+
+#[test]
+fn v2_selection_apply_lets_a_later_automation_note_supersede_an_automation_note() {
+    let applied = superseded(
+        (Origin::Automation, "Kill the long gofmt run."),
+        (
+            Origin::Automation,
+            "The gofmt run finished; do not kill anything.",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(applied.pruning.retained_human_text["old"], "");
+    assert_eq!(applied.pruning.applied.len(), 1);
+    assert!(
+        !applied
+            .pruning
+            .retained_human_text
+            .contains_key("correction")
+    );
+}
+
+#[test]
+fn v2_selection_apply_lets_a_human_correct_an_automation_note() {
+    let applied = superseded(
+        (Origin::Automation, "Build in a new worktree."),
+        (Origin::Human, "Build in the main tree."),
+    )
+    .unwrap();
+
+    assert_eq!(applied.pruning.retained_human_text["old"], "");
+}
+
+#[test]
+fn v2_selection_apply_rejects_an_automation_correction_of_a_human_instruction() {
+    // The plan structure rejects it before the selection check that names the authority rule.
+    let result = superseded(
+        (Origin::Human, "Push to the main branch."),
+        (Origin::Automation, "Do not push anything."),
+    );
+
+    assert!(result.is_err(), "{result:?}");
+}
+
+#[test]
+fn v2_candidates_present_declared_automation_with_its_origin() {
+    let source = input(vec![
+        record("unknown", Origin::Unknown, "user", "No intake record."),
+        record("note", Origin::Automation, "user", "Stop the build."),
+        record("request", Origin::Human, "user", "Build the tool."),
+    ]);
+    let payload = collect_instruction_candidates(&source, &InstructionPruning::default(), &[])
+        .unwrap()
+        .expect("declared input is a candidate");
+
+    let sources = payload["sources"].as_array().unwrap();
+    assert_eq!(
+        sources
+            .iter()
+            .map(|source| (
+                source["id"].as_str().unwrap(),
+                source["origin"].as_str().unwrap()
+            ))
+            .collect::<Vec<_>>(),
+        vec![("note", "automation"), ("request", "human")]
+    );
+    assert!(sources.iter().all(|source| source["candidate"] == true));
 }

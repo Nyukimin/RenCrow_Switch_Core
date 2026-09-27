@@ -14,9 +14,20 @@ pub const SUMMARY_TEXT_MAX_BYTES: usize = 32_000;
 #[serde(rename_all = "snake_case")]
 pub enum Origin {
     Human,
+    /// User input declared by its sender as automation (a supervisor or proxy program), with the
+    /// same verified intake record as Human. It may be superseded like Human input, but it never
+    /// carries the person's authority.
+    Automation,
     Host,
     Work,
     Unknown,
+}
+
+impl Origin {
+    /// User input whose author was declared through a verified intake record.
+    pub fn is_declared_input(&self) -> bool {
+        matches!(self, Origin::Human | Origin::Automation)
+    }
 }
 
 /// Input supplied by a trusted collector, not by the compaction model.
@@ -133,20 +144,26 @@ impl CandidateInput {
         }
         let mut fragments = Vec::new();
         for record in &self.records {
-            if record.origin == Origin::Human
+            if record.origin.is_declared_input()
                 && (record.role != "user"
                     || record
                         .intake_ref
                         .as_ref()
                         .is_none_or(|r| r.trim().is_empty()))
             {
-                return Err("human origin requires user role and trusted intake reference".into());
+                return Err(if record.origin == Origin::Human {
+                    "human origin requires user role and trusted intake reference".into()
+                } else {
+                    "automation origin requires user role and trusted intake reference".into()
+                });
             }
             if record.execution_evidence && record.origin != Origin::Work {
                 return Err("execution evidence must have work provenance".into());
             }
             let kind = if record.origin == Origin::Human {
                 SourceKind::UserInstruction
+            } else if record.origin == Origin::Automation {
+                SourceKind::AutomationInstruction
             } else if record.execution_evidence {
                 SourceKind::ExecutionEvidence
             } else {
@@ -397,7 +414,7 @@ impl CandidateInput {
         let mut protected = Vec::new();
         for (original, selected) in self.records.iter().zip(&view.retained) {
             match original.origin {
-                Origin::Human => {
+                Origin::Human | Origin::Automation => {
                     if !selected.text.is_empty() || original.opaque.is_some() {
                         human.push(serde_json::json!({"id":original.id,"intake_ref":original.intake_ref,"role":original.role,"text":selected.text,"opaque":original.opaque}));
                     }

@@ -3,7 +3,6 @@
 //! fallback, and explicit blocked states.
 use super::*;
 use codex_history::compaction_candidate::CandidateInput;
-use codex_history::compaction_candidate::Origin;
 use codex_history::compaction_candidate::history_digest;
 use codex_history::compaction_checkpoint_metadata::CheckpointResponseStage;
 use codex_history::compaction_checkpoint_metadata::CompactionModelResponseReceipt;
@@ -43,7 +42,7 @@ pub(super) use summary::should_apply_server_reasoning_included;
 #[path = "compact_rencrow_orchestration_tests.rs"]
 mod orchestration_tests;
 
-const INSTRUCTION_SELECTION_PROMPT: &str = "Select only explicit obsolete Human instructions from candidate:true Human sources. Candidate:false Human sources are context only; never remove them. Use completion_links only for the Human identified by instruction_id; a link is a candidate and does not prove success. Preserve failed, pending, ambiguous, protected, opaque, and continuing work. Do not infer completion from unrelated sources. For drop_superseded, correction_text is required and must be the exact unique correction passage that remains current; corrections must remain. source_text is optional only when the entire source is safe to remove; for a mixed instruction provide the exact unique source passage. Never remove protected portions or an entire partly protected source. For replace_completed, evidence must be the linked output_source_id; use it as factual grounding and do not claim more than the output and terminal status/exit establish. A successful command that inspects another job (such as ls or tail) does not prove that job succeeded. Keep unresolved conditions and uncertainty. Return only {\"operations\":[{\"action\":\"drop_superseded\",\"source\":\"<Human id>\",\"source_text\":\"<optional exact unique passage>\",\"correction\":\"<later Human id>\",\"correction_text\":\"<exact unique passage>\"},{\"action\":\"replace_completed\",\"source\":\"<Human id>\",\"source_text\":\"<optional exact unique passage>\",\"evidence\":\"<linked output_source_id>\",\"result\":\"<brief factual result supported by the output>\"}]}. Use only the fields shown for the chosen action. Omit source_text only when the whole source is safe to remove. Do not return a snapshot hash or extra keys. JSON only.";
+const INSTRUCTION_SELECTION_PROMPT: &str = "Select only explicit obsolete instructions from candidate:true sources. Each source has an origin: human is the person's own instruction; automation is a note from a supervising or proxy program. A human source can be superseded only by a later human correction; an automation source can be superseded by a later human or automation correction. An automation note that states a standing constraint (for example, not to operate another host) stays until a later correction withdraws it. Candidate:false sources are context only; never remove them. Use completion_links only for the source identified by instruction_id; a link is a candidate and does not prove success. Preserve failed, pending, ambiguous, protected, opaque, and continuing work. Do not infer completion from unrelated sources. For drop_superseded, correction_text is required and must be the exact unique correction passage that remains current; corrections must remain. source_text is optional only when the entire source is safe to remove; for a mixed instruction provide the exact unique source passage. Never remove protected portions or an entire partly protected source. For replace_completed, evidence must be the linked output_source_id; use it as factual grounding and do not claim more than the output and terminal status/exit establish. A successful command that inspects another job (such as ls or tail) does not prove that job succeeded. Keep unresolved conditions and uncertainty. Return only {\"operations\":[{\"action\":\"drop_superseded\",\"source\":\"<source id>\",\"source_text\":\"<optional exact unique passage>\",\"correction\":\"<later correction id>\",\"correction_text\":\"<exact unique passage>\"},{\"action\":\"replace_completed\",\"source\":\"<source id>\",\"source_text\":\"<optional exact unique passage>\",\"evidence\":\"<linked output_source_id>\",\"result\":\"<brief factual result supported by the output>\"}]}. Use only the fields shown for the chosen action. Omit source_text only when the whole source is safe to remove. Do not return a snapshot hash or extra keys. JSON only.";
 
 /// Decide whether instruction selection is needed at all (Annex A F13).
 ///
@@ -58,7 +57,7 @@ pub(super) fn selection_required(
 ) -> bool {
     !links.is_empty()
         || input.records.iter().enumerate().any(|(index, record)| {
-            record.origin == Origin::Human
+            record.origin.is_declared_input()
                 && semantic_boundary.is_none_or(|boundary| index > boundary)
         })
 }
@@ -100,8 +99,10 @@ pub(super) async fn select_obsolete_instructions(
         return Err(invalid());
     }
     let has_candidate = sources.iter().any(|source| {
-        source.get("origin").and_then(Value::as_str) == Some("human")
-            && source.get("candidate").and_then(Value::as_bool) == Some(true)
+        matches!(
+            source.get("origin").and_then(Value::as_str),
+            Some("human" | "automation")
+        ) && source.get("candidate").and_then(Value::as_bool) == Some(true)
     });
     if !has_candidate {
         return Ok(None);
