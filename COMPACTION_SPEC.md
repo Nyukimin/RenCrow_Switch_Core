@@ -4989,6 +4989,66 @@ RenCrow Switch Core Compaction V2の役割は、
 
 互換性: 注記の文面だけの変更で、checkpoint・rollout の形式は変えない。戻し方: 本変更の commit を revert する。
 
+### 提案A: 要約要求を通常 turn の prefix cache に載せる（2026-09-27、仕様案・利用者判断待ち）
+
+#### 現状と実測
+
+- 要約要求（`request_compaction_summary`）は、基本指示は通常 turn と同じだが、tool を宣言しない（`Prompt` の tools が空）。入力は `build_summary_history` が作る変形済みの履歴（完了した tool の組を observation の断片へ置換、前回要約を 1 回だけ提示）に、完了結果と要約指示（developer）を足したもの。
+- Backend（Mac の mlx-serve 26.9.3）の prefix cache は、token 列の完全一致の先頭だけを再利用し、tool の有無で別の枠になる（ソースで確認）。要約要求は通常 turn の cache を一切使えず、毎回全体を prefill する。
+- 実測（thread 01a0dc2c、compaction 11 回）: 要約要求の最初の出力まで 72〜162 秒。#10 の要約要求の再送 A/B（2026-09-27）でも、Mac 上の最初の出力まで約 120 秒で、所要（220〜262 秒）の約半分だった。reasoning effort を下げても出力は 1〜2 割しか減らず、一貫しない（medium 3,711・low 4,498・high 5,253 tokens）。marker は減った（8・16・22 個）。
+- mlx-serve の cache 上限（既定 2GB、全体）では、このモデルの prefix は約 82k tokens までしか保存できない。上限の引き上げ（`--prefix-cache-mem`）が前提になる。
+
+#### 案
+
+1. 要約要求の入力を、compaction の直前の通常 turn と同じ prompt（同じ基本指示・同じ tool 宣言・同じ `for_prompt` の履歴）にし、最後に 1 件の developer message（要約指示、host が検証した完了結果、要約で引用してよい call ID の一覧）を足す。tool_choice は `none` とする。
+2. 要約の応答に tool 呼出し（構造化・記法とも）が入れば、要約として採用しない（現行どおり Semantic 失敗として Emergency へ進む。Gateway の記法時の再送は現行どおり）。
+3. 通常 turn の prompt が context window を超える場合と、tool 宣言つきの要求を Backend が受け付けない場合は、現行の変形済み入力へ戻す（明示的な分岐で、失敗を隠さない）。
+4. observation の扱い: 変形前の履歴では tool 出力が原文のまま見えるため、要約の引用対象（`summary_covered_observations`）は「この window の検証済みの組の call ID すべて」とする。以前の window の marker は通常 turn と同じ形で見える。
+
+#### 見込みと危険
+
+- 見込み: Backend の cache 上限を十分にすれば、要約要求の prefill は足した指示の分（数千 tokens、数秒）になる。1 回あたり約 110 秒の短縮。
+- 危険 1: tool を宣言すると、Qwen が要約の代わりに tool を呼ぶ率が上がり得る。
+- 危険 2: 原文の tool 出力を読むため、変形済み入力より要約の質・長さが変わり得る。
+- 危険 3: 第2部 §18（要約要求の形）・observation の被覆の決まりを変える。
+- 危険 4: 通常 turn の prompt と byte 単位で同じでないと効果が無い（Gateway の変換・Backend の chat template を含む）。
+
+#### 受入条件
+
+- 実 thread の要約要求で、Backend の cache 再利用（mlx-serve の `reused N/P tokens`）と、最初の出力までの時間の短縮を実測する。
+- 同じ compaction 入力の現行形と新形の A/B で、要点の保持・marker の数・長さが現行形を下回らない。
+- tool 呼出しを要約として採用しない。window を超える場合は現行形へ戻る。
+
+### 提案B: automation の入力を Selection（指示削除）の対象にする（2026-09-27、仕様案・利用者判断待ち）
+
+#### 現状
+
+- 入力元の申告が `automation`（受付記録あり）の user message は `Origin::Unknown` になり、原文で無期限に残る。Selection の削除（`drop_superseded`）・完了置換（`replace_completed`）は、対象・訂正・完了の結び付けのいずれも `Origin::Human` を必須にしている（`validate_human_reference`、完了の結び付けの検査）。
+- 実測: 監督メモ（automation）は #11 で 23 件が残った。多くは状況の報告と一時的な指示で、後のメモや作業で解決済みだが、削除の経路が無い。
+- 2026-09-26 の利用者判断「保守的」は、Human・Unknown の本文を削除も要約への吸収もしないとした。本案は Unknown の扱いを変えず、受付記録のある automation だけを、Human と同じ削除の決まりへ入れる。
+
+#### 案
+
+1. 受付記録（`rencrow_input`）の author が `automation` で、thread・本文・受付 hash が一致する user message は、新しい出どころ `Automation` にする（記録が無い・一致しないものは従来どおり Unknown）。
+2. Selection の候補に Automation を加える。削除の条件は Human と同じ: `drop_superseded` は後の訂正（完全一致の本文範囲）を要し、`replace_completed` は結び付いた完了証拠を要する。host の検証（完全一致・保護範囲・既削除範囲との重なり・順序）も同じ。
+3. 権限: Automation の source は、後の Automation か Human の訂正で消せる。Human の source は Human の訂正でしか消せない（Automation の訂正では消せない）。訂正の本文は残す。
+4. Selection の依頼文に「Automation は監督・代理の入力。Human の指示を変えない」を加える。
+5. 変えないもの: Unknown・Human の扱い、要約への吸収をしないこと、時系列注記（残したものだけを列挙）、Emergency。
+
+#### 危険と確認
+
+- 監督メモの多くは「状況の報告＋一時的な指示」で、完了の証拠が同じ turn の tool 出力に結び付かない場合がある。その場合は削除されない（安全側）。効果の大きさは実 thread の入力で事前に測る（`rencrow-compaction` の選別を記録済みの入力で再生し、何件が消せるかを数える）。
+- 常設の制約（例: 「別ホストで実行しない」）は、後の訂正が無い限り消えない。これを試験で固定する。
+- 利用者判断「保守的」の範囲を automation について変えるため、採用には利用者の承認が要る。
+
+#### 受入条件
+
+- Automation の source が、後の Automation／Human の訂正で消え、訂正は残る。
+- Human の source は Automation の訂正では消えない。
+- 訂正も完了証拠も無い Automation の source（常設の制約）は消えない。
+- Unknown は従来どおり消えない。
+- 記録済みの thread 01a0dc2c の入力で、消える件数と、残る制約を事前に確認する。
+
 # 第4部 部品契約・Failure Knowledge・実測・旧仕様（2026-09-24以前の記録）
 
 旧題: RenCrow Fork Compaction 新仕様案 第2版。第1〜2部と矛盾する記述は第1〜2部が優先する。承認済み例外1〜4（「元関数への例外と必要理由」）など、第1〜2部と矛盾しない部品契約は引き続き有効。Failure Knowledgeと実測記録は削除しない。
