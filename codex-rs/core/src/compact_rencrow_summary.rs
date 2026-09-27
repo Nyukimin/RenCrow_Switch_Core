@@ -287,6 +287,7 @@ pub(super) struct ImportantRefResolution {
 ///
 /// Malformed, unknown, or ambiguous markers are ignored and counted; ordinary prose such as
 /// `key observation: ...` is not a marker. Resolved references are deduplicated in first order.
+/// Also handles continuation patterns like `observation:"call_A", "call_B", "call_C"`.
 pub(super) fn important_refs_from_summary(
     summary_text: &str,
     inventory: &[ObservationReference],
@@ -305,9 +306,9 @@ pub(super) fn important_refs_from_summary(
             resolution.ignored_markers += 1;
             break;
         };
-        rest = &literal[end + 1..];
         let Ok(call_id) = serde_json::from_str::<String>(&literal[..=end]) else {
             resolution.ignored_markers += 1;
+            rest = &literal[end + 1..];
             continue;
         };
         let mut matches = inventory
@@ -321,6 +322,43 @@ pub(super) fn important_refs_from_summary(
             }
             (None, _) | (Some(_), Some(_)) => resolution.ignored_markers += 1,
         }
+
+        // Check for continuation: , "call_B", "call_C", ...
+        let mut continuation = &literal[end + 1..];
+        while let Some(comma_pos) = continuation.find(',') {
+            let after_comma = continuation[comma_pos + 1..].trim_start();
+            if !after_comma.starts_with('"') {
+                break;
+            }
+            let continuation_literal = after_comma;
+            let mut escaped = false;
+            let closing = continuation_literal.char_indices().skip(1).find(|(_, ch)| {
+                let closes = !escaped && *ch == '"';
+                escaped = !escaped && *ch == '\\';
+                closes
+            });
+            let Some((cont_end, _)) = closing else {
+                break;
+            };
+            let Ok(cont_call_id) = serde_json::from_str::<String>(&continuation_literal[..=cont_end]) else {
+                resolution.ignored_markers += 1;
+                continuation = &continuation_literal[cont_end + 1..];
+                continue;
+            };
+            let mut cont_matches = inventory
+                .iter()
+                .filter(|reference| reference.call_id == cont_call_id);
+            match (cont_matches.next(), cont_matches.next()) {
+                (Some(reference), None) => {
+                    if !resolution.refs.contains(reference) {
+                        resolution.refs.push(reference.clone());
+                    }
+                }
+                (None, _) | (Some(_), Some(_)) => resolution.ignored_markers += 1,
+            }
+            continuation = &continuation_literal[cont_end + 1..];
+        }
+        rest = continuation;
     }
     resolution
 }
