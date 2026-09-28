@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-09-28: expose an unpinned bundled bwrap for capability probing.
 use std::ffi::CStr;
 use std::ffi::CString;
 use std::fs::File;
@@ -68,6 +69,14 @@ impl BundledBwrapLauncher {
             "failed to exec bundled bubblewrap {} via {fd_path}: {err}",
             self.program.as_path().display()
         );
+    }
+}
+
+impl BundledBwrapLauncher {
+    /// Returns the bundled binary for a capability probe, or `None` when a build-time digest
+    /// pins it to the vendored bwrap. A pinned binary is never run before `exec` verifies it.
+    pub(crate) fn unverified_program(&self) -> Option<&Path> {
+        expected_sha256().is_none().then(|| self.program.as_path())
     }
 }
 

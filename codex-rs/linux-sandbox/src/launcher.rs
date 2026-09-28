@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-09-28: probe an unpinned bundled bwrap like a system one.
 use std::ffi::CStr;
 use std::ffi::CString;
 use std::fs::File;
@@ -17,8 +18,20 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum BubblewrapLauncher {
     System(SystemBwrapLauncher),
-    Bundled(BundledBwrapLauncher),
+    Bundled(ProbedBundledLauncher),
     Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProbedBundledLauncher {
+    launcher: BundledBwrapLauncher,
+    capabilities: LauncherCapabilities,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LauncherCapabilities {
+    supports_argv0: bool,
+    supports_ro_bind_fd: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,7 +59,13 @@ pub(crate) fn exec_bwrap(mut argv: Vec<String>, preserved_files: Vec<File>) -> !
             }
             exec_system_bwrap(&launcher.program, argv, preserved_files)
         }
-        BubblewrapLauncher::Bundled(launcher) => launcher.exec(argv, preserved_files),
+        BubblewrapLauncher::Bundled(bundled) => {
+            if !bundled.capabilities.supports_ro_bind_fd {
+                translate_legacy_bwrap_fd_mounts(&mut argv)
+                    .unwrap_or_else(|error| panic!("invalid legacy bubblewrap fd mount: {error}"));
+            }
+            bundled.launcher.exec(argv, preserved_files)
+        }
         BubblewrapLauncher::Unavailable => {
             panic!(
                 "bubblewrap is unavailable: no system bwrap was found on PATH and no bundled \
@@ -134,7 +153,16 @@ fn preferred_bwrap_launcher() -> BubblewrapLauncher {
             }
 
             match bundled_bwrap::launcher() {
-                Some(launcher) => BubblewrapLauncher::Bundled(launcher),
+                Some(launcher) => {
+                    let capabilities = bundled_bwrap_capabilities_with_probe(
+                        launcher.unverified_program(),
+                        system_bwrap_capabilities,
+                    );
+                    BubblewrapLauncher::Bundled(ProbedBundledLauncher {
+                        launcher,
+                        capabilities,
+                    })
+                }
                 None => BubblewrapLauncher::Unavailable,
             }
         })
@@ -178,7 +206,23 @@ fn system_bwrap_launcher_for_path_with_probe(
 pub(crate) fn preferred_bwrap_supports_argv0() -> bool {
     match preferred_bwrap_launcher() {
         BubblewrapLauncher::System(launcher) => launcher.supports_argv0,
-        BubblewrapLauncher::Bundled(_) | BubblewrapLauncher::Unavailable => true,
+        BubblewrapLauncher::Bundled(bundled) => bundled.capabilities.supports_argv0,
+        BubblewrapLauncher::Unavailable => true,
+    }
+}
+
+/// Capabilities of the bundled bwrap. The vendored, digest-pinned build supports every option
+/// used here. Any other bundled candidate, such as a user-installed bwrap that merely sits next
+/// to the executable, is probed like a system binary, so an old bubblewrap gets the same
+/// compatibility path whether it was found on PATH or next to the executable.
+fn bundled_bwrap_capabilities_with_probe(
+    unverified_program: Option<&Path>,
+    probe: impl FnOnce(&Path) -> Option<SystemBwrapCapabilities>,
+) -> LauncherCapabilities {
+    let probed = unverified_program.and_then(probe);
+    LauncherCapabilities {
+        supports_argv0: probed.is_none_or(|capabilities| capabilities.supports_argv0),
+        supports_ro_bind_fd: probed.is_none_or(|capabilities| capabilities.supports_ro_bind_fd),
     }
 }
 
@@ -456,6 +500,57 @@ mod tests {
         assert_eq!(
             system_bwrap_launcher_for_path(Path::new("/definitely/not/a/bwrap")),
             None
+        );
+    }
+
+    #[test]
+    fn probes_unverified_bundled_bwrap_that_lacks_argv0() {
+        // A user-installed bwrap next to the executable is found as the "bundled" launcher
+        // when PATH lookup skips it because it lies under the command cwd. It must get the
+        // same compatibility path as when it is found on PATH.
+        let fake_bwrap = NamedTempFile::new().expect("temp file");
+
+        assert_eq!(
+            bundled_bwrap_capabilities_with_probe(Some(fake_bwrap.path()), |_| {
+                Some(SystemBwrapCapabilities {
+                    supports_argv0: false,
+                    supports_perms: true,
+                    supports_ro_bind_fd: false,
+                })
+            }),
+            LauncherCapabilities {
+                supports_argv0: false,
+                supports_ro_bind_fd: false,
+            }
+        );
+    }
+
+    #[test]
+    fn does_not_run_digest_pinned_bundled_bwrap_before_verification() {
+        assert_eq!(
+            bundled_bwrap_capabilities_with_probe(None, |path| {
+                panic!(
+                    "digest-pinned bundled bwrap {} must not be probed",
+                    path.display()
+                )
+            }),
+            LauncherCapabilities {
+                supports_argv0: true,
+                supports_ro_bind_fd: true,
+            }
+        );
+    }
+
+    #[test]
+    fn keeps_bundled_defaults_when_bundled_bwrap_help_is_unrecognized() {
+        let fake_bwrap = NamedTempFile::new().expect("temp file");
+
+        assert_eq!(
+            bundled_bwrap_capabilities_with_probe(Some(fake_bwrap.path()), |_| None),
+            LauncherCapabilities {
+                supports_argv0: true,
+                supports_ro_bind_fd: true,
+            }
         );
     }
 }
