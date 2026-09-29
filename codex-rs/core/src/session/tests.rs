@@ -12681,3 +12681,49 @@ async fn session_start_hooks_require_project_trust_without_config_toml() -> std:
 
     Ok(())
 }
+
+// RenCrow Switch Core, 2026-09-28: the configured allowlist narrows the session tool policy, which
+// keeps unlisted tools out of the registry (ROLE_TOOL_POLICY.md).
+#[tokio::test]
+async fn rencrow_tool_allowlist_narrows_session_tool_policy() -> anyhow::Result<()> {
+    let session = make_session_with_config(|config| {
+        config.rencrow_tool_allowlist = Some(vec![
+            "exec_command".to_string(),
+            "multi_agent_v1::spawn_agent".to_string(),
+        ]);
+    })
+    .await?;
+
+    assert!(
+        session
+            .tool_policy
+            .allows(&codex_tools::ToolName::plain("exec_command"))
+    );
+    assert!(
+        session
+            .tool_policy
+            .allows(&codex_tools::ToolName::namespaced(
+                "multi_agent_v1",
+                "spawn_agent"
+            ))
+    );
+    assert!(
+        !session
+            .tool_policy
+            .allows(&codex_tools::ToolName::plain("apply_patch"))
+    );
+    assert!(
+        !session
+            .tool_policy
+            .allows(&codex_tools::ToolName::plain("web_search"))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn unset_rencrow_tool_allowlist_keeps_every_tool() -> anyhow::Result<()> {
+    let session = make_session_with_config(|_| {}).await?;
+
+    assert_eq!(session.tool_policy.allowed_tools, None);
+    Ok(())
+}

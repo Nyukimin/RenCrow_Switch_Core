@@ -1,8 +1,10 @@
+// Modified by RenCrow Switch Core, 2026-09-28: register the read-only agent role module.
 pub(crate) mod agent_resolver;
 pub(crate) mod api;
 pub(crate) mod child_config;
 pub(crate) mod control;
 mod registry;
+pub(crate) mod rencrow_read_only;
 pub(crate) mod role;
 pub(crate) mod status;
 pub(crate) mod types;

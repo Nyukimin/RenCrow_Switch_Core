@@ -7403,6 +7403,17 @@
       "description": "Use the RenCrow validated local compaction pipeline.",
       "type": "boolean"
     },
+    "rencrow_read_only": {
+      "description": "Agent role files only: run the role's agents with a read-only sandbox (ROLE_TOOL_POLICY.md).",
+      "type": "boolean"
+    },
+    "rencrow_tool_allowlist": {
+      "description": "Tools shown to the model and accepted when called (ROLE_TOOL_POLICY.md). Each entry is a default-namespace tool name or `namespace::name`. Unset keeps every tool; an agent role file narrows it and cannot add tools.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
     "responses_api_metadata": {
       "additionalProperties": {
         "type": "string"

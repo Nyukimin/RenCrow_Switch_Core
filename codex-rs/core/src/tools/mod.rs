@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-09-28: register the role tool allowlist module.
 mod approvals;
 pub(crate) mod call_trace;
 mod catalog_parameters;
@@ -15,6 +16,7 @@ pub(crate) mod network_approval;
 pub(crate) mod orchestrator;
 pub(crate) mod parallel;
 pub(crate) mod registry;
+pub(crate) mod rencrow_tool_allowlist;
 pub(crate) mod router;
 pub(crate) mod runtimes;
 pub(crate) mod sandboxing;

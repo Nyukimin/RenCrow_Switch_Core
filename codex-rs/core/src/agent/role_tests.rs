@@ -779,3 +779,74 @@ fn built_in_config_file_contents_resolves_explorer_only() {
         None
     );
 }
+
+// RenCrow Switch Core, 2026-09-28: a role narrows the tool allowlist and can make itself read-only
+// (ROLE_TOOL_POLICY.md). This role file has no other override, so it takes the early-return path.
+#[tokio::test]
+async fn apply_role_narrows_tool_allowlist_and_sets_read_only() {
+    let (home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
+    config.rencrow_tool_allowlist = Some(vec![
+        "exec_command".to_string(),
+        "apply_patch".to_string(),
+        "view_image".to_string(),
+    ]);
+    let role_path = write_role_config(
+        &home,
+        "explorer-role.toml",
+        r#"
+rencrow_tool_allowlist = ["exec_command", "view_image", "web_search"]
+rencrow_read_only = true
+"#,
+    )
+    .await;
+    config.agent_roles.insert(
+        "explorer".to_string(),
+        AgentRoleConfig {
+            description: None,
+            config_file: Some(role_path),
+            nickname_candidates: None,
+        },
+    );
+
+    apply_role_to_config(&mut config, Some("explorer"))
+        .await
+        .expect("explorer role should apply");
+
+    assert_eq!(
+        config.rencrow_tool_allowlist,
+        Some(vec!["exec_command".to_string(), "view_image".to_string()])
+    );
+    assert!(config.rencrow_read_only);
+}
+
+// RenCrow Switch Core, 2026-09-28: a role without the fork keys keeps what it inherited, also when
+// other overrides rebuild the config.
+#[tokio::test]
+async fn apply_role_without_allowlist_keeps_inherited_allowlist() {
+    let (home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
+    let inherited = Some(vec!["exec_command".to_string(), "apply_patch".to_string()]);
+    config.rencrow_tool_allowlist = inherited.clone();
+    let role_path = write_role_config(
+        &home,
+        "worker-role.toml",
+        r#"
+developer_instructions = "Do the assigned work only"
+"#,
+    )
+    .await;
+    config.agent_roles.insert(
+        "worker".to_string(),
+        AgentRoleConfig {
+            description: None,
+            config_file: Some(role_path),
+            nickname_candidates: None,
+        },
+    );
+
+    apply_role_to_config(&mut config, Some("worker"))
+        .await
+        .expect("worker role should apply");
+
+    assert_eq!(config.rencrow_tool_allowlist, inherited);
+    assert!(!config.rencrow_read_only);
+}

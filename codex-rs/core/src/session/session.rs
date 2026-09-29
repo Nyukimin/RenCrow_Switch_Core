@@ -1,4 +1,4 @@
-// Modified by RenCrow Switch Core, 2026-09-22: handle durable compaction markers.
+// Modified by RenCrow Switch Core, 2026-09-22: handle durable compaction markers; 2026-09-28: role tool allowlist.
 use super::input_queue::InputQueue;
 use super::mcp_refresh::McpRefresh;
 use super::step_context::StepContext;
@@ -971,6 +971,15 @@ impl Session {
                     Arc::default()
                 }
             });
+        // Narrow the policy to the configured allowlist, so an unlisted tool is neither shown to
+        // the model nor executed (ROLE_TOOL_POLICY.md).
+        let tool_policy = match config.rencrow_tool_allowlist.as_deref() {
+            Some(allowlist) => Arc::new(crate::tools::rencrow_tool_allowlist::narrow_policy(
+                &tool_policy,
+                allowlist,
+            )),
+            None => tool_policy,
+        };
         let mcp_thread_init = thread_extension_init.clone();
         let thread_extension_data = codex_extension_api::ExtensionData::new_with_init(
             thread_id.to_string(),

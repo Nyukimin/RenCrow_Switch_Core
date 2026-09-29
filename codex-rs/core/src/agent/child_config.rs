@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-09-28: narrow read-only agent roles after inheritance.
 //! Prepares child configuration from captured step settings and requested overrides.
 //!
 //! Spawn and reload share live runtime policy; role and model precedence, full-history
@@ -82,6 +83,16 @@ pub(crate) async fn prepare_agent_spawn_config(
     }
     apply_spawn_agent_service_tier(session, &mut config).await?;
     apply_spawn_agent_runtime_overrides(&mut config, turn)?;
+    // Narrow after inheriting the parent's permissions, so a read-only role can only lose access.
+    if config.rencrow_read_only {
+        let read_only = crate::agent::rencrow_read_only::read_only_profile(
+            config.permissions.permission_profile(),
+        )?;
+        config
+            .permissions
+            .set_permission_profile(read_only)
+            .map_err(|err| format!("read-only agent role is invalid: {err}"))?;
+    }
 
     // Remember an applied configured default so cold reload reapplies its restrictions.
     let role_name = options

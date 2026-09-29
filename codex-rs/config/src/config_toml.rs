@@ -1,4 +1,4 @@
-// Modified by RenCrow Switch Core, 2026-09-22: opt-in validated compaction.
+// Modified by RenCrow Switch Core, 2026-09-22: opt-in validated compaction; 2026-09-28: role tool allowlist.
 //! Schema-heavy configuration TOML types used by Codex.
 
 use std::collections::BTreeMap;
@@ -275,6 +275,14 @@ pub struct ConfigToml {
 
     /// Use the RenCrow validated local compaction pipeline.
     pub rencrow_compaction: Option<bool>,
+
+    /// Tools shown to the model and accepted when called (ROLE_TOOL_POLICY.md). Each entry is a
+    /// default-namespace tool name or `namespace::name`. Unset keeps every tool; an agent role file
+    /// narrows it and cannot add tools.
+    pub rencrow_tool_allowlist: Option<Vec<String>>,
+
+    /// Agent role files only: run the role's agents with a read-only sandbox (ROLE_TOOL_POLICY.md).
+    pub rencrow_read_only: Option<bool>,
 
     /// When set, restricts ChatGPT login to one or more workspace identifiers.
     #[serde(default)]

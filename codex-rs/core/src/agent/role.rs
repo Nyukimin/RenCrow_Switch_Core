@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-09-28: roles narrow the tool allowlist and sandbox.
 //! Applies bounded agent-role overrides to an existing session config.
 //!
 //! Roles may customize the child or reduce its capabilities, but never replace the parent
@@ -77,6 +78,15 @@ async fn apply_role_to_config_inner(
     };
     let role_layer_toml = load_role_layer_toml(config, config_file, is_built_in, role_name).await?;
     let role_config = deserialize_config_toml_with_base(role_layer_toml, &config.codex_home)?;
+    // A role only narrows: its tool allowlist intersects the inherited one, and it can turn the
+    // sandbox read-only but never back (ROLE_TOOL_POLICY.md).
+    let tool_allowlist = crate::tools::rencrow_tool_allowlist::narrow(
+        config.rencrow_tool_allowlist.clone(),
+        role_config.rencrow_tool_allowlist.clone(),
+    );
+    let read_only = config.rencrow_read_only || role_config.rencrow_read_only.unwrap_or(false);
+    config.rencrow_tool_allowlist = tool_allowlist.clone();
+    config.rencrow_read_only = read_only;
     let mut overrides = AgentRoleOverrides {
         developer_instructions: role_config.developer_instructions,
         model: role_config.model,
@@ -124,6 +134,8 @@ async fn apply_role_to_config_inner(
         return Ok(());
     }
     *config = role_overrides::build_next_config(config, role_layer_toml, &overrides)?;
+    config.rencrow_tool_allowlist = tool_allowlist;
+    config.rencrow_read_only = read_only;
     Ok(())
 }
 

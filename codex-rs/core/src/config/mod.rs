@@ -1,4 +1,4 @@
-// Modified by RenCrow Switch Core, 2026-09-22: validated compaction configuration.
+// Modified by RenCrow Switch Core, 2026-09-22: validated compaction configuration; 2026-09-28: role tool allowlist.
 use crate::config::edit::ConfigEdit;
 use crate::config::edit::ConfigEditsBuilder;
 use crate::context::world_state::validate_managed_developer_instructions;
@@ -727,6 +727,13 @@ pub struct Config {
 
     /// Select the fork-owned local compaction pipeline.
     pub rencrow_compaction: bool,
+
+    /// Tools shown to the model and accepted when called; `None` keeps every tool
+    /// (ROLE_TOOL_POLICY.md).
+    pub rencrow_tool_allowlist: Option<Vec<String>>,
+
+    /// Set only by an agent role file: narrow this agent's sandbox to read-only.
+    pub rencrow_read_only: bool,
 
     /// Optional external notifier command. When set, Codex will spawn this
     /// program after each completed *turn* (i.e. when the agent finishes
@@ -4243,6 +4250,9 @@ impl Config {
             developer_instructions,
             compact_prompt,
             rencrow_compaction: cfg.rencrow_compaction.unwrap_or(false),
+            rencrow_tool_allowlist: cfg.rencrow_tool_allowlist,
+            // Only an agent role file narrows the sandbox; a top-level value is ignored.
+            rencrow_read_only: false,
             include_permissions_instructions,
             include_apps_instructions,
             include_collaboration_mode_instructions,
