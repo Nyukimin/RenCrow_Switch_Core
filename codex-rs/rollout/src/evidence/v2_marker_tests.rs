@@ -77,8 +77,34 @@ fn marker_for(
     let reference = ObservationReference::new(thread.to_string(), call_id, content_sha256(raw));
     let projection =
         codex_history::project_observation(&reference, "read_document", CALL_INPUT, raw).unwrap();
+    marker_with(raw_output, &projection)
+}
+
+/// Replace a raw output with a reference marker that claims `total_bytes` of output.
+fn reference_marker_for(
+    thread: &ThreadId,
+    call_id: &str,
+    raw_output: &ResponseItemEnvelope,
+    raw: &str,
+    total_bytes: usize,
+) -> ResponseItemEnvelope {
+    let reference = ObservationReference::new(thread.to_string(), call_id, content_sha256(raw));
+    let projection = codex_history::project_existing_observation(
+        &reference,
+        "read_document",
+        CALL_INPUT,
+        total_bytes,
+    )
+    .unwrap();
+    marker_with(raw_output, &projection)
+}
+
+fn marker_with(
+    raw_output: &ResponseItemEnvelope,
+    projection: &codex_history::ObservationProjection,
+) -> ResponseItemEnvelope {
     let mut marker = raw_output.clone();
-    let body = observation_marker_body(&projection);
+    let body = observation_marker_body(projection);
     match &mut marker.item {
         ResponseItem::FunctionCallOutput { output, .. }
         | ResponseItem::CustomToolCallOutput { output, .. } => {
@@ -137,6 +163,59 @@ fn verified_function_and_custom_markers_reuse_canonical_raw_text() {
         assert_eq!(pair.output_total_bytes, raw.len());
         assert!(prepared.protected_indices.is_empty());
     }
+}
+
+/// Part 3, 2026-09-29: a reference marker is regenerated from the canonical call and output
+/// length, and any difference from that regeneration is an integrity error.
+#[test]
+fn reference_markers_verify_against_canonical_raw_and_reject_changes() {
+    let thread = ThreadId::from_u128(52_004);
+    let raw = raw();
+    let call = function_call("marker-call");
+    let output = function_output("marker-call", &raw);
+    let canonical = vec![
+        RolloutItem::ResponseItem(call.clone()),
+        RolloutItem::ResponseItem(output.clone()),
+    ];
+    let prepare = |marker: ResponseItemEnvelope| {
+        prepare_compaction_sources(
+            &[call.clone(), marker],
+            &canonical,
+            &thread,
+            &HashSet::new(),
+        )
+    };
+
+    let marker = reference_marker_for(&thread, "marker-call", &output, &raw, raw.len());
+    let prepared = prepare(marker.clone()).unwrap();
+    assert_eq!(prepared.pairs.len(), 1);
+    let pair = &prepared.pairs[0];
+    assert_eq!(
+        pair.reference_kind,
+        PreparedCompactionReferenceKind::ObservationMarker
+    );
+    assert_eq!(pair.canonical_output_text, Some(raw.as_str()));
+    assert_eq!(pair.output_total_bytes, raw.len());
+
+    // A reference marker must claim the canonical output length.
+    let wrong_length = reference_marker_for(&thread, "marker-call", &output, &raw, raw.len() - 1);
+    assert!(prepare(wrong_length).is_err());
+
+    // Its body must be the exact regeneration.
+    let mut edited_body = marker;
+    if let ResponseItem::FunctionCallOutput { output, .. } = &mut edited_body.item {
+        let text = output
+            .text_content()
+            .unwrap()
+            .replace("Archived", "Current");
+        *output = FunctionCallOutputPayload::from_text(text);
+    }
+    assert!(prepare(edited_body).is_err());
+
+    // A reference marker for output whose canonical digest differs does not verify.
+    let other = format!("{raw}!");
+    let other_digest = reference_marker_for(&thread, "marker-call", &output, &other, raw.len());
+    assert!(prepare(other_digest).is_err());
 }
 
 #[test]

@@ -114,6 +114,7 @@ fn item_id(envelope: &ResponseItemEnvelope) -> Option<&str> {
 /// unannotated developer item. The Human carries an accepted removal that still applies.
 struct Fixture {
     originals: Vec<ResponseItemEnvelope>,
+    early_output: String,
     large_output: String,
     early_call: String,
     large_call: String,
@@ -121,6 +122,11 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::with_early_output(SMALL_OUTPUT)
+    }
+
+    /// The early pair sits before the summary at index 4, which the previous checkpoint kept.
+    fn with_early_output(early_output: &str) -> Self {
         let early_call = "{\"cmd\":\"run early\"}".to_owned();
         let large_call = "{\"cmd\":\"run large\"}".to_owned();
         let large_output = format!("HEAD{}TAIL", "x".repeat(20_000));
@@ -128,7 +134,7 @@ impl Fixture {
             human("Keep Japanese. Use old-label.", "human-a"),
             message("assistant", "old summarized work", "old-work"),
             function_call("early"),
-            function_output("early", SMALL_OUTPUT),
+            function_output("early", early_output),
             normal_summary("previous verified state"),
             message("assistant", "new unsummarized work", "new-work"),
             function_call("large"),
@@ -137,6 +143,7 @@ impl Fixture {
         ];
         Self {
             originals,
+            early_output: early_output.to_owned(),
             large_output,
             early_call,
             large_call,
@@ -150,7 +157,7 @@ impl Fixture {
                     2,
                     "early",
                     &self.early_call,
-                    SMALL_OUTPUT,
+                    &self.early_output,
                     PreparedCompactionReferenceKind::Fresh,
                 ),
                 pair(
@@ -171,6 +178,7 @@ struct Prepared {
     pruning: InstructionPruning,
     native: NativeProjection,
     projections: Vec<(usize, usize, ObservationProjection)>,
+    markers: Vec<(usize, ObservationProjection)>,
 }
 
 fn prepare(fixture: &Fixture) -> Prepared {
@@ -212,11 +220,19 @@ fn prepare(fixture: &Fixture) -> Prepared {
         &[],
     )
     .unwrap();
+    let markers = select_observation_markers(
+        &fixture.originals,
+        &prepared,
+        &projections,
+        /*durable_boundary*/ None,
+    )
+    .unwrap();
     Prepared {
         input,
         pruning,
         native,
         projections,
+        markers,
     }
 }
 
@@ -228,14 +244,21 @@ fn plan<'a>(fixture: &'a Fixture, prepared: &'a Prepared) -> EmergencyPlan<'a> {
         input: &prepared.input,
         native: &prepared.native,
         unhandled_pairs: vec![(2, 3), (6, 7)],
-        markers: select_observation_markers(
-            &fixture.originals,
-            &fixture.prepared(),
-            &prepared.projections,
-        ),
+        markers: marker_refs(&prepared.markers),
         work_boundary: Some(4),
         summary_text,
     }
+}
+
+fn marker_refs(markers: &[(usize, ObservationProjection)]) -> Vec<(usize, &ObservationProjection)> {
+    markers
+        .iter()
+        .map(|(index, projection)| (*index, projection))
+        .collect()
+}
+
+fn marker_indices(markers: &[(usize, ObservationProjection)]) -> Vec<usize> {
+    markers.iter().map(|(index, _)| *index).collect()
 }
 
 #[test]
@@ -266,23 +289,131 @@ fn emergency_carries_the_exact_previous_summary_or_a_non_semantic_placeholder() 
 fn emergency_markers_only_large_fresh_outputs() {
     let fixture = Fixture::new();
     let prepared = prepare(&fixture);
-    let markers = select_observation_markers(
-        &fixture.originals,
-        &fixture.prepared(),
-        &prepared.projections,
-    );
-    assert_eq!(
-        markers.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
-        vec![7]
-    );
+    assert_eq!(marker_indices(&prepared.markers), vec![7]);
 
-    // Existing V1 references and V2 markers are never re-marked.
+    // Existing V1 references and V2 markers after the previous checkpoint are never re-marked.
     let mut sources = fixture.prepared();
     for pair in &mut sources.pairs {
         pair.reference_kind = PreparedCompactionReferenceKind::ObservationMarker;
     }
     assert!(
-        select_observation_markers(&fixture.originals, &sources, &prepared.projections).is_empty()
+        select_observation_markers(&fixture.originals, &sources, &prepared.projections, Some(4))
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// Part 3, 2026-09-29: an output the previous checkpoint kept becomes a reference marker, so
+/// repeated Emergency checkpoints shrink instead of keeping every output at the same size.
+#[test]
+fn emergency_references_outputs_the_previous_checkpoint_kept() {
+    let medium = "m".repeat(1_500);
+    let fixture = Fixture::with_early_output(&medium);
+    let prepared = prepare(&fixture);
+    // Its bounded projection is the whole text, so without a previous checkpoint it stays raw.
+    assert_eq!(marker_indices(&prepared.markers), vec![7]);
+
+    let markers = select_observation_markers(
+        &fixture.originals,
+        &fixture.prepared(),
+        &prepared.projections,
+        Some(4),
+    )
+    .unwrap();
+    assert_eq!(marker_indices(&markers), vec![3, 7]);
+    let (_, reference) = &markers[0];
+    assert_eq!(reference.coverage.output.total_bytes, medium.len());
+    assert!(reference.coverage.output.presented_ranges.is_empty());
+    assert!(reference.coverage.output.partial);
+    assert!(reference.summary.output.excerpts.is_empty());
+    assert_eq!(
+        reference.coverage.call,
+        prepared.projections[0].2.coverage.call
+    );
+    // The later output keeps its bounded excerpts.
+    assert_eq!(markers[1].1, prepared.projections[1].2);
+
+    // The candidate carries the reference marker and passes the plan's own validation.
+    let (summary_text, _) = emergency_summary_text(&fixture.originals, Some(4)).unwrap();
+    let plan = EmergencyPlan {
+        originals: &fixture.originals,
+        input: &prepared.input,
+        native: &prepared.native,
+        unhandled_pairs: vec![(2, 3), (6, 7)],
+        markers: marker_refs(&markers),
+        work_boundary: Some(4),
+        summary_text,
+    };
+    let candidate = plan.build(&[]).unwrap();
+    plan.validate(&[], &candidate).unwrap();
+    let early_output = candidate
+        .iter()
+        .find(|envelope| item_id(envelope) == Some("early-output-item"))
+        .expect("early output");
+    let body = match &early_output.item {
+        ResponseItem::FunctionCallOutput { output, .. } => output.text_content().unwrap(),
+        _ => panic!("early output changed type"),
+    };
+    assert_eq!(body, observation_marker_body(reference));
+    assert!(body.len() < medium.len());
+
+    // An existing bounded marker the previous checkpoint kept also becomes a reference: the
+    // bounded excerpts are what kept repeated Emergency checkpoints from shrinking.
+    let large_early = format!("HEAD{}TAIL", "e".repeat(20_000));
+    let canonical_fixture = Fixture::with_early_output(&large_early);
+    let canonical_prepared = prepare(&canonical_fixture);
+    let (_, _, bounded) = &canonical_prepared.projections[0];
+    let mut with_marker = Fixture::with_early_output(&large_early);
+    with_marker.originals[3] = marker_output(&canonical_fixture.originals[3], bounded).unwrap();
+    let mut sources = with_marker.prepared();
+    sources.pairs[0].reference_kind = PreparedCompactionReferenceKind::ObservationMarker;
+    let remarked = select_observation_markers(
+        &with_marker.originals,
+        &sources,
+        &canonical_prepared.projections,
+        Some(4),
+    )
+    .unwrap();
+    assert_eq!(marker_indices(&remarked), vec![3, 7]);
+    let (_, reference) = &remarked[0];
+    assert!(reference.summary.output.excerpts.is_empty());
+    assert_eq!(reference.coverage.output.total_bytes, large_early.len());
+    let rebuilt = marker_output(&with_marker.originals[3], reference).unwrap();
+    verify_marker_output(&with_marker.originals[3], &rebuilt, reference).unwrap();
+    assert_eq!(
+        rebuilt.metadata,
+        marker_output(&canonical_fixture.originals[3], reference)
+            .unwrap()
+            .metadata
+    );
+    // After the previous checkpoint an existing marker is left as it is.
+    assert_eq!(
+        marker_indices(
+            &select_observation_markers(
+                &with_marker.originals,
+                &sources,
+                &canonical_prepared.projections,
+                Some(2),
+            )
+            .unwrap()
+        ),
+        vec![7]
+    );
+
+    // A tiny output stays raw: its reference marker would not be smaller.
+    let tiny = Fixture::new();
+    let tiny_prepared = prepare(&tiny);
+    assert_eq!(
+        marker_indices(
+            &select_observation_markers(
+                &tiny.originals,
+                &tiny.prepared(),
+                &tiny_prepared.projections,
+                Some(4),
+            )
+            .unwrap()
+        ),
+        vec![7]
     );
 }
 

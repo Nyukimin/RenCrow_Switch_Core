@@ -829,6 +829,228 @@ async fn rencrow_malformed_summary_commits_emergency_and_next_normal_summarizes_
     Ok(())
 }
 
+/// Repeated Emergency checkpoints must shrink: an output the first checkpoint kept verbatim becomes a
+/// reference marker in the second (COMPACTION_SPEC.md Part 3, 2026-09-29).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rencrow_second_emergency_references_output_the_first_kept() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = start_mock_server().await;
+    let call_id = "repeated-emergency-call";
+    let large_call_id = "repeated-emergency-large-call";
+    let tool_prompt = "REPEATED_EMERGENCY_TOOL_PROMPT";
+    let call_arguments =
+        json!({"cmd": "head -c 1500 /dev/zero | tr '\\0' r", "yield_time_ms": 5_000}).to_string();
+    let large_arguments =
+        json!({"cmd": "head -c 5000 /dev/zero | tr '\\0' b", "yield_time_ms": 5_000}).to_string();
+    let tool_call_issued = Arc::new(AtomicBool::new(false));
+    let tool_call_state = Arc::clone(&tool_call_issued);
+    let responses = Arc::new(AtomicUsize::new(0));
+    // Normal fails until the test accepts it, so the first two compactions are Emergency.
+    let accept_normal = Arc::new(AtomicBool::new(false));
+    let normal_state = Arc::clone(&accept_normal);
+    let summaries = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let captured_summaries = Arc::clone(&summaries);
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(move |request: &Request| {
+            let body: Value = request.body_json().expect("request JSON");
+            let id = format!("answer-{}", responses.fetch_add(1, Ordering::SeqCst));
+            let normal = normal_state.load(Ordering::SeqCst);
+            match stage(&body) {
+                Stage::Selection(_) if normal => {
+                    return assistant_reply(&id, r#"{"operations":[]}"#, ev_completed("selection"));
+                }
+                Stage::Selection(_) => {
+                    return assistant_reply(&id, "not a selection", ev_completed("selection"));
+                }
+                Stage::Summary => {
+                    captured_summaries
+                        .lock()
+                        .expect("summaries lock")
+                        .push(body.clone());
+                    let text = if normal {
+                        "The command printed its fixture output."
+                    } else {
+                        "unexpected summary"
+                    };
+                    return assistant_reply(&id, text, ev_completed("summary"));
+                }
+                Stage::Ordinary => {}
+            }
+            if body["input"].to_string().contains(tool_prompt)
+                && !tool_call_state.swap(true, Ordering::SeqCst)
+            {
+                return ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse(vec![
+                        ev_response_created("tool-response"),
+                        ev_function_call(call_id, "exec_command", &call_arguments),
+                        ev_function_call(large_call_id, "exec_command", &large_arguments),
+                        ev_completed("tool-response"),
+                    ]));
+            }
+            assistant_reply(&id, "acknowledged", ev_completed("ordinary"))
+        })
+        .mount(&server)
+        .await;
+    let provider = non_openai_model_provider(&server);
+    let mut builder = test_codex()
+        .with_history_mode(ThreadHistoryMode::Paginated)
+        .with_config(move |config| {
+            config.model_provider = provider;
+            config.rencrow_compaction = true;
+            config.experimental_thread_store = ThreadStoreConfig::Local;
+            config
+                .features
+                .enable(Feature::UnifiedExec)
+                .expect("repeated-emergency fixture must enable UnifiedExec");
+        });
+    let test = builder.build(&server).await?;
+    submit_human_turn(&test, "first", tool_prompt).await?;
+    compact_without_error(&test.codex).await?;
+    submit_human_turn(&test, "second", "Continue.").await?;
+    compact_without_error(&test.codex).await?;
+
+    test.codex.flush_rollout().await?;
+    let path = test.codex.rollout_path().expect("rollout path");
+    let checkpoints = checkpoint_rows(&path)?;
+    assert_eq!(checkpoints.len(), 2);
+    let output_text = |checkpoint: &Value, call_id: &str| {
+        checkpoint["payload"]["replacement_history"]
+            .as_array()
+            .expect("replacement history")
+            .iter()
+            .find(|item| item["type"] == "function_call_output" && item["call_id"] == call_id)
+            .and_then(|item| item["output"].as_str().map(str::to_owned))
+            .expect("tool output in the checkpoint")
+    };
+    for checkpoint in &checkpoints {
+        assert_eq!(
+            checkpoint_metadata(checkpoint)["selection_mode"],
+            "deterministic_emergency"
+        );
+    }
+    // The first Emergency keeps the small output verbatim: its bounded projection is the whole text.
+    let first = output_text(&checkpoints[0], call_id);
+    assert!(first.contains(&"r".repeat(1_500)));
+    // The second Emergency replaces what the first kept with a reference and no excerpts.
+    let second = output_text(&checkpoints[1], call_id);
+    let marker: Value = serde_json::from_str(&second)?;
+    assert_eq!(marker["rencrow_observation"], true);
+    assert_eq!(marker["call_id"], call_id);
+    assert_eq!(marker["partial"], true);
+    assert_eq!(marker["presented_ranges"], json!([]));
+    assert_eq!(marker["excerpts"], json!([]));
+    assert_eq!(marker["total_bytes"].as_u64(), Some(first.len() as u64));
+    assert!(second.len() < first.len());
+    // A large output becomes a bounded marker in the first Emergency and a reference in the second.
+    let bounded: Value = serde_json::from_str(&output_text(&checkpoints[0], large_call_id))?;
+    assert_eq!(bounded["excerpts"].as_array().map(Vec::len), Some(2));
+    let reference: Value = serde_json::from_str(&output_text(&checkpoints[1], large_call_id))?;
+    assert_eq!(reference["excerpts"], json!([]));
+    assert_eq!(reference["presented_ranges"], json!([]));
+    assert_eq!(reference["total_bytes"], bounded["total_bytes"]);
+
+    // The next Normal verifies the reference against the canonical rollout and summarizes the
+    // output from its canonical text, not from the reference.
+    accept_normal.store(true, Ordering::SeqCst);
+    submit_human_turn(&test, "third", "Summarize what ran.").await?;
+    compact_without_error(&test.codex).await?;
+    test.codex.flush_rollout().await?;
+    let checkpoints = checkpoint_rows(&path)?;
+    assert_eq!(checkpoints.len(), 3);
+    assert_ne!(
+        checkpoint_metadata(&checkpoints[2])["selection_mode"],
+        "deterministic_emergency"
+    );
+    let summaries = summaries.lock().expect("summaries lock");
+    assert_eq!(summaries.len(), 1);
+    assert!(
+        summaries[0]["input"]
+            .to_string()
+            .contains(&"r".repeat(1_500))
+    );
+    // The large output is summarized from its canonical text with bounded excerpts.
+    assert!(
+        summaries[0]["input"]
+            .to_string()
+            .contains(&"b".repeat(1_000))
+    );
+    Ok(())
+}
+
+/// The selection stage processes data; the ordinary executor instructions made a model act on
+/// the requests inside that data instead of returning JSON (COMPACTION_SPEC.md Part 3, 2026-09-29).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rencrow_selection_request_carries_only_its_stage_instruction() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = start_mock_server().await;
+    let seen = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let captured = Arc::clone(&seen);
+    let responses = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(move |request: &Request| {
+            let body: Value = request.body_json().expect("request JSON");
+            captured.lock().expect("requests lock").push(body.clone());
+            let id = format!("answer-{}", responses.fetch_add(1, Ordering::SeqCst));
+            let reply = match stage(&body) {
+                Stage::Selection(_) => r#"{"operations":[]}"#,
+                Stage::Summary => "Work state: nothing is pending.",
+                Stage::Ordinary => "acknowledged",
+            };
+            assistant_reply(&id, reply, ev_completed("response-fixture"))
+        })
+        .mount(&server)
+        .await;
+    let provider = non_openai_model_provider(&server);
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider = provider;
+        config.rencrow_compaction = true;
+    });
+    let test = builder.build(&server).await?;
+    submit_human_turn(&test, "first", "Keep Japanese. Use obsolete-label.").await?;
+    submit_human_turn(&test, "second", "Use current-label instead.").await?;
+    compact_without_error(&test.codex).await?;
+
+    let requests = seen.lock().expect("requests lock");
+    let ordinary = requests
+        .iter()
+        .find(|body| matches!(stage(body), Stage::Ordinary))
+        .expect("ordinary request");
+    let selection = requests
+        .iter()
+        .find(|body| matches!(stage(body), Stage::Selection(_)))
+        .expect("selection request");
+    let summary = requests
+        .iter()
+        .find(|body| matches!(stage(body), Stage::Summary))
+        .expect("summary request");
+    assert!(
+        ordinary["instructions"]
+            .as_str()
+            .is_some_and(|text| !text.is_empty())
+    );
+    assert_eq!(selection.get("instructions"), None);
+    assert!(
+        selection
+            .get("tools")
+            .and_then(Value::as_array)
+            .is_none_or(Vec::is_empty)
+    );
+    let roles = selection["input"]
+        .as_array()
+        .expect("selection input")
+        .iter()
+        .map(|item| item["role"].as_str().unwrap_or_default())
+        .collect::<Vec<_>>();
+    assert_eq!(roles.first(), Some(&"developer"));
+    assert!(roles[1..].iter().all(|role| *role == "user"));
+    // The summary request keeps the ordinary base instructions.
+    assert_eq!(summary["instructions"], ordinary["instructions"]);
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rencrow_malformed_selection_keeps_every_human_exactly_in_emergency() -> Result<()> {
     skip_if_no_network!(Ok(()));

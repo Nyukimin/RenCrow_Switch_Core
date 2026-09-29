@@ -539,12 +539,32 @@ fn prepare_observation_marker<'a>(
     {
         return Err("V2 observation marker identity differs from its canonical source".into());
     }
-    let regenerated = codex_history::project_observation(
-        &reference,
-        observation.tool_name,
-        call_text,
-        observation.body,
-    )?;
+    // Emergency writes either a bounded projection or, for an output an earlier checkpoint already
+    // kept, a reference without output excerpts (COMPACTION_SPEC.md Part 3, 2026-09-29). Both are
+    // regenerated from the canonical source; the recorded coverage only selects which one.
+    let reference_marker = output
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.rencrow_observation_projection.as_deref())
+        .is_some_and(|coverage| coverage.output.presented_ranges.is_empty());
+    let regenerated = if reference_marker {
+        if codex_history::archive_reference::content_sha256(observation.body) != reference.sha256 {
+            return Err("V2 reference marker digest differs from its canonical output".into());
+        }
+        codex_history::project_existing_observation(
+            &reference,
+            observation.tool_name,
+            call_text,
+            observation.body.len(),
+        )?
+    } else {
+        codex_history::project_observation(
+            &reference,
+            observation.tool_name,
+            call_text,
+            observation.body,
+        )?
+    };
     codex_history::observation_marker::verify_observation_marker(
         &regenerated,
         observation.output.metadata.as_ref(),

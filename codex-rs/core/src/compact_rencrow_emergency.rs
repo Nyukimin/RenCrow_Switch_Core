@@ -3,7 +3,8 @@
 //! Emergency sends no model request and makes no new semantic decision. It keeps exact Humans with
 //! already accepted removals, protected and opaque items, every unhandled observation pair, and
 //! all ordinary Work after the semantic boundary. It may only drop Work already represented by the
-//! previous semantic summary and replace eligible large outputs with verified V2 markers.
+//! previous semantic summary and replace eligible outputs with verified V2 markers: large outputs
+//! with bounded excerpts, and outputs the previous checkpoint kept with a reference only.
 
 use super::native::NativeProjection;
 use super::native::content_text;
@@ -13,6 +14,7 @@ use super::observation::cumulative_observation_coverage;
 use crate::compact::SUMMARY_PREFIX;
 use crate::context::CompactionSummary;
 use crate::context::ContextualUserFragment;
+use codex_history::CodexHarnessMetadata;
 use codex_history::RenCrowCompactionMetadataV2;
 use codex_history::ResponseItemEnvelope;
 use codex_history::archive_reference::content_sha256;
@@ -25,6 +27,7 @@ use codex_history::observation_marker::observation_marker_metadata;
 use codex_history::observation_marker::verify_observation_marker;
 use codex_history::observation_projection::ObservationCoverage;
 use codex_history::observation_projection::ObservationProjection;
+use codex_history::observation_projection::project_existing_observation;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::ResponseItem;
@@ -60,29 +63,56 @@ pub(super) fn emergency_summary_text(
     Ok((carried, true))
 }
 
-/// Choose unhandled fresh outputs whose V2 marker is smaller than the live output (§36).
+/// Choose unhandled outputs whose V2 marker is smaller than the live output (§36).
 ///
-/// Only verified fresh pairs qualify: V1 archive references and existing V2 markers are already
-/// compact, and protected, active, ambiguous, or non-text outputs never reach the prepared pairs.
-pub(super) fn select_observation_markers<'a>(
+/// An output before `durable_boundary` was kept by the previous checkpoint, raw or as a bounded
+/// V2 marker, so it becomes a reference without output excerpts; this makes repeated Emergency
+/// checkpoints shrink (COMPACTION_SPEC.md Part 3, 2026-09-29). A later fresh output keeps its
+/// bounded projection, and a later V2 marker or any V1 archive reference is left as it is.
+/// Protected, active, ambiguous, or non-text outputs never reach the prepared pairs.
+pub(super) fn select_observation_markers(
     originals: &[ResponseItemEnvelope],
     prepared: &PreparedCompactionSources<'_>,
-    projections: &'a [(usize, usize, ObservationProjection)],
-) -> Vec<(usize, &'a ObservationProjection)> {
-    projections
-        .iter()
-        .filter(|(_, output_index, _)| {
-            prepared.pairs.iter().any(|pair| {
-                pair.output_index == *output_index
-                    && pair.reference_kind == PreparedCompactionReferenceKind::Fresh
-            })
-        })
-        .filter(|(_, output_index, projection)| {
-            live_output_text(&originals[*output_index])
-                .is_some_and(|text| observation_marker_body(projection).len() < text.len())
-        })
-        .map(|(_, output_index, projection)| (*output_index, projection))
-        .collect()
+    projections: &[(usize, usize, ObservationProjection)],
+    durable_boundary: Option<usize>,
+) -> Result<Vec<(usize, ObservationProjection)>, String> {
+    let mut markers = Vec::new();
+    for (_, output_index, projection) in projections {
+        let Some(pair) = prepared
+            .pairs
+            .iter()
+            .find(|pair| pair.output_index == *output_index)
+        else {
+            continue;
+        };
+        let kept_by_previous_checkpoint =
+            durable_boundary.is_some_and(|boundary| *output_index < boundary);
+        let marker = match (pair.reference_kind, kept_by_previous_checkpoint) {
+            (
+                PreparedCompactionReferenceKind::Fresh
+                | PreparedCompactionReferenceKind::ObservationMarker,
+                true,
+            ) => {
+                let call_text = pair
+                    .canonical_call_input
+                    .ok_or_else(|| "observation has no canonical call text".to_owned())?;
+                project_existing_observation(
+                    &projection.coverage.reference,
+                    &projection.coverage.tool_name,
+                    call_text,
+                    projection.coverage.output.total_bytes,
+                )?
+            }
+            (PreparedCompactionReferenceKind::Fresh, false) => projection.clone(),
+            _ => continue,
+        };
+        if live_output_text(&originals[*output_index])
+            .is_some_and(|text| observation_marker_body(&marker).len() < text.len())
+        {
+            markers.push((*output_index, marker));
+        }
+    }
+    Ok(markers)
 }
 
 fn live_output_text(envelope: &ResponseItemEnvelope) -> Option<&str> {
@@ -91,6 +121,15 @@ fn live_output_text(envelope: &ResponseItemEnvelope) -> Option<&str> {
         | ResponseItem::CustomToolCallOutput { output, .. } => output.text_content(),
         _ => None,
     }
+}
+
+/// Metadata of the canonical output an original slot stands for. An existing V2 marker differs from
+/// it only by its coverage and the dropped truncation budget, which a new marker drops again.
+fn source_output_metadata(original: &ResponseItemEnvelope) -> Option<CodexHarnessMetadata> {
+    original.metadata.clone().map(|mut metadata| {
+        metadata.rencrow_observation_projection = None;
+        metadata
+    })
 }
 
 /// Replace one output body with its V2 marker, keeping the item type and identity (§33–35).
@@ -107,7 +146,7 @@ fn marker_output(
         _ => return Err("observation marker target is not a tool output".into()),
     }
     marker.metadata = Some(observation_marker_metadata(
-        original.metadata.as_ref(),
+        source_output_metadata(original).as_ref(),
         &projection.coverage,
     )?);
     Ok(marker)
@@ -296,7 +335,7 @@ fn verify_marker_output(
         live_output_text(actual).ok_or_else(|| "emergency marker output is not text".to_owned())?;
     verify_observation_marker(
         projection,
-        original.metadata.as_ref(),
+        source_output_metadata(original).as_ref(),
         actual.metadata.as_ref(),
         body,
     )?;

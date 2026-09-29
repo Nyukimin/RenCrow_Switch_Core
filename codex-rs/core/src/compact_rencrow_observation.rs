@@ -195,6 +195,9 @@ pub(super) fn build_completion_links(
         let text = &input.records[index].text;
         !text.is_empty() && text.len() <= OBSERVATION_PART_FULL_LIMIT_BYTES
     };
+    // Only a raw output is execution evidence; a marker or archive reference in its place is host
+    // data and cannot prove completion (the same rule the selection validator enforces).
+    let raw_output = |index: usize| input.records[index].execution_evidence;
     let mut links = Vec::new();
     for (users, tools) in turns.values() {
         let ([human], [call, output]) = (users.as_slice(), tools.as_slice()) else {
@@ -223,6 +226,7 @@ pub(super) fn build_completion_links(
                 .any(|index| originals[*index].item.id().is_none())
             || !bounded(*call)
             || !bounded(*output)
+            || !raw_output(*output)
         {
             continue;
         }

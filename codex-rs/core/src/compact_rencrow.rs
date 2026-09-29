@@ -109,12 +109,13 @@ pub(super) async fn select_obsolete_instructions(
     }
 
     let input = json!({"sources": sources, "completion_links": completion_links});
-    let (response, seconds) = model_request::drain_compaction_stage(
+    let (response, seconds) = model_request::drain_json_stage(
         sess,
         ctx,
         metadata,
         "instruction_selection",
-        model_request::json_stage_input(INSTRUCTION_SELECTION_PROMPT, &input),
+        INSTRUCTION_SELECTION_PROMPT,
+        &input,
         cancellation,
     )
     .await?;

@@ -442,6 +442,16 @@ pub(super) fn emergency_candidate(
     let (summary_text, semantic) =
         emergency::emergency_summary_text(p.originals, p.semantic.previous_summary)
             .map_err(integrity)?;
+    // The previous checkpoint's summary is last in its replacement, so every item before it was
+    // kept by that checkpoint, whether it was Normal or Emergency.
+    let durable_boundary = p.adopted.as_ref().map(|adopted| adopted.index);
+    let markers = emergency::select_observation_markers(
+        p.originals,
+        &p.sources,
+        &p.projections,
+        durable_boundary,
+    )
+    .map_err(integrity)?;
     let plan = EmergencyPlan {
         originals: p.originals,
         input: &p.input,
@@ -451,7 +461,10 @@ pub(super) fn emergency_candidate(
             .iter()
             .map(|(call_index, output_index, _)| (*call_index, *output_index))
             .collect(),
-        markers: emergency::select_observation_markers(p.originals, &p.sources, &p.projections),
+        markers: markers
+            .iter()
+            .map(|(index, projection)| (*index, projection))
+            .collect(),
         work_boundary: p.semantic.work_boundary,
         summary_text,
     };

@@ -1697,6 +1697,7 @@ Hostが決定的に安全と証明できるものだけ。
 * previous semantic summary以前のordinary Work
 * already-applied invalidated Human ranges
 * safely replaceable huge tool raw output
+* 前回checkpointがそのまま保持したfresh出力の抜粋（参照markerへ置換。第3部「Emergency の縮小不足」2026-09-29）
 * structurally duplicated derived context
 
 新規のobsolete/completed意味判定は禁止。
@@ -1942,7 +1943,7 @@ marker本文をHuman instructionへ昇格しない。
 * current thread一致
 * ObservationCoverage valid
 * output reference digest一致
-* marker本文がmetadataから決定的に再生成可能
+* marker本文がmetadataから決定的に再生成可能（抜粋付きmarkerと参照markerの2形。第3部「Emergency の縮小不足」2026-09-29）
 * unrelated metadataなし
 
 不一致:
@@ -5068,6 +5069,86 @@ RenCrow Switch Core Compaction V2の役割は、
 - 試験: automation の訂正で automation のメモが消える、human の訂正で automation のメモが消える、automation の訂正では human の指示を消せない、候補に origin が付く、thread の違う受付記録は Unknown のまま、の各単体試験。実際の compaction の流れで、automation の古いメモが後の automation の訂正で置換後履歴から消え、訂正と常設の制約が残る結合試験。
 - 未確認（配備後に観測）: 実 Qwen の選別で、監督メモがどれだけ消えるか、常設の制約を誤って消さないか。
 - 運用（2026-09-27）: 本規則は入力元の申告が正しいことを前提にする。監督用に `automation` で起動した TUI に利用者が直接入力したため、利用者の指示が automation として記録されていた（thread 01a0dc2c の 31 件中、09-27 の利用者の指示）。一つの TUI を利用者と監督者で共有しない。利用者が入力する TUI は `human`、監督者だけが入力する TUI は `automation` で起動する。thread 01a0dc2c は 2026-09-27 04:05 に `human` で再開した。
+
+### 意味判断段の要求から実行役の基本指示を外す（2026-09-29、利用者判断「1と2を進めて」）
+
+#### 解析（run 3・run 4、GPT120B-M5Max、run 4 の thread `01a0e896-7300-7993-a972-20f4ac6d4164`）
+
+- run 4 の自動 compaction 5 回すべてで `instruction_selection` が JSON を返さず（`instruction_selection schema rejected: expected value at line 1 column 1`）、Emergency になった。入力は sources=1（最初の依頼だけ）・completion_links=0 で、正解は決定的に `{"operations":[]}` だった。
+- GPT120B が idle の間に同じ要求を再送した（E0）。2 回とも JSON を返さなかった（Gateway の `EMPTY_FINAL_CONTENT`）。応答は、データ内の元の依頼文を実行すべき依頼と取り違え、存在しない tool で作業を始める内容だった。
+- 変種比較（各 2 回、`gpt120b--m5max`）: E1 基本指示（通常 turn の実行役の指示文）を外す＝2/2 正解（4〜5 秒）。E2 基本指示を残しデータを developer へ移す＝失敗（聞き返し）。E3 E1＋推論 low＝2/2 正解（1〜2 秒）。E4 そのまま＋`json_object`＝JSON の形だが中身は取り違えたまま。
+- 原因: `drain_compaction_stage` が JSON 段にも通常 turn と同じ基本指示（`get_prompt_base_instructions`、実行役の人格と作業規則）を付けていた。データを処理する段の先頭に「作業を実行する」指示文があり、データ内の依頼文がそれと結び付いた。
+
+#### 修正仕様
+
+1. JSON を返させる意味判断段（現在は `instruction_selection` だけ）の要求は、基本指示を空にする（Responses 要求に `instructions` を含めない）。要求は段の指示（developer 1 件）と JSON データ（user、8,000 byte ごとの分割）だけで、tool を宣言しない。
+2. 変えないもの: model と推論強度（E3 のような推論強度の引き下げはしない。FORK_RULES 改変原則 4）、出力の検証（schema と host の検証）、失敗時の Emergency、要約段（ターン途中の要約は提案 A どおり通常 turn の prompt を延長し、それ以外の要約も従来どおり基本指示を付ける）。
+
+#### Failure Knowledge: データを処理する段に実行役の指示文を付け、データ内の依頼を実行した（2026-09-28）
+
+- Failure / Problem: GPT120B の `instruction_selection` が 5 回続けて JSON を返さず、Normal が一度も成立しなかった。
+- Cause: JSON 段の要求の先頭に、通常 turn の実行役の指示文が付いていた。
+- Lesson: データを処理する段の要求には、その段の指示だけを置く。実行役の指示文は、データ内の依頼文を実行すべき依頼として読ませる。
+- Invariant: JSON を返させる段の要求は基本指示を持たない。
+- Enforcement / Tests: 結合試験で、`instruction_selection` の要求に `instructions` が無く、要約要求には従来どおり基本指示があることを確かめる。
+
+#### 受入条件
+
+- 結合試験: `instruction_selection` の要求に `instructions` と tool が無く、developer の段指示と JSON データだけがある。要約要求の基本指示は変わらない。
+- 実経路: GPT120B-M5Max の実 thread で、自動 compaction の `instruction_selection` が JSON を返し、Normal が成立する（checkpoint の `selection_mode` が Emergency でない）。
+
+互換性: 要求の形だけの変更で、checkpoint と rollout の形式は変えない。戻し方: 本変更の commit を revert する。
+
+### Emergency の縮小不足（2026-09-29、利用者判断「1と2を進めて」）
+
+#### 解析（run 4 の checkpoint）
+
+- Normal が毎回失敗し、Emergency が 4 回続いた。checkpoint は 65→95→140→188 項目、約 7.6 万→10.6 万→14.2 万→17.4 万字と単調に増えた。5 回目は `compaction candidate does not shrink the estimated context (32266 >= 32266 tokens)` で CapacityBlocked になった。compaction の間隔は 2 分 40 秒→2 分 36 秒→2 分 3 秒→1 分 21 秒と縮んだ。
+- 4 回目の checkpoint の中身: tool 出力 61 件（8.7 万字）のうち、前後 1,024 byte の抜粋付き V2 marker が 23 件（5.0 万字、1 件約 2.2KB）、生の出力が 38 件（1.6 万字）。reasoning 61 件（3.9 万字）、call 61 件（2.4 万字）、user 4 件（1.9 万字）。
+- 原因 1: Emergency は semantic boundary 以降の Work をすべて残す（第 2 部 §26）。Emergency checkpoint は semantic boundary にならない（§29）ため、Normal が一度も成立しないと、開始以降の Work がすべて残る。
+- 原因 2: 縮められるのは V2 marker が元の出力より小さい場合だけ（§36）。marker は 2,048 byte 以下の出力を全文、それより大きい出力を前後 1,024 byte で示すため、約 2.4KB 未満の出力は marker にしても小さくならない。一度 marker になった出力は既存 marker として以後そのまま残り（抜粋付きのまま約 2.2KB）、生の小さい出力も同じ大きさで残る。Emergency を何回繰り返しても、同じ出力が同じ大きさで残る。
+
+#### 修正仕様
+
+1. Emergency では、前回の checkpoint（durable boundary。置換後履歴の末尾に置いた要約の位置、`adopted.index`）より前にある未処理の出力を、出力の抜粋を持たない V2 marker（参照 marker）へ置換する。対象は、生の fresh 出力と、抜粋付きの既存 V2 marker の両方。形は既存の `project_existing_observation` と同じ（call は通常の projection、output は全範囲を未提示、`partial=true`、excerpts は空）で、canonical の call と出力の長さから作る。前回の checkpoint が一度保持した出力を、次の Emergency で参照だけにする。既存 marker の metadata は、canonical 出力の metadata（既存 marker の metadata から coverage を除いたもの。truncation budget は marker で落とす）から作り直す。
+2. 前回の checkpoint より後の fresh 出力は従来どおり、通常の projection で、marker が元より小さい場合だけ置換する。前回の checkpoint より後の既存 V2 marker と、V1 保管参照はそのまま残す。
+3. 置換の条件（§36: persisted canonical raw と対応確認済み、unique、text-only、inactive、nonprotected、marker が元より小さい）は変えない。
+4. 既存 V2 marker の照合（§39）: marker metadata の output coverage が全範囲未提示なら参照 marker として、canonical の call と output の長さから `project_existing_observation` で再生成し、本文と metadata の完全一致を求める。出力の digest が canonical の本文と一致することも確かめる。それ以外は従来どおり `project_observation` で再生成する。一致しなければ IntegrityBlocked。
+5. 要約の材料は減らさない。次の Normal は既存 V2 marker も canonical raw から通常の projection を作り直して Summary 入力へ出す（既存の挙動、§41・E06）。ターン途中の要約（提案 A）も、marker としてしか見えない observation の断片を要約指示に付ける（既存）。
+6. 完了の結び付け（completion link）は、出力が生の実行証拠である組だけに作る。参照 marker・保管参照は全文の実行証拠ではないため対象にしない（Selection の検証が既に求める条件を、結び付けを作る側でも守る）。これまでは marker が 2,048 byte を超える出力にしか付かず、結び付けの大きさの条件（2,048 byte 以下）と重ならなかったため顕在化しなかった。結び付けが無い指示は削除されず原文で残る（安全側）。
+7. 変えないもの: reasoning と call は削らない（reasoning は Summary 入力の Work で、call は §37 により truncate しない）。Human、Protected State、active な tool/process、initial context の保持。
+8. 累積の observation 一覧（metadata の `observations`）は、同じ観測（thread・call ID・digest が同じ）の最初の記録を残す既存の統合規則のままとする。参照 marker へ置き換えた観測の一覧上の coverage は以前の抜粋付きの記録のままになるが、照合は live の marker metadata で行い、一覧は観測の識別と取り出しにだけ使うため、安全性は変わらない。
+
+#### 見込みと限界
+
+- run 4 の 5 回目なら、4 回目の checkpoint が保持した出力 61 件（8.7 万字）のうち、参照 marker より大きい 23 件の抜粋付き marker（5.0 万字）と生の出力が、約 340 byte ずつの参照 marker になる見込み（試算、実測は受入で行う）。
+- reasoning と call は Emergency を繰り返すと増え続ける。Normal が成立しない限り、いずれ CapacityBlocked になりうる。上の節（Normal の成立）と組み合わせて効く。
+
+#### Failure Knowledge: Emergency を繰り返しても縮まず CapacityBlocked に至った（2026-09-28）
+
+- Failure / Problem: run 4 で Emergency が 4 回続き、checkpoint が単調に増え、5 回目で CapacityBlocked になった。
+- Cause: 一度保持した出力を次の Emergency も同じ大きさで保持した。小さい出力には縮める手段が無かった。
+- Lesson: 決定的な縮小手段は、繰り返すほど縮むことを確かめる。Normal が失敗し続ける間も、前回保持したものは次で小さくする。
+- Invariant: 前回の checkpoint が保持した fresh 出力は、次の Emergency で（§36 の条件を満たす限り）参照 marker になる。
+- Enforcement / Tests: 単体試験と結合試験（下記）。
+
+#### 受入条件
+
+- 単体: 前回の checkpoint より前の fresh 出力（参照 marker が元より小さいもの）が参照 marker になり、後の出力は従来どおりになる。参照 marker の照合が通り、本文・metadata・長さの改ざんは IntegrityBlocked になる。
+- 結合: Normal が失敗し続ける thread で、2 回目の Emergency の checkpoint では 1 回目が保持した出力が参照 marker になる。その後の Normal は参照 marker の照合と完了の結び付けで止まらずに成立し、Summary 入力には canonical から作った出力本文が出る。
+- 実経路: run 4 の thread を private な複製（Git 外）で新 binary から再開し、次の compaction で CapacityBlocked にならずに作業が続くことを確かめる。
+
+#### 実経路の確認（2026-09-29、生の出力だけを参照にした途中版）
+
+- run 4 の thread を新 binary で再開し、手動 compaction を 1 回行った（GPT120B-M5Max）。`instruction_selection` は基本指示なし・tool なしの 2 件の入力で送られ、3.5 秒・258 token で JSON が受理された（上の節の修正が実経路で効いた）。
+- 続く Summary は GPT120B が推論だけを返して本文が無く、Gateway の推論なし再試行でも本文が出ず失敗し、Emergency になった。Emergency は CapacityBlocked にならずに成立した（run 4 では同じ状態から 32266→32266 で止まっていた）。
+- ただし途中版では、生の出力 9 件が参照 marker になっただけで、抜粋付き marker 23 件（5.0 万字）は残った（checkpoint は 17.4 万→15.9 万字）。このため既存の抜粋付き marker も対象に広げた（修正仕様 1）。
+- 置換後の最初の通常要求（tool なしで状況を問う）には、GPT120B が現在の作業と次の手順を正しく答えた。
+- 完成版（既存の抜粋付き marker も対象）で、run 4 の thread を隔離した複製（rollout を複製し、状態 DB の `rollout_path` を複製先へ書換え）から同じ手順で再確認した。`instruction_selection` は 3.8 秒・277 token で受理、Summary は同じく本文なしで失敗し Emergency が成立した。checkpoint は 17.4 万→11.5 万字（tool 出力 8.7 万→3.7 万字。参照 marker 32 件 1.2 万字、生の小さい出力 32 件 0.6 万字、抜粋付き marker 0 件）。置換後の最初の通常要求は 147KB・prompt 23,468 token（途中版は 200KB・40,714 token）で、GPT120B は状況と次の手順を正しく答えた。元の home は変わっていない。記録: `~/.rencrow/ops/compaction-e2e/20260929T1350Z/`。
+- 未解決: GPT120B の Summary が本文を返さない（推論だけで終わり、Gateway の推論なし再試行でも本文なし）。Normal はこの段でまだ成立しないため、Emergency が繰り返され、reasoning（4.4 万字）と call（2.5 万字）は増え続ける。
+- 試験手順の誤り: CODEX_HOME を複製して再開したが、状態 DB の `threads.rollout_path` が元の home の絶対パスを指していたため、元の run 4 の rollout に追記された（末尾への追記のみ、既存の 9,398,034 byte は不変。追記分は試験の記録だけで、利用者の許可を得て除去し元の大きさへ戻した。追記後の写しは試験記録に保管）。CODEX_HOME の複製で試験するときは、rollout も複製し、複製した状態 DB の `rollout_path` を複製先へ書き換えてから開く（§76 の隔離の前提）。
+
+互換性: 参照 marker は rollout に残る新しい形である。本変更より前の binary は照合で通常の projection と比べるため、参照 marker を含む thread を開くと IntegrityBlocked で止まる（データは失わない）。戻す場合は、参照 marker を含む thread を本変更以降の binary で開く。戻し方: 本変更の commit を revert する（上記の制約あり）。
 
 # 第4部 部品契約・Failure Knowledge・実測・旧仕様（2026-09-24以前の記録）
 

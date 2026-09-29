@@ -10,6 +10,7 @@ use codex_history::ResponseItemEnvelope;
 use codex_history::compaction_checkpoint_metadata::CheckpointResponseStage;
 use codex_history::compaction_checkpoint_metadata::CompactionModelResponseReceipt;
 use codex_history::compaction_plan::DerivedResult;
+use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -53,6 +54,31 @@ pub(super) async fn drain_compaction_stage(
     drain_compaction_prompt(sess, ctx, metadata, stage, prompt, cancellation).await
 }
 
+/// Stream one read-only JSON-dataset stage with only its stage instruction and no tools.
+///
+/// The ordinary base instructions describe an executor; ahead of a dataset they made the model act
+/// on the requests inside the data instead of returning JSON (COMPACTION_SPEC.md Part 3,
+/// 2026-09-29). Empty instructions are omitted from the request.
+pub(super) async fn drain_json_stage(
+    sess: &Session,
+    ctx: &TurnContext,
+    metadata: CompactionTurnMetadata,
+    stage: &str,
+    instruction: &str,
+    data: &Value,
+    cancellation: &CancellationToken,
+) -> CodexResult<(CompactionResponse, f64)> {
+    let prompt = Prompt {
+        base_instructions: BaseInstructions {
+            text: String::new(),
+            provenance: None,
+        },
+        input: json_stage_input(instruction, data),
+        ..Default::default()
+    };
+    drain_compaction_prompt(sess, ctx, metadata, stage, prompt, cancellation).await
+}
+
 async fn drain_compaction_prompt(
     sess: &Session,
     ctx: &TurnContext,
@@ -89,7 +115,7 @@ async fn drain_compaction_prompt(
 }
 
 /// Build a read-only JSON-dataset stage: one developer instruction and bounded user chunks.
-pub(super) fn json_stage_input(instruction: &str, data: &Value) -> Vec<ResponseItem> {
+fn json_stage_input(instruction: &str, data: &Value) -> Vec<ResponseItem> {
     let mut input = vec![ResponseItem::Message {
         id: None,
         role: "developer".into(),
