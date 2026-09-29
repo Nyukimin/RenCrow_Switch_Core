@@ -170,16 +170,15 @@ fn validate_human_reference(
     if !record.origin.is_declared_input() || record.role != "user" || record.opaque.is_some() {
         return Err("selection source must be ordinary Human user text".into());
     }
-    if whole_record_requested {
-        if reference.range.start != 0
+    if whole_record_requested
+        && (reference.range.start != 0
             || reference.range.end != record.text.len()
             || !record.protected.is_empty()
-            || pruning.applied.iter().any(|known| known.id == reference.id)
-        {
-            return Err(
-                "whole-record selection requires a fully shown, unprotected Human record".into(),
-            );
-        }
+            || pruning.applied.iter().any(|known| known.id == reference.id))
+    {
+        return Err(
+            "whole-record selection requires a fully shown, unprotected Human record".into(),
+        );
     }
     if pruning
         .applied

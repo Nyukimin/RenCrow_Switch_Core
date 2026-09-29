@@ -55,7 +55,8 @@ pub fn prune_known_obsolete(
         .map(|record| (record.id.as_str(), record))
         .collect::<HashMap<_, _>>();
     let mut result = InstructionPruning::default();
-    let mut removals = BTreeMap::<String, Vec<Range<usize>>>::new();
+    // Each removal keeps the text it applies to, so applying it never looks the record up again.
+    let mut removals = BTreeMap::<String, (&str, Vec<Range<usize>>)>::new();
 
     for reference in known {
         let Some(record) = records.get(reference.id.as_str()).copied() else {
@@ -101,11 +102,12 @@ pub fn prune_known_obsolete(
         result.applied.push(reference.clone());
         removals
             .entry(record.id.clone())
-            .or_default()
+            .or_insert_with(|| (record.text.as_str(), Vec::new()))
+            .1
             .push(reference.range.start..reference.range.end);
     }
 
-    for ranges in removals.values_mut() {
+    for (_, ranges) in removals.values_mut() {
         ranges.sort_by_key(|range| (range.start, range.end));
         if ranges.windows(2).any(|pair| pair[1].start < pair[0].end) {
             return Err(
@@ -114,12 +116,9 @@ pub fn prune_known_obsolete(
         }
     }
 
-    for (id, mut ranges) in removals {
-        let record = records
-            .get(id.as_str())
-            .expect("applied source IDs came from the input record index");
+    for (id, (text, mut ranges)) in removals {
         ranges.sort_by_key(|range| std::cmp::Reverse(range.start));
-        let mut retained = record.text.clone();
+        let mut retained = text.to_owned();
         for range in ranges {
             retained.replace_range(range, "");
         }

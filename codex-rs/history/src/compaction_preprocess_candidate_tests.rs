@@ -439,11 +439,11 @@ fn instruction_presentation_hash_binds_different_pruning_ranges_with_same_retain
     );
 
     let first_hash =
-        instruction_presentation_hash(&snapshot.hash(), &first_pruning.applied, &[]).unwrap();
+        instruction_presentation_hash(snapshot.hash(), &first_pruning.applied, &[]).unwrap();
     let same_hash =
-        instruction_presentation_hash(&snapshot.hash(), &first_pruning.applied, &[]).unwrap();
+        instruction_presentation_hash(snapshot.hash(), &first_pruning.applied, &[]).unwrap();
     let second_hash =
-        instruction_presentation_hash(&snapshot.hash(), &second_pruning.applied, &[]).unwrap();
+        instruction_presentation_hash(snapshot.hash(), &second_pruning.applied, &[]).unwrap();
 
     assert_eq!(first_hash, same_hash);
     assert_ne!(first_hash, second_hash);
@@ -472,11 +472,13 @@ fn instruction_presentation_hash_binds_host_links_and_link_ranges() {
     narrower.instruction = source_ref(&source, "human-request", "Run the test suite");
 
     let full_hash =
-        instruction_presentation_hash(&snapshot_hash, &pruning.applied, &[full.clone()]).unwrap();
+        instruction_presentation_hash(snapshot_hash, &pruning.applied, std::slice::from_ref(&full))
+            .unwrap();
     let repeated_hash =
-        instruction_presentation_hash(&snapshot_hash, &pruning.applied, &[full.clone()]).unwrap();
+        instruction_presentation_hash(snapshot_hash, &pruning.applied, std::slice::from_ref(&full))
+            .unwrap();
     let narrow_hash =
-        instruction_presentation_hash(&snapshot_hash, &pruning.applied, &[narrower.clone()])
+        instruction_presentation_hash(snapshot_hash, &pruning.applied, &[narrower.clone()])
             .unwrap();
 
     assert_eq!(full_hash, repeated_hash);

@@ -243,8 +243,7 @@ fn page_slice(
         return Err("inventory offset is beyond the latest checkpoint".into());
     }
     let end = offset
-        .checked_add(INVENTORY_PAGE_SIZE)
-        .unwrap_or(usize::MAX)
+        .saturating_add(INVENTORY_PAGE_SIZE)
         .min(entries.len());
     let next_offset = (end < entries.len()).then_some(end);
     Ok((entries[offset..end].to_vec(), next_offset))

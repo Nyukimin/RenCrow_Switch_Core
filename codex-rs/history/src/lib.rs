@@ -86,13 +86,14 @@ pub struct ResponseItemEnvelope {
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
 pub struct CodexHarnessMetadata {
     /// Host proof that a text-only terminal output was replaced by a rollout reference.
+    /// Boxed, like the V2 projection below, so every history item does not carry it inline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rencrow_archive_reference: Option<archive_reference::ArchiveReference>,
+    pub rencrow_archive_reference: Option<Box<archive_reference::ArchiveReference>>,
 
     /// Host proof that a tool output body was replaced by a V2 observation marker. Kept apart
     /// from the V1 exec-only `rencrow_archive_reference`, which V2 markers never reuse.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rencrow_observation_projection: Option<observation_projection::ObservationCoverage>,
+    pub rencrow_observation_projection: Option<Box<observation_projection::ObservationCoverage>>,
 
     /// RenCrow accepted original-input reference; never sent as model instructions.
     #[serde(default, skip_serializing_if = "Option::is_none")]

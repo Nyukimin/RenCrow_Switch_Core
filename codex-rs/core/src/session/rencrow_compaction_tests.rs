@@ -104,17 +104,18 @@ async fn missing_active_task_rejects_before_persistence() {
         codex_protocol::error::CodexErrorDetails::TurnAborted
     ));
     assert!(!session.state.lock().await.rencrow_checkpoint_failed);
-    let mut state = session.state.lock().await;
-    assert_eq!(state.auto_compact_window_number(), window_number);
-    assert_eq!(state.auto_compact_window_ids(), window_ids);
-    assert_eq!(
-        state.auto_compact_window_snapshot().prefill_input_tokens,
-        Some(321)
-    );
-    assert!(state.take_new_context_window_request());
-    assert!(!state.claim_token_budget_reminder());
-    assert!(!state.claim_auto_compact_fallback());
-    drop(state);
+    {
+        let mut state = session.state.lock().await;
+        assert_eq!(state.auto_compact_window_number(), window_number);
+        assert_eq!(state.auto_compact_window_ids(), window_ids);
+        assert_eq!(
+            state.auto_compact_window_snapshot().prefill_input_tokens,
+            Some(321)
+        );
+        assert!(state.take_new_context_window_request());
+        assert!(!state.claim_token_budget_reminder());
+        assert!(!state.claim_auto_compact_fallback());
+    }
     assert_eq!(
         history_digest(before.annotated_items()).unwrap(),
         history_digest(session.clone_history().await.annotated_items()).unwrap()

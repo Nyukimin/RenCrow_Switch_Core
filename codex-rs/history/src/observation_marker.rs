@@ -46,7 +46,7 @@ pub fn observation_marker_metadata(
         return Err("observation marker source output carries RenCrow provenance".into());
     }
     metadata.history_truncation_token_limit = None;
-    metadata.rencrow_observation_projection = Some(coverage.clone());
+    metadata.rencrow_observation_projection = Some(Box::new(coverage.clone()));
     Ok(metadata)
 }
 

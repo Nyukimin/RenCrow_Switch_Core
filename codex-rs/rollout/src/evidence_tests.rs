@@ -330,7 +330,7 @@ fn prepare_compaction_sources_projects_valid_existing_marker_without_expanding_i
     );
     assert_eq!(
         prepared.pairs[0].terminal_reference,
-        Some(evidence.reference.clone())
+        Some(evidence.reference)
     );
     assert_eq!(
         prepared.pairs[0].output_total_bytes,
@@ -585,10 +585,7 @@ fn prepare_compaction_sources_protects_nonfinal_media_and_changed_selected_obser
     if let ResponseItem::CustomToolCallOutput { output, .. } = &mut media_output.item {
         *output = FunctionCallOutputPayload::from_content_items(vec![]);
     }
-    let media_selected = vec![
-        custom_call("media-custom", "read_document"),
-        media_output.clone(),
-    ];
+    let media_selected = vec![custom_call("media-custom", "read_document"), media_output];
     let media_canonical = media_selected
         .iter()
         .cloned()
@@ -783,10 +780,9 @@ fn prepare_compaction_sources_validates_unpaired_existing_markers_and_fails_clos
         &HashSet::new(),
     )
     .unwrap();
-    let mut marker = output.clone();
+    let mut marker = output;
     assert!(
-        codex_history::archive_reference::apply_reference(&mut marker, evidence.reference.clone())
-            .unwrap()
+        codex_history::archive_reference::apply_reference(&mut marker, evidence.reference).unwrap()
     );
 
     // A marker without a selected call remains protected, but its canonical evidence is checked.
@@ -923,7 +919,7 @@ fn completed_work_requires_the_exact_current_call_and_keeps_v1_lookup_compatible
         ))
     ));
 
-    let mut marker = output.clone();
+    let mut marker = output;
     assert!(
         codex_history::archive_reference::apply_reference(&mut marker, evidence.reference.clone())
             .unwrap(),
@@ -990,7 +986,7 @@ fn mismatched_thread_missing_terminal_active_and_ambiguous_are_rejected() {
         .is_err()
     );
 
-    let mut ambiguous = items.clone();
+    let mut ambiguous = items;
     ambiguous.push(RolloutItem::ResponseItem(call("call-1", "exec_command")));
     assert!(
         resolve_archive_evidence_from_items(
@@ -1008,7 +1004,7 @@ fn mismatched_thread_missing_terminal_active_and_ambiguous_are_rejected() {
 #[test]
 fn media_unknown_special_and_synthetic_terminal_results_are_rejected() {
     let (thread_id, mut items, output) = fixture(CommandExecutionStatus::Completed, Some(0));
-    let mut media = output.clone();
+    let mut media = output;
     if let ResponseItem::FunctionCallOutput { output, .. } = &mut media.item {
         *output = FunctionCallOutputPayload::from_content_items(vec![]);
     }
@@ -1040,18 +1036,17 @@ fn media_unknown_special_and_synthetic_terminal_results_are_rejected() {
     );
 
     let (thread_id, mut special, output) = fixture(CommandExecutionStatus::Completed, Some(0));
-    if let RolloutItem::ResponseItem(envelope) = &mut special[0] {
-        if let ResponseItem::FunctionCall {
+    if let RolloutItem::ResponseItem(envelope) = &mut special[0]
+        && let ResponseItem::FunctionCall {
             internal_chat_message_metadata_passthrough,
             ..
         } = &mut envelope.item
-        {
-            *internal_chat_message_metadata_passthrough =
-                Some(InternalChatMessageMetadataPassthrough {
-                    cell_id: Some("code-cell".into()),
-                    ..Default::default()
-                });
-        }
+    {
+        *internal_chat_message_metadata_passthrough =
+            Some(InternalChatMessageMetadataPassthrough {
+                cell_id: Some("code-cell".into()),
+                ..Default::default()
+            });
     }
     assert!(
         resolve_archive_evidence_from_items(
@@ -1067,10 +1062,10 @@ fn media_unknown_special_and_synthetic_terminal_results_are_rejected() {
 
     let (thread_id, mut write_stdin, output) = fixture(CommandExecutionStatus::Completed, Some(0));
     write_stdin[0] = RolloutItem::ResponseItem(call("call-1", "write_stdin"));
-    if let RolloutItem::ResponseItem(envelope) = &mut write_stdin[1] {
-        if let ResponseItem::FunctionCallOutput { name, .. } = &mut envelope.item {
-            *name = Some("write_stdin".into());
-        }
+    if let RolloutItem::ResponseItem(envelope) = &mut write_stdin[1]
+        && let ResponseItem::FunctionCallOutput { name, .. } = &mut envelope.item
+    {
+        *name = Some("write_stdin".into());
     }
     assert!(
         resolve_archive_evidence_from_items(
@@ -1217,9 +1212,11 @@ async fn persisted_lookup_rejects_hash_and_parse_corruption() {
     let (thread_id, items, _) = fixture(CommandExecutionStatus::Completed, Some(0));
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("rollout.jsonl");
-    let mut meta = SessionMeta::default();
-    meta.id = thread_id;
-    meta.session_id = thread_id.into();
+    let meta = SessionMeta {
+        id: thread_id,
+        session_id: thread_id.into(),
+        ..SessionMeta::default()
+    };
     let meta_item = RolloutItem::SessionMeta(SessionMetaLine { meta, git: None });
     let mut contents = String::new();
     for item in std::iter::once(meta_item).chain(items) {

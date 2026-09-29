@@ -161,7 +161,7 @@ pub fn classify_output(
     if let Some(reference) = envelope
         .metadata
         .as_ref()
-        .and_then(|metadata| metadata.rencrow_archive_reference.clone())
+        .and_then(|metadata| metadata.rencrow_archive_reference.as_deref().cloned())
     {
         return Ok(ArchiveOutputDecision::Existing(reference));
     }
@@ -250,7 +250,7 @@ pub fn apply_reference(
     envelope
         .metadata
         .get_or_insert_default()
-        .rencrow_archive_reference = Some(reference);
+        .rencrow_archive_reference = Some(Box::new(reference));
     Ok(true)
 }
 
@@ -286,7 +286,7 @@ pub fn validate_marker(
     let Some(metadata) = envelope.metadata.as_ref() else {
         return Err("archive reference is missing host metadata".into());
     };
-    if metadata.rencrow_archive_reference.as_ref() != Some(reference) {
+    if metadata.rencrow_archive_reference.as_deref() != Some(reference) {
         return Err("archive reference metadata does not match marker".into());
     }
     let mut remaining = metadata.clone();

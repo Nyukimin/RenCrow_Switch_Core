@@ -178,7 +178,7 @@ fn checkpoint_coverage_serializes_metadata_without_raw_or_excerpt_text() {
     assert!(coverage_json.get("tool_name").is_some());
     assert!(coverage_json.get("call").is_some());
     assert!(coverage_json.get("output").is_some());
-    assert!(!coverage_json.get("excerpts").is_some());
+    assert!(coverage_json.get("excerpts").is_none());
     assert!(!encoded_coverage.contains("CALL_SENTINEL"));
     assert!(!encoded_coverage.contains("OUTPUT_SENTINEL"));
     assert!(!encoded_coverage.contains(&call_text));

@@ -264,7 +264,7 @@ async fn rencrow_compaction_keeps_one_selected_history_through_resume_and_recomp
         compact_without_error(&test.codex).await?;
     }
     test.submit_text_turn("continue before restart").await?;
-    let path = test.codex.rollout_path().unwrap();
+    let path = test.codex.rollout_path().expect("rollout path");
     let checkpoints = checkpoint_rows(&path)?;
     assert_eq!(checkpoints.len(), 1);
     let replacement_metadata =
@@ -279,9 +279,9 @@ async fn rencrow_compaction_keeps_one_selected_history_through_resume_and_recomp
     };
     let actual = checkpoint
         .replacement_history
-        .unwrap()
+        .expect("replacement history")
         .iter()
-        .map(|envelope| serde_json::to_string(&envelope.item).unwrap())
+        .map(|envelope| serde_json::to_string(&envelope.item).expect("serialize history item"))
         .collect::<String>();
     assert!(!actual.contains("Use obsolete-label."));
     assert!(actual.contains("Keep Japanese."));
@@ -312,7 +312,7 @@ async fn rencrow_compaction_keeps_one_selected_history_through_resume_and_recomp
             .to_string()
             .contains("\"selection_mode\":\"no_candidates\"")
     );
-    let requests = seen.lock().unwrap();
+    let requests = seen.lock().expect("request log lock");
     let selections = requests
         .iter()
         .filter(|body| matches!(stage(body), Stage::Selection(_)))
@@ -328,7 +328,7 @@ async fn rencrow_compaction_keeps_one_selected_history_through_resume_and_recomp
         assert!(!summary.contains("Use obsolete-label."));
         assert!(summary.contains("Keep Japanese."));
     }
-    let last = requests.last().unwrap()["input"].to_string();
+    let last = requests.last().expect("last request")["input"].to_string();
     assert!(!last.contains("Use obsolete-label."));
     assert!(last.contains("Keep Japanese."));
     assert!(last.contains("Continue using the current label"));

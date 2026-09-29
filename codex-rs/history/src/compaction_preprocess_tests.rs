@@ -169,7 +169,7 @@ fn prune_known_obsolete_ignores_legacy_literals_and_removes_only_exact_source_re
     let obsolete = source_ref(&source, "human-1", "Use the old route");
     let before = serde_json::to_value(&source).unwrap();
 
-    let result = prune_known_obsolete(&source, &[obsolete.clone()]).unwrap();
+    let result = prune_known_obsolete(&source, std::slice::from_ref(&obsolete)).unwrap();
 
     assert_eq!(result.applied, vec![obsolete]);
     assert_eq!(
@@ -200,7 +200,7 @@ fn prune_known_obsolete_skips_missing_changed_and_reissued_sources() {
         id: "missing-id".into(),
         ..old_reference.clone()
     };
-    let refs = vec![old_reference.clone(), missing];
+    let refs = vec![old_reference, missing];
 
     let current = input(
         vec![
@@ -253,7 +253,7 @@ fn prune_known_obsolete_ignores_overlaps_from_stale_hashes_in_either_order() {
 
     for refs in [
         vec![old_reference.clone(), current_reference.clone()],
-        vec![current_reference.clone(), old_reference.clone()],
+        vec![current_reference.clone(), old_reference],
     ] {
         let result = prune_known_obsolete(&current, &refs).unwrap();
         assert_eq!(result.applied, vec![current_reference.clone()]);
@@ -424,8 +424,8 @@ fn prune_known_obsolete_is_immutable_and_returns_only_modified_human_text() {
     let human_reference = source_ref(&source, "human", "Drop the old rule");
     let before = serde_json::to_value(&source).unwrap();
 
-    let result = prune_known_obsolete(&source, &[human_reference.clone()]).unwrap();
-    let repeated = prune_known_obsolete(&source, &[human_reference.clone()]).unwrap();
+    let result = prune_known_obsolete(&source, std::slice::from_ref(&human_reference)).unwrap();
+    let repeated = prune_known_obsolete(&source, std::slice::from_ref(&human_reference)).unwrap();
 
     assert_eq!(result, repeated);
     assert_eq!(result.applied, vec![human_reference]);

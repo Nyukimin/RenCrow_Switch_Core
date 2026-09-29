@@ -288,7 +288,7 @@ pub fn prepare_compaction_sources<'a>(
         let Some(reference) = envelope
             .metadata
             .as_ref()
-            .and_then(|metadata| metadata.rencrow_archive_reference.as_ref())
+            .and_then(|metadata| metadata.rencrow_archive_reference.as_deref())
         else {
             continue;
         };
@@ -659,10 +659,10 @@ fn resolve_archive_evidence_with_index(
             error => error,
         })?;
 
-    if let ArchiveEvidenceTarget::Candidate { expected_output } = target {
-        if !same_persisted_item(&observation.output.item, &expected_output.item) {
-            return Err(target.ineligible(ArchiveEvidenceIneligibility::OutputMismatch));
-        }
+    if let ArchiveEvidenceTarget::Candidate { expected_output } = target
+        && !same_persisted_item(&observation.output.item, &expected_output.item)
+    {
+        return Err(target.ineligible(ArchiveEvidenceIneligibility::OutputMismatch));
     }
     if let ArchiveEvidenceTarget::Existing { expected_reference } = target
         && &reference != expected_reference

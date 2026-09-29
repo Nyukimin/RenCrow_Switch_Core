@@ -48,7 +48,7 @@ fn marker_metadata_keeps_bookkeeping_drops_truncation_and_rejects_provenance() {
     assert_eq!(metadata.history_truncation_token_limit, None);
     assert_eq!(
         metadata.rencrow_observation_projection,
-        Some(projection.coverage.clone())
+        Some(Box::new(projection.coverage.clone()))
     );
 
     for provenance in [
@@ -61,7 +61,7 @@ fn marker_metadata_keeps_bookkeeping_drops_truncation_and_rejects_provenance() {
             ..Default::default()
         },
         CodexHarnessMetadata {
-            rencrow_observation_projection: Some(projection.coverage.clone()),
+            rencrow_observation_projection: Some(Box::new(projection.coverage.clone())),
             ..Default::default()
         },
     ] {

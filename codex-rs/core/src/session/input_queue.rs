@@ -1,4 +1,5 @@
-// Modified by RenCrow Switch Core, 2026-09-22: serialize compaction commit with input acceptance.
+// Modified by RenCrow Switch Core, 2026-09-22: serialize compaction commit with input acceptance;
+// 2026-09-29: accept input without a panic path when taking the compaction gate.
 use crate::state::ActiveTurn;
 use crate::state::MailboxDeliveryPhase;
 use crate::state::TurnState;
@@ -92,6 +93,12 @@ struct PendingMailboxCommunication {
 }
 
 impl InputQueue {
+    /// Keeps a compaction commit out while input is accepted. The gate is never closed; if it
+    /// were, compaction could not take it either, so input is still accepted without the permit.
+    async fn hold_compaction_commit(&self) -> Option<tokio::sync::SemaphorePermit<'_>> {
+        self.compaction_gate.acquire().await.ok()
+    }
+
     pub(crate) fn new() -> Self {
         let (activity_tx, _) = watch::channel(InputQueueActivity::Mailbox);
         Self {
@@ -129,11 +136,7 @@ impl InputQueue {
         communication: InterAgentCommunication,
         start_options: TurnStartOptions,
     ) {
-        let _commit_guard = self
-            .compaction_gate
-            .acquire()
-            .await
-            .expect("compaction gate is never closed");
+        let _commit_guard = self.hold_compaction_commit().await;
         self.mailbox_pending_mails
             .lock()
             .await
@@ -269,11 +272,7 @@ impl InputQueue {
         turn_state: &Mutex<TurnState>,
         input: Vec<TurnInput>,
     ) {
-        let _commit_guard = self
-            .compaction_gate
-            .acquire()
-            .await
-            .expect("compaction gate is never closed");
+        let _commit_guard = self.hold_compaction_commit().await;
         {
             let mut turn_state = turn_state.lock().await;
             turn_state.pending_input.items.extend(input);

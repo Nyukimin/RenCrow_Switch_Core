@@ -82,7 +82,7 @@ fn apply_reference_is_smaller_and_records_typed_host_metadata() {
     assert!(marker.contains("\"retrieval_argv\""));
     assert_eq!(
         envelope.metadata.unwrap().rencrow_archive_reference,
-        Some(reference)
+        Some(Box::new(reference))
     );
 }
 
@@ -167,14 +167,14 @@ fn a_marker_without_typed_metadata_is_not_an_existing_reference() {
     ));
     assert!(validate_marker(&forged, &reference.thread_id, &reference).is_err());
     forged.metadata = Some(CodexHarnessMetadata {
-        rencrow_archive_reference: Some(ArchiveReference::new(
+        rencrow_archive_reference: Some(Box::new(ArchiveReference::new(
             "00000000-0000-0000-0000-000000000001",
             "call-1",
             content_sha256(&reference.marker().unwrap()),
             ArchiveTerminalStatus::Completed,
             0,
             None,
-        )),
+        ))),
         ..Default::default()
     });
     assert!(matches!(
@@ -207,7 +207,7 @@ fn realistic_fallback_budget_metadata_is_ordinary_and_preserved() {
     assert_eq!(
         envelope.metadata,
         Some(CodexHarnessMetadata {
-            rencrow_archive_reference: Some(reference.clone()),
+            rencrow_archive_reference: Some(Box::new(reference.clone())),
             history_truncation_token_limit: Some(4800),
             ..Default::default()
         })
@@ -256,7 +256,7 @@ fn marker_thread_and_terminal_consistency_are_validated() {
     );
     let mut envelope = output("call-1", &reference.marker().unwrap());
     envelope.metadata = Some(CodexHarnessMetadata {
-        rencrow_archive_reference: Some(reference.clone()),
+        rencrow_archive_reference: Some(Box::new(reference.clone())),
         ..Default::default()
     });
     assert!(
@@ -278,7 +278,7 @@ fn marker_thread_and_terminal_consistency_are_validated() {
     );
     let mut contradictory_envelope = output("call-1", &contradictory.marker().unwrap());
     contradictory_envelope.metadata = Some(CodexHarnessMetadata {
-        rencrow_archive_reference: Some(contradictory.clone()),
+        rencrow_archive_reference: Some(Box::new(contradictory.clone())),
         ..Default::default()
     });
     assert!(

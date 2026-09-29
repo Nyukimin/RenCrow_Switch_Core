@@ -222,7 +222,7 @@ fn versioned_review_receipts_preserve_v1_and_make_v2_absence_explicit() {
         input.assemble(&missing_summary_hash).unwrap_err(),
         "summary validation failed"
     );
-    let mut stale_summary_hash = current.clone();
+    let mut stale_summary_hash = current;
     stale_summary_hash.summary_hash = Some("stale".into());
     assert_eq!(
         input.assemble(&stale_summary_hash).unwrap_err(),
