@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-09-29: initialize the fork-owned Config fields.
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::io::IsTerminal;
@@ -225,6 +226,9 @@ fn new_config(model: Option<String>, arg0_paths: Arg0DispatchPaths) -> anyhow::R
         orchestrator_mcp_enabled: false,
         include_environment_context: false,
         compact_prompt: None,
+        rencrow_compaction: false,
+        rencrow_tool_allowlist: None,
+        rencrow_read_only: false,
         notify: None,
         tui_notifications: TuiNotificationSettings::default(),
         animations: true,
