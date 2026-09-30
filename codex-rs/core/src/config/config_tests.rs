@@ -11725,6 +11725,33 @@ include_instructions = false
 }
 
 #[tokio::test]
+async fn rencrow_thread_title_reasoning_effort_is_read_from_config() -> std::io::Result<()> {
+    let codex_home = TempDir::new()?;
+    let build = |codex_home: &TempDir| {
+        ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .fallback_cwd(Some(codex_home.path().to_path_buf()))
+            .build()
+    };
+
+    let unset = build(&codex_home).await?;
+    std::fs::write(
+        codex_home.path().join(CONFIG_TOML_FILE),
+        "rencrow_thread_title_reasoning_effort = \"low\"\n",
+    )?;
+    let set = build(&codex_home).await?;
+
+    assert_eq!(
+        (
+            unset.rencrow_thread_title_reasoning_effort,
+            set.rencrow_thread_title_reasoning_effort
+        ),
+        (None, Some(ReasoningEffort::Low))
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn approvals_reviewer_stays_manual_only_when_guardian_feature_is_enabled()
 -> std::io::Result<()> {
     let codex_home = TempDir::new()?;

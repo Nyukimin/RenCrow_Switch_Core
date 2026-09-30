@@ -735,6 +735,10 @@ pub struct Config {
     /// Set only by an agent role file: narrow this agent's sandbox to read-only.
     pub rencrow_read_only: bool,
 
+    /// Reasoning effort for automatic thread titles generated on the session's own model;
+    /// `None` keeps the session's effort.
+    pub rencrow_thread_title_reasoning_effort: Option<ReasoningEffort>,
+
     /// Optional external notifier command. When set, Codex will spawn this
     /// program after each completed *turn* (i.e. when the agent finishes
     /// processing a user submission). The value must be the full command
@@ -4253,6 +4257,7 @@ impl Config {
             rencrow_tool_allowlist: cfg.rencrow_tool_allowlist,
             // Only an agent role file narrows the sandbox; a top-level value is ignored.
             rencrow_read_only: false,
+            rencrow_thread_title_reasoning_effort: cfg.rencrow_thread_title_reasoning_effort,
             include_permissions_instructions,
             include_apps_instructions,
             include_collaboration_mode_instructions,

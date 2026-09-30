@@ -284,6 +284,10 @@ pub struct ConfigToml {
     /// Agent role files only: run the role's agents with a read-only sandbox (ROLE_TOOL_POLICY.md).
     pub rencrow_read_only: Option<bool>,
 
+    /// Reasoning effort for automatic thread titles generated on the session's own model. Unset
+    /// keeps the session's effort; the dedicated title model always uses `low`.
+    pub rencrow_thread_title_reasoning_effort: Option<ReasoningEffort>,
+
     /// When set, restricts ChatGPT login to one or more workspace identifiers.
     #[serde(default)]
     pub forced_chatgpt_workspace_id: Option<ForcedChatgptWorkspaceIds>,

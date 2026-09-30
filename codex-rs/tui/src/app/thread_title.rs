@@ -98,8 +98,12 @@ impl App {
         } else {
             self.chat_widget.current_model().to_string()
         };
-        let effort = (model == THREAD_TITLE_MODEL).then_some(ReasoningEffort::Low);
         let config = self.chat_widget.config_ref();
+        let effort = if model == THREAD_TITLE_MODEL {
+            Some(ReasoningEffort::Low)
+        } else {
+            config.rencrow_thread_title_reasoning_effort.clone()
+        };
         let options = TemporaryStructuredThreadOptions {
             thread_source: ThreadSource::Feature("thread_title".to_string()),
             model,

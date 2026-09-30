@@ -229,6 +229,7 @@ fn new_config(model: Option<String>, arg0_paths: Arg0DispatchPaths) -> anyhow::R
         rencrow_compaction: false,
         rencrow_tool_allowlist: None,
         rencrow_read_only: false,
+        rencrow_thread_title_reasoning_effort: None,
         notify: None,
         tui_notifications: TuiNotificationSettings::default(),
         animations: true,

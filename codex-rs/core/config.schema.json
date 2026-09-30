@@ -7407,6 +7407,14 @@
       "description": "Agent role files only: run the role's agents with a read-only sandbox (ROLE_TOOL_POLICY.md).",
       "type": "boolean"
     },
+    "rencrow_thread_title_reasoning_effort": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/ReasoningEffort"
+        }
+      ],
+      "description": "Reasoning effort for automatic thread titles generated on the session's own model. Unset keeps the session's effort; the dedicated title model always uses `low`."
+    },
     "rencrow_tool_allowlist": {
       "description": "Tools shown to the model and accepted when called (ROLE_TOOL_POLICY.md). Each entry is a default-namespace tool name or `namespace::name`. Unset keeps every tool; an agent role file narrows it and cannot add tools.",
       "items": {
