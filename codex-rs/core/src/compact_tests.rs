@@ -23,6 +23,40 @@ use pretty_assertions::assert_eq;
 use serde_json::json;
 use test_case::test_case;
 
+#[test]
+fn compaction_route_prioritizes_rencrow_over_provider_remote_capability() {
+    assert_eq!(
+        compaction_route(true, false, RemoteCompactionSupport::V2),
+        Ok(CompactionRoute::RenCrowV2),
+    );
+    assert_eq!(
+        compaction_route(true, false, RemoteCompactionSupport::Unsupported),
+        Ok(CompactionRoute::RenCrowV2),
+    );
+    assert_eq!(
+        compaction_route(false, false, RemoteCompactionSupport::V2),
+        Ok(CompactionRoute::RemoteV2),
+    );
+    assert_eq!(
+        compaction_route(false, false, RemoteCompactionSupport::Unsupported),
+        Ok(CompactionRoute::Local),
+    );
+    assert_eq!(
+        compaction_route(true, true, RemoteCompactionSupport::V2),
+        Err(
+            "RenCrow compaction requires local Responses without TokenBudget; no legacy fallback was applied"
+        ),
+    );
+    assert_eq!(
+        compaction_error_message_prefix(Ok(CompactionRoute::RenCrowV2)),
+        None,
+    );
+    assert_eq!(
+        compaction_error_message_prefix(Ok(CompactionRoute::RemoteV2)),
+        Some("Error running remote compact task"),
+    );
+}
+
 #[test_case(true; "metadata enabled")]
 #[test_case(false; "metadata disabled after capture")]
 #[tokio::test]

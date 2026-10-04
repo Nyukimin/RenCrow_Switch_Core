@@ -79,7 +79,6 @@ use codex_features::Feature;
 use codex_file_system::FindUpErrorPolicy;
 use codex_file_system::find_nearest_ancestor_with_markers;
 use codex_login::CodexAuth;
-use codex_model_provider::RemoteCompactionSupport;
 use codex_protocol::ResponseItemId;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::config_types::ModeKind;
@@ -210,10 +209,13 @@ pub(crate) async fn run_turn(
             .await;
         // Publish the failure only after prompt hooks finish, so clients cannot react to
         // an error by steering follow-up input into a turn still preserving its prompt.
-        let message_prefix = match turn_context.provider.capabilities().remote_compaction {
-            RemoteCompactionSupport::V2 => Some("Error running remote compact task".to_string()),
-            RemoteCompactionSupport::Unsupported => None,
-        };
+        let message_prefix =
+            crate::compact::compaction_error_message_prefix(crate::compact::compaction_route(
+                turn_context.config.rencrow_compaction,
+                turn_context.config.features.enabled(Feature::TokenBudget),
+                turn_context.provider.capabilities().remote_compaction,
+            ))
+            .map(str::to_owned);
         sess.send_event(
             turn_context.as_ref(),
             EventMsg::Error(err.to_error_event(message_prefix)),
@@ -1453,29 +1455,38 @@ async fn run_auto_compact(
 ) -> CodexResult<()> {
     let turn_context = &step_context.turn;
     let _profile_guard = turn_context.turn_timing_state.begin_compaction();
-    if turn_context.config.rencrow_compaction
-        && (turn_context.config.features.enabled(Feature::TokenBudget)
-            || !matches!(
-                turn_context.provider.capabilities().remote_compaction,
-                RemoteCompactionSupport::Unsupported
-            ))
-    {
-        return Err(codex_protocol::error::CodexErr::Stream("RenCrow compaction requires local Responses without TokenBudget; no legacy fallback was applied".into()));
-    }
-    if turn_context.config.features.enabled(Feature::TokenBudget) {
-        // Compaction is the reset request, so force a new context window
-        // instead of consuming a pending `new_context` tool request.
-        crate::compact_token_budget::run_inline_auto_compact_task(
-            Arc::clone(sess),
-            step_context,
-            initial_context_injection,
-        )
-        .await?;
-        return Ok(());
-    }
-
-    match turn_context.provider.capabilities().remote_compaction {
-        RemoteCompactionSupport::V2 => {
+    match crate::compact::compaction_route(
+        turn_context.config.rencrow_compaction,
+        turn_context.config.features.enabled(Feature::TokenBudget),
+        turn_context.provider.capabilities().remote_compaction,
+    ) {
+        Err(message) => Err(codex_protocol::error::CodexErr::Stream(message.into())),
+        Ok(crate::compact::CompactionRoute::TokenBudget) => {
+            // Compaction is the reset request, so force a new context window
+            // instead of consuming a pending `new_context` tool request.
+            crate::compact_token_budget::run_inline_auto_compact_task(
+                Arc::clone(sess),
+                step_context,
+                initial_context_injection,
+            )
+            .await
+        }
+        Ok(crate::compact::CompactionRoute::RenCrowV2 | crate::compact::CompactionRoute::Local) => {
+            emit_compact_metric(
+                &sess.services.session_telemetry,
+                "local",
+                /*manual*/ false,
+            );
+            run_inline_auto_compact_task(
+                Arc::clone(sess),
+                Arc::clone(turn_context),
+                initial_context_injection,
+                reason,
+                phase,
+            )
+            .await
+        }
+        Ok(crate::compact::CompactionRoute::RemoteV2) => {
             emit_compact_metric(
                 &sess.services.session_telemetry,
                 "remote_v2",
@@ -1490,25 +1501,9 @@ async fn run_auto_compact(
                 reason,
                 phase,
             )
-            .await?;
-        }
-        RemoteCompactionSupport::Unsupported => {
-            emit_compact_metric(
-                &sess.services.session_telemetry,
-                "local",
-                /*manual*/ false,
-            );
-            run_inline_auto_compact_task(
-                Arc::clone(sess),
-                Arc::clone(turn_context),
-                initial_context_injection,
-                reason,
-                phase,
-            )
-            .await?;
+            .await
         }
     }
-    Ok(())
 }
 
 pub(super) fn collect_explicit_app_ids_from_skill_items(

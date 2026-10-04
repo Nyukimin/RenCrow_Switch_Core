@@ -8,8 +8,6 @@ use crate::session::TurnInput;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::state::TaskKind;
-use codex_features::Feature;
-use codex_model_provider::RemoteCompactionSupport;
 use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::user_input::UserInput;
 use tokio_util::sync::CancellationToken;
@@ -34,22 +32,19 @@ impl SessionTask for CompactTask {
         _cancellation_token: CancellationToken,
     ) -> SessionTaskResult {
         let _profile_guard = ctx.turn_timing_state.begin_compaction();
-        if ctx.config.rencrow_compaction
-            && (ctx.config.features.enabled(Feature::TokenBudget)
-                || !matches!(
-                    ctx.provider.capabilities().remote_compaction,
-                    RemoteCompactionSupport::Unsupported
-                ))
-        {
-            return Err(codex_protocol::error::CodexErr::Stream("RenCrow compaction requires local Responses without TokenBudget; no legacy fallback was applied".into()));
-        }
-        if ctx.config.features.enabled(Feature::TokenBudget) {
-            crate::compact_token_budget::run_manual_compact_task(session, ctx).await?;
-            return Ok(None);
-        }
-
-        let result = match ctx.provider.capabilities().remote_compaction {
-            RemoteCompactionSupport::V2 => {
+        let result = match crate::compact::compaction_route(
+            ctx.config.rencrow_compaction,
+            ctx.config
+                .features
+                .enabled(codex_features::Feature::TokenBudget),
+            ctx.provider.capabilities().remote_compaction,
+        ) {
+            Err(message) => return Err(codex_protocol::error::CodexErr::Stream(message.into())),
+            Ok(crate::compact::CompactionRoute::TokenBudget) => {
+                crate::compact_token_budget::run_manual_compact_task(session, ctx).await?;
+                return Ok(None);
+            }
+            Ok(crate::compact::CompactionRoute::RemoteV2) => {
                 emit_compact_metric(
                     &session.services.session_telemetry,
                     "remote_v2",
@@ -57,7 +52,9 @@ impl SessionTask for CompactTask {
                 );
                 crate::compact_remote_v2::run_remote_compact_task(session.clone(), ctx).await
             }
-            RemoteCompactionSupport::Unsupported => {
+            Ok(
+                crate::compact::CompactionRoute::RenCrowV2 | crate::compact::CompactionRoute::Local,
+            ) => {
                 emit_compact_metric(
                     &session.services.session_telemetry,
                     "local",

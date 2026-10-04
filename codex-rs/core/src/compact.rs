@@ -34,6 +34,7 @@ use codex_context_fragments::AnnotatedContent;
 use codex_context_fragments::set_annotated_content;
 use codex_history::CodexHarnessMetadata;
 use codex_history::ResponseItemEnvelope;
+use codex_model_provider::RemoteCompactionSupport;
 use codex_protocol::ResponseItemId;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::CodexErrorDetails;
@@ -59,6 +60,42 @@ use tracing::error;
 pub use codex_prompts::SUMMARIZATION_PROMPT;
 pub use codex_prompts::SUMMARY_PREFIX;
 const COMPACT_USER_MESSAGE_MAX_TOKENS: usize = 20_000;
+
+const RENCROW_COMPACTION_CONFLICT: &str = "RenCrow compaction requires local Responses without TokenBudget; no legacy fallback was applied";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompactionRoute {
+    RenCrowV2,
+    TokenBudget,
+    RemoteV2,
+    Local,
+}
+
+pub(crate) fn compaction_route(
+    rencrow_compaction: bool,
+    token_budget_enabled: bool,
+    remote_compaction: RemoteCompactionSupport,
+) -> Result<CompactionRoute, &'static str> {
+    if rencrow_compaction && token_budget_enabled {
+        return Err(RENCROW_COMPACTION_CONFLICT);
+    }
+    if token_budget_enabled {
+        return Ok(CompactionRoute::TokenBudget);
+    }
+    if rencrow_compaction {
+        return Ok(CompactionRoute::RenCrowV2);
+    }
+    Ok(match remote_compaction {
+        RemoteCompactionSupport::V2 => CompactionRoute::RemoteV2,
+        RemoteCompactionSupport::Unsupported => CompactionRoute::Local,
+    })
+}
+
+pub(crate) fn compaction_error_message_prefix(
+    route: Result<CompactionRoute, &'static str>,
+) -> Option<&'static str> {
+    matches!(route, Ok(CompactionRoute::RemoteV2)).then_some("Error running remote compact task")
+}
 
 /// Controls whether compaction replacement history must include initial context.
 ///
