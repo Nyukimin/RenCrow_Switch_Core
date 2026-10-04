@@ -8,6 +8,7 @@ use codex_history::compaction_preprocess::prune_known_obsolete;
 use codex_history::compaction_selection::InstructionSelectionApplication;
 use codex_protocol::ResponseItemId;
 use codex_protocol::models::ContentItemKind;
+use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::InternalChatMessageMetadataPassthrough;
 use codex_rollout::PreparedCompactionSourcePair;
@@ -89,6 +90,7 @@ fn pair<'a>(
     call_id: &str,
     call_text: &'a str,
     output_text: &'a str,
+    tool_name: &'a str,
     kind: PreparedCompactionReferenceKind,
 ) -> PreparedCompactionSourcePair<'a> {
     PreparedCompactionSourcePair {
@@ -97,7 +99,7 @@ fn pair<'a>(
         reference: ObservationReference::new(THREAD_ID, call_id, content_sha256(output_text)),
         reference_kind: kind,
         output_total_bytes: output_text.len(),
-        tool_name: "exec_command",
+        tool_name,
         canonical_call_input: Some(call_text),
         canonical_output_text: Some(Cow::Borrowed(output_text)),
         terminal_reference: None,
@@ -119,6 +121,7 @@ struct Fixture {
     large_output: String,
     early_call: String,
     large_call: String,
+    large_tool_name: &'static str,
 }
 
 impl Fixture {
@@ -148,6 +151,7 @@ impl Fixture {
             large_output,
             early_call,
             large_call,
+            large_tool_name: "exec_command",
         }
     }
 
@@ -159,6 +163,7 @@ impl Fixture {
                     "early",
                     &self.early_call,
                     &self.early_output,
+                    "exec_command",
                     PreparedCompactionReferenceKind::Fresh,
                 ),
                 pair(
@@ -166,11 +171,43 @@ impl Fixture {
                     "large",
                     &self.large_call,
                     &self.large_output,
+                    self.large_tool_name,
                     PreparedCompactionReferenceKind::Fresh,
                 ),
             ],
             protected_indices: vec![0, 1, 4, 5, 8],
         }
+    }
+
+    fn with_large_structured_output() -> Self {
+        let mut fixture = Self::new();
+        let items = vec![
+            FunctionCallOutputContentItem::InputText {
+                text: format!("HEAD{}", "x".repeat(10_000)),
+            },
+            FunctionCallOutputContentItem::InputText {
+                text: format!("{}TAIL", "x".repeat(10_000)),
+            },
+        ];
+        fixture.large_output = serde_json::to_string(&items).unwrap();
+        fixture.large_tool_name = "read_document";
+        fixture.originals[6] = ResponseItemEnvelope::new(ResponseItem::CustomToolCall {
+            id: Some(ResponseItemId::from_server("large-item".into())),
+            status: Some("completed".into()),
+            call_id: "large".into(),
+            name: fixture.large_tool_name.into(),
+            namespace: None,
+            input: fixture.large_call.clone(),
+            internal_chat_message_metadata_passthrough: None,
+        });
+        fixture.originals[7] = ResponseItemEnvelope::new(ResponseItem::CustomToolCallOutput {
+            id: Some(ResponseItemId::from_server("large-output-item".into())),
+            call_id: "large".into(),
+            name: Some(fixture.large_tool_name.into()),
+            output: FunctionCallOutputPayload::from_content_items(items),
+            internal_chat_message_metadata_passthrough: None,
+        });
+        fixture
     }
 }
 
@@ -416,6 +453,31 @@ fn emergency_references_outputs_the_previous_checkpoint_kept() {
         ),
         vec![7]
     );
+}
+
+#[test]
+fn emergency_marks_fresh_all_input_text_structured_output_and_shrinks() {
+    let fixture = Fixture::with_large_structured_output();
+    let prepared = prepare(&fixture);
+    assert_eq!(marker_indices(&prepared.markers), vec![7]);
+    assert!(matches!(
+        &fixture.originals[7].item,
+        ResponseItem::CustomToolCallOutput { output, .. }
+            if output.content_items().is_some_and(|items| items.iter().all(|item| matches!(
+                item,
+                FunctionCallOutputContentItem::InputText { .. }
+            )))
+    ));
+
+    let plan = plan(&fixture, &prepared);
+    let candidate = plan.build(&[]).unwrap();
+    plan.validate(&[], &candidate).unwrap();
+    let marker = candidate
+        .iter()
+        .find(|envelope| item_id(envelope) == Some("large-output-item"))
+        .expect("structured output");
+    let body = live_output_text(marker).expect("Emergency replaces it with a text marker");
+    assert!(body.len() < fixture.large_output.len());
 }
 
 #[test]

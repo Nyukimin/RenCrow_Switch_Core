@@ -106,9 +106,14 @@ pub(super) fn select_observation_markers(
             (PreparedCompactionReferenceKind::Fresh, false) => projection.clone(),
             _ => continue,
         };
-        if live_output_text(&originals[*output_index])
-            .is_some_and(|text| observation_marker_body(&marker).len() < text.len())
-        {
+        let live_text = live_output_text(&originals[*output_index]).or_else(|| {
+            if pair.reference_kind == PreparedCompactionReferenceKind::Fresh {
+                pair.canonical_output_text.as_deref()
+            } else {
+                None
+            }
+        });
+        if live_text.is_some_and(|text| observation_marker_body(&marker).len() < text.len()) {
             markers.push((*output_index, marker));
         }
     }
