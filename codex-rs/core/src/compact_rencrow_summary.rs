@@ -287,7 +287,7 @@ pub(super) struct ImportantRefResolution {
 ///
 /// Malformed, unknown, or ambiguous markers are ignored and counted; ordinary prose such as
 /// `key observation: ...` is not a marker. Resolved references are deduplicated in first order.
-/// Also handles continuation patterns like `observation:"call_A", "call_B", "call_C"`.
+/// A marker may list more IDs directly after its string, as in `observation:"a", "b"`.
 pub(super) fn important_refs_from_summary(
     summary_text: &str,
     inventory: &[ObservationReference],
@@ -296,71 +296,74 @@ pub(super) fn important_refs_from_summary(
     let mut rest = summary_text;
     while let Some(position) = rest.find(IMPORTANT_REF_MARKER) {
         let literal = &rest[position + IMPORTANT_REF_MARKER.len() - 1..];
-        let mut escaped = false;
-        let closing = literal.char_indices().skip(1).find(|(_, ch)| {
-            let closes = !escaped && *ch == '"';
-            escaped = !escaped && *ch == '\\';
-            closes
-        });
-        let Some((end, _)) = closing else {
+        let Some(end) = json_string_end(literal) else {
             resolution.ignored_markers += 1;
             break;
         };
+        rest = &literal[end + 1..];
         let Ok(call_id) = serde_json::from_str::<String>(&literal[..=end]) else {
             resolution.ignored_markers += 1;
-            rest = &literal[end + 1..];
             continue;
         };
+        resolution.record(&call_id, inventory);
+        rest = resolution.record_listed_ids(rest, inventory);
+    }
+    resolution
+}
+
+impl ImportantRefResolution {
+    fn record(&mut self, call_id: &str, inventory: &[ObservationReference]) {
         let mut matches = inventory
             .iter()
             .filter(|reference| reference.call_id == call_id);
         match (matches.next(), matches.next()) {
             (Some(reference), None) => {
-                if !resolution.refs.contains(reference) {
-                    resolution.refs.push(reference.clone());
+                if !self.refs.contains(reference) {
+                    self.refs.push(reference.clone());
                 }
             }
-            (None, _) | (Some(_), Some(_)) => resolution.ignored_markers += 1,
+            (None, _) | (Some(_), Some(_)) => self.ignored_markers += 1,
         }
-
-        // Check for continuation: , "call_B", "call_C", ...
-        let mut continuation = &literal[end + 1..];
-        while let Some(comma_pos) = continuation.find(',') {
-            let after_comma = continuation[comma_pos + 1..].trim_start();
-            if !after_comma.starts_with('"') {
-                break;
-            }
-            let continuation_literal = after_comma;
-            let mut escaped = false;
-            let closing = continuation_literal.char_indices().skip(1).find(|(_, ch)| {
-                let closes = !escaped && *ch == '"';
-                escaped = !escaped && *ch == '\\';
-                closes
-            });
-            let Some((cont_end, _)) = closing else {
-                break;
-            };
-            let Ok(cont_call_id) = serde_json::from_str::<String>(&continuation_literal[..=cont_end]) else {
-                resolution.ignored_markers += 1;
-                continuation = &continuation_literal[cont_end + 1..];
-                continue;
-            };
-            let mut cont_matches = inventory
-                .iter()
-                .filter(|reference| reference.call_id == cont_call_id);
-            match (cont_matches.next(), cont_matches.next()) {
-                (Some(reference), None) => {
-                    if !resolution.refs.contains(reference) {
-                        resolution.refs.push(reference.clone());
-                    }
-                }
-                (None, _) | (Some(_), Some(_)) => resolution.ignored_markers += 1,
-            }
-            continuation = &continuation_literal[cont_end + 1..];
-        }
-        rest = continuation;
     }
-    resolution
+
+    /// Record `, "<call_id>"` items that directly follow a marker and return the text after them.
+    fn record_listed_ids<'a>(
+        &mut self,
+        mut rest: &'a str,
+        inventory: &[ObservationReference],
+    ) -> &'a str {
+        loop {
+            let Some(item) = rest.trim_start().strip_prefix(',').map(str::trim_start) else {
+                return rest;
+            };
+            let Some(end) = json_string_end(item) else {
+                return rest;
+            };
+            let literal = &item[..=end];
+            // An unclosed quote in prose would otherwise swallow the next marker's opening quote.
+            if literal.contains(IMPORTANT_REF_MARKER) {
+                return rest;
+            }
+            let Ok(call_id) = serde_json::from_str::<String>(literal) else {
+                return rest;
+            };
+            self.record(&call_id, inventory);
+            rest = &item[end + 1..];
+        }
+    }
+}
+
+/// Byte index of the closing quote of the JSON string that starts `text`.
+fn json_string_end(text: &str) -> Option<usize> {
+    if !text.starts_with('"') {
+        return None;
+    }
+    let mut escaped = false;
+    text.char_indices().skip(1).find_map(|(index, ch)| {
+        let closes = !escaped && ch == '"';
+        escaped = !escaped && ch == '\\';
+        closes.then_some(index)
+    })
 }
 
 /// Keep compaction-only server reasoning metadata out of the live context policy.

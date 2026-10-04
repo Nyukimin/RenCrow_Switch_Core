@@ -1,7 +1,7 @@
 # ForkのローカルbuildとCodex-switch接続
 
 2026-09-22。Linuxでの初回試行用。非公式Forkであり、公開release・三OSの受入完了を意味しない。
-「再現条件」は2026-09-22の初回build（独自Compaction処理なし）の記録である。現在の稼働binaryは新方式の通常Compactionを含む（SHA-256 `3f6d6d61bd176ee08e65c0a486a4dfc3a9aceb7c6cbbcfc7024305ea87ad03b9`、source記録は私有の`target/fork-bootstrap/compaction-runtime-deploy/candidate.json`）。最新sourceの実装状況はCOMPACTION_SPEC.mdの「実装状態」を参照。build完了・接続の実測結果はLLM ownerの監督検証記録で管理する。
+「再現条件」は2026-09-22の初回build（独自Compaction処理なし）の記録である。当時の配備binary SHA-256は`3f6d6d61bd176ee08e65c0a486a4dfc3a9aceb7c6cbbcfc7024305ea87ad03b9`で、source記録は私有の`target/fork-bootstrap/compaction-runtime-deploy/candidate.json`にある。現行sourceのV2実装状態は[Compaction仕様](COMPACTION_SPEC.md#第3部-現在の実装状態2026-09-25)を参照。利用中binaryの版と接続は起動時に実測し、過去のSHAから推定しない。
 
 ## 再現条件
 
@@ -47,8 +47,8 @@ cargo +1.95.0 build --locked --profile fork-deploy -j 2 -p codex-cli --bin codex
 2. `~/.local/bin/rencrow-switch-core`という別名へ導入する。公式`codex`は置換しない。
 3. 新規環境はRenCrow_LLMの`examples/codex/install.sh`でlauncherとassetsを配備する。
    既存profile/catalogに運用設定がある場合は、それを保全してwrapperだけを更新する。
-   RenCrow targetは`RENCROW_CODEX_BIN`の明示指定、PATHの`rencrow-switch-core`、公式`codex`の順に選択する。
-   `openai` targetは公式版を使う。Windowsではlauncher選択契約を共有するが、native確認は別途必要。
+   現行のlauncherは全Codex targetで`rencrow-switch-core`を要求し、公式`codex`へfallbackしない。
+   Windowsでも同じ起動先契約を使い、native確認は別途行う。
 4. 旧Codexのwriterを停止し、専用CODEX_HOMEのsession・設定・SQLiteを私有領域へbackupする。
    認証情報を複製しない。同じsessionを新旧同時に開かない。
 5. 同じsessionをresumeし、実processの実行ファイル、model、Gateway経路、sandboxとapproval、実tool結果を確認する。
@@ -88,10 +88,7 @@ launcherによるprofile再生成後も維持する運用設定は`CODEX_HOME/co
 rencrow_compaction = true
 ```
 
-`/compact`とlocalの自動Compactionが同じ検証済みpipelineを利用する。
-要約生成は1要求で、モデルにWork ID全件の転記を求めない。host-bound `summary_hash`、coverage、invalidation検査と保存barrier成功後だけ通常履歴へ採用する。人間由来入力がある場合のplan提案・意味reviewは維持する。summary reviewは自動実行せず、bundleには`summary_review: null`を未実施receiptとして保存する。
-remote V2 / TokenBudgetとの併用は拒否し、旧方式へ暗黙fallbackしない。
-sourceにあるV2（8工程）の部品はこの経路にまだ接続されていない。この設定で動くのは上記の現行経路である。
+`/compact`とlocalの自動CompactionがV2のruntime経路を利用する。V2が失敗した場合に上流Compactionへ暗黙fallbackしない。実装状態、失敗status、受入範囲は[Compaction仕様](COMPACTION_SPEC.md#第3部-現在の実装状態2026-09-25)を参照する。
 `--rencrow-input-author human`は利用者による直接投稿の受付を申告する設定。
 Astra等による代理操作は`automation`を指定する。旧記録・照合不一致を本人入力と推定しない。
 

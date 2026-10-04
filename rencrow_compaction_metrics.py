@@ -353,10 +353,7 @@ def main():
                         )
                         print(
                             "stages tok/sec:",
-                            [
-                                s["output_tok_per_wall_second"]
-                                for s in c["stages"]
-                            ],
+                            [s["output_tok_per_wall_second"] for s in c["stages"]],
                         )
                     print(
                         "Adjacent requests are not a controlled comparison. Quality: independent review.",

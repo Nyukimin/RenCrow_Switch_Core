@@ -754,6 +754,53 @@ fn v2_important_refs_do_not_promote_an_inventory_without_explicit_markers() {
 }
 
 #[test]
+fn v2_important_refs_resolve_ids_listed_directly_after_one_marker() {
+    let reference =
+        |call_id: &str| ObservationReference::new(THREAD_ID, call_id, content_sha256(call_id));
+    let inventory = [
+        reference("call_a"),
+        reference("call_b"),
+        reference("call_c"),
+    ];
+    let resolution = |indexes: &[usize], ignored_markers| super::summary::ImportantRefResolution {
+        refs: indexes
+            .iter()
+            .map(|&index| inventory[index].clone())
+            .collect(),
+        ignored_markers,
+    };
+
+    assert_eq!(
+        super::summary::important_refs_from_summary(
+            r#"Evidence: observation:"call_a", "call_b" , "missing","call_c"."#,
+            &inventory,
+        ),
+        resolution(&[0, 1, 2], 1)
+    );
+    assert_eq!(
+        super::summary::important_refs_from_summary(
+            r#"observation:"call_a" then observation:"call_b", "call_c""#,
+            &inventory,
+        ),
+        resolution(&[0, 1, 2], 0)
+    );
+    assert_eq!(
+        super::summary::important_refs_from_summary(
+            r#"observation:"call_a". Edited file, "call_b" too."#,
+            &inventory,
+        ),
+        resolution(&[0], 0)
+    );
+    assert_eq!(
+        super::summary::important_refs_from_summary(
+            r#"observation:"call_a", "unterminated observation:"call_b""#,
+            &inventory,
+        ),
+        resolution(&[0, 1], 0)
+    );
+}
+
+#[test]
 fn fork_auxiliary_server_reasoning_metadata_does_not_change_active_context_policy() {
     // This pure dispatch-policy case does not claim an SSE fixture exercises the actual
     // Responses websocket ServerReasoningIncluded event. The drain integration still needs that

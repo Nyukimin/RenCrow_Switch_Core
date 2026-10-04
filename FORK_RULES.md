@@ -6,7 +6,7 @@
 
 - Fork: `Nyukimin/RenCrow_Switch_Core`。上流: `openai/codex`。
 - 作成時の上流基点: `94174e44cbc54cece45f6052328ca0c2cd7a8a2a`（`main`）。これは開発基点であり、安定版・動作検証済み版の宣言ではない。
-- 独自差分はFork運用文書と入口、および履歴ownerのCompaction整理案検証・選別処理。新方式のlocal Compactionへの接続を実装・Linux配備済み。共有Qwen sessionで圧縮・通常ツール・cold resumeを確認済み。受入範囲は[Compaction仕様](COMPACTION_SPEC.md)を参照。V2（8工程）の部品はsourceにあるが、runtime未接続・未配備（同仕様の「実装状態」）。役割ごとの許可toolとsandboxの縮小は[役割toolの仕様](ROLE_TOOL_POLICY.md)を参照。TUIの自動thread題名を選択中のModelで作る場合のreasoning effortは`rencrow_thread_title_reasoning_effort`で指定でき、未指定なら上流どおりsessionのeffortを使う（上流は題名専用Modelだけ`low`）。2026-09-22にLinuxの`dev-small` buildを`rencrow-switch-core`としてローカル配備し、Codex-switchから既存Qwen sessionをresumeした。公開release・三OS受入完了ではない。[build・切替手順](FORK_BUILD.md)を参照。
+- 独自差分はFork運用文書と入口、および履歴ownerのCompaction V2。`rencrow_compaction = true`ではV2のruntime経路を使用する。実装・配備と受入範囲は[Compaction仕様の現在の実装状態](COMPACTION_SPEC.md#第3部-現在の実装状態2026-09-25)を参照。役割ごとの許可toolとsandboxの縮小は[役割toolの仕様](ROLE_TOOL_POLICY.md)を参照。TUIの自動thread題名を選択中のModelで作る場合のreasoning effortは`rencrow_thread_title_reasoning_effort`で指定でき、未指定なら上流どおりsessionのeffortを使う（上流は題名専用Modelだけ`low`）。公開release・三OS受入完了ではない。[build・切替手順](FORK_BUILD.md)を参照。
 - このrepositoryはCodexクライアント本体の派生実装を所有する。既存Codex-switchのlauncher、Gateway、Backend、RenCrowのIdentity移行とは所有範囲を分ける。
 - RenCrow共通作業ルールを受領している環境ではそれを継承し、本文・モデル役割を複製しない。上流由来の実装規約は[AGENTS.md](AGENTS.md)、build入口は[docs/install.md](docs/install.md)を参照する。
 

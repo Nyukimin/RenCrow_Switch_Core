@@ -98,12 +98,10 @@ def v2_prepared(selection_mode="model_selection", responses=None):
     return {
         "type": "compacted",
         "timestamp": "2026-09-23",
-        "payload": {
-            "replacement_history_metadata": [
-                {"rencrow_compaction": metadata}
-            ]
-        },
+        "payload": {"replacement_history_metadata": [{"rencrow_compaction": metadata}]},
     }
+
+
 class MeasurementTests(unittest.TestCase):
     def test_deduplication_and_stage_cost_not_added_twice(self):
         m = Metrics()
@@ -301,7 +299,9 @@ class MeasurementTests(unittest.TestCase):
                     stream.write(json.dumps(row) + "\n")
             output = io.StringIO()
             with patch.object(sys, "argv", ["metrics", rollout, "--watch"]):
-                with patch("rencrow_compaction_metrics.time.sleep", side_effect=StopWatch):
+                with patch(
+                    "rencrow_compaction_metrics.time.sleep", side_effect=StopWatch
+                ):
                     with redirect_stdout(output), self.assertRaises(StopWatch):
                         metrics_main()
         self.assertIn("stages tok/sec: [None]", output.getvalue())
