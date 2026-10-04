@@ -13,6 +13,7 @@ use codex_protocol::models::InternalChatMessageMetadataPassthrough;
 use codex_rollout::PreparedCompactionSourcePair;
 use pretty_assertions::assert_eq;
 use serde_json::json;
+use std::borrow::Cow;
 
 const THREAD_ID: &str = "thread-v2-emergency";
 const SMALL_OUTPUT: &str = "ok";
@@ -98,7 +99,7 @@ fn pair<'a>(
         output_total_bytes: output_text.len(),
         tool_name: "exec_command",
         canonical_call_input: Some(call_text),
-        canonical_output_text: Some(output_text),
+        canonical_output_text: Some(Cow::Borrowed(output_text)),
         terminal_reference: None,
     }
 }

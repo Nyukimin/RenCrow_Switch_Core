@@ -10,6 +10,7 @@ use codex_history::archive_reference::content_sha256;
 use codex_history::observation_marker::observation_marker_body;
 use codex_history::observation_marker::observation_marker_metadata;
 use codex_protocol::ThreadId;
+use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseItem;
 use pretty_assertions::assert_eq;
@@ -63,6 +64,19 @@ fn custom_output(call_id: &str, body: &str) -> ResponseItemEnvelope {
         call_id: call_id.into(),
         name: Some("read_document".into()),
         output: FunctionCallOutputPayload::from_text(body.into()),
+        internal_chat_message_metadata_passthrough: None,
+    })
+}
+
+fn custom_content_output(
+    call_id: &str,
+    items: Vec<FunctionCallOutputContentItem>,
+) -> ResponseItemEnvelope {
+    ResponseItemEnvelope::new(ResponseItem::CustomToolCallOutput {
+        id: None,
+        call_id: call_id.into(),
+        name: Some("read_document".into()),
+        output: FunctionCallOutputPayload::from_content_items(items),
         internal_chat_message_metadata_passthrough: None,
     })
 }
@@ -159,10 +173,65 @@ fn verified_function_and_custom_markers_reuse_canonical_raw_text() {
         );
         assert_eq!(pair.reference.sha256, content_sha256(&raw));
         assert_eq!(pair.canonical_call_input, Some(CALL_INPUT));
-        assert_eq!(pair.canonical_output_text, Some(raw.as_str()));
+        assert_eq!(pair.canonical_output_text.as_deref(), Some(raw.as_str()));
         assert_eq!(pair.output_total_bytes, raw.len());
         assert!(prepared.protected_indices.is_empty());
     }
+}
+
+#[test]
+fn structured_input_text_marker_reuses_the_same_canonical_projection() {
+    let thread = ThreadId::from_u128(52_005);
+    let items = vec![
+        FunctionCallOutputContentItem::InputText {
+            text: "first block".into(),
+        },
+        FunctionCallOutputContentItem::InputText {
+            text: "second block".into(),
+        },
+    ];
+    let canonical_call = custom_call("structured-marker");
+    let canonical_output = custom_content_output("structured-marker", items.clone());
+    let canonical_text = serde_json::to_string(&items).unwrap();
+    let reference = ObservationReference::new(
+        thread.to_string(),
+        "structured-marker",
+        content_sha256(&canonical_text),
+    );
+    let projection = codex_history::project_observation(
+        &reference,
+        "read_document",
+        CALL_INPUT,
+        &canonical_text,
+    )
+    .unwrap();
+    let marker = marker_with(&canonical_output, &projection);
+    let canonical = vec![
+        RolloutItem::ResponseItem(canonical_call.clone()),
+        RolloutItem::ResponseItem(canonical_output),
+    ];
+
+    let prepared = prepare_compaction_sources(
+        &[canonical_call, marker],
+        &canonical,
+        &thread,
+        &HashSet::new(),
+    )
+    .unwrap();
+
+    assert_eq!(prepared.pairs.len(), 1);
+    assert_eq!(
+        prepared.pairs[0].reference.sha256,
+        content_sha256(&canonical_text)
+    );
+    assert_eq!(
+        prepared.pairs[0].canonical_output_text.as_deref(),
+        Some(canonical_text.as_str())
+    );
+    assert_eq!(
+        prepared.pairs[0].reference_kind,
+        PreparedCompactionReferenceKind::ObservationMarker
+    );
 }
 
 /// Part 3, 2026-09-29: a reference marker is regenerated from the canonical call and output
@@ -194,7 +263,7 @@ fn reference_markers_verify_against_canonical_raw_and_reject_changes() {
         pair.reference_kind,
         PreparedCompactionReferenceKind::ObservationMarker
     );
-    assert_eq!(pair.canonical_output_text, Some(raw.as_str()));
+    assert_eq!(pair.canonical_output_text.as_deref(), Some(raw.as_str()));
     assert_eq!(pair.output_total_bytes, raw.len());
 
     // A reference marker must claim the canonical output length.

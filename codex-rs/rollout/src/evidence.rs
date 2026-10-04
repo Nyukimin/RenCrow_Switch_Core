@@ -25,10 +25,12 @@ pub use observation_index::IndexedObservationRef;
 pub use observation_index::ObservationIndex;
 pub use observation_index::ObservationPart;
 pub use observation_index::ObservationRange;
+use observation_index::canonical_text_output;
 use observation_index::passthrough;
 use observation_index::same_fresh_output_except_text_body;
 use observation_index::same_output_identity_ignoring_body;
 use observation_index::same_persisted_item;
+use std::borrow::Cow;
 
 pub const MAX_ARCHIVE_EVIDENCE_BYTES: usize = 1024 * 1024;
 
@@ -246,11 +248,13 @@ pub struct PreparedCompactionSourcePair<'a> {
     /// Original canonical output byte length, borrowed from the same verified index entry.
     /// This scalar lets history project an existing marker without materializing its raw body.
     pub output_total_bytes: usize,
-    /// Canonical text fields borrowed from the rollout only for fresh pairs. Existing markers
-    /// deliberately carry no raw body and must use the existing-reference projection path.
+    /// Canonical call text is borrowed from the rollout. Output text is borrowed for plain text
+    /// bodies and owned for the deterministic projection of structured text-only content items.
+    /// Existing archive markers deliberately carry no raw body and must use the existing-reference
+    /// projection path.
     pub tool_name: &'a str,
     pub canonical_call_input: Option<&'a str>,
-    pub canonical_output_text: Option<&'a str>,
+    pub canonical_output_text: Option<Cow<'a, str>>,
     /// Present only for verified `exec_command` observations. This is transient validation data;
     /// V2 persists the generic output reference and must not add a legacy V1 marker.
     pub terminal_reference: Option<ArchiveReference>,
@@ -388,7 +392,7 @@ pub fn prepare_compaction_sources<'a>(
         } else {
             PreparedCompactionReferenceKind::Fresh
         };
-        let (reference, terminal_reference, canonical_observation, fresh_source) =
+        let (reference, terminal_reference, canonical_observation, canonical_call_input) =
             if let Some(reference) = &existing_references[output_index] {
                 let observation = match canonical_index.get(call_id) {
                     Ok(observation) => observation,
@@ -420,7 +424,7 @@ pub fn prepare_compaction_sources<'a>(
                 let terminal_reference = if canonical_observation.tool_name == "exec_command" {
                     match canonical_index.terminal_reference_for_observation(
                         &canonical_reference,
-                        canonical_observation,
+                        &canonical_observation,
                     ) {
                         Ok(reference) => Some(reference),
                         Err(ArchiveEvidenceError::Invalid(reason)) => return Err(reason.into()),
@@ -454,12 +458,16 @@ pub fn prepare_compaction_sources<'a>(
                     canonical_reference,
                     terminal_reference,
                     canonical_observation,
-                    Some((canonical_call_input, canonical_observation.body)),
+                    Some(canonical_call_input),
                 )
             };
         if !same_persisted_item(&canonical_observation.call.item, &selected_call.item) {
             continue;
         }
+        let output_total_bytes = canonical_observation.body.len();
+        let tool_name = canonical_observation.tool_name;
+        let canonical_output_text = (reference_kind == PreparedCompactionReferenceKind::Fresh)
+            .then_some(canonical_observation.body);
         paired_indices[call_index] = true;
         paired_indices[output_index] = true;
         pairs.push(PreparedCompactionSourcePair {
@@ -467,10 +475,10 @@ pub fn prepare_compaction_sources<'a>(
             output_index,
             reference,
             reference_kind,
-            output_total_bytes: canonical_observation.body.len(),
-            tool_name: canonical_observation.tool_name,
-            canonical_call_input: fresh_source.map(|(input, _)| input),
-            canonical_output_text: fresh_source.map(|(_, output)| output),
+            output_total_bytes,
+            tool_name,
+            canonical_call_input,
+            canonical_output_text,
             terminal_reference,
         });
     }
@@ -535,7 +543,7 @@ fn prepare_observation_marker<'a>(
     .ok_or_else(|| "V2 observation marker body is not text".to_owned())?;
     if !same_persisted_item(&observation.call.item, &call.item)
         || !same_harness_metadata(observation.call.metadata.as_ref(), call.metadata.as_ref())
-        || !same_fresh_output_except_text_body(&output.item, &observation.output.item)
+        || !same_output_identity_ignoring_body(&output.item, &observation.output.item)
     {
         return Err("V2 observation marker identity differs from its canonical source".into());
     }
@@ -548,7 +556,9 @@ fn prepare_observation_marker<'a>(
         .and_then(|metadata| metadata.rencrow_observation_projection.as_deref())
         .is_some_and(|coverage| coverage.output.presented_ranges.is_empty());
     let regenerated = if reference_marker {
-        if codex_history::archive_reference::content_sha256(observation.body) != reference.sha256 {
+        if codex_history::archive_reference::content_sha256(observation.body.as_ref())
+            != reference.sha256
+        {
             return Err("V2 reference marker digest differs from its canonical output".into());
         }
         codex_history::project_existing_observation(
@@ -562,7 +572,7 @@ fn prepare_observation_marker<'a>(
             &reference,
             observation.tool_name,
             call_text,
-            observation.body,
+            observation.body.as_ref(),
         )?
     };
     codex_history::observation_marker::verify_observation_marker(
@@ -572,7 +582,7 @@ fn prepare_observation_marker<'a>(
         marker_body,
     )?;
     let terminal_reference = if observation.tool_name == "exec_command" {
-        match canonical_index.terminal_reference_for_observation(&reference, observation) {
+        match canonical_index.terminal_reference_for_observation(&reference, &observation) {
             Ok(reference) => Some(reference),
             Err(ArchiveEvidenceError::Invalid(reason)) => return Err(reason.into()),
             Err(ArchiveEvidenceError::Ineligible(_)) => None,
@@ -630,17 +640,9 @@ fn fresh_output_matches(
         return false;
     }
     codex_utils_output_truncation::truncate_text(
-        canonical_text,
+        canonical_text.as_ref(),
         TruncationPolicy::Tokens(token_limit),
-    ) == selected_text
-}
-
-fn canonical_text_output(item: &ResponseItem) -> Option<&str> {
-    match item {
-        ResponseItem::FunctionCallOutput { output, .. }
-        | ResponseItem::CustomToolCallOutput { output, .. } => output.text_content(),
-        _ => None,
-    }
+    ) == selected_text.as_ref()
 }
 
 fn resolve_archive_evidence_from_items_inner(
@@ -695,7 +697,7 @@ fn resolve_archive_evidence_with_index(
     Ok(ArchiveEvidence {
         reference,
         tool_name: observation.tool_name.to_owned(),
-        result: observation.body.to_owned(),
+        result: observation.body.into_owned(),
     })
 }
 

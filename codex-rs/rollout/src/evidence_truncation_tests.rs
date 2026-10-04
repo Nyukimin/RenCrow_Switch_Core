@@ -109,7 +109,7 @@ fn fresh_function_pair_accepts_exact_live_truncation_and_binds_raw_canonical_byt
     assert_eq!(pair.output_total_bytes, raw.len());
     assert_eq!(pair.tool_name, "read_document");
     assert_eq!(pair.canonical_call_input, Some("{\"path\":\"a\"}"));
-    let canonical_text = pair.canonical_output_text.unwrap();
+    let canonical_text = pair.canonical_output_text.as_deref().unwrap();
     let canonical_body = match &canonical[1] {
         RolloutItem::ResponseItem(envelope) => match &envelope.item {
             ResponseItem::FunctionCallOutput { output, .. } => output.text_content().unwrap(),
@@ -174,7 +174,11 @@ fn fresh_custom_pair_accepts_exact_live_truncation_and_keeps_raw_reference() {
         _ => unreachable!(),
     };
     assert!(std::ptr::eq(
-        prepared.pairs[0].canonical_output_text.unwrap().as_ptr(),
+        prepared.pairs[0]
+            .canonical_output_text
+            .as_deref()
+            .unwrap()
+            .as_ptr(),
         canonical_body.as_ptr()
     ));
 }

@@ -33,6 +33,7 @@ use codex_rollout::PreparedCompactionReferenceKind;
 use codex_rollout::PreparedCompactionSourcePair;
 use codex_rollout::PreparedCompactionSources;
 use serde_json::json;
+use std::borrow::Cow;
 
 const THREAD_ID: &str = "thread-v2-orchestration";
 
@@ -383,7 +384,7 @@ fn v2_generic_capture_projects_large_custom_tool_input_from_canonical_raw_pair()
             output_total_bytes: canonical_output.len(),
             tool_name: "custom_read",
             canonical_call_input: Some(&canonical_call),
-            canonical_output_text: Some(&canonical_output),
+            canonical_output_text: Some(Cow::Borrowed(canonical_output.as_str())),
             terminal_reference: None,
         }],
         protected_indices: vec![3],
@@ -462,7 +463,7 @@ fn v2_verified_pair_capture_keeps_full_text_only_for_bounded_pairs() {
                 output_total_bytes: small_output.len(),
                 tool_name: "exec_command",
                 canonical_call_input: Some(small_call),
-                canonical_output_text: Some(small_output),
+                canonical_output_text: Some(Cow::Borrowed(small_output)),
                 terminal_reference: None,
             },
             PreparedCompactionSourcePair {
@@ -473,7 +474,7 @@ fn v2_verified_pair_capture_keeps_full_text_only_for_bounded_pairs() {
                 output_total_bytes: large_output.len(),
                 tool_name: "read_file",
                 canonical_call_input: Some(large_call),
-                canonical_output_text: Some(&large_output),
+                canonical_output_text: Some(Cow::Borrowed(large_output.as_str())),
                 terminal_reference: None,
             },
             PreparedCompactionSourcePair {
@@ -970,7 +971,7 @@ fn prepared_pair<'a>(
         output_total_bytes,
         tool_name: "exec_command",
         canonical_call_input: texts.map(|(call, _)| call),
-        canonical_output_text: texts.map(|(_, output)| output),
+        canonical_output_text: texts.map(|(_, output)| Cow::Borrowed(output)),
         terminal_reference: None,
     }
 }

@@ -35,16 +35,18 @@ pub(super) fn verified_pair_projections(
         .pairs
         .iter()
         .map(|pair| {
-            let (call_text, output_text) =
-                match (pair.canonical_call_input, pair.canonical_output_text) {
-                    (Some(call), Some(output))
-                        if call.len() <= OBSERVATION_PART_FULL_LIMIT_BYTES
-                            && output.len() <= OBSERVATION_PART_FULL_LIMIT_BYTES =>
-                    {
-                        (call.to_owned(), output.to_owned())
-                    }
-                    _ => (String::new(), String::new()),
-                };
+            let (call_text, output_text) = match (
+                pair.canonical_call_input,
+                pair.canonical_output_text.as_deref(),
+            ) {
+                (Some(call), Some(output))
+                    if call.len() <= OBSERVATION_PART_FULL_LIMIT_BYTES
+                        && output.len() <= OBSERVATION_PART_FULL_LIMIT_BYTES =>
+                {
+                    (call.to_owned(), output.to_owned())
+                }
+                _ => (String::new(), String::new()),
+            };
             CompletedWorkProjection {
                 call_index: pair.call_index,
                 output_index: pair.output_index,

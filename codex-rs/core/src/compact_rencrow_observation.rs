@@ -46,9 +46,10 @@ pub(super) fn project_unhandled_observations(
             // A verified V2 marker is re-projected from its canonical raw text, like a fresh pair.
             PreparedCompactionReferenceKind::Fresh
             | PreparedCompactionReferenceKind::ObservationMarker => {
-                let (Some(call_text), Some(output_text)) =
-                    (pair.canonical_call_input, pair.canonical_output_text)
-                else {
+                let (Some(call_text), Some(output_text)) = (
+                    pair.canonical_call_input,
+                    pair.canonical_output_text.as_deref(),
+                ) else {
                     return Err("fresh observation has no canonical call or output text".into());
                 };
                 project_observation(reference, pair.tool_name, call_text, output_text)?

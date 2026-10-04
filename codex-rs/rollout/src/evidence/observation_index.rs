@@ -16,6 +16,7 @@ use codex_protocol::items::CommandExecutionStatus;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt;
@@ -55,22 +56,23 @@ struct IndexedObservation<'a> {
 
 /// Borrowed call/output index for batch projection and rollout retrieval.
 ///
-/// Construction visits the rollout once and never copies response bodies. Callers can retain
-/// the index while validating multiple references or retrieving raw call/output envelopes.
-/// `ObservationReference.sha256` hashes only the output text, not call arguments.
+/// Construction visits the rollout once and never copies raw response bodies. Callers can retain
+/// the index while validating multiple references or retrieving raw call/output envelopes;
+/// text-only structured outputs use an owned canonical projection when needed.
+/// `ObservationReference.sha256` hashes only the canonical output text, not call arguments.
 pub struct ObservationIndex<'a> {
     by_call_id: HashMap<String, IndexedObservation<'a>>,
     thread_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct IndexedObservationRef<'a> {
     pub call_index: usize,
     pub output_index: usize,
     pub call: &'a ResponseItemEnvelope,
     pub output: &'a ResponseItemEnvelope,
     pub tool_name: &'a str,
-    pub body: &'a str,
+    pub body: Cow<'a, str>,
     kind: ToolCallKind,
     terminal: Option<&'a codex_protocol::items::CommandExecutionItem>,
 }
@@ -287,9 +289,9 @@ impl<'a> ObservationIndex<'a> {
                 ArchiveEvidenceIneligibility::NonFinalTerminal,
             ));
         }
-        let body = text_output(&output.envelope.item).ok_or(ArchiveEvidenceError::Ineligible(
-            ArchiveEvidenceIneligibility::NonTextOutput,
-        ))?;
+        let body = canonical_text_output(&output.envelope.item).ok_or(
+            ArchiveEvidenceError::Ineligible(ArchiveEvidenceIneligibility::NonTextOutput),
+        )?;
         if call.name == "exec_command" {
             if call.kind != ToolCallKind::Function {
                 return Err(ArchiveEvidenceError::Ineligible(
@@ -363,7 +365,7 @@ impl<'a> ObservationIndex<'a> {
             ObservationReference::new(
                 thread_id.to_string(),
                 call_id.to_owned(),
-                content_sha256(observation.body),
+                content_sha256(observation.body.as_ref()),
             ),
             observation,
         ))
@@ -388,7 +390,7 @@ impl<'a> ObservationIndex<'a> {
             ));
         }
         let observation = self.get(&reference.call_id)?;
-        if content_sha256(observation.body) != reference.sha256 {
+        if content_sha256(observation.body.as_ref()) != reference.sha256 {
             return Err(ArchiveEvidenceError::Invalid(
                 "observation output hash does not match persisted reference",
             ));
@@ -428,7 +430,7 @@ impl<'a> ObservationIndex<'a> {
                     ));
                 }
             },
-            ObservationPart::Output => observation.body,
+            ObservationPart::Output => observation.body.as_ref(),
         };
         if content_sha256(text) != part_sha256 {
             return Err(ArchiveEvidenceError::Invalid(
@@ -471,7 +473,7 @@ impl<'a> ObservationIndex<'a> {
             ));
         }
         let reference =
-            self.terminal_reference_for_observation(&observation_reference, observation)?;
+            self.terminal_reference_for_observation(&observation_reference, &observation)?;
         Ok((reference, observation))
     }
 
@@ -480,7 +482,7 @@ impl<'a> ObservationIndex<'a> {
     pub(super) fn terminal_reference_for_observation(
         &self,
         observation_reference: &ObservationReference,
-        observation: IndexedObservationRef<'a>,
+        observation: &IndexedObservationRef<'a>,
     ) -> Result<ArchiveReference, ArchiveEvidenceError> {
         let indexed_thread = self.thread_id.as_deref();
         let call_id = match &observation.call.item {
@@ -495,7 +497,7 @@ impl<'a> ObservationIndex<'a> {
         if indexed_thread != Some(observation_reference.thread_id.as_str())
             || call_id != &observation_reference.call_id
             || observation_reference.call_id.is_empty()
-            || content_sha256(observation.body) != observation_reference.sha256
+            || content_sha256(observation.body.as_ref()) != observation_reference.sha256
         {
             return Err(ArchiveEvidenceError::Invalid(
                 "observation reference does not match indexed exec pair",
@@ -565,10 +567,31 @@ pub(super) fn passthrough(
     }
 }
 
-fn text_output(item: &ResponseItem) -> Option<&str> {
+/// Return the exact text representation used by observation references.
+///
+/// Plain text output keeps its existing borrowed body. Structured output is eligible only when
+/// every block is `InputText`; its compact JSON serialization preserves block boundaries without
+/// changing the canonical rollout item. Any media or encrypted block remains protected.
+pub(super) fn canonical_text_output(item: &ResponseItem) -> Option<Cow<'_, str>> {
     match item {
         ResponseItem::FunctionCallOutput { output, .. }
-        | ResponseItem::CustomToolCallOutput { output, .. } => output.text_content(),
+        | ResponseItem::CustomToolCallOutput { output, .. } => {
+            if let Some(text) = output.text_content() {
+                return Some(Cow::Borrowed(text));
+            }
+            let items = output.content_items()?;
+            if items.is_empty()
+                || !items.iter().all(|item| {
+                    matches!(
+                        item,
+                        codex_protocol::models::FunctionCallOutputContentItem::InputText { .. }
+                    )
+                })
+            {
+                return None;
+            }
+            serde_json::to_string(items).ok().map(Cow::Owned)
+        }
         _ => None,
     }
 }
@@ -681,6 +704,27 @@ pub(super) fn same_output_identity_ignoring_body(
                 && actual_call_id == expected_call_id
                 && actual_name == expected_name
                 && actual_namespace == expected_namespace
+                && actual_passthrough == expected_passthrough
+        }
+        (
+            ResponseItem::CustomToolCallOutput {
+                id: actual_id,
+                call_id: actual_call_id,
+                name: actual_name,
+                internal_chat_message_metadata_passthrough: actual_passthrough,
+                ..
+            },
+            ResponseItem::CustomToolCallOutput {
+                id: expected_id,
+                call_id: expected_call_id,
+                name: expected_name,
+                internal_chat_message_metadata_passthrough: expected_passthrough,
+                ..
+            },
+        ) => {
+            actual_id == expected_id
+                && actual_call_id == expected_call_id
+                && actual_name == expected_name
                 && actual_passthrough == expected_passthrough
         }
         _ => false,

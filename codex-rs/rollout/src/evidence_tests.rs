@@ -10,6 +10,7 @@ use codex_protocol::ThreadId;
 use codex_protocol::items::CommandExecutionItem;
 use codex_protocol::items::CommandExecutionStatus;
 use codex_protocol::items::TurnItem;
+use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::InternalChatMessageMetadataPassthrough;
 use codex_protocol::models::ResponseItem;
@@ -19,6 +20,7 @@ use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use pretty_assertions::assert_eq;
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::time::Duration;
 
@@ -71,6 +73,19 @@ fn custom_output(call_id: &str, name: Option<&str>, body: &str) -> ResponseItemE
         call_id: call_id.into(),
         name: name.map(str::to_owned),
         output: FunctionCallOutputPayload::from_text(body.into()),
+        internal_chat_message_metadata_passthrough: None,
+    })
+}
+
+fn custom_output_items(
+    call_id: &str,
+    items: Vec<FunctionCallOutputContentItem>,
+) -> ResponseItemEnvelope {
+    ResponseItemEnvelope::new(ResponseItem::CustomToolCallOutput {
+        id: None,
+        call_id: call_id.into(),
+        name: Some("read_document".into()),
+        output: FunctionCallOutputPayload::from_content_items(items),
         internal_chat_message_metadata_passthrough: None,
     })
 }
@@ -201,18 +216,142 @@ fn prepare_compaction_sources_projects_verified_nonadjacent_completed_pairs() {
                 )),
                 tool_name: "exec_command",
                 canonical_call_input: Some("{}"),
-                canonical_output_text: Some(match &selected[2].item {
+                canonical_output_text: Some(Cow::Borrowed(match &selected[2].item {
                     ResponseItem::FunctionCallOutput { output, .. } => {
                         output.text_content().unwrap()
                     }
                     _ => unreachable!(),
-                }),
+                })),
             }]
         );
         assert_eq!(prepared.protected_indices, vec![1]);
         assert_eq!(selected, selected_before);
         assert_eq!(serde_json::to_value(&canonical).unwrap(), canonical_before);
     }
+}
+
+#[test]
+fn prepare_compaction_sources_projects_multi_input_text_custom_output_with_stable_boundaries() {
+    let thread = ThreadId::from_u128(48);
+    let items = vec![
+        FunctionCallOutputContentItem::InputText {
+            text: "first block".into(),
+        },
+        FunctionCallOutputContentItem::InputText {
+            text: "second block".into(),
+        },
+    ];
+    let canonical_call = custom_call("content-text", "read_document");
+    let canonical_output = custom_output_items("content-text", items.clone());
+    let canonical = vec![
+        RolloutItem::ResponseItem(canonical_call.clone()),
+        RolloutItem::ResponseItem(canonical_output.clone()),
+    ];
+    let raw_before = serde_json::to_value(&canonical).unwrap();
+    let expected = serde_json::to_string(&items).unwrap();
+
+    let prepared = prepare_compaction_sources(
+        &[canonical_call, canonical_output],
+        &canonical,
+        &thread,
+        &HashSet::new(),
+    )
+    .unwrap();
+
+    assert_eq!(prepared.pairs.len(), 1);
+    assert!(prepared.protected_indices.is_empty());
+    assert_eq!(
+        prepared.pairs[0].reference.sha256,
+        content_sha256(&expected)
+    );
+    assert_eq!(
+        prepared.pairs[0].canonical_output_text.as_deref(),
+        Some(expected.as_str())
+    );
+    assert_eq!(serde_json::to_value(&canonical).unwrap(), raw_before);
+}
+
+#[test]
+fn content_item_observation_hash_and_range_resolution_are_repeatable() {
+    let thread = ThreadId::from_u128(49);
+    let items = vec![
+        FunctionCallOutputContentItem::InputText {
+            text: "first".into(),
+        },
+        FunctionCallOutputContentItem::InputText {
+            text: "second".into(),
+        },
+    ];
+    let canonical = vec![
+        RolloutItem::ResponseItem(custom_call("repeat-content", "read_document")),
+        RolloutItem::ResponseItem(custom_output_items("repeat-content", items.clone())),
+    ];
+    let expected = serde_json::to_string(&items).unwrap();
+    let index = ObservationIndex::new(&canonical, &thread);
+    let first = index
+        .reference("repeat-content", &thread, &HashSet::new())
+        .unwrap()
+        .0;
+    let second = index
+        .reference("repeat-content", &thread, &HashSet::new())
+        .unwrap()
+        .0;
+    assert_eq!(first, second);
+    assert_eq!(first.sha256, content_sha256(&expected));
+
+    let resolved = index.resolve_reference(&first, &HashSet::new()).unwrap();
+    assert_eq!(resolved.body.as_ref(), expected.as_str());
+    let range = index
+        .resolve_range(
+            &first,
+            &HashSet::new(),
+            super::ObservationPart::Output,
+            0,
+            expected.len(),
+            &content_sha256(&expected),
+        )
+        .unwrap();
+    assert_eq!(range.text, expected);
+}
+
+#[test]
+fn prepare_compaction_sources_protects_mixed_content_item_output() {
+    let thread = ThreadId::from_u128(50);
+    let canonical_call = custom_call("mixed-content", "read_document");
+    let canonical_output = custom_output_items(
+        "mixed-content",
+        vec![
+            FunctionCallOutputContentItem::InputText {
+                text: "caption".into(),
+            },
+            FunctionCallOutputContentItem::InputImage {
+                image: codex_protocol::models::ImageReference::Inline {
+                    image_url: "data:image/png;base64,AQ==".into(),
+                },
+                detail: None,
+            },
+            FunctionCallOutputContentItem::InputAudio {
+                audio_url: "data:audio/wav;base64,AQ==".into(),
+            },
+            FunctionCallOutputContentItem::EncryptedContent {
+                encrypted_content: "opaque".into(),
+            },
+        ],
+    );
+    let canonical = vec![
+        RolloutItem::ResponseItem(canonical_call.clone()),
+        RolloutItem::ResponseItem(canonical_output.clone()),
+    ];
+    let prepared = prepare_compaction_sources(
+        &[canonical_call, canonical_output],
+        &canonical,
+        &thread,
+        &HashSet::new(),
+    )
+    .unwrap();
+
+    assert!(prepared.pairs.is_empty());
+    assert_eq!(prepared.protected_indices, vec![0, 1]);
 }
 
 #[test]
