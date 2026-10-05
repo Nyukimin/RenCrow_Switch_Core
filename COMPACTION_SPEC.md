@@ -2278,6 +2278,46 @@ session-localのみ。
 * stable source identity contradiction
 * replay後も再現するdeterministic canonical mismatch
 
+### 57.1 Canonical rollout telemetry discard boundary (2026-10-05)
+
+`RolloutRecorder::load_rollout_items` is the single owner for canonical rollout parsing. Its
+returned `items` and `parse_errors` are authoritative for V2 and archive evidence retrieval;
+`evidence.rs` and the V2 compaction loader must not introduce another parser or repair the source
+file. Authoritative history corruption remains fail closed.
+
+Only non-authoritative usage/speed telemetry is discardable when its identity is unambiguous:
+
+* top-level `type: "token_usage_record"` with a direct object `payload`;
+* top-level `type: "event_msg"` with a direct object `payload.type: "token_count"`.
+
+Valid records in this allowlist are retained unchanged. A schema-invalid record in the allowlist,
+or structural EOF after the canonical timestamp/header and discriminator have been parsed while an
+actual telemetry body field value parser is still incomplete, is omitted from `items` and does not
+increment `parse_errors`. EOF while waiting for the next body key, in a partial key, or before a
+field value begins remains an authoritative parse error. This is
+`metrics_missing`: consumers may report that usage/rate data is unavailable, but must not invent
+zero counts or infer a successful measurement. Warnings are bounded metadata only: telemetry kind,
+source line number, and a short reason; raw bodies are never emitted.
+
+Structural parsing uses Serde's actual envelope. Header errors, duplicate or conflicting
+discriminators (including equal duplicates), missing or partial discriminators, nested/quoted
+`token_count` text, invalid non-EOF syntax, and concatenated/trailing records remain parse errors.
+The public strict `parse_rollout_line` API is unchanged. Original rollout bytes are never rewritten.
+
+Failure Knowledge:
+
+* Failure: corrupt telemetry blocked the full V2 load.
+* Problem: missing usage/rate telemetry made an otherwise authoritative rollout fail closed.
+* Cause: corruption origin is unknown.
+* Lesson: classify only the explicit telemetry envelope at the canonical loader boundary.
+* Invariant: authoritative history and source identity errors remain fail closed; allowlisted
+  malformed telemetry alone yields `metrics_missing`.
+* Enforcement: structural Serde envelope inspection, duplicate-discriminator rejection, and the
+  single `load_rollout_items` owner path.
+* Tests: truncated and schema-invalid telemetry discard; valid telemetry, critical records,
+  duplicates, misleading nested text, trailing data, unchanged bytes, and archive evidence
+  retrieval are covered by `codex-rollout` tests.
+
 ---
 
 ## 58. Persistence classification

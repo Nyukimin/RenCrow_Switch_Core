@@ -61,6 +61,9 @@ use crate::RolloutItem;
 use crate::config::RolloutConfigView;
 use crate::state_db;
 use crate::state_db::StateDbHandle;
+use crate::telemetry_discard::LineInspection;
+use crate::telemetry_discard::has_valid_rollout_header;
+use crate::telemetry_discard::inspect_line;
 use codex_git_utils::collect_git_info;
 use codex_git_utils::get_git_repo_root;
 use codex_protocol::protocol::GitInfo as ProtocolGitInfo;
@@ -1098,15 +1101,26 @@ impl RolloutRecorder {
         let mut parse_errors = 0usize;
         let mut reader = compression::open_rollout_line_reader(path).await?;
         let mut saw_non_empty_line = false;
+        let mut line_number = 0usize;
         while let Some(line) = reader.next_line().await? {
+            line_number = line_number.saturating_add(1);
             if line.trim().is_empty() {
                 continue;
             }
             saw_non_empty_line = true;
-            let mut value: Value = match serde_json::from_str(&line) {
-                Ok(value) => value,
-                Err(e) => {
-                    warn!("failed to parse line as JSON: {line:?}, error: {e}");
+            let (mut value, telemetry) = match inspect_line(&line) {
+                LineInspection::Parsed { value, telemetry } => (value, telemetry),
+                LineInspection::Discard { kind, reason } => {
+                    warn!(
+                        kind = kind.label(),
+                        line = line_number,
+                        reason,
+                        "discarded malformed telemetry"
+                    );
+                    continue;
+                }
+                LineInspection::Invalid { reason } => {
+                    warn!(line = line_number, reason = %reason, "failed to parse rollout line");
                     parse_errors = parse_errors.saturating_add(1);
                     continue;
                 }
@@ -1122,11 +1136,21 @@ impl RolloutRecorder {
                 reject_unknown_thread_history_mode(&value)?;
             }
 
+            let header_valid = has_valid_rollout_header(&value);
             let rollout_line = match crate::decode_rollout_line(value) {
                 Ok(rollout_line) => rollout_line,
                 Err(e) => {
-                    trace!("failed to parse rollout line: {e}");
-                    parse_errors = parse_errors.saturating_add(1);
+                    if let Some(kind) = telemetry.filter(|_| header_valid) {
+                        warn!(
+                            kind = kind.label(),
+                            line = line_number,
+                            reason = "schema-invalid telemetry",
+                            "discarded malformed telemetry"
+                        );
+                    } else {
+                        trace!("failed to parse rollout line: {e}");
+                        parse_errors = parse_errors.saturating_add(1);
+                    }
                     continue;
                 }
             };

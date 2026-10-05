@@ -344,6 +344,198 @@ async fn load_rollout_items_defaults_legacy_session_id() -> std::io::Result<()> 
 }
 
 #[tokio::test]
+async fn load_rollout_items_discards_only_malformed_telemetry() -> std::io::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let rollout_path = home.path().join("rollout.jsonl");
+    let timestamp = "2026-10-04T19:00:14.066Z";
+    let valid_message = serde_json::json!({
+        "timestamp": timestamp,
+        "ordinal": 1300,
+        "type": "event_msg",
+        "payload": {"type": "agent_message", "message": "important"},
+    });
+    let valid_token_count = serde_json::json!({
+        "timestamp": timestamp,
+        "ordinal": 1301,
+        "type": "event_msg",
+        "payload": {"type": "token_count", "info": null, "rate_limits": null},
+    });
+    let valid_usage = serde_json::json!({
+        "timestamp": timestamp,
+        "ordinal": 1302,
+        "type": "token_usage_record",
+        "payload": {
+            "thread_id": "0195cda5-433d-7f9a-9d7b-a9f15b60c2e2",
+            "turn_id": "turn-1",
+            "session_id": "0195cda5-433d-7f9a-9d7b-a9f15b60c2e2",
+            "root_turn_id": "turn-1",
+            "response_id": "response-1",
+            "usage": {
+                "input_tokens": 10,
+                "cached_input_tokens": 2,
+                "cache_write_input_tokens": 0,
+                "output_tokens": 3,
+                "reasoning_output_tokens": 1,
+                "total_tokens": 13,
+            },
+            "turn_token_usage": {
+                "input_tokens": 10,
+                "cached_input_tokens": 2,
+                "cache_write_input_tokens": 0,
+                "output_tokens": 3,
+                "reasoning_output_tokens": 1,
+                "total_tokens": 13,
+            },
+            "thread_token_usage": {
+                "input_tokens": 10,
+                "cached_input_tokens": 2,
+                "cache_write_input_tokens": 0,
+                "output_tokens": 3,
+                "reasoning_output_tokens": 1,
+                "total_tokens": 13,
+            },
+        },
+    });
+    let malformed_token_count = format!(
+        r#"{{"timestamp":"{timestamp}","ordinal":1299,"type":"event_msg","payload":{{"type":"token_count","rate_limits":{{"secondary":{{"used_percent":12.5"#
+    );
+    let malformed_usage = format!(
+        r#"{{"timestamp":"{timestamp}","ordinal":1298,"type":"token_usage_record","payload":{{"thread_id":"0195cda5-433d-7f9a-9d7b-a9f15b60c2e2","usage":{{"input_tokens":1"#
+    );
+    let schema_invalid_token_count = serde_json::json!({
+        "timestamp": timestamp,
+        "ordinal": 1297,
+        "type": "event_msg",
+        "payload": {"type": "token_count", "info": "invalid", "rate_limits": null},
+    });
+    let schema_invalid_usage = serde_json::json!({
+        "timestamp": timestamp,
+        "ordinal": 1296,
+        "type": "token_usage_record",
+        "payload": {},
+    });
+    let malformed_message = serde_json::json!({
+        "timestamp": timestamp,
+        "ordinal": 1295,
+        "type": "response_item",
+        "payload": {"type": "message"},
+    });
+    let missing_discriminator = serde_json::json!({
+        "timestamp": timestamp,
+        "ordinal": 1294,
+        "type": "event_msg",
+        "payload": {"message": "token_count"},
+    });
+    let misleading_nested = serde_json::json!({
+        "timestamp": timestamp,
+        "ordinal": 1293,
+        "type": "event_msg",
+        "payload": {"nested": {"type": "token_count"}},
+    });
+    let duplicate_discriminators = r#"{"timestamp":"2026-10-04T19:00:14.066Z","ordinal":1292,"type":"event_msg","type":"event_msg","payload":{"type":"token_count","type":"message"}}"#;
+    let duplicate_same_discriminators = r#"{"timestamp":"2026-10-04T19:00:14.066Z","ordinal":1290,"type":"event_msg","type":"event_msg","payload":{"type":"token_count","type":"token_count","info":null}}"#;
+    let duplicate_timestamp = r#"{"timestamp":"2026-10-04T19:00:14.066Z","timestamp":"2026-10-04T19:00:14.066Z","ordinal":1289,"type":"event_msg","payload":{"type":"token_count","info":null}}"#;
+    let duplicate_ordinal = r#"{"timestamp":"2026-10-04T19:00:14.066Z","ordinal":1288,"ordinal":1288,"type":"event_msg","payload":{"type":"token_count","info":null}}"#;
+    let invalid_timestamp_header = serde_json::json!({
+        "timestamp": 42,
+        "ordinal": 1289,
+        "type": "event_msg",
+        "payload": {"type": "token_count", "info": null},
+    });
+    let invalid_ordinal_header = serde_json::json!({
+        "timestamp": timestamp,
+        "ordinal": "not-a-number",
+        "type": "event_msg",
+        "payload": {"type": "token_count", "info": null},
+    });
+    let partial_discriminator = format!(
+        r#"{{"timestamp":"{timestamp}","ordinal":1288,"type":"event_msg","payload":{{"type":"token_c"#
+    );
+    let partial_duplicate_root_type =
+        format!(r#"{{"timestamp":"{timestamp}","ordinal":1287,"type":"event_msg","type":"#);
+    let partial_duplicate_payload_type = format!(
+        r#"{{"timestamp":"{timestamp}","ordinal":1286,"type":"event_msg","payload":{{"type":"token_count","type":"#
+    );
+    let syntax_error_in_telemetry = format!(
+        r#"{{"timestamp":"{timestamp}","ordinal":1287,"type":"event_msg","payload":{{"type":"token_count","rate_limits":{{"secondary":{{"used_percent":12.5,}}}}}}}}"#
+    );
+    let eof_waiting_for_next_key = format!(
+        r#"{{"timestamp":"{timestamp}","ordinal":1284,"type":"event_msg","payload":{{"type":"token_count","info":null,"#
+    );
+    let eof_in_partial_next_key = format!(
+        r#"{{"timestamp":"{timestamp}","ordinal":1283,"type":"event_msg","payload":{{"type":"token_count","info":null,"ty"#
+    );
+    let eof_before_field_value = format!(
+        r#"{{"timestamp":"{timestamp}","ordinal":1282,"type":"event_msg","payload":{{"type":"token_count","info"#
+    );
+    let malformed_tool = serde_json::json!({
+        "timestamp": timestamp,
+        "ordinal": 1286,
+        "type": "response_item",
+        "payload": {"type": "function_call_output", "call_id": "call-1"},
+    });
+    let malformed_compacted = serde_json::json!({
+        "timestamp": timestamp,
+        "ordinal": 1285,
+        "type": "compacted",
+        "payload": {},
+    });
+    let concatenated_important = format!(
+        r#"{{"timestamp":"{timestamp}","ordinal":1291,"type":"event_msg","payload":{{"type":"token_count","rate_limits":{{"secondary":{{"used_percent":12.5"#
+    ) + &serde_json::to_string(&valid_message)?;
+    let lines = [
+        malformed_token_count,
+        malformed_usage,
+        serde_json::to_string(&schema_invalid_token_count)?,
+        serde_json::to_string(&schema_invalid_usage)?,
+        serde_json::to_string(&valid_token_count)?,
+        serde_json::to_string(&valid_usage)?,
+        serde_json::to_string(&malformed_message)?,
+        serde_json::to_string(&missing_discriminator)?,
+        serde_json::to_string(&misleading_nested)?,
+        duplicate_discriminators.to_string(),
+        duplicate_same_discriminators.to_string(),
+        serde_json::to_string(&invalid_timestamp_header)?,
+        serde_json::to_string(&invalid_ordinal_header)?,
+        partial_discriminator,
+        partial_duplicate_root_type,
+        partial_duplicate_payload_type,
+        syntax_error_in_telemetry,
+        eof_waiting_for_next_key,
+        eof_in_partial_next_key,
+        eof_before_field_value,
+        serde_json::to_string(&malformed_tool)?,
+        serde_json::to_string(&malformed_compacted)?,
+        duplicate_timestamp.to_string(),
+        duplicate_ordinal.to_string(),
+        concatenated_important,
+        serde_json::to_string(&valid_message)?,
+    ]
+    .join("\n")
+        + "\n";
+    fs::write(&rollout_path, &lines)?;
+    let before = fs::read(&rollout_path)?;
+
+    let (items, thread_id, parse_errors) =
+        RolloutRecorder::load_rollout_items(&rollout_path).await?;
+
+    assert_eq!(thread_id, None);
+    assert_eq!(parse_errors, 19);
+    assert_eq!(items.len(), 3);
+    assert!(matches!(
+        items[0],
+        RolloutItem::EventMsg(EventMsg::TokenCount(_))
+    ));
+    assert!(matches!(items[1], RolloutItem::TokenUsageRecord(_)));
+    assert!(matches!(
+        items[2],
+        RolloutItem::EventMsg(EventMsg::AgentMessage(_))
+    ));
+    assert_eq!(fs::read(&rollout_path)?, before);
+    Ok(())
+}
+
+#[tokio::test]
 async fn load_rollout_items_ignores_unknown_fork_source_history_mode() -> std::io::Result<()> {
     let home = TempDir::new().expect("temp dir");
     let uuid = Uuid::new_v4();

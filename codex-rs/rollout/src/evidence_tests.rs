@@ -1386,3 +1386,41 @@ async fn persisted_lookup_rejects_hash_and_parse_corruption() {
     let result = resolve_archive_evidence(&path, &thread_id, "call-1", "wrong").await;
     assert!(result.is_err());
 }
+
+#[tokio::test]
+async fn persisted_lookup_retains_tool_evidence_with_malformed_telemetry() {
+    let (thread_id, items, _) = fixture(CommandExecutionStatus::Completed, Some(0));
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("rollout.jsonl");
+    let meta_item = RolloutItem::SessionMeta(SessionMetaLine {
+        meta: SessionMeta {
+            id: thread_id,
+            session_id: thread_id.into(),
+            ..SessionMeta::default()
+        },
+        git: None,
+    });
+    let mut contents = String::new();
+    for item in std::iter::once(meta_item).chain(items) {
+        contents.push_str(
+            &serde_json::to_string(&RolloutLine {
+                timestamp: "2026-01-01T00:00:00Z".into(),
+                ordinal: None,
+                item,
+            })
+            .unwrap(),
+        );
+        contents.push('\n');
+    }
+    contents.push_str(
+        r#"{"timestamp":"2026-10-04T19:00:14.066Z","ordinal":1299,"type":"event_msg","payload":{"type":"token_count","rate_limits":{"secondary":{"used_percent":12.5"#,
+    );
+    contents.push('\n');
+    std::fs::write(&path, contents).unwrap();
+
+    let body = "a persisted command result that is longer than its archive marker ".repeat(128);
+    let evidence = resolve_archive_evidence(&path, &thread_id, "call-1", &content_sha256(&body))
+        .await
+        .unwrap();
+    assert_eq!(evidence.result, body);
+}
