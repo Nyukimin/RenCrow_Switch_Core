@@ -6,11 +6,11 @@
 - 構成と優先順位:
   1. 第1部 上位仕様 v0.5（v0.7 §69により改訂）: 目的・優先順位・不変条件。
   2. 第2部 実装仕様 v0.7 Scope Freeze: 初回共有配備のスコープ・契約・実装順・完了条件。付属A（Level 1 関数仕様 v0.4）は第2部と矛盾しない範囲で有効。
-  3. 第3部 現在の実装状態。
+  3. [第3部 現在の実装状態](#compaction-current-state): 2026-10-05の実装・配備・確認範囲。後続の日付付き進捗記録は過去時点の記録として読む。
   4. 第4部 部品契約・Failure Knowledge・実測・旧仕様（2026-09-24以前の記録）。第1〜2部と矛盾する記述は第1〜2部が優先する。
 - 取込み: 2026-09-24、利用者が提示したv0.4・v0.5・v0.7の本文を保持し、見出しの階層だけ整えた。第1部の改訂箇所は見出しに明記し、付属Aには整合注記を付けた。旧`COMPACTION_V2_SPEC.md`（実装引き渡し仕様）はv0.4・v0.7が包含するため削除した。
 - 仕様凍結: 第2部 §80に従う。
-- 進捗・検査証拠: 私有の`target/fork-bootstrap/compaction-check-plan.json`（`v2`）を正本とし、本書へ複製しない。
+- 進捗・検査証拠: 工程別の状態・検査証拠は私有の`target/fork-bootstrap/compaction-check-plan.json`（`v2`）が正本。第3部はその証拠と本セッションの確認結果に基づく、公開可能な時点の要約であり、別の進捗台帳を設けない。未確認事項を仕様上の保証として扱わない。
 
 # 第1部 上位仕様 v0.5（v0.7 §69により改訂）
 
@@ -4825,7 +4825,76 @@ RenCrow Switch Core Compaction V2の役割は、
 
 性能最適化と実装簡素化は、その目的を守れる範囲でのみ行う。
 
-# 第3部 現在の実装状態（2026-09-25）
+<a id="compaction-current-state"></a>
+<a id="第3部-現在の実装状態2026-09-25"></a>
+
+# 第3部 現在の実装状態（2026-10-05）
+
+## 現行状態の読み方
+
+本節は2026-10-05の本セッションで確認した状態を記載する。現行の契約は第1〜2部、実装・配備・検証の確認範囲は本節、工程別の証拠は私有のCheck Planが所有する。後続の「過去の実装・検査記録」にある「未接続」「未配備」「未完了」は、その記録の日付時点の状態であり、現在の状態へ読み替えない。本節で確認していない受入条件は、過去の部分成功や今回の単体試験から完了と推定しない。
+
+## 実装と正規経路
+
+`rencrow_compaction = true`ではNormal V2がruntimeへ接続されている。旧Forkのplan・plan review・summaryの3要求経路を通常のfallbackとして残していない。
+
+```text
+手動 /compact または自動圧縮
+  → compact::rencrow::run
+  → canonical rollout読込・source準備
+  → 必要時だけSelection
+  → Summary
+  → candidate検証
+  → commit_rencrow_checkpoint
+```
+
+履歴の置換は検証後のcommitが所有する。モデルへ渡す履歴と保存原本は区別し、原本のrolloutを書き換えて修復しない。Normalの意味・モデル上の失敗は決定的なEmergencyへ進み、容量不足はCapacityBlocked、原本・ID・metadataの決定的な不整合はIntegrityBlockedとして扱う。保存の不確実性はPersistence側の分類に従う。これらの契約は第2部を参照し、本節では別定義しない。
+
+|機能・境界|実装状態|確認範囲と限界|
+|---|---|---|
+|Normal V2のsource準備・Selection・Summary・candidate検証・commit|runtime接続済み。中心は`core/src/compact_rencrow.rs`と関連部品|今回のV2関連lib試験79件が成功。現行バイナリで任意の実threadのNormal成功を保証したものではない|
+|決定的なEmergencyと失敗分類|runtime接続済み。Normalの失敗と原本の不整合を区別する|V2関連の回帰試験に含まれる。Emergencyが成立してもNormal成功とは記録しない|
+|原本参照・Observation・inventory|`codex-rollout`と`rencrow-compaction` CLIへ接続済み|範囲取得・hash照合の契約は第2部と`COMPACTION_CLI.md`。inventoryには認識・検証できる確定済みV2 checkpointが必要|
+|保存・checkpoint・cold resume/replay|既存のV2 transaction経路へ接続済み|過去のPhase 4〜5に試験・実経路の受入記録がある。今回の変更で保存障害の発生原因や全てのreplay境界を新たに保証したものではない|
+|不良な計測記録の除外|2026-10-05に仕様化・実装・配備済み|canonical loaderの1箇所が所有する。詳細は第2部 §57.1。会話・指示・ツール結果・checkpointを計測情報として捨てない|
+
+実装位置は表中の`codex-rs/`配下を指す。各部品の詳細契約は第2部と付属Aが所有する。
+
+## 不良な計測記録の現行仕様
+
+`RolloutRecorder::load_rollout_items`は、種類を確実に判別できる`token_usage_record`と`event_msg.payload.type = token_count`の不良を、第2部 §57.1の条件内で読み込み時に除外する。保存原本は保持する。欠落した値は`metrics_missing`であり、ゼロ・測定成功へ置き換えない。
+
+正常な計測値は保持する。小数・任意精度数値はSerdeの正規処理を維持し、数値payloadをobjectと誤認しない。重複・不完全な識別子、対象を断定できない破損、会話やcheckpointの破損はエラーとして残す。新しい診断経路は分類・位置などのmetadataだけを出し、破損行の本文を出さない。公開のstrict parser APIは変更していない。
+
+## 配備と有効な検証
+
+- 実装のsource基準: `9a5e1e0c0`（`Discard malformed measurement telemetry in canonical rollout load`）。`main`へpush済み。本節の文書更新と、稼働バイナリのsource基準を混同しない。
+- Linuxの配備: `fork-deploy` profileで`codex`と`rencrow-compaction`をbuildし、旧バイナリを退避して`~/.local/bin/rencrow-switch-core`と`~/.local/bin/rencrow-compaction`へ配置した。成果物・配置先のSHA-256一致を確認した。
+- 稼働確認: `192.168.1.204`のtmux `ren1`で旧processの終了後に起動し直し、稼働processのSHA-256が成果物と一致し、`rencrow_compaction=true`であることを確認した。確認時のcwdは`RenCrow_Tools`、画面は入力待ち。CORE/保存データ分離の作業は再開していない。
+- owner試験: CLIと同じ`serde_json/arbitrary_precision`を有効にした`codex-rollout --lib`で184件成功、0件skip。計測除外、正常値保持、曖昧な破損の拒否、本文非出力、原本不変、原本参照の結合試験を含む。
+- 直接依存の試験: 同featureを有効にした`codex-core --lib`の`compact::rencrow::`対象79件が成功。対象外の2,613件はこの検査の受入範囲に含めない。
+- 独立レビュー: 診断への原文混入と任意精度数値の扱いの2指摘を修正し、再レビューでblocking findingなし。`just fmt`と`git diff --check`を実施済み。
+- 証拠の参照先: 私有Check Planの`v2.telemetry_discard`、`target/fork-bootstrap/compaction-runtime-deploy/telemetry-discard-deploy.json`、同directoryの`telemetry-discard-final-build.log`、`telemetry-discard-v2-final-tests.log`、`telemetry-discard-incident-read.json`。owner184件の実行証拠は担当agentのtool実行履歴にある。
+
+上記は計測除外の変更と、その直接依存の検証範囲である。workspace全体、三OS実機、全model/provider、全ての圧縮・保存障害の受入を完了したという意味ではない。公開binary releaseの受入完了でもない。
+
+## 実際に停止したログの確認結果
+
+破損した`token_count`行がある保存ログを新CLIで読んだところ、変更前の`rollout contains 1 parse errors`による拒否は解消した。その後のinventory判定では`no committed V2 compaction checkpoint is available`で拒否された。読込前後の原本SHA-256は一致した。
+
+この結果は「canonical読込の計測破損による停止が解消した」ことを示す。「当該threadのV2圧縮が成功した」ことは示さない。`compacted`行の存在だけでV2の確定を認定せず、検証可能なV2 metadataとtransactionを要求する。V2 checkpointが未作成なのか、既存記録を認識できないのかは未確認であり、消失・破損のバグとは断定していない。当該ログでの原本参照CLIの取得成功も、ownerの結合試験とは別に未確認として残す。
+
+## 未確認・未採用の境界
+
+- 原本の`token_count`行がどの時点・経路で不良になったかは未確定。書き込み途中、書き込み前、他processの変更のいずれかを断定していない。
+- 書き込み前の原本の健全性・意味の正しさを端から端まで証明する新しい仕組みは、今回の計測除外には含めていない。
+- 既存のCheck Planにあるcheckpoint hash不一致時のreplay方針・永続化byte列とのhash契約の未決事項は、今回の単体成功から解決済みへ変更しない。
+- 索引・キャッシュの再生成、不良な要約の再生成、checkpointへのロールバック、原本の依存範囲の隔離を統一する「レイヤー別復旧」の提案は、まだ現行の共通復旧契約として採用・実装していない。既存の通常入力組立や個別の回復処理が存在しないという意味ではない。
+- Windows/macOS実機と公開releaseの受入は未確認。実modelでの自動圧縮・容量不足・長期連続運転などは、個別の既存証拠の範囲を超えて完了としない。
+
+## 過去の実装・検査記録（2026-09-24〜2026-09-29）
+
+以下は実装の経緯・当時の検査・Failure Knowledgeを保持した記録である。現在の接続・配備状態は上の現行状態を参照する。過去の局所的な「未接続」や途中版の結果を現在の仕様・配備状態として扱わない。
 
 第2部 §70のPhase 1（項目1〜13、下記「Phase 1の進捗」）、Phase 2（Level 2 schema、下記「Phase 2の進捗」）、Phase 3（Level 2 runtime、下記「Phase 3の進捗」）、Phase 4（Level 5 / Integrity、下記「Phase 4の進捗」）を実装し、Phase 5（実QwenのE2E、下記「Phase 5の進捗」）とPhase 6（共有配備、下記「Phase 6の進捗」）を実施した。本部は第4部「第2版の実装契約」の8責務とsourceの対応だけを示す。工程別の検査・証拠・未解決の指摘は私有の`target/fork-bootstrap/compaction-check-plan.json`（`v2`）が正本であり、ここへ複製しない。
 

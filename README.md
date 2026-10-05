@@ -3,7 +3,7 @@
 
 Unofficial fork of [OpenAI Codex](https://github.com/openai/codex) maintained for RenCrow. Not affiliated with or endorsed by OpenAI.
 
-Purpose: improve compaction so obsolete instructions do not survive as active commands, while preserving current requirements and capabilities. **Compaction work is in progress: accepted composer input has separate provenance, and `rencrow_compaction = true` connects the shared selection/review/summary pipeline to local Responses compaction. The eight-stage V2 components are in source as unit-tested functions and intentional TDD stubs; they are not yet connected to the runtime or deployed. Runtime validation and deployment results are tracked in COMPACTION_SPEC.md; source availability alone is not a release acceptance.**
+Purpose: improve compaction so obsolete instructions do not survive as active commands, while preserving current requirements and capabilities. **Compaction V2 is connected to the runtime when `rencrow_compaction = true`, including Normal, deterministic Emergency, candidate validation, checkpoint commit, and original-data retrieval. The Linux installation was updated from source `9a5e1e0c0` on 2026-10-05, including the malformed measurement telemetry discard policy. See the [current implementation and verified limits](COMPACTION_SPEC.md#compaction-current-state); runtime activation, individual thread success, and release acceptance are distinct checks.**
 
 - [Fork改変ルール・上流更新・検証・復旧](FORK_RULES.md)
 - [Compaction specification: upper spec, implementation spec (scope freeze), status and records](COMPACTION_SPEC.md)
@@ -12,7 +12,7 @@ Purpose: improve compaction so obsolete instructions do not survive as active co
 - [Contributor instructions](AGENTS.md)
 - [License](LICENSE) / [Attribution notices](NOTICE)
 
-A Linux `dev-small` build has been installed locally as `rencrow-switch-core` for a Codex-switch trial. No public fork binary release is available. The original README below describes **official OpenAI Codex**, including its installers, services and support links; those commands do not install this fork.
+A Linux `fork-deploy` build is installed locally as `rencrow-switch-core` for Codex-switch. Binary hash equality and Compaction V2 activation were verified in tmux `ren1` on 2026-10-05. No public fork binary release is available, and Windows/macOS runtime acceptance is not claimed. The original README below describes **official OpenAI Codex**, including its installers, services and support links; those commands do not install this fork.
 
 ---
 
