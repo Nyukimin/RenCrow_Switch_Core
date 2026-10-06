@@ -8,6 +8,7 @@ Purpose: improve compaction so obsolete instructions do not survive as active co
 - [Fork改変ルール・上流更新・検証・復旧](FORK_RULES.md)
 - [Compaction specification: upper spec, implementation spec (scope freeze), status and records](COMPACTION_SPEC.md)
 - [Separate compaction candidate CLI](COMPACTION_CLI.md)
+- `rencrow-compaction-diagnose --rollout <session.jsonl> [--logs-db <CODEX_HOME/logs_2.sqlite>]` はRenCrow Compaction V2のcheckpoint・Normal/Emergency回数・同threadのV2警告を読み取り専用で集計する。通常Codexの圧縮は数えない。会話本文と警告原文は出力しない。`--logs-db`未指定時はrolloutの`CODEX_HOME`から推定し、DBがなければ`log_status=unavailable`とする。
 - [Local build and Codex-switch integration](FORK_BUILD.md)
 - [Contributor instructions](AGENTS.md)
 - [License](LICENSE) / [Attribution notices](NOTICE)
