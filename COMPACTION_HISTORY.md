@@ -47,6 +47,7 @@
 | 10/5 02:21確認／08:11対策commit | 正本にcanonical構造化テキストはあるが、Emergencyの容量比較がliveの文字列だけを見ており、その出力を縮約できなかった。 | fresh pairだけcanonicalテキストへフォールバック。既存markerへの無条件適用は避ける。 | `970c50380`で修正。後述の保存ログ破損を直したcommitではない。[E15][G09] |
 | 10/5の停止調査／12:20対策commit | 保存済み`token_count`の1300行目が`secondary`付近で不完全なJSONになり、原本読み込みの拒否でV2が止まった。 | 明確に判別できる不良計測情報だけをcanonical読込時に除外。会話等はfail closed、原本bytesは変更しない。 | `9a5e1e0c0`で実装・配備。184＋79件の関連試験を記録。parse拒否は解消したが、対象threadのinventoryは「確定したV2 checkpointなし」。V2全体の成功は未確認。[E16][S16][G10] |
 | 10/5：残件の提案 | 不良箇所の種類に関係なく全体停止すると、計測情報・索引・要約・原本の故障を区別できない。 | 計測は捨てる、索引・入力・候補等は健全な原本から作り直す、原本やcheckpointの不整合は隔離・停止、というレイヤー別案。 | 計測不良の除外のみ実装・配備済み。他の共通自動復旧は提案段階。[S17] |
+| 10/22 04:45 UTCのfollow-up報告 | 04:45:38 UTCに選別応答（`chatcmpl-52ceeabd639a4180ac201f80`、input/output 1,281/1,466 tokens）が完了してEmergencyへ進んだ。直前context表示は108,953、設定windowは114,688、23 markersがあり、Emergency前のsummary requestはなかった。rolloutは選別応答のtoken usage、Emergency compacted、checkpoint commitを記録しているが、hostの正確な拒否理由と完了応答本文は記録していない。 | Normal失敗時の新規captureは配備されていない。既存のopt-in rollout inference traceはsession start時に有効なら将来のcompleted responseを保持できるが、現行ren4では無効。 | E18 rolloutの3930行目にresponse IDとusageを伴うselection token_usage_record、3932行目にEmergency compacted、3936行目にcommitがある。これらは完了とEmergencyへの移行を裏付けるが、選別拒否の正確な理由とモデル出力本文は不明のまま。過去の本文は復元不能。[E18] |
 
 ## 説明の訂正・未確定事項
 
@@ -67,6 +68,7 @@
 - E15：同JSON、id 177233/177234。10/5 02:21の容量比較実装の調査報告。
 - E16：`recent_telemetry.json`、id 171128。10/5 12:29、上記01a10547 rolloutの12644行。79件試験成功、原本hash不変、inventory拒否理由を含む実command結果。現行仕様の184件・配備receiptも参照。
 - E17：`recent_short_evidence.json`、id 170519/170521。10/5 10:44〜10:46、上記rollout 11164/11170行。当時の断定の記録として保持し、確定原因としては使わない。
+- E18：`~/.codex/sessions/2026/10/21/rollout-2026-10-21T23-29-24-01a160cc-4fb6-7522-baa6-c55e79688615.jsonl`、3930/3932/3936行目でselection response ID・usage、Emergency compacted、checkpoint commitを確認。04:45:38 UTCの選別応答ID `chatcmpl-52ceeabd639a4180ac201f80`、input/output 1,281/1,466 tokens。前回session reportには直前context表示108,953／設定window 114,688、23 markers、Emergency前のsummary requestなし、とある。rolloutに選別モデル出力本文とhostの正確な拒否理由はなく、これらの事実から推定しない。新しいcaptureはこの過去失敗を補完しない。
 
 仕様の関連節：`COMPACTION_SPEC.md`。
 

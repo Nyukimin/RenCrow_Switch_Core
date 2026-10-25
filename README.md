@@ -9,6 +9,21 @@ Purpose: improve compaction so obsolete instructions do not survive as active co
 - [Compaction specification: upper spec, implementation spec (scope freeze), status and records](COMPACTION_SPEC.md)
 - [Separate compaction candidate CLI](COMPACTION_CLI.md)
 - `rencrow-compaction-diagnose --rollout <session.jsonl> [--logs-db <CODEX_HOME/logs_2.sqlite>]` はRenCrow Compaction V2のcheckpoint・Normal/Emergency回数・同threadのV2警告を読み取り専用で集計する。通常Codexの圧縮は数えない。会話本文と警告原文は出力しない。`--logs-db`未指定時はrolloutの`CODEX_HOME`から推定し、DBがなければ`log_status=unavailable`とする。
+- Emergency時の失敗理由と完了済みresponse payloadを確認する場合、session開始時に
+  `CODEX_ROLLOUT_TRACE_ROOT`を設定した上でtrace bundleを渡す。traceはopt-inのsession-wide・
+  best-effort記録で、prompt、response、tool dataを含み得る。CLIはEmergency直前の同thread
+  `token_usage_record`のresponse IDをtraceの`InferenceCompleted`とthread・IDで照合し、bundle内
+  payloadのpath、size、SHA-256だけを報告する。この照合はfailure causalityを証明しない。traceに
+  保存されるのは正規化済みresponse payloadで、wire上のSSE bytesは保持しない。
+
+```sh
+rencrow-compaction-diagnose --rollout <session.jsonl> \
+  --trace-bundle <trace-bundle> --warning-output <new-private-file>
+```
+
+`--warning-output`は新規fileに限り、Unixではmode `0600`でV2 same-thread warning本文を保存する。
+fileは8-byte big-endian lengthとそのbyte数のwarning本文を時系列順に繰り返す。JSON/stdoutには
+本文を出さない。trace bundle自体がresponse payloadの原本であり、CLIはresponseを複製しない。
 - [Local build and Codex-switch integration](FORK_BUILD.md)
 - [Contributor instructions](AGENTS.md)
 - [License](LICENSE) / [Attribution notices](NOTICE)
