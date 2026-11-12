@@ -1,6 +1,6 @@
 ---
 source: tui/src/app/owned_transcript_tests.rs
-assertion_line: 1074
+assertion_line: 1132
 expression: "normalize_snapshot_paths(buffer_text(crate::custom_terminal::test_support::last_rendered_buffer(&tui.terminal)))"
 ---
 
@@ -12,7 +12,7 @@ expression: "normalize_snapshot_paths(buffer_text(crate::custom_terminal::test_s
 
 
 
-› third question
+Subagents: 0 running / 0 total · /subagents details
 
 
 › Ask Codex to do anything

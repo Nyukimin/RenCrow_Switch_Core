@@ -6880,6 +6880,7 @@ async fn directive_only_completion_removes_streamed_directive() -> Result<()> {
     app.handle_consolidate_agent_message(
         &mut tui,
         String::new(),
+        /*source_item*/ None,
         PathBuf::from("/tmp"),
         /*inline_visualization_context*/ None,
         ConsolidationScrollbackReflow::Required,
@@ -6896,6 +6897,226 @@ async fn directive_only_completion_removes_streamed_directive() -> Result<()> {
             .collect::<Vec<_>>()
             .join("\n")
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn completed_item_reconciles_an_answer_consolidated_by_an_earlier_flush() -> Result<()> {
+    let (mut app, _rx, _op_rx) = make_test_app_with_channels().await;
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    let turn_id = "turn-1".to_string();
+    let item_id = "msg-1".to_string();
+    let mut streamed = AgentMessageCell::new(
+        vec![Line::from("The task is complete.")],
+        /*is_first_line*/ true,
+    );
+    streamed.set_source_item(turn_id.clone(), item_id.clone());
+    app.transcript_cells = vec![Arc::new(streamed)];
+
+    app.handle_consolidate_agent_message(
+        &mut tui,
+        "The task is complete.".to_string(),
+        Some((turn_id.clone(), item_id.clone())),
+        app.config.cwd.to_path_buf(),
+        /*inline_visualization_context*/ None,
+        ConsolidationScrollbackReflow::IfResizeReflowRan,
+        /*deferred_history_cell*/ None,
+    )?;
+    app.handle_consolidate_agent_message(
+        &mut tui,
+        "The task is complete. Here is the result.".to_string(),
+        Some((turn_id.clone(), item_id.clone())),
+        app.config.cwd.to_path_buf(),
+        /*inline_visualization_context*/ None,
+        ConsolidationScrollbackReflow::Required,
+        /*deferred_history_cell*/ None,
+    )?;
+
+    assert_eq!(app.transcript_cells.len(), 1);
+    let cell = app.transcript_cells[0]
+        .as_any()
+        .downcast_ref::<history_cell::AgentMarkdownCell>()
+        .expect("the streamed item should remain one finalized answer cell");
+    assert_eq!(
+        cell.source_item(),
+        Some((turn_id.as_str(), item_id.as_str()))
+    );
+    assert_eq!(
+        cell.markdown_source(),
+        "The task is complete. Here is the result."
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn canonical_answer_reconciles_multiple_flush_fragments_without_removing_other_cells()
+-> Result<()> {
+    let (mut app, _rx, _op_rx) = make_test_app_with_channels().await;
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    let identity = ("turn-1".to_string(), "msg-1".to_string());
+    let cwd = app.config.cwd.to_path_buf();
+    let mut first = AgentMessageCell::new(
+        vec![Line::from("Answer fragment A")],
+        /*is_first_line*/ true,
+    );
+    first.set_source_item(identity.0.clone(), identity.1.clone());
+    app.transcript_cells = vec![Arc::new(first)];
+    app.handle_consolidate_agent_message(
+        &mut tui,
+        "Answer fragment A".to_string(),
+        Some(identity.clone()),
+        cwd.clone(),
+        /*inline_visualization_context*/ None,
+        ConsolidationScrollbackReflow::IfResizeReflowRan,
+        /*deferred_history_cell*/ None,
+    )?;
+    app.transcript_cells.push(plain_line_cell("tool output"));
+    let mut second = AgentMessageCell::new(
+        vec![Line::from("Answer fragment B")],
+        /*is_first_line*/ false,
+    );
+    second.set_source_item(identity.0.clone(), identity.1.clone());
+    app.transcript_cells.push(Arc::new(second));
+    app.handle_consolidate_agent_message(
+        &mut tui,
+        "Answer fragment B".to_string(),
+        Some(identity.clone()),
+        cwd.clone(),
+        /*inline_visualization_context*/ None,
+        ConsolidationScrollbackReflow::IfResizeReflowRan,
+        /*deferred_history_cell*/ None,
+    )?;
+    app.handle_consolidate_agent_message(
+        &mut tui,
+        "Canonical answer AB".to_string(),
+        Some(identity.clone()),
+        cwd,
+        /*inline_visualization_context*/ None,
+        ConsolidationScrollbackReflow::Required,
+        /*deferred_history_cell*/ None,
+    )?;
+
+    let answers = app
+        .transcript_cells
+        .iter()
+        .filter_map(|cell| {
+            cell.as_any()
+                .downcast_ref::<history_cell::AgentMarkdownCell>()
+                .filter(|cell| {
+                    cell.source_item() == Some((identity.0.as_str(), identity.1.as_str()))
+                })
+                .map(history_cell::AgentMarkdownCell::markdown_source)
+        })
+        .filter(|source| !source.is_empty())
+        .collect::<Vec<_>>();
+    assert_eq!(answers, vec!["Canonical answer AB"]);
+    assert!(app.transcript_cells.iter().all(|cell| {
+        cell.as_any()
+            .downcast_ref::<history_cell::AgentMessageCell>()
+            .is_none_or(|cell| {
+                cell.source_item() != Some((identity.0.as_str(), identity.1.as_str()))
+            })
+    }));
+    assert!(app.transcript_cells.iter().any(|cell| {
+        cell.display_lines(/*width*/ 80)
+            .iter()
+            .any(|line| line.to_string().contains("tool output"))
+    }));
+    Ok(())
+}
+
+#[tokio::test]
+async fn canonical_answer_reconciles_stream_fragments_split_by_reasoning_cell() -> Result<()> {
+    let (mut app, _rx, _op_rx) = make_test_app_with_channels().await;
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    let identity = ("turn-1".to_string(), "msg-1".to_string());
+    let cwd = app.config.cwd.to_path_buf();
+    let mut first = AgentMessageCell::new(vec![Line::from("ALPHA")], /*is_first_line*/ true);
+    first.set_source_item(identity.0.clone(), identity.1.clone());
+    let mut continuation =
+        AgentMessageCell::new(vec![Line::from("BRAVO")], /*is_first_line*/ false);
+    continuation.set_source_item(identity.0.clone(), identity.1.clone());
+    app.transcript_cells = vec![
+        Arc::new(first),
+        Arc::new(history_cell::ReasoningSummaryCell::new(
+            "Reasoning".to_string(),
+            "kept reasoning".to_string(),
+            &cwd,
+            /*transcript_only*/ false,
+        )),
+        Arc::new(continuation),
+    ];
+
+    app.handle_consolidate_agent_message(
+        &mut tui,
+        "ALPHA\nBRAVO\nCHARLIE".to_string(),
+        Some(identity.clone()),
+        cwd,
+        /*inline_visualization_context*/ None,
+        ConsolidationScrollbackReflow::Required,
+        /*deferred_history_cell*/ None,
+    )?;
+
+    assert!(
+        app.transcript_cells
+            .iter()
+            .all(|cell| { !cell.as_any().is::<history_cell::AgentMessageCell>() })
+    );
+    let answers = app
+        .transcript_cells
+        .iter()
+        .filter_map(|cell| {
+            cell.as_any()
+                .downcast_ref::<history_cell::AgentMarkdownCell>()
+                .filter(|cell| {
+                    cell.source_item() == Some((identity.0.as_str(), identity.1.as_str()))
+                })
+                .map(history_cell::AgentMarkdownCell::markdown_source)
+        })
+        .filter(|source| !source.is_empty())
+        .collect::<Vec<_>>();
+    assert_eq!(answers, vec!["ALPHA\nBRAVO\nCHARLIE"]);
+    assert!(app.transcript_cells.iter().any(|cell| {
+        cell.as_any()
+            .downcast_ref::<history_cell::ReasoningSummaryCell>()
+            .is_some_and(|cell| cell.markdown_source() == "kept reasoning")
+    }));
+    Ok(())
+}
+
+#[tokio::test]
+async fn item_identity_does_not_reconcile_another_items_untagged_stream_cell() -> Result<()> {
+    let (mut app, _rx, _op_rx) = make_test_app_with_channels().await;
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    let cwd = app.config.cwd.to_path_buf();
+    app.transcript_cells = vec![Arc::new(AgentMessageCell::new(
+        vec![Line::from("another item's stream")],
+        /*is_first_line*/ true,
+    ))];
+
+    app.handle_consolidate_agent_message(
+        &mut tui,
+        "canonical answer for this item".to_string(),
+        Some(("turn-1".to_string(), "msg-1".to_string())),
+        cwd,
+        /*inline_visualization_context*/ None,
+        ConsolidationScrollbackReflow::Required,
+        /*deferred_history_cell*/ None,
+    )?;
+
+    assert!(
+        app.transcript_cells
+            .iter()
+            .any(|cell| { cell.as_any().is::<history_cell::AgentMessageCell>() })
+    );
+    assert!(app.transcript_cells.iter().any(|cell| {
+        cell.as_any()
+            .downcast_ref::<history_cell::AgentMarkdownCell>()
+            .is_some_and(|cell| {
+                cell.source_item() == Some(("turn-1", "msg-1"))
+                    && cell.markdown_source() == "canonical answer for this item"
+            })
+    }));
     Ok(())
 }
 
@@ -6926,6 +7147,7 @@ async fn required_stream_reflow_during_capped_initial_replay_survives_transcript
         &mut tui,
         "Final answer:\n\n| Pattern | Outcome |\n| --- | --- |\n| Table tail | Preserved |"
             .to_string(),
+        /*source_item*/ None,
         PathBuf::from("/tmp"),
         /*inline_visualization_context*/ None,
         ConsolidationScrollbackReflow::Required,

@@ -229,6 +229,9 @@ use codex_protocol::error::Result as CodexResult;
 use codex_protocol::exec_output::StreamOutput;
 
 mod code_mode_warning;
+mod completion_children;
+pub(crate) mod completion_persistence;
+mod completion_recovery;
 pub(crate) mod context_window;
 mod daemon_recovery;
 mod environment;
@@ -256,6 +259,7 @@ pub(crate) mod session;
 mod step_activation;
 pub(crate) mod step_context;
 pub(crate) mod step_settings;
+mod task_context_boundary;
 mod thread_settings;
 pub(crate) mod time_reminder;
 mod token_budget;
@@ -1611,6 +1615,8 @@ impl Session {
     }
 
     async fn record_initial_history(&self, conversation_history: InitialHistory) {
+        self.restore_autonomous_completion_snapshot(conversation_history.get_rollout_items())
+            .await;
         let (is_subagent, is_paginated_subagent) = {
             let state = self.state.lock().await;
             let session_configuration = &state.session_configuration;
@@ -2497,10 +2503,18 @@ impl Session {
             return;
         };
 
-        let status = match turn_context.terminal_error.lock().await.take() {
+        let terminal_error = { turn_context.terminal_error.lock().await.take() };
+        let status = match terminal_error {
             Some(error) => {
                 let status = AgentStatus::Errored(error.message);
-                self.agent_status.send_replace(status.clone());
+                let state = self.state.lock().await;
+                if state
+                    .last_started_turn_id
+                    .as_deref()
+                    .is_none_or(|turn_id| turn_id == turn_context.sub_id.as_str())
+                {
+                    self.agent_status.send_replace(status.clone());
+                }
                 status
             }
             None => {
@@ -2659,11 +2673,37 @@ impl Session {
     async fn deliver_event_raw(&self, event: Event) {
         // Record the last known agent status.
         if let Some(status) = agent_status_from_event(&event.msg) {
-            self.agent_status.send_replace(status);
+            let turn_scoped = matches!(
+                &event.msg,
+                EventMsg::TurnStarted(_)
+                    | EventMsg::TurnComplete(_)
+                    | EventMsg::TurnAborted(_)
+                    | EventMsg::Error(_)
+            );
+            let state = self.state.lock().await;
+            let is_current_turn = !turn_scoped
+                || state
+                    .last_started_turn_id
+                    .as_deref()
+                    .is_none_or(|turn_id| turn_id == event.id.as_str());
+            // A late status event may describe the previous turn after a follow-up has already
+            // been admitted. Keep the event and its history; only suppress the stale status write.
+            if is_current_turn {
+                self.agent_status.send_replace(status);
+            }
+            drop(state);
         }
         if let Err(e) = self.tx_event.send(event).await {
             debug!("dropping event because channel is closed: {e}");
         }
+    }
+
+    pub(crate) async fn agent_status_generation(&self) -> (Option<String>, AgentStatus) {
+        let state = self.state.lock().await;
+        (
+            state.last_started_turn_id.clone(),
+            self.agent_status.borrow().clone(),
+        )
     }
 
     pub(crate) async fn emit_turn_item_started(&self, turn_context: &TurnContext, item: &TurnItem) {

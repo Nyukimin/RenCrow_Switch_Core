@@ -168,6 +168,15 @@ pub struct LoadThreadHistoryParams {
     pub include_archived: bool,
 }
 
+/// Requested canonical tool call IDs whose persisted source items may support compaction.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadCompactionSourcesParams {
+    /// Thread whose own rollout segments may provide canonical evidence.
+    pub thread_id: ThreadId,
+    /// Call IDs present in the selected model history, including existing reference markers.
+    pub call_ids: Vec<String>,
+}
+
 /// Persisted rollout history for a thread, without any filesystem path requirement.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StoredThreadHistory {

@@ -324,6 +324,7 @@ struct ThreadSpawnRequest {
     inherited_instructions: Option<SessionInstructions>,
     inherited_exec_policy: Option<Arc<crate::exec_policy::ExecPolicyManager>>,
     user_shell_override: Option<crate::shell::Shell>,
+    autonomous_completion_idle_resume: bool,
 }
 
 impl ThreadSpawnRequest {
@@ -345,6 +346,7 @@ impl ThreadSpawnRequest {
             inherited_instructions: None,
             inherited_exec_policy: None,
             user_shell_override: None,
+            autonomous_completion_idle_resume: false,
         }
     }
 }
@@ -1249,6 +1251,28 @@ impl ThreadManager {
         parent_trace: Option<W3cTraceContext>,
         client_mcp_extensions: ClientMcpExtensions,
     ) -> CodexResult<NewThread> {
+        self.resume_thread_with_history_for_completion(
+            config,
+            initial_history,
+            auth_manager,
+            parent_trace,
+            client_mcp_extensions,
+            false,
+        )
+        .await
+    }
+
+    /// Resumes persisted history and optionally starts one safe autonomous completion turn.
+    #[instrument(level = "trace", skip_all)]
+    pub async fn resume_thread_with_history_for_completion(
+        &self,
+        config: Config,
+        initial_history: InitialHistory,
+        auth_manager: Arc<AuthManager>,
+        parent_trace: Option<W3cTraceContext>,
+        client_mcp_extensions: ClientMcpExtensions,
+        autonomous_completion_idle_resume: bool,
+    ) -> CodexResult<NewThread> {
         let agent_control = self.agent_control_for_config(&config);
         let (session_source, thread_source) = initial_history
             .get_resumed_session_sources()
@@ -1261,12 +1285,9 @@ impl ThreadManager {
             client_mcp_extensions,
             ..StartThreadOptions::new(config)
         };
-        Box::pin(self.state.spawn_thread(ThreadSpawnRequest::new(
-            options,
-            auth_manager,
-            agent_control,
-        )))
-        .await
+        let mut request = ThreadSpawnRequest::new(options, auth_manager, agent_control);
+        request.autonomous_completion_idle_resume = autonomous_completion_idle_resume;
+        Box::pin(self.state.spawn_thread(request)).await
     }
 
     pub(crate) async fn start_thread_with_user_shell_override_for_tests(
@@ -2024,6 +2045,7 @@ impl ThreadManagerState {
             inherited_instructions,
             inherited_exec_policy,
             user_shell_override,
+            autonomous_completion_idle_resume,
         } = request;
         let StartThreadOptions {
             mut config,
@@ -2288,6 +2310,21 @@ impl ThreadManagerState {
         }
         if is_resumed_thread {
             new_thread.thread.emit_thread_resume_lifecycle().await;
+        }
+        if new_thread
+            .thread
+            .session
+            .autonomous_completion_is_parent_session()
+            .await
+        {
+            crate::agent::completion_recovery::start(
+                &new_thread.thread,
+                !autonomous_completion_idle_resume,
+            )
+            .await;
+        }
+        if is_resumed_thread && autonomous_completion_idle_resume {
+            crate::agent::autonomous_completion::wake_after_cold_resume(&new_thread.thread).await;
         }
         Ok(new_thread)
     }

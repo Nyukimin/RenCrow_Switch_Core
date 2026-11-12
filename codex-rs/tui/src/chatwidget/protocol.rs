@@ -33,6 +33,31 @@ impl ChatWidget {
         let from_replay = replay_kind.is_some();
         let is_resume_initial_replay =
             matches!(replay_kind, Some(ReplayKind::ResumeInitialMessages));
+        let live_event_timestamp = if replay_kind.is_none()
+            && matches!(
+                &notification,
+                ServerNotification::TurnStarted(_)
+                    | ServerNotification::ItemStarted(_)
+                    | ServerNotification::ItemCompleted(_)
+                    | ServerNotification::TurnCompleted(_)
+                    | ServerNotification::Error(_)
+                    | ServerNotification::AgentMessageDelta(_)
+                    | ServerNotification::CommandExecutionOutputDelta(_)
+                    | ServerNotification::FileChangeOutputDelta(_)
+            ) {
+            Some(super::activity_clock::now_epoch_seconds())
+        } else if replay_kind.is_some()
+            && let ServerNotification::TurnCompleted(completed) = &notification
+            && let Some(completed_at) = completed.turn.completed_at
+        {
+            self.record_replay_activity_epoch(completed_at);
+            None
+        } else {
+            None
+        };
+        if let Some(timestamp) = live_event_timestamp {
+            self.record_activity_epoch(timestamp);
+        }
         let is_retry_error = matches!(
             &notification,
             ServerNotification::Error(ErrorNotification {
@@ -103,14 +128,21 @@ impl ChatWidget {
             }
             ServerNotification::AgentMessageDelta(notification) => {
                 self.restore_realtime_transcripts_before_turn(&notification.turn_id);
-                if !self.is_realtime_delegated_reasoning_turn(&notification.turn_id)
-                    && (from_replay
-                        || !self.is_realtime_delegated_agent_item(
-                            &notification.turn_id,
-                            &notification.item_id,
-                        ))
-                {
-                    self.on_agent_message_delta(notification.delta);
+                let delegated_turn =
+                    self.is_realtime_delegated_reasoning_turn(&notification.turn_id);
+                let delegated_item = (!delegated_turn && !from_replay).then(|| {
+                    self.is_realtime_delegated_agent_item(
+                        &notification.turn_id,
+                        &notification.item_id,
+                    )
+                });
+                if !delegated_turn && (from_replay || !delegated_item.unwrap_or(false)) {
+                    self.on_agent_message_delta_for_item(
+                        notification.turn_id,
+                        notification.item_id,
+                        notification.delta,
+                        !from_replay,
+                    );
                 }
             }
             ServerNotification::PlanDelta(notification) => {
@@ -205,10 +237,18 @@ impl ChatWidget {
                             notification.error.misalignment,
                         );
                     } else {
-                        self.handle_non_retry_error(
-                            notification.error.message,
-                            notification.error.codex_error_info,
-                        );
+                        if let Some(timestamp) = live_event_timestamp {
+                            self.handle_non_retry_error_at(
+                                notification.error.message,
+                                notification.error.codex_error_info,
+                                timestamp,
+                            );
+                        } else {
+                            self.handle_non_retry_error(
+                                notification.error.message,
+                                notification.error.codex_error_info,
+                            );
+                        }
                     }
                 }
             }
@@ -441,11 +481,17 @@ impl ChatWidget {
                             turn_id != &notification.turn.id || item_id != id
                         })
                 {
+                    let timestamp = notification.turn.completed_at.or_else(|| {
+                        replay_kind
+                            .is_none()
+                            .then(super::activity_clock::now_epoch_seconds)
+                    });
                     self.handle_thread_item(
                         item.clone(),
                         notification.turn.id.clone(),
                         replay_kind
-                            .map_or(ThreadItemRenderSource::Live, ThreadItemRenderSource::Replay),
+                            .map_or(ThreadItemRenderSource::Live, ThreadItemRenderSource::Replay)
+                            .with_completion_timestamp(timestamp),
                     );
                 }
                 if replay_kind.is_none()
@@ -489,7 +535,20 @@ impl ChatWidget {
                     {
                         self.last_non_retry_error = None;
                     } else {
-                        self.handle_non_retry_error(error.message, error.codex_error_info);
+                        let timestamp = notification.turn.completed_at.or_else(|| {
+                            replay_kind
+                                .is_none()
+                                .then(super::activity_clock::now_epoch_seconds)
+                        });
+                        if let Some(timestamp) = timestamp {
+                            self.handle_non_retry_error_at(
+                                error.message,
+                                error.codex_error_info,
+                                timestamp,
+                            );
+                        } else {
+                            self.handle_non_retry_error(error.message, error.codex_error_info);
+                        }
                     }
                 } else {
                     self.last_non_retry_error = None;
@@ -601,7 +660,33 @@ impl ChatWidget {
         notification: ItemCompletedNotification,
         replay_kind: Option<ReplayKind>,
     ) {
+        let completed_at_epoch_seconds = notification.completed_at_ms / 1_000;
         self.restore_realtime_transcripts_before_turn(&notification.turn_id);
+        if replay_kind.is_none()
+            && let ThreadItem::AgentMessage { id, .. } = &notification.item
+            && self
+                .transcript
+                .last_live_completed_agent_message
+                .as_ref()
+                .is_some_and(|(turn_id, item_id)| turn_id == &notification.turn_id && item_id == id)
+        {
+            return;
+        }
+        if replay_kind.is_none()
+            && let ThreadItem::AgentMessage { id, questions, .. } = &notification.item
+            && self
+                .transcript
+                .last_completed_agent_message
+                .as_ref()
+                .is_some_and(|(turn_id, item_id)| turn_id == &notification.turn_id && item_id == id)
+        {
+            if let Some(questions) = questions {
+                self.add_async_questions(id, questions);
+            }
+            self.transcript.last_live_completed_agent_message =
+                Some((notification.turn_id, id.clone()));
+            return;
+        }
         if replay_kind.is_none()
             && self.is_realtime_delegated_reasoning_turn(&notification.turn_id)
             && realtime::is_private_realtime_agent_item(&notification.item)
@@ -634,7 +719,9 @@ impl ChatWidget {
             item => self.handle_thread_item(
                 item,
                 notification.turn_id,
-                replay_kind.map_or(ThreadItemRenderSource::Live, ThreadItemRenderSource::Replay),
+                replay_kind
+                    .map_or(ThreadItemRenderSource::Live, ThreadItemRenderSource::Replay)
+                    .with_completion_timestamp(Some(completed_at_epoch_seconds)),
             ),
         }
     }

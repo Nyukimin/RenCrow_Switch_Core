@@ -396,6 +396,29 @@ fn v2_native_projection_ordinary_work_is_not_readded_but_unknown_and_protected_n
             .id()
             .is_some_and(|id| id.as_str() == "tool-output-item")
     }));
+
+    let mut protected_call_ids = std::collections::HashSet::new();
+    protected_call_ids.insert("tool-call".to_owned());
+    let protected_projection = super::filter_retained_instructions_with_task_context(
+        &pair,
+        &captured,
+        application(&captured, &[]),
+        None,
+        &protected_call_ids,
+    )
+    .unwrap();
+    let protected_history =
+        build_native_replacement(&protected_projection, "summary", vec![]).unwrap();
+    assert!(protected_history.iter().any(|item| {
+        item.item
+            .id()
+            .is_some_and(|id| id.as_str() == "tool-call-item")
+    }));
+    assert!(protected_history.iter().any(|item| {
+        item.item
+            .id()
+            .is_some_and(|id| id.as_str() == "tool-output-item")
+    }));
 }
 
 #[test]
@@ -562,6 +585,40 @@ fn v2_native_projection_keeps_only_the_latest_internal_context_per_source() {
         filter_retained_instructions(&items, &captured, application(&captured, &[])).unwrap();
 
     assert_eq!(retained_ids(&projection), vec!["user-1", "goal-3"]);
+}
+
+#[test]
+fn v2_native_replacement_replaces_retained_context_when_fresh_context_has_same_source() {
+    let items = vec![
+        user_at("start the task", "user-1", 1_790_306_659.4),
+        internal_context("goal", "old continuation", "goal-old"),
+        internal_context("workspace", "workspace context", "workspace-old"),
+    ];
+    let captured = input(&items);
+    let projection =
+        filter_retained_instructions(&items, &captured, application(&captured, &[])).unwrap();
+    let fresh_goal = internal_context("goal", "new continuation", "goal-new");
+    let fresh_task = internal_context("task", "current task", "task-current");
+    let summary = format!("{}\nsummary", super::super::super::SUMMARY_PREFIX);
+
+    let rebuilt = build_native_replacement(
+        &projection,
+        &summary,
+        vec![fresh_goal.clone(), fresh_task.clone()],
+    )
+    .unwrap();
+
+    assert!(!rebuilt.iter().any(|item| item == &items[1]));
+    assert!(rebuilt.iter().any(|item| item == &fresh_goal));
+    assert!(rebuilt.iter().any(|item| item == &items[2]));
+    assert!(rebuilt.iter().any(|item| item == &fresh_task));
+    assert_eq!(
+        rebuilt
+            .iter()
+            .filter(|item| super::internal_context_source(&item.item) == Some("goal"))
+            .count(),
+        1
+    );
 }
 
 #[test]

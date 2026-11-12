@@ -90,6 +90,43 @@ fn passive_activity_keeps_shortcuts_only_when_the_complete_hint_fits() {
 }
 
 #[test]
+fn activity_context_renders_once_with_and_without_configured_status() {
+    for status_enabled in [false, true] {
+        let mut composer = composer();
+        composer.set_status_line_enabled(status_enabled);
+        if !status_enabled {
+            composer.set_status_line(None);
+        }
+        composer.set_activity_context(Some("13:21 JST · 1m05s · 11-08 13:21:03 JST".to_string()));
+
+        for width in [20, 120] {
+            let (text, _) = render(&composer, width, /*footer*/ None);
+            assert_eq!(text.matches("13:21 JST").count(), 1, "{text:?}");
+            assert_eq!(text.matches("1m05s").count(), 1, "{text:?}");
+            assert!(text.contains("JST"), "{text:?}");
+            assert!(
+                text.lines()
+                    .all(|line| unicode_width::UnicodeWidthStr::width(line) <= usize::from(width)),
+                "{text:?}"
+            );
+        }
+
+        composer.handle_key_event(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+        let (hinted_text, _) = render(&composer, /*width*/ 120, /*footer*/ None);
+        assert_eq!(
+            hinted_text.matches("13:21 JST").count(),
+            1,
+            "{hinted_text:?}"
+        );
+        assert_eq!(
+            hinted_text.matches("? / esc close").count(),
+            1,
+            "{hinted_text:?}"
+        );
+    }
+}
+
+#[test]
 fn shortcut_help_stays_above_the_prompt_and_bottom_status() {
     let mut composer = composer();
     composer.handle_key_event(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));

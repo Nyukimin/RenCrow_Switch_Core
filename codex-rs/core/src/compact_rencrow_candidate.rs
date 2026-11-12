@@ -7,6 +7,7 @@ use crate::context::ContextualUserFragment;
 use crate::context_manager::ContextManager;
 use crate::session::context_window::ContextWindowTokenStatus;
 use codex_history::RenCrowCompactionMetadataV2;
+use codex_history::RenCrowTaskCheckpointMetadataV3;
 use codex_history::ResponseItemEnvelope;
 use codex_history::archive_reference::ObservationReference;
 use codex_history::archive_reference::content_sha256;
@@ -15,6 +16,7 @@ use codex_history::compaction_checkpoint_metadata::CompactionModelResponseReceip
 use codex_history::compaction_checkpoint_metadata::CompactionSelectionMode;
 use codex_history::compaction_selection::InstructionSelectionApplication;
 use codex_history::observation_projection::ObservationCoverage;
+use codex_history::task_checkpoint_metadata::TaskCheckpointMode;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
@@ -68,12 +70,31 @@ pub(super) fn validate_compaction_candidate(
         return Err("compaction candidate summary is not marked compaction.summary".into());
     }
 
-    let metadata = summary
+    let metadata_value = summary
         .metadata
         .as_ref()
         .and_then(|metadata| metadata.rencrow_compaction.clone())
         .ok_or_else(|| "compaction candidate has no V2 checkpoint metadata".to_owned())?;
-    let metadata = RenCrowCompactionMetadataV2::parse_and_validate(metadata, thread_id, text)?;
+    let metadata = match metadata_value
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+    {
+        Some(2) => {
+            RenCrowCompactionMetadataV2::parse_and_validate(metadata_value, thread_id, text)?
+        }
+        Some(3) => {
+            let checkpoint = RenCrowTaskCheckpointMetadataV3::parse_and_validate(
+                metadata_value,
+                thread_id,
+                text,
+            )?;
+            if checkpoint.mode != TaskCheckpointMode::Capacity {
+                return Err("new compaction candidate cannot be a task boundary checkpoint".into());
+            }
+            checkpoint.into_capacity_metadata()?
+        }
+        _ => return Err("compaction candidate has an unsupported checkpoint version".into()),
+    };
     if metadata.transaction_following_items.is_some()
         || metadata.committed_transaction_hash.is_some()
     {

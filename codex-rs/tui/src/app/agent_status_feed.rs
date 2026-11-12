@@ -1,3 +1,4 @@
+// Modified by RenCrow: share bounded activity previews with the persistent agent panel.
 //! Bounded, best-effort previews for the v2 `/subagents` status output.
 
 use super::ThreadBufferedEvent;
@@ -135,7 +136,7 @@ impl AgentStatusThreadPreview {
     }
 }
 
-fn activity_summary(item: &ThreadItem) -> Option<String> {
+pub(super) fn activity_summary(item: &ThreadItem) -> Option<String> {
     let summary = match item {
         ThreadItem::AgentMessage { text, .. } | ThreadItem::Plan { text, .. } => text,
         ThreadItem::Reasoning { summary, .. } => summary.last()?,
@@ -207,7 +208,7 @@ fn activity_summary(item: &ThreadItem) -> Option<String> {
     bounded_summary(summary)
 }
 
-fn bounded_summary(summary: &str) -> Option<String> {
+pub(super) fn bounded_summary(summary: &str) -> Option<String> {
     let summary = truncate_text(summary, AGENT_STATUS_PREVIEW_GRAPHEMES);
     let summary = summary.split_whitespace().collect::<Vec<_>>().join(" ");
     (!summary.is_empty()).then_some(summary)

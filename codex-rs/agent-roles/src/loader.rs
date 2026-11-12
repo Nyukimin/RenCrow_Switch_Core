@@ -164,6 +164,7 @@ async fn read_declared_role(
 }
 
 fn merge_missing_role_fields(role: &mut AgentRoleConfig, fallback: &AgentRoleConfig) {
+    role.enabled = role.enabled.or(fallback.enabled);
     role.description = role.description.clone().or(fallback.description.clone());
     role.config_file = role.config_file.clone().or(fallback.config_file.clone());
     role.nickname_candidates = role
@@ -210,6 +211,7 @@ async fn agent_role_config_from_toml(
     )?;
 
     Ok(AgentRoleConfig {
+        enabled: role.enabled,
         description,
         config_file: config_file.map(AbsolutePathBuf::into_path_buf),
         nickname_candidates,
@@ -324,6 +326,7 @@ async fn discover_agent_roles_in_dir(
         roles.insert(
             role_name,
             AgentRoleConfig {
+                enabled: None,
                 description: parsed_file.description,
                 config_file: Some(agent_file.to_path_buf()),
                 nickname_candidates: parsed_file.nickname_candidates,

@@ -86,6 +86,9 @@ impl ChatWidget {
     fn flush_answer_stream(&mut self, completed_message: Option<&str>) {
         let had_stream_controller = self.stream_controller.is_some();
         if let Some(mut controller) = self.stream_controller.take() {
+            if self.transcript.agent_message_stream_item.is_some() {
+                self.transcript.agent_message_stream_flushed = true;
+            }
             let had_live_tail = controller.has_live_tail();
             self.clear_active_stream_tail();
             let (cell, streamed_source) = controller.finalize();
@@ -123,6 +126,7 @@ impl ChatWidget {
                 })
             });
             if let Some(source) = source {
+                let source_item = self.transcript.agent_message_stream_item.clone();
                 let inline_visualization_context = self.thread_id.and_then(|thread_id| {
                     crate::inline_visualization::InlineVisualizationContext::from_config(
                         &self.config,
@@ -132,6 +136,7 @@ impl ChatWidget {
                 self.note_stream_consolidation_queued();
                 self.app_event_tx.send(AppEvent::ConsolidateAgentMessage {
                     source,
+                    source_item,
                     cwd: self.config.cwd.to_path_buf(),
                     inline_visualization_context,
                     scrollback_reflow,
@@ -200,6 +205,39 @@ impl ChatWidget {
 
     pub(super) fn on_agent_message_delta(&mut self, delta: String) {
         self.handle_streaming_delta(delta);
+    }
+
+    pub(super) fn on_agent_message_delta_for_item(
+        &mut self,
+        turn_id: String,
+        item_id: String,
+        delta: String,
+        is_live: bool,
+    ) {
+        let identity = (turn_id, item_id);
+        if self.transcript.agent_message_stream_item.as_ref() != Some(&identity) {
+            self.flush_answer_stream_with_separator();
+            self.transcript.agent_message_stream_item = Some(identity);
+            self.transcript.agent_message_stream_flushed = false;
+            self.transcript.agent_message_display_timestamp = None;
+        }
+        let mut display_delta = delta;
+        if is_live
+            && !display_delta.trim().is_empty()
+            && self.transcript.agent_message_display_timestamp.is_none()
+        {
+            let timestamp = self.activity_timestamps_enabled().then(|| {
+                self.last_activity_epoch_seconds
+                    .unwrap_or_else(super::activity_clock::now_epoch_seconds)
+            });
+            self.transcript.agent_message_display_timestamp = Some(timestamp);
+            if let Some(timestamp) = timestamp
+                && let Some(label) = super::activity_clock::history_timestamp_label(timestamp)
+            {
+                display_delta = format!("{label}\n\n{display_delta}");
+            }
+        }
+        self.on_agent_message_delta(display_delta);
     }
 
     pub(super) fn on_plan_delta(&mut self, delta: String) {
@@ -412,11 +450,17 @@ impl ChatWidget {
         item: AgentMessageItem,
         turn_id: &str,
         from_replay: bool,
+        completion_timestamp: Option<i64>,
     ) {
+        let identity = (turn_id.to_string(), item.id.clone());
         if !from_replay && let Some(questions) = &item.questions {
             self.add_async_questions(&item.id, questions);
         }
         self.transcript.last_completed_agent_message = Some((turn_id.to_string(), item.id.clone()));
+        if !from_replay {
+            self.transcript.last_live_completed_agent_message =
+                Some((turn_id.to_string(), item.id.clone()));
+        }
         let mut message = String::new();
         for content in &item.content {
             match content {
@@ -424,6 +468,27 @@ impl ChatWidget {
             }
         }
         let parsed = parse_assistant_markdown(&message, self.config.cwd.as_path());
+        if self.transcript.agent_message_stream_item.as_ref() != Some(&identity) {
+            self.transcript.agent_message_display_timestamp = None;
+        }
+        if self.transcript.agent_message_display_timestamp.is_none() {
+            let should_stamp = self.activity_timestamps_enabled()
+                && (matches!(item.phase, Some(MessagePhase::FinalAnswer) | None)
+                    || self.stream_controller.is_some()
+                    || self.transcript.agent_message_stream_flushed);
+            self.transcript.agent_message_display_timestamp =
+                Some(should_stamp.then_some(completion_timestamp).flatten());
+        }
+        let display_timestamp = self.transcript.agent_message_display_timestamp.flatten();
+        let display_markdown = display_timestamp
+            .and_then(super::activity_clock::history_timestamp_label)
+            .filter(|_| !parsed.visible_markdown.is_empty())
+            .map(|timestamp| format!("{timestamp}\n\n{}", parsed.visible_markdown))
+            .unwrap_or_else(|| parsed.visible_markdown.clone());
+        if self.transcript.agent_message_stream_item.as_ref() != Some(&identity) {
+            self.transcript.agent_message_stream_item = Some(identity.clone());
+            self.transcript.agent_message_stream_flushed = false;
+        }
         if from_replay && self.stream_controller.is_none() && !parsed.visible_markdown.is_empty() {
             self.prepare_assistant_message();
             self.mark_safety_buffering_agent_message_started();
@@ -436,15 +501,31 @@ impl ChatWidget {
             });
             self.add_to_history(
                 history_cell::AgentMarkdownCell::new_with_inline_visualizations(
-                    parsed.visible_markdown.clone(),
+                    display_markdown.clone(),
                     self.config.cwd.as_path(),
                     context,
                 ),
             );
             self.handle_stream_finished();
             self.request_redraw();
+        } else if self.stream_controller.is_none() && self.transcript.agent_message_stream_flushed {
+            self.app_event_tx.send(AppEvent::ConsolidateAgentMessage {
+                source: display_markdown.clone(),
+                source_item: Some(identity),
+                cwd: self.config.cwd.to_path_buf(),
+                inline_visualization_context: self.thread_id.and_then(|thread_id| {
+                    crate::inline_visualization::InlineVisualizationContext::from_config(
+                        &self.config,
+                        thread_id,
+                    )
+                }),
+                scrollback_reflow: crate::app_event::ConsolidationScrollbackReflow::Required,
+                deferred_history_cell: None,
+            });
+            self.handle_stream_finished();
+            self.request_redraw();
         } else {
-            self.finalize_completed_assistant_message(Some(parsed.visible_markdown.as_str()));
+            self.finalize_completed_assistant_message(Some(display_markdown.as_str()));
         }
         if !parsed.visible_markdown.is_empty() {
             self.transcript
@@ -478,6 +559,8 @@ impl ChatWidget {
                 }
                 Some(MessagePhase::Commentary) => true,
             };
+        self.transcript.agent_message_stream_item = None;
+        self.transcript.agent_message_stream_flushed = false;
         self.maybe_restore_status_indicator_after_stream_idle();
     }
 

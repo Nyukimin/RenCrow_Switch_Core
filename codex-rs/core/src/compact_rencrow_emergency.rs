@@ -28,6 +28,8 @@ use codex_history::observation_marker::verify_observation_marker;
 use codex_history::observation_projection::ObservationCoverage;
 use codex_history::observation_projection::ObservationProjection;
 use codex_history::observation_projection::project_existing_observation;
+use codex_history::task_checkpoint_metadata::RenCrowTaskCheckpointMetadataV3;
+use codex_history::task_checkpoint_metadata::TaskCheckpointMode;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::ResponseItem;
@@ -439,9 +441,17 @@ pub(super) fn validate_emergency_summary(
         .as_ref()
         .and_then(|metadata| metadata.rencrow_compaction.clone())
         .ok_or_else(|| "emergency summary has no V2 checkpoint metadata".to_owned())?;
-    let metadata =
-        RenCrowCompactionMetadataV2::parse_and_validate(metadata, thread_id, summary_text)?;
-    if metadata != *expected {
+    let parsed = if metadata.get("version").and_then(serde_json::Value::as_u64) == Some(3) {
+        let checkpoint =
+            RenCrowTaskCheckpointMetadataV3::parse_and_validate(metadata, thread_id, summary_text)?;
+        if checkpoint.mode != TaskCheckpointMode::Capacity {
+            return Err("emergency capacity checkpoint has a non-capacity V3 mode".into());
+        }
+        checkpoint.into_capacity_metadata()?
+    } else {
+        RenCrowCompactionMetadataV2::parse_and_validate(metadata, thread_id, summary_text)?
+    };
+    if parsed != *expected {
         return Err("emergency checkpoint metadata differs from the deterministic plan".into());
     }
     Ok(())

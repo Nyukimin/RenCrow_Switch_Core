@@ -29,11 +29,13 @@ pub use codex_protocol::turn_input::TurnInputSubmission;
 pub use codex_protocol::turn_input::TurnStartOptions;
 pub use responses_metadata::CodexResponsesMetadata;
 pub use turn_metadata::detached_memory_responses_metadata;
+mod autonomous_progress;
 mod codex_thread;
 mod compact_model_fallback;
 mod compact_remote_history;
 mod compact_remote_v2;
 mod compact_token_budget;
+mod task_check;
 mod thread_startup_metadata;
 pub use codex_network_proxy::EnvironmentNetworkPolicy;
 pub use codex_network_proxy::NetworkDomainPermission;
@@ -50,6 +52,12 @@ pub use codex_thread::GuardianAuthorizationVersion;
 pub use codex_thread::GuardianRootMessage;
 pub use codex_thread::GuardianRootSnapshot;
 pub use codex_thread::ThreadConfigSnapshot;
+pub use session::completion_persistence::MaintenanceRepairEvidenceDigest;
+pub use session::completion_persistence::MaintenanceRepairReceipt;
+pub use session::completion_persistence::MaintenanceRepairSnapshotInfo;
+pub use session::completion_persistence::build_maintenance_repair_snapshot;
+pub use session::completion_persistence::inspect_maintenance_repair_snapshot;
+pub use session::completion_persistence::maintenance_snapshot_digest;
 pub use session::turn_context::TurnContext;
 pub use thread_startup_metadata::ThreadStartupMetadata;
 mod agent;
@@ -249,3 +257,7 @@ pub mod otel_init;
 
 // Captured environment bindings can be passed back to ThreadManager by internal reviewers.
 pub use environment_selection::TurnEnvironmentSnapshot;
+
+// Modified by RenCrow: native executor contract enforcement.
+mod rencrow_execution_guard;
+mod rencrow_shell_edit_guard;

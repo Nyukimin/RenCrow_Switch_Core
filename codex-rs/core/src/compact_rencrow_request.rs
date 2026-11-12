@@ -12,7 +12,6 @@ use codex_history::compaction_checkpoint_metadata::CompactionModelResponseReceip
 use codex_history::compaction_plan::DerivedResult;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
-use serde::de::DeserializeOwned;
 use serde_json::Value;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
@@ -59,13 +58,11 @@ pub(super) async fn drain_compaction_stage(
 /// The ordinary base instructions describe an executor; ahead of a dataset they made the model act
 /// on the requests inside the data instead of returning JSON (COMPACTION_SPEC.md Part 3,
 /// 2026-09-29). Empty instructions are omitted from the request.
-pub(super) async fn drain_json_stage(
+pub(super) async fn drain_instruction_selection(
     sess: &Session,
     ctx: &TurnContext,
     metadata: CompactionTurnMetadata,
-    stage: &str,
-    instruction: &str,
-    data: &Value,
+    request: &codex_history::compaction_selection_wire::SelectionRequest,
     cancellation: &CancellationToken,
 ) -> CodexResult<(CompactionResponse, f64)> {
     let prompt = Prompt {
@@ -73,10 +70,22 @@ pub(super) async fn drain_json_stage(
             text: String::new(),
             provenance: None,
         },
-        input: json_stage_input(instruction, data),
+        input: json_stage_input(
+            codex_history::compaction_selection_wire::SELECTION_INSTRUCTION,
+            request.data(),
+        ),
+        output_schema: Some(request.schema()),
         ..Default::default()
     };
-    drain_compaction_prompt(sess, ctx, metadata, stage, prompt, cancellation).await
+    drain_compaction_prompt(
+        sess,
+        ctx,
+        metadata,
+        "instruction_selection",
+        prompt,
+        cancellation,
+    )
+    .await
 }
 
 async fn drain_compaction_prompt(
@@ -177,13 +186,6 @@ pub(super) fn json_stage_text(output: Vec<ResponseItem>) -> CodexResult<String> 
     Ok(text)
 }
 
-/// Parse the concatenated assistant text of a JSON-dataset stage against its schema.
-pub(super) fn parse_json_stage<T: DeserializeOwned>(stage: &str, text: &str) -> CodexResult<T> {
-    serde_json::from_str(text.trim()).map_err(|error| {
-        CodexErr::InvalidRequest(format!("RenCrow {stage} schema rejected: {error}"))
-    })
-}
-
 /// Send the single V2 summary request and return its summary suffix and response ID.
 ///
 /// The summary history is normalized by the original `for_prompt` and executed-tool attachment,
@@ -223,11 +225,14 @@ pub(super) async fn request_compaction_summary(
         sess.services
             .executed_tool_calls
             .attach_to_compaction_prompt(&mut input);
-        let prompt = crate::session::turn::build_prompt(
+        let mut prompt = crate::session::turn::build_prompt(
             input,
             prefix.step_context,
             sess.get_prompt_base_instructions().await,
         );
+        // The turn prefix preserves ordinary-turn tools and instructions, but this request's
+        // output contract is plain summary text rather than the turn's requested JSON schema.
+        prompt.output_schema = None;
         let (response, seconds) =
             drain_compaction_prompt(sess, ctx, metadata, "summary", prompt, cancellation).await?;
         return finish_summary(response, seconds, receipts);

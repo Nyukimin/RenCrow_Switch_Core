@@ -1,6 +1,6 @@
 ---
 source: tui/src/app/owned_transcript_tests.rs
-assertion_line: 1245
+assertion_line: 1302
 expression: "format!(\"{}\\n\\n{}\", selection_frames.join(\"\\n\\n\"),\nnormalize_snapshot_paths(buffer_text(crate::custom_terminal::test_support::last_rendered_buffer(&tui.terminal))))"
 ---
 keyboard Err("clipboard unavailable")
@@ -44,7 +44,7 @@ hello world
 
 
 
-
+Subagents: 0 running / 0 total · /subagents details
                                                Copied 5 chars to host clipboard
 
 › hello world

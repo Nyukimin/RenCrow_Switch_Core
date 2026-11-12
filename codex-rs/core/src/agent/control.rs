@@ -62,6 +62,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::Weak;
+use std::time::Duration;
 use tokio::sync::watch;
 use tracing::warn;
 use uuid::Uuid;
@@ -396,6 +397,34 @@ impl LocalAgentControl {
         thread.agent_status().await
     }
 
+    pub(crate) async fn get_rencrow_execution_evidence(
+        &self,
+        agent_id: ThreadId,
+        parent_thread_id: ThreadId,
+    ) -> Option<crate::rencrow_execution_guard::GuardExecutionEvidence> {
+        let state = self.upgrade().ok()?;
+        let thread = state.get_thread(agent_id).await.ok()?;
+        if !matches!(thread.agent_status().await, AgentStatus::Completed(_)) {
+            return None;
+        }
+        thread
+            .session
+            .rencrow_execution_evidence_for_parent(parent_thread_id)
+            .await
+    }
+
+    /// Resolve the child's effective edit contract. Unknown threads/configs are
+    /// represented as `None` so callers can fail closed.
+    pub(crate) async fn get_rencrow_child_requires_edit(&self, agent_id: ThreadId) -> Option<bool> {
+        let state = self.upgrade().ok()?;
+        let thread = state.get_thread(agent_id).await.ok()?;
+        let config = thread.config().await;
+        config
+            .rencrow_execution_guard
+            .as_ref()
+            .map(codex_config::RencrowExecutionGuard::requires_edit)
+    }
+
     pub(crate) fn register_session_root(
         &self,
         current_thread_id: ThreadId,
@@ -408,6 +437,20 @@ impl LocalAgentControl {
 
     pub(crate) fn get_agent_metadata(&self, agent_id: ThreadId) -> Option<AgentMetadata> {
         self.state.agent_metadata_for_thread(agent_id)
+    }
+
+    /// Atomically sample a loaded child's current turn generation and status.
+    pub(crate) async fn get_agent_status_generation(
+        &self,
+        agent_id: ThreadId,
+    ) -> CodexResult<(Option<String>, AgentStatus)> {
+        let state = self.upgrade()?;
+        let thread = state.get_thread(agent_id).await?;
+        Ok(thread.session.agent_status_generation().await)
+    }
+
+    pub(crate) fn has_registered_agents(&self) -> bool {
+        !self.state.live_agents().is_empty()
     }
 
     pub(crate) fn ensure_agent_known(&self, agent_id: ThreadId) -> CodexResult<AgentMetadata> {
@@ -606,80 +649,136 @@ impl LocalAgentControl {
         };
         let control = self.clone();
         tokio::spawn(async move {
-            let status = match control.subscribe_status(child_thread_id).await {
-                Ok(mut status_rx) => {
-                    let mut status = status_rx.borrow().clone();
-                    while !is_final(&status) {
-                        if status_rx.changed().await.is_err() {
-                            status = control.get_status(child_thread_id).await;
-                            break;
-                        }
-                        status = status_rx.borrow().clone();
+            let mut status_rx = match control.subscribe_status(child_thread_id).await {
+                Ok(status_rx) => status_rx,
+                Err(_) => {
+                    let Ok(manager) = control.upgrade() else {
+                        return;
+                    };
+                    if let Ok(parent_thread) = manager.get_thread(parent_thread_id).await {
+                        parent_thread
+                            .inject_fragment_without_turn(SubagentNotification::new(
+                                child_reference.as_str(),
+                                AgentStatus::NotFound,
+                            ))
+                            .await;
                     }
-                    status
+                    return;
                 }
-                Err(_) => control.get_status(child_thread_id).await,
             };
-            if !is_final(&status) {
-                return;
-            }
-
-            let Ok(state) = control.upgrade() else {
-                return;
-            };
-            let child_thread = state.get_thread(child_thread_id).await.ok();
-            let child_uses_multi_agent_v2 = match child_thread.as_ref() {
-                Some(child_thread) => {
-                    child_thread.multi_agent_version() == Some(MultiAgentVersion::V2)
+            let mut notified_terminal: Option<(String, AgentStatus)> = None;
+            loop {
+                let Ok(manager) = control.upgrade() else {
+                    return;
+                };
+                let Ok(child_thread) = manager.get_thread(child_thread_id).await else {
+                    return;
+                };
+                let (turn_id, status) = child_thread.session.agent_status_generation().await;
+                let child_uses_multi_agent_v2 =
+                    child_thread.multi_agent_version() == Some(MultiAgentVersion::V2);
+                drop(child_thread);
+                drop(manager);
+                if !is_final(&status) {
+                    match tokio::time::timeout(Duration::from_secs(30), status_rx.changed()).await {
+                        Ok(Ok(())) => continue,
+                        Ok(Err(_)) => return,
+                        Err(_) => {
+                            let Ok(manager) = control.upgrade() else {
+                                return;
+                            };
+                            if manager.get_thread(parent_thread_id).await.is_err() {
+                                return;
+                            }
+                            continue;
+                        }
+                    }
                 }
-                None => true,
-            };
-            if child_agent_path.is_some() && child_uses_multi_agent_v2 {
-                let Some(child_agent_path) = child_agent_path.clone() else {
+                let generation = turn_id
+                    .clone()
+                    .unwrap_or_else(|| format!("status:{status:?}"));
+                let should_exit_after_notification = matches!(&status, AgentStatus::Shutdown);
+                if notified_terminal.as_ref() == Some(&(generation.clone(), status.clone())) {
+                    match tokio::time::timeout(Duration::from_secs(30), status_rx.changed()).await {
+                        Ok(Ok(())) => continue,
+                        Ok(Err(_)) => return,
+                        Err(_) => {
+                            let Ok(manager) = control.upgrade() else {
+                                return;
+                            };
+                            if manager.get_thread(parent_thread_id).await.is_err() {
+                                return;
+                            }
+                            continue;
+                        }
+                    }
+                }
+                notified_terminal = Some((generation, status.clone()));
+                let completion_event_key = turn_id
+                    .as_deref()
+                    .map(|turn_id| format!("child-result:{child_thread_id}:{turn_id}"));
+                let Ok(state) = control.upgrade() else {
                     return;
                 };
-                let Some(parent_agent_path) = child_agent_path
-                    .as_str()
-                    .rsplit_once('/')
-                    .and_then(|(parent, _)| AgentPath::try_from(parent).ok())
-                else {
+                if child_agent_path.is_some() && child_uses_multi_agent_v2 {
+                    let Some(child_agent_path) = child_agent_path.clone() else {
+                        continue;
+                    };
+                    let Some(parent_agent_path) = child_agent_path
+                        .as_str()
+                        .rsplit_once('/')
+                        .and_then(|(parent, _)| AgentPath::try_from(parent).ok())
+                    else {
+                        continue;
+                    };
+                    let Some(message) = format_inter_agent_completion_message(
+                        parent_agent_path.clone(),
+                        child_agent_path.clone(),
+                        &status,
+                    ) else {
+                        continue;
+                    };
+                    let communication = InterAgentCommunication::new(
+                        child_agent_path,
+                        parent_agent_path,
+                        Vec::new(),
+                        message,
+                        /*trigger_turn*/ false,
+                    );
+                    let context = AgentCommunicationContext::new(
+                        AgentCommunicationKind::Result,
+                        child_thread_id,
+                    );
+                    let _ = control
+                        .send_inter_agent_communication(
+                            parent_thread_id,
+                            communication,
+                            context,
+                            TurnStartOptions::default(),
+                        )
+                        .await;
+                    if let Some(event_key) = completion_event_key.as_deref()
+                        && let Ok(parent_thread) = state.get_thread(parent_thread_id).await
+                    {
+                        super::autonomous_completion::wake_parent(&parent_thread, event_key).await;
+                    }
+                } else if let Ok(parent_thread) = state.get_thread(parent_thread_id).await {
+                    parent_thread
+                        .inject_fragment_without_turn(SubagentNotification::new(
+                            child_reference.as_str(),
+                            status,
+                        ))
+                        .await;
+                    if let Some(event_key) = completion_event_key.as_deref() {
+                        super::autonomous_completion::wake_parent(&parent_thread, event_key).await;
+                    }
+                } else {
                     return;
-                };
-                let Some(message) = format_inter_agent_completion_message(
-                    parent_agent_path.clone(),
-                    child_agent_path.clone(),
-                    &status,
-                ) else {
+                }
+                if should_exit_after_notification {
                     return;
-                };
-                let communication = InterAgentCommunication::new(
-                    child_agent_path,
-                    parent_agent_path,
-                    Vec::new(),
-                    message,
-                    /*trigger_turn*/ false,
-                );
-                let context =
-                    AgentCommunicationContext::new(AgentCommunicationKind::Result, child_thread_id);
-                let _ = control
-                    .send_inter_agent_communication(
-                        parent_thread_id,
-                        communication,
-                        context,
-                        TurnStartOptions::default(),
-                    )
-                    .await;
-                return;
+                }
             }
-            let Ok(parent_thread) = state.get_thread(parent_thread_id).await else {
-                return;
-            };
-            parent_thread
-                .inject_fragment_without_turn(SubagentNotification::new(
-                    child_reference.as_str(),
-                    status,
-                ))
-                .await;
         });
     }
 

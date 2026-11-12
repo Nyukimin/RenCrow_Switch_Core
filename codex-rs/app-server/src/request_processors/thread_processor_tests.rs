@@ -662,6 +662,7 @@ mod thread_processor_behavior_tests {
         let cwd = test_path_buf("/tmp").abs();
         let request = ThreadResumeParams {
             thread_id: "thread-1".to_string(),
+            defer_autonomous_completion: None,
             history: None,
             path: None,
             model: None,

@@ -70,6 +70,58 @@ async fn apply_role_returns_error_for_unknown_role() {
 }
 
 #[tokio::test]
+async fn apply_role_rejects_disabled_custom_role_instead_of_using_builtin() {
+    let (_home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
+    config.agent_roles.insert(
+        "explorer".to_string(),
+        AgentRoleConfig {
+            enabled: Some(false),
+            description: Some("Unavailable because its route is not live.".to_string()),
+            config_file: None,
+            nickname_candidates: None,
+        },
+    );
+
+    let err = apply_role_to_config(&mut config, Some("explorer"))
+        .await
+        .expect_err("disabled custom role must mask the builtin explorer");
+
+    assert_eq!(
+        err,
+        "agent_type 'explorer' is unavailable because this role is disabled"
+    );
+}
+
+#[tokio::test]
+async fn apply_role_model_override_inherits_parent_reasoning_effort_when_unset() {
+    let (home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
+    let role_path = write_role_config(
+        &home,
+        "model-only-role.toml",
+        r#"model = "qwen38-flash--rtx5060""#,
+    )
+    .await;
+    config.model = Some("parent-model".to_string());
+    config.model_reasoning_effort = Some(ReasoningEffort::XHigh);
+    config.agent_roles.insert(
+        "worker".to_string(),
+        AgentRoleConfig {
+            enabled: None,
+            description: Some("Model-only role".to_string()),
+            config_file: Some(role_path),
+            nickname_candidates: None,
+        },
+    );
+
+    apply_role_to_config(&mut config, Some("worker"))
+        .await
+        .expect("role with no effort override should inherit the parent effort");
+
+    assert_eq!(config.model.as_deref(), Some("qwen38-flash--rtx5060"));
+    assert_eq!(config.model_reasoning_effort, Some(ReasoningEffort::XHigh));
+}
+
+#[tokio::test]
 async fn apply_empty_explorer_role_preserves_current_model_and_reasoning_effort() {
     let (_home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
     let before_layers = session_flags_layer_count(&config);
@@ -91,6 +143,7 @@ async fn apply_role_returns_unavailable_for_missing_user_role_file() {
     config.agent_roles.insert(
         "custom".to_string(),
         AgentRoleConfig {
+            enabled: None,
             description: None,
             config_file: Some(PathBuf::from("/path/does/not/exist.toml")),
             nickname_candidates: None,
@@ -114,6 +167,7 @@ async fn apply_role_rejects_symlinked_role_file() {
     config.agent_roles.insert(
         "custom".to_string(),
         AgentRoleConfig {
+            enabled: None,
             description: None,
             config_file: Some(role_path),
             nickname_candidates: None,
@@ -134,6 +188,7 @@ async fn apply_role_returns_unavailable_for_invalid_user_role_toml() {
     config.agent_roles.insert(
         "custom".to_string(),
         AgentRoleConfig {
+            enabled: None,
             description: None,
             config_file: Some(role_path),
             nickname_candidates: None,
@@ -145,6 +200,91 @@ async fn apply_role_returns_unavailable_for_invalid_user_role_toml() {
         .expect_err("invalid role file should fail");
 
     assert_eq!(err, AGENT_TYPE_UNAVAILABLE_ERROR);
+}
+
+#[tokio::test]
+async fn apply_role_rejects_read_only_task_with_required_edit() {
+    let (home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
+    let role_path = write_role_config(
+        &home,
+        "contradictory-role.toml",
+        "[rencrow_execution_guard]\ntask_kind = \"read_only\"\nrequire_edit = true",
+    )
+    .await;
+    config.agent_roles.insert(
+        "custom".to_string(),
+        AgentRoleConfig {
+            enabled: None,
+            description: None,
+            config_file: Some(role_path),
+            nickname_candidates: None,
+        },
+    );
+
+    let err = apply_role_to_config(&mut config, Some("custom"))
+        .await
+        .expect_err("contradictory read-only role should fail");
+
+    assert_eq!(err, AGENT_TYPE_UNAVAILABLE_ERROR);
+}
+
+#[tokio::test]
+async fn apply_role_rejects_edit_contract_under_inherited_read_only_permissions() {
+    for role_guard in [
+        "[rencrow_execution_guard]\ntask_kind = \"implement\"",
+        "[rencrow_execution_guard]\nrequire_edit = true",
+    ] {
+        let (home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
+        config.rencrow_read_only = true;
+        let role_path = write_role_config(&home, "edit-role.toml", role_guard).await;
+        config.agent_roles.insert(
+            "custom".to_string(),
+            AgentRoleConfig {
+                enabled: None,
+                description: None,
+                config_file: Some(role_path),
+                nickname_candidates: None,
+            },
+        );
+
+        let err = apply_role_to_config(&mut config, Some("custom"))
+            .await
+            .expect_err("edit contract under inherited read-only permissions should fail");
+
+        assert_eq!(err, AGENT_TYPE_UNAVAILABLE_ERROR);
+    }
+}
+
+#[tokio::test]
+async fn read_only_task_kind_overrides_inherited_legacy_edit_requirement() {
+    let (home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
+    config.rencrow_execution_guard = Some(codex_config::RencrowExecutionGuard {
+        require_edit: true,
+        ..Default::default()
+    });
+    let role_path = write_role_config(
+        &home,
+        "read-only-role.toml",
+        "[rencrow_execution_guard]\ntask_kind = \"read_only\"",
+    )
+    .await;
+    config.agent_roles.insert(
+        "custom".to_string(),
+        AgentRoleConfig {
+            enabled: None,
+            description: None,
+            config_file: Some(role_path),
+            nickname_candidates: None,
+        },
+    );
+
+    apply_role_to_config(&mut config, Some("custom"))
+        .await
+        .expect("read-only task kind should override legacy edit requirement");
+
+    let guard = config.rencrow_execution_guard.as_ref().unwrap();
+    assert!(guard.require_edit);
+    assert!(!guard.requires_edit());
 }
 
 #[tokio::test]
@@ -165,6 +305,7 @@ model = "role-model"
     config.agent_roles.insert(
         "custom".to_string(),
         AgentRoleConfig {
+            enabled: None,
             description: None,
             config_file: Some(role_path),
             nickname_candidates: None,
@@ -196,6 +337,7 @@ async fn apply_role_preserves_unspecified_keys() {
     config.agent_roles.insert(
         "custom".to_string(),
         AgentRoleConfig {
+            enabled: None,
             description: None,
             config_file: Some(role_path),
             nickname_candidates: None,
@@ -301,6 +443,7 @@ async fn apply_role_refreshes_model_instructions_only_when_personality_opt_out_c
         config.agent_roles.insert(
             "custom".to_string(),
             AgentRoleConfig {
+                enabled: None,
                 description: None,
                 config_file: Some(role_path),
                 nickname_candidates: None,
@@ -342,6 +485,7 @@ service_tier = "priority"
     config.agent_roles.insert(
         "custom".to_string(),
         AgentRoleConfig {
+            enabled: None,
             description: None,
             config_file: Some(role_path),
             nickname_candidates: None,
@@ -372,6 +516,7 @@ async fn apply_role_preserves_existing_service_tier_without_override() {
     config.agent_roles.insert(
         "custom".to_string(),
         AgentRoleConfig {
+            enabled: None,
             description: None,
             config_file: Some(role_path),
             nickname_candidates: None,
@@ -415,6 +560,7 @@ writable_roots = ["./sandbox-root"]
     config.agent_roles.insert(
         "custom".to_string(),
         AgentRoleConfig {
+            enabled: None,
             description: None,
             config_file: Some(role_path),
             nickname_candidates: None,
@@ -469,6 +615,7 @@ command = "attacker-command"
     config.agent_roles.insert(
         "custom".to_string(),
         AgentRoleConfig {
+            enabled: None,
             description: None,
             config_file: Some(role_path),
             nickname_candidates: None,
@@ -576,6 +723,7 @@ async fn apply_role_takes_precedence_over_existing_session_flags_for_same_key() 
     config.agent_roles.insert(
         "custom".to_string(),
         AgentRoleConfig {
+            enabled: None,
             description: None,
             config_file: Some(role_path),
             nickname_candidates: None,
@@ -619,6 +767,7 @@ enabled = false
     config.agent_roles.insert(
         "custom".to_string(),
         AgentRoleConfig {
+            enabled: None,
             description: None,
             config_file: Some(role_path),
             nickname_candidates: None,
@@ -663,6 +812,7 @@ fn spawn_tool_spec_build_deduplicates_user_defined_built_in_roles() {
         (
             "explorer".to_string(),
             AgentRoleConfig {
+                enabled: None,
                 description: Some("user override".to_string()),
                 config_file: None,
                 nickname_candidates: None,
@@ -680,10 +830,57 @@ fn spawn_tool_spec_build_deduplicates_user_defined_built_in_roles() {
 }
 
 #[test]
+fn spawn_tool_spec_hides_disabled_custom_roles_and_masks_builtins() {
+    let user_defined_roles = BTreeMap::from([
+        (
+            "default".to_string(),
+            AgentRoleConfig {
+                enabled: Some(false),
+                description: Some("Unavailable default".to_string()),
+                ..Default::default()
+            },
+        ),
+        (
+            "explorer".to_string(),
+            AgentRoleConfig {
+                enabled: Some(false),
+                description: Some("Unavailable explorer".to_string()),
+                ..Default::default()
+            },
+        ),
+        (
+            "worker".to_string(),
+            AgentRoleConfig {
+                enabled: Some(false),
+                description: Some("Unavailable worker".to_string()),
+                ..Default::default()
+            },
+        ),
+        (
+            "analyst".to_string(),
+            AgentRoleConfig {
+                enabled: None,
+                description: Some("Available analyst".to_string()),
+                ..Default::default()
+            },
+        ),
+    ]);
+
+    let spec = spawn_tool_spec::build(&user_defined_roles);
+
+    assert!(spec.contains("analyst: {\nAvailable analyst\n}"));
+    assert!(!spec.contains("default:"));
+    assert!(!spec.contains("explorer:"));
+    assert!(!spec.contains("Explorers are fast and authoritative."));
+    assert!(!spec.contains("worker:"));
+}
+
+#[test]
 fn spawn_tool_spec_lists_user_defined_roles_before_built_ins() {
     let user_defined_roles = BTreeMap::from([(
         "aaa".to_string(),
         AgentRoleConfig {
+            enabled: None,
             description: Some("first".to_string()),
             config_file: None,
             nickname_candidates: None,
@@ -711,6 +908,7 @@ fn spawn_tool_spec_marks_role_locked_model_and_reasoning_effort() {
     let user_defined_roles = BTreeMap::from([(
         "researcher".to_string(),
         AgentRoleConfig {
+            enabled: None,
             description: Some("Research carefully.".to_string()),
             config_file: Some(role_path),
             nickname_candidates: None,
@@ -736,6 +934,7 @@ fn spawn_tool_spec_marks_role_locked_reasoning_effort_only() {
     let user_defined_roles = BTreeMap::from([(
         "reviewer".to_string(),
         AgentRoleConfig {
+            enabled: None,
             description: Some("Review carefully.".to_string()),
             config_file: Some(role_path),
             nickname_candidates: None,
@@ -761,6 +960,7 @@ fn spawn_tool_spec_omits_role_service_tier() {
     let user_defined_roles = BTreeMap::from([(
         "tiered".to_string(),
         AgentRoleConfig {
+            enabled: None,
             description: Some("Stay fast.".to_string()),
             config_file: Some(role_path),
             nickname_candidates: None,
@@ -802,6 +1002,7 @@ rencrow_read_only = true
     config.agent_roles.insert(
         "explorer".to_string(),
         AgentRoleConfig {
+            enabled: None,
             description: None,
             config_file: Some(role_path),
             nickname_candidates: None,
@@ -837,6 +1038,7 @@ developer_instructions = "Do the assigned work only"
     config.agent_roles.insert(
         "worker".to_string(),
         AgentRoleConfig {
+            enabled: None,
             description: None,
             config_file: Some(role_path),
             nickname_candidates: None,

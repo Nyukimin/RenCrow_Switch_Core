@@ -385,6 +385,21 @@ impl CodexThread {
         .await
     }
 
+    /// Starts an autonomous completion turn when idle using normal Automatic admission.
+    pub async fn continue_autonomous_turn_if_idle(
+        &self,
+        request: TurnInputRequest,
+        expected_previous_turn_id: String,
+    ) -> CodexResult<TurnInputSubmission> {
+        self.submit_turn_input_with_mode(
+            request,
+            TurnInputMode::AutonomousContinueIfIdle {
+                expected_previous_turn_id,
+            },
+        )
+        .await
+    }
+
     /// Resumes an interrupted regular turn only when the thread is idle.
     ///
     /// Recovery starts no new user input and preserves the turn ID that was

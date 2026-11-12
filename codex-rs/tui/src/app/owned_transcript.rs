@@ -1,3 +1,4 @@
+// Modified by RenCrow: reserve persistent subagent status above the composer.
 //! Compose the owned transcript above the composer and route their selection gestures.
 //! Reserve a cleared row below activity and previews, immediately above the composer.
 //! Slash suggestions overlay already-painted rows so opening or closing them leaves transcript
@@ -88,6 +89,7 @@ impl App {
         .then(crate::bottom_pane::ComposerGap::default);
         let mut prompt_footer =
             self.prompt_navigation_footer(screen_size.width.saturating_sub(/*rhs*/ 2));
+        let agent_lines = self.agent_panel_lines(screen_size.width);
         let chat_widget = &self.chat_widget;
         let view = &mut self.transcript_view;
         let active_key = chat_widget.active_cell_transcript_key();
@@ -115,15 +117,40 @@ impl App {
         let dashboard_visible = chat_widget
             .selected_index_for_present_view(AGENTS_OVERVIEW_VIEW_ID)
             .is_some();
-        let bottom_height = if dashboard_visible {
+        let desired_bottom_height = if dashboard_visible {
             screen_size.height
         } else {
             bottom
                 .desired_height(screen_size.width)
                 .min(screen_size.height)
         };
+        let agent_panel_enabled =
+            !dashboard_visible && !chat_widget.has_active_view() && screen_size.height >= 8;
+        let body_reserve = 1;
+        let max_bottom_height = if agent_panel_enabled && screen_size.height > body_reserve {
+            screen_size.height.saturating_sub(body_reserve + 1)
+        } else {
+            screen_size.height
+        };
+        let bottom_height = desired_bottom_height.min(max_bottom_height);
         drop(bottom);
-        let available = screen_size.height.saturating_sub(bottom_height);
+        let remaining_above_composer = screen_size.height.saturating_sub(bottom_height);
+        let panel_budget = if !agent_panel_enabled {
+            0
+        } else if screen_size.height <= 30 || remaining_above_composer <= 3 {
+            1.min(remaining_above_composer.saturating_sub(body_reserve))
+        } else {
+            (agent_lines.len() as u16)
+                .min(screen_size.height / 4)
+                .min(remaining_above_composer.saturating_sub(body_reserve))
+        };
+        let agent_lines =
+            super::agent_panel::fit_panel_lines(&agent_lines, usize::from(panel_budget));
+        let panel_height = agent_lines.len() as u16;
+        let available = screen_size
+            .height
+            .saturating_sub(bottom_height)
+            .saturating_sub(panel_height);
         let bottom_area = Rect::new(
             /*x*/ 0,
             screen_size.height.saturating_sub(bottom_height),
@@ -176,7 +203,10 @@ impl App {
                 && bottom
                     .desired_height(screen_size.width)
                     .min(screen_size.height)
+                    .min(max_bottom_height)
                     != bottom_height;
+            let panel_area = Rect::new(0, available, screen_size.width, panel_height);
+            super::agent_panel::render_panel(&agent_lines, panel_area, frame.buffer);
             bottom.render(bottom_area, frame.buffer);
             let follow_area = if let Some(gap) = composer_gap.as_ref() {
                 Some(Rect {

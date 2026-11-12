@@ -40,6 +40,32 @@ impl ObservationReference {
     }
 }
 
+/// Host-authored evidence that a matching tool output was blocked before its handler ran.
+///
+/// The reference binds the evidence to the persisted thread, call ID, and canonical output body.
+/// It does not assert that the tool completed or that the blocked output is successful.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BlockedToolCallReference {
+    pub version: u32,
+    pub observation: ObservationReference,
+}
+
+impl BlockedToolCallReference {
+    pub const VERSION: u32 = 1;
+
+    pub fn new(observation: ObservationReference) -> Self {
+        Self {
+            version: Self::VERSION,
+            observation,
+        }
+    }
+
+    pub fn validates(&self, observation: &ObservationReference) -> bool {
+        self.version == Self::VERSION && self.observation == *observation
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ArchiveTerminalStatus {

@@ -315,6 +315,7 @@ use crate::status_indicator_widget::STATUS_DETAILS_DEFAULT_MAX_LINES;
 use crate::status_indicator_widget::StatusDetailsCapitalization;
 use crate::text_formatting::truncate_text;
 use crate::tui::FrameRequester;
+mod activity_clock;
 mod activity_groups;
 mod activity_presentation;
 mod command_lifecycle;
@@ -660,6 +661,8 @@ pub(crate) struct ChatWidget {
     realtime_conversation_available_for_thread: bool,
     safety_buffering: SafetyBufferingState,
     task_complete_pending: bool,
+    /// Latest real activity wall-clock timestamp, retained for passive idle display.
+    last_activity_epoch_seconds: Option<i64>,
     unified_exec_processes: Vec<UnifiedExecProcessSummary>,
     /// Tracks per-server MCP startup state while startup is in progress.
     ///
@@ -894,18 +897,40 @@ pub(crate) enum TurnAbortReason {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ThreadItemRenderSource {
     Live,
+    LiveAt(i64),
     Replay(ReplayKind),
+    ReplayAt(ReplayKind, i64),
 }
 
 impl ThreadItemRenderSource {
     fn is_replay(self) -> bool {
-        matches!(self, Self::Replay(_))
+        matches!(self, Self::Replay(_)) || matches!(self, Self::ReplayAt(_, _))
     }
 
     fn replay_kind(self) -> Option<ReplayKind> {
         match self {
-            Self::Live => None,
-            Self::Replay(replay_kind) => Some(replay_kind),
+            Self::Live | Self::LiveAt(_) => None,
+            Self::Replay(replay_kind) | Self::ReplayAt(replay_kind, _) => Some(replay_kind),
+        }
+    }
+
+    fn with_completion_timestamp(self, timestamp: Option<i64>) -> Self {
+        match (self, timestamp) {
+            (Self::Live, Some(timestamp)) | (Self::LiveAt(_), Some(timestamp)) => {
+                Self::LiveAt(timestamp)
+            }
+            (Self::Replay(replay_kind), Some(timestamp))
+            | (Self::ReplayAt(replay_kind, _), Some(timestamp)) => {
+                Self::ReplayAt(replay_kind, timestamp)
+            }
+            (source, None) => source,
+        }
+    }
+
+    fn completion_timestamp(self) -> Option<i64> {
+        match self {
+            Self::Live | Self::Replay(_) => None,
+            Self::LiveAt(timestamp) | Self::ReplayAt(_, timestamp) => Some(timestamp),
         }
     }
 }
@@ -1230,6 +1255,7 @@ impl ChatWidget {
         }
         self.refresh_status_line_if_workspace_headline_due();
         self.refresh_thread_usage_if_settlement_due();
+        self.refresh_activity_footer();
     }
 
     fn flush_active_cell(&mut self) {
@@ -1262,9 +1288,16 @@ impl ChatWidget {
     }
 
     fn add_boxed_history(&mut self, cell: Box<dyn HistoryCell>) {
-        let Err(cell) = self.absorb_activity_detail(cell) else {
+        let Err(mut cell) = self.absorb_activity_detail(cell) else {
             return;
         };
+        if let Some((turn_id, item_id)) = &self.transcript.agent_message_stream_item
+            && let Some(agent_message) = cell
+                .as_any_mut()
+                .downcast_mut::<history_cell::AgentMessageCell>()
+        {
+            agent_message.set_source_item(turn_id.clone(), item_id.clone());
+        }
         if let Some(active) = self.take_history_insertion_prefix(cell.as_ref()) {
             self.app_event_tx.send(AppEvent::InsertHistoryCell(active));
             self.request_pending_usage_output_insertion();

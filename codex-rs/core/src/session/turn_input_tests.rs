@@ -108,6 +108,143 @@ async fn submit_steer_only(
     .expect("steer-only submission should be valid")
 }
 
+async fn write_intake_receipt(
+    session: &Session,
+    client_id: &str,
+    author: codex_history::input_intake::InputAuthor,
+    receipt_thread_id: &str,
+    original_text: &str,
+    submitted_text: &str,
+) {
+    use codex_history::input_intake::OriginalInput;
+    use codex_history::input_intake::SubmissionIntake;
+
+    let receipt = SubmissionIntake::new(
+        receipt_thread_id.to_string(),
+        client_id.to_string(),
+        OriginalInput {
+            author,
+            text: original_text.to_string(),
+            attachments: Vec::new(),
+        },
+        submitted_text,
+    )
+    .expect("valid intake receipt");
+    let config = session.get_config().await;
+    let path = config
+        .codex_home
+        .join("rencrow/input-intake")
+        .join(session.thread_id().to_string());
+    tokio::fs::create_dir_all(&path)
+        .await
+        .expect("create intake directory");
+    tokio::fs::write(
+        path.join(format!("{client_id}.json")),
+        serde_json::to_vec(&receipt).expect("serialize intake receipt"),
+    )
+    .await
+    .expect("write intake receipt");
+}
+
+fn resume_user_input(text: &str, client_id: &str) -> SubmittedTurnInput {
+    SubmittedTurnInput::UserInput {
+        content: vec![UserInput::Text {
+            text: text.to_string(),
+            text_elements: Vec::new(),
+        }],
+        client_id: Some(client_id.to_string()),
+    }
+}
+
+#[tokio::test]
+async fn autonomous_resume_requires_matching_human_intake_and_does_not_clear_pause_by_itself() {
+    use codex_history::input_intake::InputAuthor;
+
+    let (session, _) = make_session_and_context().await;
+    session.pause_autonomous_completion().await;
+    let thread_id = session.thread_id().to_string();
+    let resume_text = "resume autonomous completion";
+
+    write_intake_receipt(
+        &session,
+        "human-resume",
+        InputAuthor::Human,
+        &thread_id,
+        resume_text,
+        resume_text,
+    )
+    .await;
+    assert!(
+        is_explicit_human_autonomous_resume(
+            &session,
+            &resume_user_input(resume_text, "human-resume")
+        )
+        .await
+    );
+    // Recognition is only a gate; this helper must not itself resume the contract.
+    assert!(session.autonomous_completion_paused().await);
+
+    write_intake_receipt(
+        &session,
+        "automation-resume",
+        InputAuthor::Automation,
+        &thread_id,
+        resume_text,
+        resume_text,
+    )
+    .await;
+    assert!(
+        !is_explicit_human_autonomous_resume(
+            &session,
+            &resume_user_input(resume_text, "automation-resume")
+        )
+        .await
+    );
+
+    assert!(
+        !is_explicit_human_autonomous_resume(
+            &session,
+            &resume_user_input(resume_text, "missing-receipt")
+        )
+        .await
+    );
+
+    write_intake_receipt(
+        &session,
+        "wrong-thread",
+        InputAuthor::Human,
+        "another-thread",
+        resume_text,
+        resume_text,
+    )
+    .await;
+    assert!(
+        !is_explicit_human_autonomous_resume(
+            &session,
+            &resume_user_input(resume_text, "wrong-thread")
+        )
+        .await
+    );
+
+    write_intake_receipt(
+        &session,
+        "ordinary-human",
+        InputAuthor::Human,
+        &thread_id,
+        "Please inspect the latest status",
+        "Please inspect the latest status",
+    )
+    .await;
+    assert!(
+        !is_explicit_human_autonomous_resume(
+            &session,
+            &resume_user_input("Please inspect the latest status", "ordinary-human")
+        )
+        .await
+    );
+    assert!(session.autonomous_completion_paused().await);
+}
+
 #[tokio::test]
 #[expect(
     clippy::await_holding_invalid_type,
@@ -337,6 +474,24 @@ async fn start_only_rejects_current_plan_before_validating_settings() {
     .expect("current Plan must reject before settings validation");
     assert_eq!(
         submission,
+        TurnInputSubmission::NotSubmitted {
+            reason: NotSubmittedReason::PlanMode,
+        }
+    );
+    let autonomous_submission = handle(
+        &session,
+        TurnInputRequest::new(SubmittedTurnInput::ResponseItem(user_message(
+            "autonomous continuation",
+        ))),
+        TurnInputMode::AutonomousContinueIfIdle {
+            expected_previous_turn_id: "previous-turn".to_string(),
+        },
+        "autonomous-plan-submission".to_string(),
+    )
+    .await
+    .expect("autonomous completion must use Automatic Plan admission");
+    assert_eq!(
+        autonomous_submission,
         TurnInputSubmission::NotSubmitted {
             reason: NotSubmittedReason::PlanMode,
         }

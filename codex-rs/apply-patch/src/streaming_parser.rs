@@ -51,7 +51,12 @@ impl StreamingPatchParser {
     }
 
     fn ensure_update_hunk_is_not_empty(&self, line: &str) -> Result<(), ParseError> {
-        if let Some(UpdateFile { path, chunks, .. }) = self.state.hunks.last() {
+        if let Some(UpdateFile {
+            path,
+            move_path,
+            chunks,
+        }) = self.state.hunks.last()
+        {
             if chunks.is_empty()
                 && let StreamingParserMode::UpdateFile { hunk_line_number } = self.state.mode
             {
@@ -73,6 +78,20 @@ impl StreamingPatchParser {
                 return Err(InvalidHunkError {
                     message: format!(
                         "Unexpected line found in update hunk: '{line}'. Every line should start with ' ' (context line), '+' (added line), or '-' (removed line)"
+                    ),
+                    line_number: self.line_number,
+                });
+            }
+            if move_path.is_none()
+                && chunks
+                    .iter()
+                    .any(|chunk| !chunk.context_line_indices.is_empty())
+                && chunks.iter().all(|chunk| !chunk.has_changes())
+            {
+                return Err(InvalidHunkError {
+                    message: format!(
+                        "Update file hunk for path '{}' contains only context lines",
+                        path.display()
                     ),
                     line_number: self.line_number,
                 });
@@ -634,7 +653,6 @@ mod tests {
  context before
 
  context after
-*** End Patch
 ",
             ),
             Ok(vec![UpdateFile {
@@ -659,6 +677,7 @@ mod tests {
                 }],
             }])
         );
+        assert!(parser.push_delta("*** End Patch\n").is_err());
     }
 
     #[test]

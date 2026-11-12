@@ -660,6 +660,7 @@ fn open_questions(chat: &mut ChatWidget, options: Option<Vec<String>>) {
         },
         "turn",
         /*from_replay*/ false,
+        /*completion_timestamp*/ None,
     );
     chat.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
     render_bottom_popup(chat, /*width*/ 80);

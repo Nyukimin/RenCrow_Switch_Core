@@ -49,6 +49,8 @@ pub type SharedTurnDiffTracker = Arc<Mutex<TurnDiffTracker>>;
 #[derive(Default)]
 pub(crate) struct ToolCallState {
     pub(crate) terminal_outcome_reached: AtomicBool,
+    /// Set only when host policy blocks before entering the tool handler.
+    pub(crate) blocked_before_handler: AtomicBool,
     pub(crate) delivered_assistant_message: OnceLock<String>,
 }
 

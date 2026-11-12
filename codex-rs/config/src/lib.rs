@@ -222,3 +222,8 @@ pub use thread_config::ThreadConfigLoaderFuture;
 pub use thread_config::ThreadConfigSource;
 pub use thread_config::UserThreadConfig;
 pub use toml::Value as TomlValue;
+
+// Modified by RenCrow: native executor progress contract.
+mod rencrow_execution_guard;
+pub use rencrow_execution_guard::RencrowExecutionGuard;
+pub use rencrow_execution_guard::RencrowTaskKind;

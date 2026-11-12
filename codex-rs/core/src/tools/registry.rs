@@ -644,6 +644,22 @@ impl ToolRegistry {
             }
         }
 
+        // Native guard runs after hook rewrites and never depends on hook trust.
+        if let Err(err) = crate::rencrow_execution_guard::before_tool(&invocation).await {
+            if tool.is_builtin_control_tool() {
+                let mut analytics = ControlToolCallGuard::new(&invocation);
+                analytics.finish(ControlToolCallStatus::Rejected);
+            }
+            dispatch_trace.record_failed(&err);
+            notify_tool_finish_if_unclaimed(
+                &invocation,
+                call_state.as_deref(),
+                ToolCallOutcome::Blocked,
+            )
+            .await;
+            return Err(err);
+        }
+
         if tool.mcp_server_name().is_none() {
             notify_tool_start(&invocation, /*mcp_tool*/ None).await;
         }
@@ -762,6 +778,24 @@ impl ToolRegistry {
                     }
                 }
                 tool.on_tool_result_accepted(&invocation, result.result.as_ref());
+                if invocation.turn.config.rencrow_execution_guard.is_some()
+                    || invocation.turn.config.rencrow_autonomous_completion
+                {
+                    let receipt = crate::rencrow_execution_guard::ToolReceipt {
+                        value: if matches!(
+                            invocation.tool_name.name.as_str(),
+                            "exec_command" | "write_stdin" | "shell"
+                        ) || invocation.tool_name.namespace.as_deref()
+                            == Some("multi_agent_v1")
+                        {
+                            result.result.code_mode_result(&invocation.payload)
+                        } else {
+                            Value::Null
+                        },
+                        successful: result.result.success_for_logging(),
+                    };
+                    crate::rencrow_execution_guard::after_tool(&invocation, receipt).await;
+                }
                 dispatch_trace.record_completed(
                     &invocation,
                     &result.call_id,
@@ -771,6 +805,9 @@ impl ToolRegistry {
                 Ok(result)
             }
             Err(err) => {
+                let err =
+                    crate::rencrow_execution_guard::patch_verification_failure(&invocation, err)
+                        .await;
                 dispatch_trace.record_failed(&err);
                 Err(err)
             }
@@ -783,8 +820,13 @@ async fn notify_tool_finish_if_unclaimed(
     call_state: Option<&ToolCallState>,
     outcome: ToolCallOutcome,
 ) -> bool {
-    if call_state.is_some_and(|state| state.terminal_outcome_reached.swap(true, Ordering::AcqRel)) {
-        return false;
+    if let Some(state) = call_state {
+        if state.terminal_outcome_reached.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        if outcome == ToolCallOutcome::Blocked {
+            state.blocked_before_handler.store(true, Ordering::Release);
+        }
     }
 
     notify_tool_finish(invocation, outcome).await;

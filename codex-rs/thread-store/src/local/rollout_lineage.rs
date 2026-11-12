@@ -161,9 +161,6 @@ impl LocalThreadStore {
                 // their owners may concurrently archive or unarchive those immutable files.
                 LineageRepresentation::PlainForReference => rollout_path,
             };
-            if let Some(end) = end {
-                validate_cutoff_bounds(requested_thread_id, rollout_path.as_path(), &end).await?;
-            }
             let start_ordinal = match meta.meta.history_base {
                 Some(base) => base.end_ordinal_exclusive.checked_add(1).ok_or_else(|| {
                     malformed_lineage(requested_thread_id, "source ordinal overflow")
@@ -185,6 +182,12 @@ impl LocalThreadStore {
         }
 
         segments.reverse();
+        for segment in &segments {
+            if let Some(end) = segment.end {
+                validate_cutoff_bounds(requested_thread_id, segment.rollout_path.as_path(), &end)
+                    .await?;
+            }
+        }
         Ok(RolloutLineage { segments })
     }
 }
@@ -271,8 +274,9 @@ async fn validate_cutoff_bounds(
     }
     let path = rollout_path.to_path_buf();
     let end_byte_offset = end.end_byte_offset;
+    let end_ordinal_exclusive = end.end_ordinal_exclusive;
     let contains_prefix = tokio::task::spawn_blocking(move || {
-        codex_rollout::rollout_contains_prefix(&path, end_byte_offset)
+        codex_rollout::rollout_prefix_matches_ordinal(&path, end_byte_offset, end_ordinal_exclusive)
     })
     .await
     .map_err(|err| ThreadStoreError::Internal {
@@ -287,7 +291,7 @@ async fn validate_cutoff_bounds(
     if !contains_prefix {
         return Err(malformed_lineage(
             requested_thread_id,
-            "cutoff byte offset is past the source rollout",
+            "cutoff byte offset does not match the source rollout ordinal",
         ));
     }
     Ok(())

@@ -186,6 +186,7 @@ impl ChatWidget {
             realtime_conversation_available_for_thread: false,
             safety_buffering: SafetyBufferingState::default(),
             task_complete_pending: false,
+            last_activity_epoch_seconds: None,
             unified_exec_processes: Vec::new(),
             mcp_startup_status: None,
             mcp_startup_expected_servers: None,

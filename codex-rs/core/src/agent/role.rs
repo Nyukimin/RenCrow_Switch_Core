@@ -54,6 +54,7 @@ pub(crate) async fn apply_role_to_config(
     role_name: Option<&str>,
 ) -> Result<(), String> {
     let role_name = role_name.unwrap_or(DEFAULT_ROLE_NAME);
+    ensure_agent_role_enabled(config, Some(role_name))?;
 
     let role = resolve_role_config(config, role_name)
         .cloned()
@@ -65,6 +66,23 @@ pub(crate) async fn apply_role_to_config(
             tracing::warn!("failed to apply role to config: {err}");
             AGENT_TYPE_UNAVAILABLE_ERROR.to_string()
         })
+}
+
+pub(crate) fn ensure_agent_role_enabled(
+    config: &Config,
+    role_name: Option<&str>,
+) -> Result<(), String> {
+    let role_name = role_name.unwrap_or(DEFAULT_ROLE_NAME);
+    if config
+        .agent_roles
+        .get(role_name)
+        .is_some_and(|role| role.enabled == Some(false))
+    {
+        return Err(format!(
+            "agent_type '{role_name}' is unavailable because this role is disabled"
+        ));
+    }
+    Ok(())
 }
 
 async fn apply_role_to_config_inner(
@@ -85,6 +103,27 @@ async fn apply_role_to_config_inner(
         role_config.rencrow_tool_allowlist.clone(),
     );
     let read_only = config.rencrow_read_only || role_config.rencrow_read_only.unwrap_or(false);
+    if role_config
+        .rencrow_execution_guard
+        .as_ref()
+        .is_some_and(|guard| {
+            guard.task_kind == Some(codex_config::RencrowTaskKind::ReadOnly) && guard.require_edit
+        })
+    {
+        return Err(anyhow!("read_only task_kind cannot require_edit"));
+    }
+    let execution_guard = codex_config::RencrowExecutionGuard::narrow(
+        config.rencrow_execution_guard.clone(),
+        role_config.rencrow_execution_guard,
+    );
+    if read_only
+        && execution_guard
+            .as_ref()
+            .is_some_and(codex_config::RencrowExecutionGuard::requires_edit)
+    {
+        return Err(anyhow!("read-only permissions conflict with required edit"));
+    }
+    config.rencrow_execution_guard = execution_guard.clone();
     config.rencrow_tool_allowlist = tool_allowlist.clone();
     config.rencrow_read_only = read_only;
     let mut overrides = AgentRoleOverrides {
@@ -136,6 +175,7 @@ async fn apply_role_to_config_inner(
     *config = role_overrides::build_next_config(config, role_layer_toml, &overrides)?;
     config.rencrow_tool_allowlist = tool_allowlist;
     config.rencrow_read_only = read_only;
+    config.rencrow_execution_guard = execution_guard;
     Ok(())
 }
 
@@ -290,7 +330,7 @@ pub(crate) mod spawn_tool_spec {
         let mut seen = BTreeSet::new();
         let mut formatted_roles = Vec::new();
         for (name, declaration) in user_defined_roles {
-            if seen.insert(name.as_str()) {
+            if seen.insert(name.as_str()) && declaration.enabled != Some(false) {
                 formatted_roles.push(format_role(name, declaration));
             }
         }
@@ -356,6 +396,7 @@ mod built_in {
                 (
                     DEFAULT_ROLE_NAME.to_string(),
                     AgentRoleConfig {
+                        enabled: None,
                         description: Some("Default agent.".to_string()),
                         config_file: None,
                         nickname_candidates: None,
@@ -364,6 +405,7 @@ mod built_in {
                 (
                     "explorer".to_string(),
                     AgentRoleConfig {
+                        enabled: None,
                         description: Some(r#"Use `explorer` for specific codebase questions.
 Explorers are fast and authoritative.
 They must be used to ask specific, well-scoped questions on the codebase.
@@ -378,6 +420,7 @@ Rules:
                 (
                     "worker".to_string(),
                     AgentRoleConfig {
+                        enabled: None,
                         description: Some(r#"Use for execution and production work.
 Typical tasks:
 - Implement part of a feature

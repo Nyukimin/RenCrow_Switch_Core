@@ -112,42 +112,53 @@ class Metrics:
                 }
         elif kind == "compacted":
             self.pending = None
-            for metadata in p.get("replacement_history_metadata") or []:
-                if metadata and metadata.get("rencrow_compaction"):
-                    value = metadata["rencrow_compaction"]
-                    if value.get("version") == 2:
-                        applied_refs = value.get("applied_refs")
-                        results = value.get("results")
-                        self.pending = {
-                            "timestamp": row["timestamp"],
-                            "selection_mode": value.get("selection_mode"),
-                            "stages": value.get("responses") or [],
-                            "model": value.get("model"),
-                            "effort": value.get("effort"),
-                            "applied_ref_count": len(applied_refs)
-                            if isinstance(applied_refs, list)
-                            else None,
-                            "result_count": len(results)
-                            if isinstance(results, list)
-                            else None,
-                        }
-                    else:
-                        bundle = value.get("bundle")
-                        if not isinstance(bundle, dict):
-                            continue
-                        self.pending = {
-                            "timestamp": row["timestamp"],
-                            "selection_mode": value.get("selection_mode"),
-                            "stages": bundle.get("responses") or [],
-                            "model": bundle.get("model"),
-                            "effort": bundle.get("effort"),
-                            "approved_operations": len(
-                                (bundle.get("plan_review") or {}).get(
-                                    "accepted_operations"
-                                )
-                                or []
-                            ),
-                        }
+            metadata_items = p.get("replacement_history_metadata") or []
+            latest = next(
+                (
+                    metadata["rencrow_compaction"]
+                    for metadata in reversed(metadata_items)
+                    if isinstance(metadata, dict)
+                    and isinstance(metadata.get("rencrow_compaction"), dict)
+                ),
+                None,
+            )
+            if not isinstance(latest, dict):
+                return
+            # V3 task-boundary snapshots inherit older replacement metadata.
+            # The latest checkpoint owns this commit; its inherited V2
+            # responses are not helper work performed for this checkpoint.
+            if latest.get("version") == 3 and latest.get("mode") == "task_boundary":
+                return
+            value = latest
+            if value.get("version") == 2:
+                applied_refs = value.get("applied_refs")
+                results = value.get("results")
+                self.pending = {
+                    "timestamp": row["timestamp"],
+                    "selection_mode": value.get("selection_mode"),
+                    "stages": value.get("responses") or [],
+                    "model": value.get("model"),
+                    "effort": value.get("effort"),
+                    "applied_ref_count": len(applied_refs)
+                    if isinstance(applied_refs, list)
+                    else None,
+                    "result_count": len(results) if isinstance(results, list) else None,
+                }
+            else:
+                bundle = value.get("bundle")
+                if not isinstance(bundle, dict):
+                    return
+                self.pending = {
+                    "timestamp": row["timestamp"],
+                    "selection_mode": value.get("selection_mode"),
+                    "stages": bundle.get("responses") or [],
+                    "model": bundle.get("model"),
+                    "effort": bundle.get("effort"),
+                    "approved_operations": len(
+                        (bundle.get("plan_review") or {}).get("accepted_operations")
+                        or []
+                    ),
+                }
         elif kind == "rencrow_compaction_commit" and self.pending:
             self.pending["index"] = self.index
             self.pending["commit_marker_observed"] = True

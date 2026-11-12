@@ -1,15 +1,15 @@
 ---
 source: tui/src/app/owned_transcript_tests.rs
-assertion_line: 227
+assertion_line: 280
 expression: "snapshots.join(\"\\n\\n\")"
 ---
 Latest
-Transcript row 35
 Transcript row 36
 Transcript row 37
 Transcript row 38
 Transcript row 39
 Transcript row 40
+Subagents: 0 running / 0 total · /subagents details
 
 
 › draft
@@ -18,12 +18,12 @@ Transcript row 40
 
 
 Reading
-Transcript row 30
-Transcript row 31
 Transcript row 32
 Transcript row 33
 Transcript row 34
 Transcript row 35
+Transcript row 36
+Subagents: 0 running / 0 total · /subagents details
                              ↓ Back to bottom · esc
 
 › draft
@@ -32,10 +32,10 @@ Transcript row 35
   esc latest
 
 Resized multiline composer
-Transcript row 30
-Transcript row 31
 Transcript row 32
 Transcript row 33
+Transcript row 34
+Subagents: 0 running / 0 total · /sub...
          ↓ Back to bottom · esc
 
 › draft
@@ -58,7 +58,7 @@ Detailed
 
 
 
-
+Subagents: 0 running / 0 total · /subagents details
 
 
 › preserved draft

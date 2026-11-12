@@ -87,6 +87,25 @@ fn stage(body: &Value) -> Stage {
     Stage::Ordinary
 }
 
+/// Select a host-owned ID without copying original text into a model response.
+fn passage_id(data: &Value, text: &str) -> Value {
+    data["passages"]
+        .as_array()
+        .expect("passages")
+        .iter()
+        .find(|passage| {
+            passage["text"] == text
+                || (passage["whole"] == true
+                    && data["sources"]
+                        .as_array()
+                        .expect("fixture sources")
+                        .iter()
+                        .any(|source| source["id"] == passage["source"] && source["text"] == text))
+        })
+        .expect("fixture passage")["id"]
+        .clone()
+}
+
 fn assistant_reply(id: &str, text: &str, completed: Value) -> ResponseTemplate {
     ResponseTemplate::new(200)
         .insert_header("content-type", "text/event-stream")
@@ -203,12 +222,10 @@ async fn rencrow_compaction_keeps_one_selected_history_through_resume_and_recomp
                         .iter()
                         .find(|source| source["text"] == "Use current-label instead.");
                     let operations = match (old, new) {
-                        (Some(old), Some(new)) => json!([{
+                        (Some(_), Some(_)) => json!([{
                             "action": "drop_superseded",
-                            "source": old["id"],
-                            "source_text": "Use obsolete-label.",
-                            "correction": new["id"],
-                            "correction_text": "Use current-label instead.",
+                            "source": passage_id(&data, "Use obsolete-label."),
+                            "correction": passage_id(&data, "Use current-label instead."),
                         }]),
                         _ => json!([]),
                     };
@@ -871,7 +888,7 @@ async fn rencrow_second_emergency_references_output_the_first_kept() -> Result<(
                     let text = if normal {
                         "The command printed its fixture output."
                     } else {
-                        "unexpected summary"
+                        ""
                     };
                     return assistant_reply(&id, text, ev_completed("summary"));
                 }
@@ -964,15 +981,15 @@ async fn rencrow_second_emergency_references_output_the_first_kept() -> Result<(
         "deterministic_emergency"
     );
     let summaries = summaries.lock().expect("summaries lock");
-    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries.len(), 3);
     assert!(
-        summaries[0]["input"]
+        summaries[2]["input"]
             .to_string()
             .contains(&"r".repeat(1_500))
     );
     // The large output is summarized from its canonical text with bounded excerpts.
     assert!(
-        summaries[0]["input"]
+        summaries[2]["input"]
             .to_string()
             .contains(&"b".repeat(1_000))
     );
@@ -999,7 +1016,7 @@ async fn rencrow_selection_request_carries_only_its_stage_instruction() -> Resul
                 Stage::Summary => "Work state: nothing is pending.",
                 Stage::Ordinary => "acknowledged",
             };
-            assistant_reply(&id, reply, ev_completed("response-fixture"))
+            assistant_reply(&id, reply, ev_completed(&id))
         })
         .mount(&server)
         .await;
@@ -1032,6 +1049,14 @@ async fn rencrow_selection_request_carries_only_its_stage_instruction() -> Resul
             .is_some_and(|text| !text.is_empty())
     );
     assert_eq!(selection.get("instructions"), None);
+    assert_eq!(selection["text"]["format"]["type"], "json_schema");
+    assert_eq!(selection["text"]["format"]["strict"], true);
+    assert!(
+        !selection["text"]["format"]["schema"]
+            .to_string()
+            .contains("source_text")
+    );
+
     assert!(
         selection
             .get("tools")
@@ -1052,7 +1077,7 @@ async fn rencrow_selection_request_carries_only_its_stage_instruction() -> Resul
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn rencrow_malformed_selection_keeps_every_human_exactly_in_emergency() -> Result<()> {
+async fn rencrow_malformed_selection_keeps_instructions_and_still_summarizes_work() -> Result<()> {
     skip_if_no_network!(Ok(()));
     let server = start_mock_server().await;
     let seen = Arc::new(Mutex::new(Vec::<Value>::new()));
@@ -1066,10 +1091,10 @@ async fn rencrow_malformed_selection_keeps_every_human_exactly_in_emergency() ->
             let id = format!("answer-{}", responses.fetch_add(1, Ordering::SeqCst));
             let reply = match stage(&body) {
                 Stage::Selection(_) => "not a selection",
-                Stage::Summary => "unexpected summary",
+                Stage::Summary => "Work pending.",
                 Stage::Ordinary => "acknowledged",
             };
-            assistant_reply(&id, reply, ev_completed("response-fixture"))
+            assistant_reply(&id, reply, ev_completed(&id))
         })
         .mount(&server)
         .await;
@@ -1092,17 +1117,17 @@ async fn rencrow_malformed_selection_keeps_every_human_exactly_in_emergency() ->
         1
     );
     assert!(
-        !requests
+        requests
             .iter()
             .any(|body| matches!(stage(body), Stage::Summary))
     );
-    assert_eq!(requests.len(), 3);
+    assert_eq!(requests.len(), 4);
     let path = test.codex.rollout_path().expect("rollout path");
     let checkpoints = checkpoint_rows(&path)?;
     assert_eq!(checkpoints.len(), 1);
     assert_eq!(
         checkpoint_metadata(&checkpoints[0])["selection_mode"],
-        "deterministic_emergency"
+        "conservative_selection"
     );
     // Without an accepted selection nothing is removed; both instructions stay verbatim.
     let replacement = serde_json::to_string(&replacement_history_from_rollout(&path)?)?;
@@ -1554,11 +1579,10 @@ async fn rencrow_automation_note_is_removed_only_by_a_later_correction() -> Resu
                             .map(|source| source["id"].clone())
                     };
                     let operations = match (find(OLD), find(CORRECTION)) {
-                        (Some(old), Some(correction)) => json!([{
+                        (Some(_), Some(_)) => json!([{
                             "action": "drop_superseded",
-                            "source": old,
-                            "correction": correction,
-                            "correction_text": CORRECTION,
+                            "source": passage_id(&data, OLD),
+                            "correction": passage_id(&data, CORRECTION),
                         }]),
                         _ => json!([]),
                     };
@@ -1618,3 +1642,6 @@ async fn rencrow_automation_note_is_removed_only_by_a_later_correction() -> Resu
     assert!(replacement.contains(CORRECTION));
     Ok(())
 }
+
+#[path = "compact_rencrow_recovery.rs"]
+mod recovery;

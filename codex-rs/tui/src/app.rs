@@ -201,6 +201,8 @@ mod agent_message_consolidation;
 mod agent_navigation;
 mod agent_picker;
 mod agent_status_feed;
+// Modified by RenCrow: persistent subagent activity above the composer.
+mod agent_panel;
 #[cfg(any(unix, windows))]
 mod agents_overview;
 mod agents_overview_actions;
@@ -1118,6 +1120,22 @@ impl App {
 
     fn render_chat_widget_frame(&mut self, tui: &mut tui::Tui, screen_size: Size) -> Result<Rect> {
         self.sync_thread_title_progress();
+        if self
+            .agent_navigation
+            .ordered_threads()
+            .iter()
+            .any(|(id, _)| Some(*id) != self.primary_thread_id)
+        {
+            // Modified by RenCrow: refresh cached child activity while the parent is idle.
+            tui.frame_requester()
+                .schedule_frame_in(Duration::from_secs(1));
+        }
+        if self.chat_widget.activity_timestamps_enabled()
+            && self.chat_widget.has_recorded_activity()
+        {
+            tui.frame_requester()
+                .schedule_frame_in(Duration::from_secs(1));
+        }
         self.chat_widget
             .set_sparkle_terminal_focus(tui.is_terminal_focused());
         if tui.is_owned_screen() {
@@ -1146,15 +1164,36 @@ impl App {
             self.schedule_immediate_resize_reflow(tui);
             self.maybe_run_resize_reflow(tui, screen_size)?;
         }
+        let agent_lines = self.agent_panel_lines(screen_size.width);
+        let panel_height = if dashboard_visible {
+            0
+        } else {
+            (agent_lines.len() as u16).min(screen_size.height / 3)
+        };
         self.with_chat_widget_frame(screen_size.width, |desired_height, chat_widget| {
             let desired_height = if dashboard_visible {
                 screen_size.height
             } else {
-                desired_height
+                desired_height.saturating_add(panel_height)
             };
             let mut rendered_area = Rect::default();
             tui.draw_with_resize_reflow(desired_height, screen_size, |frame| {
-                let area = frame.area();
+                let full_area = frame.area();
+                let height = panel_height.min(
+                    full_area
+                        .height
+                        .saturating_sub(desired_height.saturating_sub(panel_height)),
+                );
+                let panel_area = Rect {
+                    height,
+                    ..full_area
+                };
+                agent_panel::render_panel(&agent_lines, panel_area, frame.buffer);
+                let area = Rect {
+                    y: full_area.y + height,
+                    height: full_area.height.saturating_sub(height),
+                    ..full_area
+                };
                 rendered_area = area;
                 chat_widget.render(area, frame.buffer);
                 self.chat_widget.note_rendered_width(area.width);

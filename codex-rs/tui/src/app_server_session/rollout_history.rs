@@ -138,6 +138,24 @@ impl AppServerSession {
         thread_id: ThreadId,
         model_settings: ResumeModelSettings,
     ) -> Result<AppServerStartedThread> {
+        self.resume_thread_with_pending_initial_message(
+            local_settings,
+            config,
+            thread_id,
+            model_settings,
+            false,
+        )
+        .await
+    }
+
+    pub(crate) async fn resume_thread_with_pending_initial_message(
+        &mut self,
+        local_settings: &crate::local_settings::LocalSettings,
+        config: Config,
+        thread_id: ThreadId,
+        model_settings: ResumeModelSettings,
+        pending_initial_message: bool,
+    ) -> Result<AppServerStartedThread> {
         let session_config = if matches!(
             model_settings,
             ResumeModelSettings::RestoreFromThread | ResumeModelSettings::PreserveExistingThread
@@ -153,6 +171,7 @@ impl AppServerSession {
             self.remote_cwd_override.as_deref(),
             model_settings,
         );
+        params.defer_autonomous_completion = Some(pending_initial_message);
         self.thread_tool_transport()
             .configure_mcp(&mut params.config);
         let mut rollout_maintenance_guard = None;

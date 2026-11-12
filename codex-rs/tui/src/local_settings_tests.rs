@@ -48,6 +48,54 @@ async fn launch_screen_mode_survives_configuration_reload() -> anyhow::Result<()
 }
 
 #[tokio::test]
+async fn jst_activity_timestamps_read_the_nested_tui_config_value() -> anyhow::Result<()> {
+    for (config_text, expected) in [
+        ("[tui]\nrencrow_tui_jst_timestamps = true\n", true),
+        ("[tui]\nrencrow_tui_jst_timestamps = false\n", false),
+        ("", false),
+    ] {
+        let home = tempfile::tempdir()?;
+        std::fs::write(home.path().join("config.toml"), config_text)?;
+        let config = ConfigBuilder::default()
+            .codex_home(home.path().to_path_buf())
+            .loader_overrides(LoaderOverrides {
+                ignore_project_config: true,
+                ..LoaderOverrides::without_managed_config_for_tests()
+            })
+            .build()
+            .await?;
+        assert_eq!(
+            LocalSettings::from(&config).tui.rencrow_tui_jst_timestamps,
+            expected
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn jst_activity_timestamps_reach_local_settings_from_cli_override() -> anyhow::Result<()> {
+    let home = tempfile::tempdir()?;
+    std::fs::write(
+        home.path().join("config.toml"),
+        "[tui]\nrencrow_tui_jst_timestamps = false\n",
+    )?;
+    let config = ConfigBuilder::default()
+        .codex_home(home.path().to_path_buf())
+        .fallback_cwd(Some(home.path().to_path_buf()))
+        .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
+        .cli_overrides(vec![(
+            "tui.rencrow_tui_jst_timestamps".to_string(),
+            toml::Value::Boolean(true),
+        )])
+        .build()
+        .await?;
+
+    assert!(config.tui_rencrow_jst_timestamps);
+    assert!(LocalSettings::from(&config).tui.rencrow_tui_jst_timestamps);
+    Ok(())
+}
+
+#[tokio::test]
 async fn system_motion_suppresses_animations_without_changing_saved_preferences()
 -> anyhow::Result<()> {
     use crate::motion::MotionMode;

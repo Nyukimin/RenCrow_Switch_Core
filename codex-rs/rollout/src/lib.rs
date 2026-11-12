@@ -106,6 +106,7 @@ pub use compression::spawn_rollout_compression_worker;
 pub use seekable_reader::open_rollout_seekable_reader;
 pub use seekable_reader::read_rollout_prefix;
 pub use seekable_reader::rollout_contains_prefix;
+pub use seekable_reader::rollout_prefix_matches_ordinal;
 
 /// Materializes a compressed rollout as plain JSONL before another rollout references it.
 pub async fn materialize_rollout_for_reference(

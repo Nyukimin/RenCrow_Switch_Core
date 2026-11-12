@@ -983,15 +983,18 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
         if let Some(thread_id) =
             resolve_resume_thread_id(&client, &config, state_db.as_ref(), args).await?
         {
+            let mut resume_params = thread_resume_params_from_config(
+                &config,
+                thread_id,
+                resume_approvals_reviewer_override,
+            );
+            // `exec resume` always submits an InitialOperation::UserTurn after this response.
+            resume_params.defer_autonomous_completion = Some(true);
             let response: ThreadResumeResponse = send_request_with_response(
                 &client,
                 ClientRequest::ThreadResume {
                     request_id: request_ids.next(),
-                    params: thread_resume_params_from_config(
-                        &config,
-                        thread_id,
-                        resume_approvals_reviewer_override,
-                    ),
+                    params: resume_params,
                 },
                 "thread/resume",
             )

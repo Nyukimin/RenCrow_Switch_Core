@@ -4,6 +4,8 @@ use std::io::Seek;
 use std::io::SeekFrom;
 use std::io::Write;
 
+use codex_history::RolloutItem;
+use codex_history::RolloutLine;
 use pretty_assertions::assert_eq;
 
 use super::*;
@@ -75,5 +77,39 @@ fn prefix_bounds_support_sized_unsized_and_concatenated_frames() -> io::Result<(
         assert_eq!(actual, expected);
         assert!(!path.with_extension("").exists());
     }
+    Ok(())
+}
+
+#[test]
+fn prefix_position_must_match_its_last_included_ordinal() -> io::Result<()> {
+    let home = tempfile::tempdir()?;
+    let path = home.path().join("rollout.jsonl");
+    let line = |ordinal| {
+        serde_json::to_string(&RolloutLine {
+            timestamp: "2026-07-16T00:00:00.000Z".to_string(),
+            ordinal: Some(ordinal),
+            item: RolloutItem::EventMsg(codex_protocol::protocol::EventMsg::ShutdownComplete),
+        })
+        .expect("serialize rollout line")
+    };
+    let first = format!("{}\n", line(0));
+    let second = format!("{}\n", line(1));
+    fs::write(&path, format!("{first}{second}"))?;
+
+    assert!(rollout_prefix_matches_ordinal(
+        &path,
+        first.len() as u64,
+        /*end_ordinal_exclusive*/ 1,
+    )?);
+    assert!(!rollout_prefix_matches_ordinal(
+        &path,
+        first.len() as u64,
+        /*end_ordinal_exclusive*/ 2,
+    )?);
+    assert!(!rollout_prefix_matches_ordinal(
+        &path,
+        first.len() as u64 - 1,
+        /*end_ordinal_exclusive*/ 1,
+    )?);
     Ok(())
 }

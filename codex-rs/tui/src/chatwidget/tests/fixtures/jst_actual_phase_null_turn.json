@@ -1,0 +1,20 @@
+{
+  "id": "01a1ba91-6145-7b32-a0cb-9cc494698a5c",
+  "itemsView": "full",
+  "status": "completed",
+  "error": null,
+  "startedAt": 1794131452,
+  "completedAt": 1794132708,
+  "durationMs": 1254341,
+  "items": [
+    {
+      "type": "agentMessage",
+      "id": "msg_chatcmpl-89383f54d34144e9964d46a8",
+      "text": "## 完了報告（小課題: presentation 凍結数値域検査のCLI接続）\n\n**何ができるようになったか**\n凍結schemaが確定している数値下限（`$defs/PositiveRevision` の min=1、`$defs/Sequence` の min=0）違反を、StoryPlayerのCLI（produce→validate）が実際に弾くようになりました。`package_revision: 0` は `PRES_FROZEN_INT_RANGE` で rejected（exit=2）、`from_event_seq: -1` も拒否、小数値は型違反、正常値は従来どおり blocked（全文法未合意）で止まります。認証・採用権限や未決契約には手を入れていません。\n\n**変更したファイル**\n- `internal/presentation/presentation.go` — 整数フィールドの型＋数値域検査（`frozenIntegerMin` / `scanFrozenInteger`、`math` import）を追加。**親（私）が編集**\n- `internal/presentation/presentation_test.go` — 子追加のテスト4件（下限違反・負値・小数・正常域）\n- `testfixtures/presentation/reject_frozen_revision_below_min.json` — 子追加のdata-only fixture\n- `scripts/e2e-static.sh` — 第11節の `echo` 内の `$defs` が `set -u` で未定義変数展開され落としていたため `\\$defs` に修正（**親が編集**・検査結果そのものは変えていません）\n\n**実際に実行した検査（すべて最終編集後・単独実行）**\n- `go test -count=1 ./internal/presentation` → exit 0（ok、子追加テスト含む）\n- `gofmt -l internal/presentation` → 出力なし\n- `bash scripts/e2e-static.sh` → `E2E RESULT: PASS`（第11節で `PRES_FROZEN_INT_RANGE path=$.package_revision` をCLI出力で確認）\n- `go test -count=1 ./...` → exit 0、テストある11 packageすべて ok（失敗0）\n\n**回収状況**\n委譲先Lovelace（KAT worker）は `presentation.go` のpatch検証で3回失敗し、その時点で-guardにより停止（実編集ゼロを確認済み）。childが入れたテスト・fixture・e2e節は保持し、実装側とshell修正を親が引き取って仕上げました。未回収の子はありません。\n\n**残っているもの（WORLD/StoryPlayer全体は未完）**\n実WORLD接続はfake transportまでで未検証。D-14 canonical route、production read-bridge DTO、port/TLS、private-room本文/redaction/stream、動的ChoiceのCommand/Receipt、Canon registry/採用、Authoring store、presentation全文法・189 parameter mappingのowner schema化・renderer capability registry、PORTAL連携、実機E2E。これらはowner契約の確定が要る分で、今回の小課題完了とは別に未完のままです。\n\n全変更は未コミットで保存しています（本番配備・移行・公開・権限付与・commit/pushは未実施）。",
+      "phase": null,
+      "memoryCitation": null,
+      "delivery": null,
+      "questions": null
+    }
+  ]
+}

@@ -5,6 +5,7 @@ use super::ArchiveEvidenceIneligibility;
 use super::MAX_ARCHIVE_EVIDENCE_BYTES;
 use codex_history::ArchiveReference;
 use codex_history::ArchiveTerminalStatus;
+use codex_history::CodexHarnessMetadata;
 use codex_history::ObservationReference;
 use codex_history::ResponseItemEnvelope;
 use codex_history::archive_reference::content_sha256;
@@ -75,6 +76,24 @@ pub struct IndexedObservationRef<'a> {
     pub body: Cow<'a, str>,
     kind: ToolCallKind,
     terminal: Option<&'a codex_protocol::items::CommandExecutionItem>,
+}
+
+impl IndexedObservationRef<'_> {
+    pub(super) fn has_terminal(&self) -> bool {
+        self.terminal.is_some()
+    }
+}
+
+fn is_ordinary_output_metadata(metadata: Option<&CodexHarnessMetadata>) -> bool {
+    let Some(metadata) = metadata else {
+        return true;
+    };
+    if metadata.rencrow_blocked_tool_call.is_none() {
+        return is_ordinary_harness_metadata(Some(metadata));
+    }
+    let mut metadata_without_blocked_reference = metadata.clone();
+    metadata_without_blocked_reference.rencrow_blocked_tool_call = None;
+    is_ordinary_harness_metadata(Some(&metadata_without_blocked_reference))
 }
 
 /// Which original text part to retrieve from a referenced observation.
@@ -278,7 +297,7 @@ impl<'a> ObservationIndex<'a> {
         if !is_ordinary_passthrough(passthrough(&call.envelope.item))
             || !is_ordinary_harness_metadata(call.envelope.metadata.as_ref())
             || !is_ordinary_passthrough(passthrough(&output.envelope.item))
-            || !is_ordinary_harness_metadata(output.envelope.metadata.as_ref())
+            || !is_ordinary_output_metadata(output.envelope.metadata.as_ref())
         {
             return Err(ArchiveEvidenceError::Ineligible(
                 ArchiveEvidenceIneligibility::NonOrdinaryProvenance,

@@ -7,10 +7,13 @@ use std::fs::File;
 use std::io;
 use std::io::Read;
 use std::io::Seek;
+use std::io::SeekFrom;
 use std::path::Path;
 use std::time::Duration;
 
 use crate::plain_rollout_path;
+use crate::reverse_jsonl_scanner::ReverseJsonlScanner;
+use crate::reverse_jsonl_scanner::ScanOutcome;
 
 enum RolloutReader {
     Plain(File),
@@ -102,6 +105,37 @@ pub fn rollout_contains_prefix(path: &Path, end_byte_offset: u64) -> io::Result<
             let mut prefix = zstd::stream::read::Decoder::new(file)?.take(end_byte_offset);
             Ok(io::copy(&mut prefix, &mut io::sink())? == end_byte_offset)
         }
+    }
+}
+
+/// Checks that a frozen byte prefix ends immediately after the record preceding the supplied
+/// exclusive ordinal. Both values address the original JSONL bytes, regardless of compression.
+pub fn rollout_prefix_matches_ordinal(
+    path: &Path,
+    end_byte_offset: u64,
+    end_ordinal_exclusive: u64,
+) -> io::Result<bool> {
+    if end_byte_offset == 0 || end_ordinal_exclusive == 0 {
+        return Ok(false);
+    }
+    let mut reader = open_rollout_seekable_reader(path)?;
+    let file_len = reader.seek(SeekFrom::End(0))?;
+    if end_byte_offset > file_len {
+        return Ok(false);
+    }
+    if end_byte_offset < file_len {
+        reader.seek(SeekFrom::Start(end_byte_offset - 1))?;
+        let mut final_byte = [0; 1];
+        reader.read_exact(&mut final_byte)?;
+        if final_byte[0] != b'\n' {
+            return Ok(false);
+        }
+    }
+
+    let mut scanner = ReverseJsonlScanner::new_at(reader, end_byte_offset)?;
+    match scanner.scan_next_rollout_line()? {
+        Some(ScanOutcome::Parsed(line)) => Ok(line.ordinal == Some(end_ordinal_exclusive - 1)),
+        Some(ScanOutcome::Rejected(_)) | None => Ok(false),
     }
 }
 

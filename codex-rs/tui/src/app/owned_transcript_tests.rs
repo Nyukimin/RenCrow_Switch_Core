@@ -103,6 +103,7 @@ async fn list_spacing_completion_preserves_the_scrolled_reader() -> Result<()> {
     app.handle_consolidate_agent_message(
         &mut tui,
         "- First item wraps onto a second row\n- b\n- c".into(),
+        /*source_item*/ None,
         app.config.cwd.to_path_buf(),
         /*inline_visualization_context*/ None,
         ConsolidationScrollbackReflow::Required,
@@ -246,13 +247,17 @@ async fn owned_transcript_reserves_a_row_above_the_composer() -> Result<()> {
                 "{label}",
             );
         } else {
-            assert!(
-                buffer_text(buffer)
-                    .lines()
-                    .nth(usize::from(gap.y))
-                    .unwrap()
-                    .contains("Back to bottom")
-            );
+            let gap_line = buffer
+                .content()
+                .chunks(usize::from(buffer.area.width))
+                .nth(usize::from(gap.y))
+                .map(|row| {
+                    row.iter()
+                        .map(ratatui::buffer::Cell::symbol)
+                        .collect::<String>()
+                })
+                .unwrap_or_default();
+            assert!(gap_line.contains("Back to bottom"), "{label}: {gap_line:?}");
         }
         let rendered = normalize_snapshot_paths(buffer_text(buffer));
         snapshots.push(format!("{label}\n{rendered}"));

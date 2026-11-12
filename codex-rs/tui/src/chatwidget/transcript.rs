@@ -48,6 +48,15 @@ pub(super) struct TranscriptState {
     /// Latest `/status` card and fields, retained across copying until a later turn or command.
     pub(super) last_status_copy_targets: Option<StatusCopySource>,
     pub(super) last_completed_agent_message: Option<(String, String)>,
+    /// Latest assistant item completed from the live event stream, excluding replayed history.
+    pub(super) last_live_completed_agent_message: Option<(String, String)>,
+    /// Item identity for answer deltas, retained across lifecycle flushes until item completion.
+    pub(super) agent_message_stream_item: Option<(String, String)>,
+    /// Fixed live display timestamp for this item; outer `None` means the first visible delta has
+    /// not decided whether to stamp, while `Some(None)` records an opted-out/unknown timestamp.
+    pub(super) agent_message_display_timestamp: Option<Option<i64>>,
+    /// Whether this item's streamed text has already been consolidated at least once.
+    pub(super) agent_message_stream_flushed: bool,
     /// Raw markdown of the most recently completed proposed plan.
     pub(super) latest_proposed_plan_markdown: Option<String>,
     /// Whether this turn already produced a copyable response.
@@ -106,6 +115,9 @@ impl TranscriptState {
     pub(super) fn reset_turn_flags(&mut self) {
         self.saw_copy_source_this_turn = false;
         self.last_completed_agent_message = None;
+        self.agent_message_stream_item = None;
+        self.agent_message_display_timestamp = None;
+        self.agent_message_stream_flushed = false;
         self.saw_plan_update_this_turn = false;
         self.saw_plan_item_this_turn = false;
         self.latest_proposed_plan_markdown = None;

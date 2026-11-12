@@ -17,6 +17,22 @@ use pretty_assertions::assert_eq;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::unbounded_channel;
 
+#[test]
+fn startup_resume_defers_autonomous_work_only_for_an_initial_user_message() {
+    assert!(!super::super::startup::startup_has_pending_user_message(
+        None,
+        &[],
+    ));
+    assert!(super::super::startup::startup_has_pending_user_message(
+        Some("continue this task".to_string()),
+        &[],
+    ));
+    assert!(super::super::startup::startup_has_pending_user_message(
+        None,
+        &[std::path::PathBuf::from("input.png")],
+    ));
+}
+
 #[tokio::test]
 async fn windows_sandbox_setup_uses_local_app_server_connection() {
     let mut app = make_test_app().await;

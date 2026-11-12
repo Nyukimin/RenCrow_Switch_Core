@@ -1,4 +1,5 @@
 mod archive_thread;
+mod compaction_sources;
 mod create_thread;
 mod delete_thread;
 mod helpers;
@@ -11,10 +12,8 @@ mod pending_thread_metadata;
 mod projects;
 mod read_thread;
 mod revert_thread;
-mod rollout_migration;
-// This lands before the reader PRs that consume the shared lineage resolver.
-#[allow(dead_code)]
 mod rollout_lineage;
+mod rollout_migration;
 mod search_threads;
 mod thread_attachments;
 mod thread_history;
@@ -81,6 +80,7 @@ use crate::PersistContext;
 use crate::PrepareForkParams;
 use crate::PreparedFork;
 use crate::ProjectMoveOutcome;
+use crate::ReadCompactionSourcesParams;
 use crate::ReadThreadByRolloutPathParams;
 use crate::ReadThreadParams;
 use crate::RemoveThreadAttachmentOutcome;
@@ -278,6 +278,18 @@ impl LocalThreadStore {
     /// Return the state DB handle used by local rollout writers.
     pub async fn state_db(&self) -> Option<StateDbHandle> {
         self.state_db.clone()
+    }
+
+    /// Read the latest durable thread-history projection checkpoint without modifying it.
+    /// The tuple is `(next_byte_offset, next_ordinal)`. `None` means the store has no state DB,
+    /// the thread-history DB is not present yet, or this thread has no projection row.
+    pub async fn thread_history_projection_state(
+        &self,
+        thread_id: ThreadId,
+    ) -> ThreadStoreResult<Option<(u64, u64)>> {
+        Ok(thread_history::projection_state(self, thread_id)
+            .await?
+            .map(|state| (state.next_byte_offset, state.next_ordinal)))
     }
 
     async fn thread_history_db(&self) -> ThreadStoreResult<&sqlx::SqlitePool> {
@@ -557,6 +569,13 @@ impl ThreadStore for LocalThreadStore {
         Box::pin(LocalThreadStore::load_history(self, params))
     }
 
+    fn read_compaction_sources(
+        &self,
+        params: ReadCompactionSourcesParams,
+    ) -> ThreadStoreFuture<'_, StoredThreadHistory> {
+        Box::pin(async move { compaction_sources::read(self, params).await })
+    }
+
     fn load_latest_model_context(
         &self,
         params: LoadThreadHistoryParams,
@@ -816,6 +835,65 @@ mod tests {
     use crate::local::test_support::write_archived_session_file;
     use crate::local::test_support::write_session_file;
     use crate::local::test_support::write_session_file_with_history_mode;
+
+    #[tokio::test]
+    async fn thread_history_projection_state_is_none_without_state_db() {
+        let home = TempDir::new().expect("temp dir");
+        let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+
+        assert_eq!(
+            store
+                .thread_history_projection_state(ThreadId::new())
+                .await
+                .expect("read projection state without state DB"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_history_projection_state_reads_missing_and_persisted_checkpoints() {
+        let home = TempDir::new().expect("temp dir");
+        let config = test_config(home.path());
+        let rollout_config = codex_rollout::RolloutConfig {
+            codex_home: config.codex_home.clone(),
+            sqlite: config.sqlite.clone(),
+            cwd: home.path().to_path_buf(),
+            model_provider_id: config.default_model_provider_id.clone(),
+            generate_memories: false,
+        };
+        let state_db = codex_rollout::state_db::try_init(&rollout_config)
+            .await
+            .expect("initialize state DB");
+        let store = LocalThreadStore::new(config, Some(state_db));
+        let thread_id = ThreadId::new();
+
+        assert_eq!(
+            store
+                .thread_history_projection_state(thread_id)
+                .await
+                .expect("read missing projection state"),
+            None
+        );
+
+        thread_history::apply_projection(
+            &store,
+            thread_id,
+            /*start_offset*/ 0,
+            /*next_offset*/ 0,
+            /*initial_ordinal*/ 0,
+            Vec::new(),
+        )
+        .await
+        .expect("persist empty-prefix projection checkpoint");
+
+        assert_eq!(
+            store
+                .thread_history_projection_state(thread_id)
+                .await
+                .expect("read persisted projection state"),
+            Some((0, 0))
+        );
+    }
 
     #[tokio::test]
     async fn live_writer_lifecycle_writes_and_closes() {

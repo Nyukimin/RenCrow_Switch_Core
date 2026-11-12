@@ -381,8 +381,21 @@ impl ApplyPatchHandler {
         let args = match codex_apply_patch::parse_patch(&patch_input) {
             Ok(args) => args,
             Err(parse_error) => {
+                let retry_marker = if turn.config.rencrow_execution_guard.is_some()
+                    && !matches!(
+                        &turn.session_source,
+                        codex_protocol::protocol::SessionSource::Internal(_)
+                    ) {
+                    format!(
+                        "{}{} ",
+                        crate::rencrow_execution_guard::PATCH_RETRYABLE_ERROR_MARKER,
+                        crate::rencrow_execution_guard::PATCH_SYNTAX_FAILURE_KIND
+                    )
+                } else {
+                    String::new()
+                };
                 return Err(FunctionCallError::RespondToModel(format!(
-                    "apply_patch verification failed: {parse_error}"
+                    "{retry_marker}apply_patch verification failed: {parse_error}"
                 )));
             }
         };
@@ -428,8 +441,32 @@ impl ApplyPatchHandler {
                 Ok(boxed_tool_output(ApplyPatchToolOutput::from_text(content)))
             }
             codex_apply_patch::MaybeApplyPatchVerified::CorrectnessError(parse_error) => {
+                let failure_kind = match &parse_error {
+                    codex_apply_patch::ApplyPatchError::ParseError(_) => {
+                        Some(crate::rencrow_execution_guard::PATCH_SYNTAX_FAILURE_KIND)
+                    }
+                    codex_apply_patch::ApplyPatchError::ComputeReplacements(_) => {
+                        Some(crate::rencrow_execution_guard::PATCH_CONTEXT_FAILURE_KIND)
+                    }
+                    _ => None,
+                };
+                let retryable = failure_kind.is_some()
+                    && turn.config.rencrow_execution_guard.is_some()
+                    && !matches!(
+                        &turn.session_source,
+                        codex_protocol::protocol::SessionSource::Internal(_)
+                    );
                 Err(FunctionCallError::RespondToModel(format!(
-                    "apply_patch verification failed: {parse_error}"
+                    "{}apply_patch verification failed: {parse_error}",
+                    if retryable {
+                        format!(
+                            "{}{} ",
+                            crate::rencrow_execution_guard::PATCH_RETRYABLE_ERROR_MARKER,
+                            failure_kind.unwrap_or_default()
+                        )
+                    } else {
+                        String::new()
+                    }
                 )))
             }
             codex_apply_patch::MaybeApplyPatchVerified::ShellParseError(error) => {
@@ -584,6 +621,7 @@ async fn execute_verified_patch(
         changes.clone(),
         apply.auto_approved,
         turn_environment.selection.environment_id.clone(),
+        !turn_environment.environment.is_remote(),
     );
     let event_ctx = ToolEventCtx::new(
         tool_ctx.session.as_ref(),

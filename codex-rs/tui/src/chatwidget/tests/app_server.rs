@@ -1,6 +1,7 @@
 use super::helpers::drain_insert_history_transcript;
 use super::*;
 use codex_app_server_protocol::AuthRecoveryNotification;
+use codex_app_server_protocol::ImageGenerationItem;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::CodexErrorDetails;
 use pretty_assertions::assert_eq;
@@ -871,6 +872,138 @@ async fn live_app_server_turn_completed_clears_working_status_after_answer_item(
         chat.transcript.last_completed_agent_message,
         Some(("turn-1".to_string(), "msg-1".to_string()))
     );
+}
+
+#[tokio::test]
+async fn live_app_server_lifecycle_flush_does_not_duplicate_completed_answer_item() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    handle_turn_started(&mut chat, "turn-1");
+    while rx.try_recv().is_ok() {}
+
+    let answer = "The task is complete. Here is the result.";
+    handle_agent_message_delta(&mut chat, answer);
+    chat.run_commit_tick();
+    while rx.try_recv().is_ok() {}
+
+    // Starting image generation is a real item event that flushes an active answer stream.
+    chat.handle_server_notification(
+        ServerNotification::ItemStarted(ItemStartedNotification {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            started_at_ms: 0,
+            item: AppServerThreadItem::ImageGeneration(ImageGenerationItem {
+                id: "image-1".to_string(),
+                status: "in_progress".to_string(),
+                revised_prompt: None,
+                result: String::new(),
+                transparent_background: None,
+                failure: None,
+                saved_path: None,
+                imagegen_request_id: None,
+                generation_id: None,
+            }),
+        }),
+        /*replay_kind*/ None,
+    );
+
+    chat.handle_server_notification(
+        ServerNotification::ItemCompleted(ItemCompletedNotification {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            completed_at_ms: 0,
+            item: AppServerThreadItem::AgentMessage {
+                id: "msg-1".to_string(),
+                text: answer.to_string(),
+                phase: None,
+                memory_citation: None,
+                delivery: None,
+                questions: None,
+            },
+        }),
+        /*replay_kind*/ None,
+    );
+
+    let consolidated_answers = std::iter::from_fn(|| rx.try_recv().ok())
+        .filter_map(|event| match event {
+            AppEvent::ConsolidateAgentMessage {
+                source,
+                source_item,
+                ..
+            } if source.contains(answer) => Some((source, source_item)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(consolidated_answers.len(), 2);
+    assert!(consolidated_answers.iter().all(|(_, identity)| {
+        identity.as_ref() == Some(&("turn-1".to_string(), "msg-1".to_string()))
+    }));
+    assert_eq!(consolidated_answers[1].0, answer);
+}
+
+#[tokio::test]
+async fn live_app_server_delayed_item_completed_after_turn_completed_is_suppressed() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let item = AppServerThreadItem::AgentMessage {
+        id: "msg-1".to_string(),
+        text: "The task is complete.".to_string(),
+        phase: None,
+        memory_citation: None,
+        delivery: None,
+        questions: None,
+    };
+
+    handle_agent_message_delta(&mut chat, "The task is complete.");
+    chat.run_commit_tick();
+    chat.flush_answer_stream_with_separator();
+
+    chat.handle_server_notification(
+        ServerNotification::TurnCompleted(TurnCompletedNotification {
+            thread_id: "thread-1".to_string(),
+            turn: AppServerTurn {
+                id: "turn-1".to_string(),
+                items_view: codex_app_server_protocol::TurnItemsView::Full,
+                items: vec![item.clone()],
+                status: AppServerTurnStatus::Completed,
+                error: None,
+                started_at: Some(0),
+                completed_at: Some(1),
+                duration_ms: Some(1),
+            },
+        }),
+        /*replay_kind*/ None,
+    );
+    let completion_sources = std::iter::from_fn(|| rx.try_recv().ok())
+        .filter_map(|event| match event {
+            AppEvent::ConsolidateAgentMessage {
+                source,
+                source_item: Some(identity),
+                ..
+            } if source.contains("The task is complete.") => Some((source, identity)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(!completion_sources.is_empty());
+    assert!(
+        completion_sources
+            .iter()
+            .all(|(_, identity)| { identity == &("turn-1".to_string(), "msg-1".to_string()) })
+    );
+
+    chat.handle_server_notification(
+        ServerNotification::ItemCompleted(ItemCompletedNotification {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            completed_at_ms: 1,
+            item,
+        }),
+        /*replay_kind*/ None,
+    );
+    let delayed_duplicate = std::iter::from_fn(|| rx.try_recv().ok()).any(|event| {
+        matches!(event, AppEvent::ConsolidateAgentMessage { source, .. }
+            if source.contains("The task is complete."))
+    });
+    assert!(!delayed_duplicate);
 }
 
 #[tokio::test]

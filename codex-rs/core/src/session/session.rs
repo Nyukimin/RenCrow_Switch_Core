@@ -638,7 +638,1462 @@ async fn warm_plugins_and_skills_for_session_init(
         .clone()
 }
 
+fn canonicalize_completion_evidence(
+    value: &mut serde_json::Value,
+    completed: &std::collections::BTreeMap<
+        String,
+        codex_history::task_context::AcceptedTaskReceipt,
+    >,
+) -> Result<(), String> {
+    match value {
+        serde_json::Value::Object(object) => {
+            if object.contains_key("task_id") && object.contains_key("task_revision") {
+                let task_id = object
+                    .get("task_id")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| "completion evidence task_id must be a string".to_string())?;
+                let revision = object
+                    .get("task_revision")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or_else(|| {
+                        "completion evidence task_revision must be a positive integer".to_string()
+                    })?;
+                let receipt = completed.get(task_id)
+                    .filter(|receipt| receipt.revision == revision)
+                    .ok_or_else(|| format!("no accepted host receipt matches completion evidence {task_id}@{revision}"))?;
+                object.insert(
+                    "artifact_ref".into(),
+                    serde_json::Value::String(receipt.artifact_ref.clone()),
+                );
+                object.insert(
+                    "verification_ref".into(),
+                    serde_json::Value::String(receipt.verification_ref.clone()),
+                );
+            }
+            for child in object.values_mut() {
+                canonicalize_completion_evidence(child, completed)?;
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for child in values {
+                canonicalize_completion_evidence(child, completed)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+pub(crate) fn canonicalize_completion_state_evidence(
+    value: &mut serde_json::Value,
+    completed: &std::collections::BTreeMap<
+        String,
+        codex_history::task_context::AcceptedTaskReceipt,
+    >,
+) -> Result<(), String> {
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| "completion state must be an object".to_string())?;
+    if let Some(conditions) = object
+        .get_mut("conditions")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for condition in conditions {
+            if let Some(evidence) = condition.get_mut("evidence") {
+                canonicalize_completion_evidence(evidence, completed)?;
+            }
+        }
+    }
+    if let Some(units) = object
+        .get_mut("units")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for unit in units {
+            for field in ["evidence", "task_refs"] {
+                if let Some(evidence) = unit.get_mut(field) {
+                    canonicalize_completion_evidence(evidence, completed)?;
+                }
+            }
+        }
+    }
+    if let Some(blocker) = object.get_mut("blocker")
+        && let Some(evidence) = blocker.get_mut("evidence")
+    {
+        canonicalize_completion_evidence(evidence, completed)?;
+    }
+    Ok(())
+}
+
+fn collect_completion_evidence(
+    value: &serde_json::Value,
+    output: &mut Vec<(String, u64, String, String)>,
+) {
+    match value {
+        serde_json::Value::Object(object) => {
+            if let (
+                Some(task_id),
+                Some(task_revision),
+                Some(artifact_ref),
+                Some(verification_ref),
+            ) = (
+                object.get("task_id").and_then(serde_json::Value::as_str),
+                object
+                    .get("task_revision")
+                    .and_then(serde_json::Value::as_u64),
+                object
+                    .get("artifact_ref")
+                    .and_then(serde_json::Value::as_str),
+                object
+                    .get("verification_ref")
+                    .and_then(serde_json::Value::as_str),
+            ) {
+                output.push((
+                    task_id.to_owned(),
+                    task_revision,
+                    artifact_ref.to_owned(),
+                    verification_ref.to_owned(),
+                ));
+            }
+            for child in object.values() {
+                collect_completion_evidence(child, output);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for child in values {
+                collect_completion_evidence(child, output);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_fresh_completion_evidence(
+    proposal: &serde_json::Value,
+    previous: Option<&codex_history::task_context::CompletionState>,
+    output: &mut Vec<(String, u64, String, String)>,
+) {
+    let previous_value = previous.and_then(|state| serde_json::to_value(state).ok());
+    let previous_units = previous_value
+        .as_ref()
+        .and_then(|value| value.get("units"))
+        .and_then(serde_json::Value::as_array);
+
+    if let Some(conditions) = proposal
+        .get("conditions")
+        .and_then(serde_json::Value::as_array)
+    {
+        for condition in conditions {
+            if condition.get("status").and_then(serde_json::Value::as_str) == Some("satisfied")
+                && let Some(evidence) = condition.get("evidence")
+            {
+                collect_completion_evidence(evidence, output);
+            }
+        }
+    }
+
+    if let Some(units) = proposal.get("units").and_then(serde_json::Value::as_array) {
+        for unit in units {
+            if unit.get("status").and_then(serde_json::Value::as_str) != Some("done") {
+                continue;
+            }
+            let unit_id = unit.get("id").and_then(serde_json::Value::as_str);
+            let previous_unit = previous_units.and_then(|previous_units| {
+                previous_units.iter().find(|previous_unit| {
+                    previous_unit.get("id").and_then(serde_json::Value::as_str) == unit_id
+                })
+            });
+            let was_done = previous_unit
+                .and_then(|previous_unit| previous_unit.get("status"))
+                .and_then(serde_json::Value::as_str)
+                == Some("done");
+            let mut current_refs = Vec::new();
+            for field in ["evidence", "task_refs"] {
+                if let Some(refs) = unit.get(field) {
+                    collect_completion_evidence(refs, &mut current_refs);
+                }
+            }
+            if !was_done {
+                output.extend(current_refs);
+                continue;
+            }
+            let mut previous_refs = Vec::new();
+            for field in ["evidence", "task_refs"] {
+                if let Some(refs) = previous_unit.and_then(|previous_unit| previous_unit.get(field))
+                {
+                    collect_completion_evidence(refs, &mut previous_refs);
+                }
+            }
+            let previous_refs = previous_refs
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>();
+            output.extend(
+                current_refs
+                    .into_iter()
+                    .filter(|reference| !previous_refs.contains(reference)),
+            );
+        }
+    }
+}
+
+pub(super) fn condition_progress_is_product_progress(
+    had_previous_evidence: bool,
+    previous_was_satisfied: bool,
+    previous_proof_invalidated: bool,
+    previous_artifacts: Option<&std::collections::HashSet<(String, String)>>,
+    current_artifacts: Option<&std::collections::HashSet<(String, String)>>,
+) -> bool {
+    if previous_was_satisfied && !previous_proof_invalidated {
+        return false;
+    }
+    if !had_previous_evidence {
+        return true;
+    }
+    matches!((previous_artifacts, current_artifacts), (Some(previous), Some(current)) if previous != current)
+}
+
+pub(super) fn history_ends_with_completed_turn(items: &[RolloutItem]) -> bool {
+    let mut current_turn_id: Option<&str> = None;
+    let mut completed = false;
+    for item in items {
+        match item {
+            RolloutItem::EventMsg(EventMsg::TurnStarted(event)) => {
+                current_turn_id = Some(event.turn_id.as_str());
+                completed = false;
+            }
+            RolloutItem::EventMsg(EventMsg::TurnComplete(event)) => {
+                completed = current_turn_id == Some(event.turn_id.as_str());
+            }
+            RolloutItem::EventMsg(EventMsg::TurnAborted(_)) => completed = false,
+            _ => {}
+        }
+    }
+    completed
+}
+
 impl Session {
+    pub(crate) async fn set_rencrow_completion_state(
+        &self,
+        root_task_id: String,
+        mut completion_state: serde_json::Value,
+    ) -> Result<(), String> {
+        if root_task_id.trim().is_empty() {
+            return Err("completion state requires a root ID".into());
+        }
+        // Invalidation is a host fact, not a model-controlled progress reset.
+        // A stale condition may be reopened after its evidence is removed from the proposal.
+        let previous_contract = self.rencrow_completion_state(&root_task_id).await;
+        // Review evidence is host-collected from the reviewer child lifecycle. Never
+        // accept a model-supplied replacement or deletion of that binding.
+        if let Some(previous) = previous_contract.as_ref() {
+            let proposed_units = completion_state
+                .get("units")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| {
+                    "completion update must retain host-bound review units".to_string()
+                })?;
+            for old_unit in previous.units.iter().filter(|unit| {
+                unit.review_launch.is_some()
+                    || (unit.kind == codex_history::task_context::CompletionUnitKind::Review
+                        && unit.review_evidence.is_some()
+                        && unit.status != codex_history::task_context::UnitStatus::Done)
+            }) {
+                let proposed = proposed_units.iter().find(|unit| {
+                    unit.get("id").and_then(serde_json::Value::as_str) == Some(old_unit.id.as_str())
+                });
+                let Some(proposed) = proposed else {
+                    return Err(format!(
+                        "completion update cannot remove unresolved review unit {}",
+                        old_unit.id
+                    ));
+                };
+                let target = proposed.get("review_target");
+                if proposed.get("kind").and_then(serde_json::Value::as_str) != Some("review")
+                    || target
+                        .and_then(|target| target.get("task_id"))
+                        .and_then(serde_json::Value::as_str)
+                        != old_unit
+                            .review_target
+                            .as_ref()
+                            .map(|target| target.task_id.as_str())
+                    || target
+                        .and_then(|target| target.get("task_revision"))
+                        .and_then(serde_json::Value::as_u64)
+                        != old_unit
+                            .review_target
+                            .as_ref()
+                            .map(|target| target.task_revision)
+                {
+                    return Err(format!(
+                        "completion update cannot change the identity or target of unresolved review unit {}",
+                        old_unit.id
+                    ));
+                }
+            }
+        }
+        if let Some(proposal_units) = completion_state
+            .get_mut("units")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for proposed in proposal_units {
+                let Some(object) = proposed.as_object_mut() else {
+                    continue;
+                };
+                object.remove("review_evidence");
+                object.remove("review_launch");
+                let Some(old_unit) = previous_contract.as_ref().and_then(|old| {
+                    old.units.iter().find(|unit| {
+                        object.get("id").and_then(serde_json::Value::as_str)
+                            == Some(unit.id.as_str())
+                    })
+                }) else {
+                    continue;
+                };
+                if let Some(evidence) = old_unit.review_evidence.as_ref() {
+                    object.insert(
+                        "review_evidence".into(),
+                        serde_json::to_value(evidence).map_err(|error| error.to_string())?,
+                    );
+                }
+                if let Some(launch) = old_unit.review_launch.as_ref() {
+                    object.insert(
+                        "review_launch".into(),
+                        serde_json::to_value(launch).map_err(|error| error.to_string())?,
+                    );
+                }
+            }
+        }
+        let mut invalidated_conditions = std::collections::HashSet::new();
+        if let Some(previous) = previous_contract.as_ref() {
+            for condition in previous.conditions.iter().filter(|condition| {
+                condition.status == codex_history::task_context::AcceptanceStatus::Satisfied
+            }) {
+                for evidence in &condition.evidence {
+                    if !self
+                        .completion_evidence_matches_current_artifact(evidence)
+                        .await
+                    {
+                        invalidated_conditions.insert(condition.id.clone());
+                        break;
+                    }
+                }
+            }
+        }
+        if !invalidated_conditions.is_empty()
+            && let Some(conditions) = completion_state
+                .get_mut("conditions")
+                .and_then(serde_json::Value::as_array_mut)
+        {
+            for condition in conditions {
+                let Some(id) = condition
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                else {
+                    continue;
+                };
+                let has_new_host_evidence = previous_contract
+                    .as_ref()
+                    .and_then(|previous| previous.conditions.iter().find(|old| old.id == id))
+                    .is_some_and(|old| {
+                        let prior = old
+                            .evidence
+                            .iter()
+                            .map(|evidence| {
+                                (evidence.task_id.as_str(), evidence.task_revision)
+                            })
+                            .collect::<std::collections::HashSet<_>>();
+                        condition
+                            .get("evidence")
+                            .and_then(serde_json::Value::as_array)
+                            .is_some_and(|evidence| {
+                                evidence.iter().any(|item| {
+                                    let task_id = item
+                                        .get("task_id")
+                                        .and_then(serde_json::Value::as_str);
+                                    let revision = item
+                                        .get("task_revision")
+                                        .and_then(serde_json::Value::as_u64);
+                                    matches!((task_id, revision), (Some(task_id), Some(revision)) if !prior.contains(&(task_id, revision)))
+                                })
+                            })
+                    });
+                if invalidated_conditions.contains(&id)
+                    && !has_new_host_evidence
+                    && let Some(condition) = condition.as_object_mut()
+                {
+                    condition.insert("status".into(), serde_json::Value::String("open".into()));
+                    if let Some(previous_evidence) = previous_contract
+                        .as_ref()
+                        .and_then(|previous| previous.conditions.iter().find(|old| old.id == id))
+                        .map(|previous| serde_json::to_value(&previous.evidence))
+                        .transpose()
+                        .map_err(|error| error.to_string())?
+                    {
+                        condition.insert("evidence".into(), previous_evidence);
+                    }
+                    condition.insert("unmet_reason".into(), serde_json::Value::String(
+                        "Previously accepted evidence no longer matches the current artifact revision.".into(),
+                    ));
+                }
+            }
+        }
+        let latest = self
+            .latest_rencrow_task_state()
+            .await
+            .map_err(|error| error.to_string())?;
+        if latest
+            .as_ref()
+            .is_some_and(|state| state.boundary.root_task_id != root_task_id)
+        {
+            return Err("completion root does not match the latest accepted task state".into());
+        }
+        let completed = latest
+            .as_ref()
+            .map(|state| state.completed.clone())
+            .unwrap_or_default();
+        if let Some(accepted) = latest.as_ref()
+            && accepted.boundary.root_task_id != root_task_id
+        {
+            return Err("completion root does not match the latest accepted task state".into());
+        }
+        canonicalize_completion_state_evidence(&mut completion_state, &completed)?;
+        let mut evidence_refs = Vec::new();
+        collect_fresh_completion_evidence(
+            &completion_state,
+            previous_contract.as_ref(),
+            &mut evidence_refs,
+        );
+        for (task_id, task_revision, artifact_ref, verification_ref) in evidence_refs {
+            let attempt = self.latest_task_check_for_scope(&task_id, task_revision).await
+                .ok_or_else(|| format!("no current host verification exists for completion evidence {task_id}@{task_revision}"))?;
+            let receipt = match attempt.status {
+                crate::task_check::TaskCheckAttemptStatus::Finished(receipt) => receipt,
+                crate::task_check::TaskCheckAttemptStatus::Pending => {
+                    return Err("completion evidence verification is still running".into());
+                }
+                crate::task_check::TaskCheckAttemptStatus::ChangedArtifacts => {
+                    return Err("completion evidence verification is stale".into());
+                }
+            };
+            if !receipt.succeeded
+                || receipt.exit_code != 0
+                || receipt.artifact_before != receipt.artifact_after
+            {
+                return Err(
+                    "completion evidence does not have a successful stable verification receipt"
+                        .into(),
+                );
+            }
+            let paths = receipt
+                .artifact_after
+                .iter()
+                .map(|stamp| stamp.path.clone())
+                .collect::<Vec<_>>();
+            let current =
+                crate::task_check::hash_workspace_artifacts(&receipt.workspace_root, &paths)
+                    .ok_or_else(|| {
+                        "completion evidence artifacts are no longer available".to_string()
+                    })?;
+            if current != receipt.artifact_after {
+                return Err("completion evidence artifacts changed after verification".into());
+            }
+            let artifact_stamp_set = receipt
+                .artifact_after
+                .iter()
+                .map(|stamp| {
+                    serde_json::json!({
+                        "path": stamp.path.to_string_lossy(), "sha256": stamp.sha256,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let fingerprint = codex_history::compaction_candidate::digest(&serde_json::json!({
+                "task_id": receipt.task_id,
+                "task_revision": receipt.task_revision,
+                "workspace_root": receipt.workspace_root.to_string_lossy(),
+                "artifacts": artifact_stamp_set,
+            }))?;
+            let host_ref = format!("task-check:{}:{fingerprint}", receipt.call_id);
+            if artifact_ref != host_ref || verification_ref != host_ref {
+                return Err("completion evidence does not match its current host receipt".into());
+            }
+        }
+        let mut completion_state: codex_history::task_context::CompletionState =
+            serde_json::from_value(completion_state).map_err(|error| error.to_string())?;
+        if completion_state.contract_revision == 0 {
+            return Err("completion state requires a positive contract revision".into());
+        }
+        codex_history::task_context::validate_completion_state(
+            Some(&completion_state),
+            &completed,
+        )?;
+        if completion_state.conditions.iter().any(|condition| {
+            condition.status == codex_history::task_context::AcceptanceStatus::Waived
+        }) {
+            return Err(
+                "waiving an acceptance condition is not authorized by this host action".into(),
+            );
+        }
+        let mut product_progress_conditions = std::collections::HashSet::new();
+        if let Some(previous) = previous_contract.as_ref() {
+            for condition in completion_state.conditions.iter().filter(|condition| {
+                condition.status == codex_history::task_context::AcceptanceStatus::Satisfied
+            }) {
+                let Some(old) = previous
+                    .conditions
+                    .iter()
+                    .find(|old| old.id == condition.id)
+                else {
+                    product_progress_conditions.insert(condition.id.clone());
+                    continue;
+                };
+                let prior_proof_invalidated = invalidated_conditions.contains(&condition.id);
+                let mut old_bytes = std::collections::HashSet::new();
+                let mut new_bytes = std::collections::HashSet::new();
+                let mut comparable = true;
+                for evidence in &old.evidence {
+                    if let Some(bytes) = self.task_evidence_artifact_bytes(evidence).await {
+                        old_bytes.extend(bytes);
+                    } else {
+                        comparable = false;
+                    }
+                }
+                for evidence in &condition.evidence {
+                    if let Some(bytes) = self.task_evidence_artifact_bytes(evidence).await {
+                        new_bytes.extend(bytes);
+                    } else {
+                        comparable = false;
+                    }
+                }
+                let old_bytes = (comparable && !old.evidence.is_empty()).then_some(old_bytes);
+                let new_bytes = comparable.then_some(new_bytes);
+                if condition_progress_is_product_progress(
+                    !old.evidence.is_empty(),
+                    old.status == codex_history::task_context::AcceptanceStatus::Satisfied,
+                    prior_proof_invalidated,
+                    old_bytes.as_ref(),
+                    new_bytes.as_ref(),
+                ) {
+                    product_progress_conditions.insert(condition.id.clone());
+                }
+            }
+        } else {
+            product_progress_conditions.extend(
+                completion_state
+                    .conditions
+                    .iter()
+                    .filter(|condition| {
+                        condition.status == codex_history::task_context::AcceptanceStatus::Satisfied
+                    })
+                    .map(|condition| condition.id.clone()),
+            );
+        }
+        {
+            let mut state = self.state.lock().await;
+            if let Some((active_root, previous)) = &state.rencrow_completion_state {
+                if active_root != &root_task_id {
+                    return Err("completion state root does not match the active contract".into());
+                }
+                if completion_state.contract_revision < previous.contract_revision {
+                    return Err("completion contract revision cannot move backwards".into());
+                }
+                completion_state.paused = previous.paused;
+                completion_state.consumed_host_events = previous.consumed_host_events.clone();
+                let prior = previous
+                    .conditions
+                    .iter()
+                    .map(|item| (item.id.as_str(), item))
+                    .collect::<std::collections::HashMap<_, _>>();
+                if completion_state.conditions.iter().any(|item| {
+                    prior.get(item.id.as_str()).is_some_and(|old| {
+                        item.revision < old.revision
+                            || (item.result != old.result
+                                || item.scope != old.scope
+                                || item.verification != old.verification
+                                || item.acceptance_criteria != old.acceptance_criteria)
+                            || (old.status
+                                == codex_history::task_context::AcceptanceStatus::Satisfied
+                                && item.status
+                                    != codex_history::task_context::AcceptanceStatus::Satisfied
+                                && (!invalidated_conditions.contains(&item.id)
+                                    || item
+                                        .unmet_reason
+                                        .as_ref()
+                                        .is_none_or(|reason| reason.trim().is_empty())))
+                            || (item.status
+                                == codex_history::task_context::AcceptanceStatus::Satisfied
+                                && old.status
+                                    != codex_history::task_context::AcceptanceStatus::Satisfied
+                                && item.evidence == old.evidence)
+                    })
+                }) || previous.conditions.iter().any(|old| {
+                    !completion_state
+                        .conditions
+                        .iter()
+                        .any(|item| item.id == old.id)
+                }) {
+                    return Err(
+                    "acceptance conditions cannot be removed, weakened, or redefined by a model update; a revision increment is not owner authorization".into(),
+                );
+                }
+            }
+            if let Some((_, previous)) = &state.rencrow_completion_state {
+                completion_state.paused = previous.paused;
+                completion_state.consumed_host_events = previous.consumed_host_events.clone();
+            } else {
+                completion_state.paused = state.rencrow_completion_paused;
+                completion_state.consumed_host_events.clear();
+            }
+            let now = chrono::Utc::now().timestamp();
+            if let Some((_, previous)) = &state.rencrow_completion_state {
+                for approach in &mut completion_state.failed_approaches {
+                    if !previous.failed_approaches.iter().any(|old| old == approach) {
+                        approach.recorded_at = now;
+                    }
+                }
+            } else {
+                for approach in &mut completion_state.failed_approaches {
+                    approach.recorded_at = now;
+                }
+            }
+            let prior_progress = state
+                .rencrow_completion_state
+                .as_ref()
+                .and_then(|(_, old)| old.product_progress_at);
+            completion_state.units_completed_since_review = state
+                .rencrow_completion_state
+                .as_ref()
+                .map(|(_, old)| old.units_completed_since_review)
+                .unwrap_or(0);
+            completion_state.plan_review_at = state
+                .rencrow_completion_state
+                .as_ref()
+                .and_then(|(_, old)| old.plan_review_at)
+                .or(Some(now));
+            completion_state.plan_reviews = state
+                .rencrow_completion_state
+                .as_ref()
+                .map(|(_, old)| old.plan_reviews.clone())
+                .unwrap_or_default();
+            completion_state.product_progress_at = prior_progress;
+            completion_state.runtime_recovery_at = state
+                .rencrow_completion_state
+                .as_ref()
+                .and_then(|(_, old)| old.runtime_recovery_at);
+            completion_state.activity_at = state
+                .rencrow_completion_state
+                .as_ref()
+                .and_then(|(_, old)| old.activity_at);
+            if !product_progress_conditions.is_empty() {
+                completion_state.product_progress_at = Some(now);
+                completion_state.activity_at = Some(now);
+                completion_state.units_completed_since_review = 0;
+                completion_state.plan_review_at = Some(now);
+            }
+            state.rencrow_completion_state = Some((root_task_id, completion_state));
+        }
+        self.persist_autonomous_completion_snapshot().await?;
+        Ok(())
+    }
+
+    pub(crate) async fn rencrow_completion_state(
+        &self,
+        root_task_id: &str,
+    ) -> Option<codex_history::task_context::CompletionState> {
+        self.state
+            .lock()
+            .await
+            .rencrow_completion_state
+            .as_ref()
+            .filter(|(root, _)| root == root_task_id)
+            .map(|(_, completion_state)| completion_state.clone())
+    }
+
+    pub(crate) async fn autonomous_completion_pending(&self) -> bool {
+        let state = self.state.lock().await;
+        if state.rencrow_completion_paused
+            || state
+                .rencrow_completion_state
+                .as_ref()
+                .is_none_or(|(_, contract)| contract.paused)
+        {
+            return false;
+        }
+        let Some((_, contract)) = state.rencrow_completion_state.as_ref() else {
+            return false;
+        };
+        let open_conditions = contract.conditions.iter().any(|condition| {
+            condition.status != codex_history::task_context::AcceptanceStatus::Satisfied
+                && condition.status != codex_history::task_context::AcceptanceStatus::Waived
+        });
+        let unfinished_units = contract.units.iter().any(|unit| {
+            !matches!(
+                unit.status,
+                codex_history::task_context::UnitStatus::Done
+                    | codex_history::task_context::UnitStatus::Cancelled
+            )
+        });
+        (open_conditions
+            || unfinished_units
+            || !state.rencrow_completion_uncollected_children.is_empty())
+            && contract.blocker.is_none()
+    }
+
+    pub(crate) async fn autonomous_completion_plan_review_due(&self) -> bool {
+        let state = self.state.lock().await;
+        let Some((_, contract)) = state.rencrow_completion_state.as_ref() else {
+            return false;
+        };
+        if contract.paused || contract.blocker.is_some() {
+            return false;
+        }
+        let two_units = contract.units_completed_since_review >= 2;
+        let thirty_minutes = contract
+            .plan_review_at
+            .is_some_and(|at| chrono::Utc::now().timestamp().saturating_sub(at) >= 30 * 60);
+        two_units || thirty_minutes
+    }
+
+    pub(crate) async fn note_autonomous_completion_unit_accepted(&self) {
+        {
+            let mut state = self.state.lock().await;
+            let Some((_, contract)) = state.rencrow_completion_state.as_mut() else {
+                return;
+            };
+            contract.units_completed_since_review =
+                contract.units_completed_since_review.saturating_add(1);
+            contract.activity_at = Some(chrono::Utc::now().timestamp());
+        }
+        if let Err(error) = self.persist_autonomous_completion_snapshot().await {
+            tracing::error!(%error, "failed to persist accepted completion unit count");
+            self.pause_autonomous_completion().await;
+        }
+    }
+
+    pub(crate) async fn record_autonomous_plan_review(
+        &self,
+        root_task_id: &str,
+        previous_plan: String,
+        revised_plan: String,
+        reason: String,
+    ) -> Result<(), String> {
+        if previous_plan.trim().is_empty()
+            || revised_plan.trim().is_empty()
+            || reason.trim().is_empty()
+            || previous_plan == revised_plan
+        {
+            return Err(
+                "plan review requires distinct non-empty old and new plans with a reason".into(),
+            );
+        }
+        let now = chrono::Utc::now().timestamp();
+        {
+            let mut state = self.state.lock().await;
+            let (active_root, contract) = state
+                .rencrow_completion_state
+                .as_mut()
+                .ok_or_else(|| "no host completion contract is registered".to_string())?;
+            if active_root != root_task_id {
+                return Err("plan review root does not match the registered contract".into());
+            }
+            if contract.paused || contract.blocker.is_some() {
+                return Err(
+                    "cannot review a paused or externally blocked completion contract".into(),
+                );
+            }
+            if contract.units_completed_since_review < 2
+                && contract
+                    .plan_review_at
+                    .is_none_or(|at| now.saturating_sub(at) < 30 * 60)
+            {
+                return Err("plan review threshold has not been reached".into());
+            }
+            let host_previous_plan = contract
+                .next_action
+                .as_deref()
+                .unwrap_or("No plan recorded");
+            if host_previous_plan != previous_plan {
+                return Err("previous plan does not match the host-registered next action".into());
+            }
+            contract
+                .plan_reviews
+                .push(codex_history::task_context::PlanReviewRecord {
+                    at: now,
+                    previous_plan,
+                    revised_plan: revised_plan.clone(),
+                    reason,
+                });
+            contract.next_action = Some(revised_plan);
+            contract.units_completed_since_review = 0;
+            contract.plan_review_at = Some(now);
+            contract.activity_at = Some(now);
+        }
+        self.persist_autonomous_completion_snapshot().await
+    }
+
+    pub(crate) async fn autonomous_completion_has_unresolved_work(
+        &self,
+        source: &codex_protocol::protocol::SessionSource,
+    ) -> bool {
+        if !self
+            .services
+            .unified_exec_manager
+            .list_processes()
+            .await
+            .is_empty()
+        {
+            return true;
+        }
+        if !self.services.agent_control.has_registered_agents() {
+            return false;
+        }
+        self.services
+            .agent_control
+            .list_agents(source, None)
+            .await
+            .map(|agents| {
+                agents.iter().any(|agent| {
+                    matches!(
+                        agent.status,
+                        codex_protocol::protocol::AgentStatus::PendingInit
+                            | codex_protocol::protocol::AgentStatus::Running
+                            | codex_protocol::protocol::AgentStatus::Interrupted
+                    )
+                })
+            })
+            .unwrap_or(true)
+    }
+
+    pub(crate) async fn autonomous_completion_paused(&self) -> bool {
+        let state = self.state.lock().await;
+        state.rencrow_completion_paused
+            || state
+                .rencrow_completion_state
+                .as_ref()
+                .is_some_and(|(_, contract)| contract.paused)
+    }
+
+    pub(crate) async fn autonomous_completion_previous_turn_id(&self) -> Option<String> {
+        self.state.lock().await.last_started_turn_id.clone()
+    }
+
+    pub(crate) async fn autonomous_completion_cold_resume_turn_id(&self) -> Option<String> {
+        let state = self.state.lock().await;
+        state
+            .rencrow_last_history_turn_completed
+            .then(|| state.last_started_turn_id.clone())
+            .flatten()
+    }
+
+    pub(crate) async fn autonomous_completion_current_state(
+        &self,
+    ) -> Option<(String, codex_history::task_context::CompletionState)> {
+        self.state.lock().await.rencrow_completion_state.clone()
+    }
+
+    pub(crate) fn autonomous_completion_action_digest(
+        contract: &codex_history::task_context::CompletionState,
+    ) -> String {
+        let failed_approaches = contract
+            .failed_approaches
+            .iter()
+            .map(|approach| {
+                serde_json::json!({
+                    "cause": &approach.cause,
+                    "next_action": &approach.next_action,
+                })
+            })
+            .collect::<Vec<_>>();
+        codex_history::compaction_candidate::digest(&serde_json::json!({
+            "contract_revision": contract.contract_revision,
+            "conditions": &contract.conditions,
+            "units": &contract.units,
+            "current_unit": &contract.current_unit,
+            "failed_approaches": failed_approaches,
+            "blocker": &contract.blocker,
+            "next_action": &contract.next_action,
+        }))
+        .unwrap_or_else(|_| "invalid-action-state".to_string())
+    }
+
+    pub(crate) async fn autonomous_completion_has_unresolved_runtime_work(&self) -> bool {
+        let source = self
+            .state
+            .lock()
+            .await
+            .session_configuration
+            .session_source
+            .clone();
+        self.autonomous_completion_has_unresolved_work(&source)
+            .await
+    }
+
+    pub(crate) async fn stop_completion_recovery_task_for_teardown(&self) {
+        let observer = self
+            .state
+            .lock()
+            .await
+            .rencrow_completion_recovery_task
+            .take();
+        if let Some(observer) = observer {
+            observer.abort();
+            let _ = observer.await;
+        }
+    }
+
+    pub(crate) async fn autonomous_completion_is_parent_session(&self) -> bool {
+        !self
+            .state
+            .lock()
+            .await
+            .session_configuration
+            .session_source
+            .is_non_root_agent()
+    }
+
+    pub(crate) async fn mark_autonomous_completion_bootstrap(
+        &self,
+        turn_id: &str,
+    ) -> Option<String> {
+        if self.state.lock().await.rencrow_completion_state.is_some() {
+            return None;
+        }
+        let root_task_id = if let Some(scope) = self.active_task_scope().await {
+            Some(scope.root_task_id)
+        } else {
+            self.latest_rencrow_task_state()
+                .await
+                .ok()
+                .flatten()
+                .filter(|state| state.boundary.current_task_id.is_some())
+                .map(|state| state.boundary.root_task_id)
+        }?;
+        let mut state = self.state.lock().await;
+        if state.rencrow_completion_state.is_some()
+            || !state
+                .rencrow_completion_bootstrap_turn_ids
+                .insert(turn_id.to_owned())
+        {
+            return None;
+        }
+        Some(root_task_id)
+    }
+
+    pub(crate) async fn mark_autonomous_completion_turn(&self, turn_id: String) -> bool {
+        let mut state = self.state.lock().await;
+        if state.rencrow_completion_paused
+            || !state
+                .rencrow_completion_state
+                .as_ref()
+                .is_some_and(|(_, contract)| {
+                    !contract.paused
+                        && contract.blocker.is_none()
+                        && contract.conditions.iter().any(|condition| {
+                            condition.status
+                                != codex_history::task_context::AcceptanceStatus::Satisfied
+                                && condition.status
+                                    != codex_history::task_context::AcceptanceStatus::Waived
+                        })
+                })
+        {
+            return false;
+        }
+        state.rencrow_autonomous_turn_ids.insert(turn_id)
+    }
+
+    pub(crate) async fn is_autonomous_completion_turn(&self, turn_id: &str) -> bool {
+        self.state
+            .lock()
+            .await
+            .rencrow_autonomous_turn_ids
+            .contains(turn_id)
+    }
+
+    pub(crate) async fn mark_autonomous_completion_continued(
+        &self,
+        turn_id: &str,
+        host_event_key: &str,
+    ) -> bool {
+        {
+            let mut state = self.state.lock().await;
+            if state.rencrow_completion_paused
+                || state.rencrow_completion_state.is_none()
+                || state
+                    .rencrow_completion_state
+                    .as_ref()
+                    .is_some_and(|(_, contract)| {
+                        contract.paused
+                            || contract
+                                .consumed_host_events
+                                .iter()
+                                .any(|event| event == host_event_key)
+                    })
+            {
+                return false;
+            }
+            state.rencrow_completion_continued_for_turn = Some(turn_id.to_owned());
+            if let Some((_, contract)) = state.rencrow_completion_state.as_mut() {
+                contract
+                    .consumed_host_events
+                    .push(host_event_key.to_owned());
+            }
+        }
+        if let Err(error) = self.persist_autonomous_completion_snapshot().await {
+            tracing::error!(%error, "failed to persist consumed autonomous completion event");
+            self.pause_autonomous_completion().await;
+            return false;
+        }
+        true
+    }
+
+    pub(crate) async fn pause_autonomous_completion(&self) {
+        {
+            let mut state = self.state.lock().await;
+            state.rencrow_completion_paused = true;
+            if let Some((_, contract)) = state.rencrow_completion_state.as_mut() {
+                contract.paused = true;
+            }
+        }
+        if let Err(error) = self.persist_autonomous_completion_snapshot().await {
+            tracing::error!(%error, "failed to persist autonomous completion pause");
+        }
+    }
+
+    pub(crate) async fn resume_autonomous_completion_from_user_turn(&self) -> Result<bool, String> {
+        {
+            let mut state = self.state.lock().await;
+            let Some((_, contract)) = state.rencrow_completion_state.as_mut() else {
+                return Ok(false);
+            };
+            contract.paused = false;
+            state.rencrow_completion_paused = false;
+            state.rencrow_completion_resume_generation =
+                state.rencrow_completion_resume_generation.saturating_add(1);
+        }
+        if let Err(error) = self.persist_autonomous_completion_snapshot().await {
+            self.pause_autonomous_completion().await;
+            return Err(error);
+        }
+        Ok(true)
+    }
+
+    pub(crate) async fn begin_task_scope(
+        &self,
+        root_task_id: String,
+        task_id: String,
+        task_revision: u64,
+        begin_call_id: String,
+        allow_unfinished_root_rebind: bool,
+    ) -> Result<crate::state::ActiveTaskScope, String> {
+        let history_cursor = self.clone_history().await.raw_items().count();
+        let mut state = self.state.lock().await;
+        let requested = crate::state::ActiveTaskScope {
+            root_task_id,
+            task_id,
+            task_revision,
+            begin_call_id,
+            start_history_cursor: history_cursor,
+        };
+        match state.active_task_scope.as_ref() {
+            Some(active)
+                if active.root_task_id == requested.root_task_id
+                    && active.task_id == requested.task_id
+                    && active.task_revision == requested.task_revision =>
+            {
+                // An exact begin replay is idempotent and keeps the original host cursor/call ID.
+                Ok(active.clone())
+            }
+            Some(active)
+                if allow_unfinished_root_rebind
+                    && active.root_task_id == requested.root_task_id
+                    && active.task_id == active.root_task_id =>
+            {
+                if state.pending_task_boundary.is_some() {
+                    return Err(
+                        "cannot start another unit while a task boundary commit is pending".into(),
+                    );
+                }
+                // Root plan lifetime does not own the active execution scope. Preserve its
+                // history and receipts, and move only the cursor for future work.
+                state.active_task_scope = Some(requested.clone());
+                state.rencrow_scope_needs_rebase = false;
+                Ok(requested)
+            }
+            Some(active) => Err(format!(
+                "task scope `{}` revision {} is already active; finish it before beginning `{}` revision {}",
+                active.task_id, active.task_revision, requested.task_id, requested.task_revision
+            )),
+            None => {
+                state.active_task_scope = Some(requested.clone());
+                state.rencrow_scope_needs_rebase = false;
+                Ok(requested)
+            }
+        }
+    }
+
+    pub(crate) async fn validate_task_scope_begin(
+        &self,
+        root_task_id: &str,
+        task_id: &str,
+        task_revision: u64,
+        allow_unfinished_root_rebind: bool,
+    ) -> Result<(), String> {
+        let state = self.state.lock().await;
+        match state.active_task_scope.as_ref() {
+            Some(active)
+                if active.root_task_id == root_task_id
+                    && active.task_id == task_id
+                    && active.task_revision == task_revision =>
+            {
+                Ok(())
+            }
+            Some(active)
+                if allow_unfinished_root_rebind
+                    && active.root_task_id == root_task_id
+                    && active.task_id == active.root_task_id =>
+            {
+                if state.pending_task_boundary.is_some() {
+                    Err("cannot start another unit while a task boundary commit is pending".into())
+                } else {
+                    Ok(())
+                }
+            }
+            Some(active) => Err(format!(
+                "task scope `{}` revision {} is already active; finish it before beginning `{}` revision {}",
+                active.task_id, active.task_revision, task_id, task_revision
+            )),
+            None => Ok(()),
+        }
+    }
+
+    pub(crate) async fn active_task_scope(&self) -> Option<crate::state::ActiveTaskScope> {
+        let (scope, needs_rebase) = {
+            let state = self.state.lock().await;
+            (
+                state.active_task_scope.clone()?,
+                state.rencrow_scope_needs_rebase,
+            )
+        };
+        if !needs_rebase {
+            return Some(scope);
+        }
+        let history = self.clone_history().await;
+        let begin_index = history.annotated_items().iter().position(|envelope| {
+            matches!(
+                &envelope.item,
+                ResponseItem::FunctionCall { name, call_id, .. }
+                    if name == "task_context_boundary" && call_id == &scope.begin_call_id
+            )
+        })?;
+        let mut state = self.state.lock().await;
+        if let Some(active) = state
+            .active_task_scope
+            .as_mut()
+            .filter(|active| active.begin_call_id == scope.begin_call_id)
+        {
+            active.start_history_cursor = begin_index;
+        } else {
+            return None;
+        }
+        state.rencrow_scope_needs_rebase = false;
+        let scope = state.active_task_scope.clone()?;
+        for attempt in state
+            .task_patch_attempts
+            .values_mut()
+            .filter(|attempt| attempt.scope.begin_call_id == scope.begin_call_id)
+        {
+            attempt.scope.start_history_cursor = begin_index;
+        }
+        Some(scope)
+    }
+
+    pub(crate) async fn task_check_completion_root_id(&self) -> Option<String> {
+        let state = self.state.lock().await;
+        state
+            .active_task_scope
+            .as_ref()
+            .map(|scope| scope.root_task_id.clone())
+            .or_else(|| {
+                state
+                    .rencrow_completion_state
+                    .as_ref()
+                    .map(|(root_task_id, _)| root_task_id.clone())
+            })
+    }
+
+    pub(crate) async fn rebase_active_task_scope_cursor(
+        &self,
+        begin_call_id: &str,
+        start_history_cursor: usize,
+    ) {
+        let mut state = self.state.lock().await;
+        if let Some(scope) = state
+            .active_task_scope
+            .as_mut()
+            .filter(|scope| scope.begin_call_id == begin_call_id)
+        {
+            scope.start_history_cursor = start_history_cursor;
+        }
+    }
+
+    pub(crate) async fn begin_task_patch_attempt(&self, call_id: &str, local_environment: bool) {
+        let mut state = self.state.lock().await;
+        let Some(scope) = state.active_task_scope.clone() else {
+            return;
+        };
+        state.task_patch_attempts.insert(
+            call_id.to_string(),
+            crate::state::TaskPatchAttempt {
+                scope,
+                local_environment,
+                paths: Vec::new(),
+                completed_successfully: false,
+            },
+        );
+    }
+
+    pub(crate) async fn finish_task_patch_attempt(
+        &self,
+        call_id: &str,
+        paths: Vec<std::path::PathBuf>,
+        completed_successfully: bool,
+    ) {
+        let mut state = self.state.lock().await;
+        let Some(attempt) = state.task_patch_attempts.get_mut(call_id) else {
+            return;
+        };
+        attempt.paths = paths;
+        attempt.completed_successfully = completed_successfully;
+    }
+
+    pub(crate) async fn verified_task_patch_call_ids(
+        &self,
+        scope: &crate::state::ActiveTaskScope,
+        workspace_root: &std::path::Path,
+        artifacts: &[crate::task_check::TaskArtifactStamp],
+    ) -> Vec<String> {
+        let root = match std::fs::canonicalize(workspace_root) {
+            Ok(root) => root,
+            Err(_) => return Vec::new(),
+        };
+        let artifact_paths = artifacts
+            .iter()
+            .map(|artifact| artifact.path.clone())
+            .collect::<HashSet<_>>();
+        let state = self.state.lock().await;
+        state
+            .task_patch_attempts
+            .iter()
+            .filter_map(|(call_id, attempt)| {
+                // The history cursor is a mutable projection index that can be rebased
+                // after a checkpoint. Scope identity is the host begin call and task
+                // revision; requiring cursor equality would discard valid patch receipts
+                // recorded before that rebase.
+                if !attempt.scope.same_execution(scope)
+                    || !attempt.local_environment
+                    || !attempt.completed_successfully
+                    || attempt.paths.is_empty()
+                {
+                    return None;
+                }
+                let paths = attempt
+                    .paths
+                    .iter()
+                    .map(|path| {
+                        let canonical = if path.is_absolute() {
+                            std::fs::canonicalize(path).ok()?
+                        } else {
+                            std::fs::canonicalize(root.join(path)).ok()?
+                        };
+                        canonical
+                            .strip_prefix(&root)
+                            .ok()
+                            .map(std::path::Path::to_path_buf)
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                if paths.iter().all(|path| {
+                    !path.as_os_str().is_empty()
+                        && path
+                            .components()
+                            .all(|component| matches!(component, std::path::Component::Normal(_)))
+                        && artifact_paths.contains(path)
+                }) {
+                    Some(call_id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    pub(crate) async fn latest_task_check_for_scope(
+        &self,
+        task_id: &str,
+        task_revision: u64,
+    ) -> Option<crate::task_check::TaskCheckAttempt> {
+        self.state
+            .lock()
+            .await
+            .task_check_ledger
+            .latest_for_task(task_id, task_revision)
+            .cloned()
+    }
+
+    pub(crate) async fn unresolved_task_check_obligations(
+        &self,
+        scope: &crate::state::ActiveTaskScope,
+    ) -> usize {
+        self.state
+            .lock()
+            .await
+            .task_check_ledger
+            .unresolved_count_for_scope(scope)
+    }
+
+    pub(crate) async fn unresolved_task_check_obligations_for_root(
+        &self,
+        root_task_id: &str,
+    ) -> usize {
+        self.state
+            .lock()
+            .await
+            .task_check_ledger
+            .unresolved_count_for_root(root_task_id)
+    }
+
+    pub(super) async fn task_check_attempt_by_call(
+        &self,
+        call_id: &str,
+    ) -> Option<crate::task_check::TaskCheckAttempt> {
+        self.state
+            .lock()
+            .await
+            .task_check_ledger
+            .attempt_for_call(call_id)
+            .cloned()
+    }
+
+    pub(super) async fn task_evidence_artifact_bytes(
+        &self,
+        evidence: &codex_history::task_context::CompletionEvidenceRef,
+    ) -> Option<std::collections::HashSet<(String, String)>> {
+        let call_id = evidence
+            .artifact_ref
+            .strip_prefix("task-check:")?
+            .rsplit_once(':')?
+            .0;
+        let attempt = self.task_check_attempt_by_call(call_id).await?;
+        let crate::task_check::TaskCheckAttemptStatus::Finished(receipt) = attempt.status else {
+            return None;
+        };
+        if !receipt.succeeded
+            || receipt.exit_code != 0
+            || receipt.task_id != evidence.task_id
+            || receipt.task_revision != evidence.task_revision
+            || receipt.artifact_before != receipt.artifact_after
+        {
+            return None;
+        }
+        Some(
+            receipt
+                .artifact_after
+                .into_iter()
+                .map(|stamp| (stamp.path.to_string_lossy().into_owned(), stamp.sha256))
+                .collect(),
+        )
+    }
+
+    pub(crate) async fn set_pending_task_boundary(
+        &self,
+        pending: crate::state::PendingTaskBoundary,
+    ) -> Result<(), String> {
+        let mut state = self.state.lock().await;
+        if state.pending_task_boundary.is_some() {
+            return Err("a task boundary is already prepared".into());
+        }
+        state.pending_task_boundary = Some(pending);
+        Ok(())
+    }
+
+    pub(crate) async fn pending_task_boundary(&self) -> Option<crate::state::PendingTaskBoundary> {
+        self.state.lock().await.pending_task_boundary.clone()
+    }
+
+    pub(crate) async fn begin_task_check(
+        &self,
+        call_id: String,
+        request: crate::task_check::TaskEvidenceRequest,
+        workspace_root: std::path::PathBuf,
+        before: Vec<crate::task_check::TaskArtifactStamp>,
+    ) {
+        self.begin_task_check_with_obligation(call_id, request, workspace_root, before, None)
+            .await;
+    }
+
+    pub(crate) async fn begin_task_check_with_obligation(
+        &self,
+        call_id: String,
+        request: crate::task_check::TaskEvidenceRequest,
+        workspace_root: std::path::PathBuf,
+        before: Vec<crate::task_check::TaskArtifactStamp>,
+        obligation: Option<crate::task_check::TaskCheckObligation>,
+    ) {
+        self.state
+            .lock()
+            .await
+            .task_check_ledger
+            .begin_with_obligation(call_id, request, workspace_root, before, obligation);
+        if let Err(error) = self.persist_autonomous_completion_snapshot().await {
+            let mut state = self.state.lock().await;
+            state.rencrow_completion_paused = true;
+            if let Some((_, contract)) = state.rencrow_completion_state.as_mut() {
+                contract.paused = true;
+            }
+            tracing::error!(%error, "failed to persist pending task verification; autonomous completion paused");
+        }
+    }
+
+    pub(crate) async fn finish_task_check(
+        &self,
+        call_id: &str,
+        exit_code: i32,
+        completed: bool,
+        after: Vec<crate::task_check::TaskArtifactStamp>,
+    ) -> Option<crate::task_check::TaskCheckReceipt> {
+        let receipt = self
+            .state
+            .lock()
+            .await
+            .task_check_ledger
+            .finish(call_id, exit_code, completed, after);
+        if let Err(error) = self.persist_autonomous_completion_snapshot().await {
+            let mut state = self.state.lock().await;
+            state.rencrow_completion_paused = true;
+            if let Some((_, contract)) = state.rencrow_completion_state.as_mut() {
+                contract.paused = true;
+            }
+            tracing::error!(%error, "failed to persist task verification result; autonomous completion paused");
+        }
+        receipt
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn task_check_receipt(
+        &self,
+        call_id: &str,
+    ) -> Option<crate::task_check::TaskCheckReceipt> {
+        self.state
+            .lock()
+            .await
+            .task_check_ledger
+            .get(call_id)
+            .cloned()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn task_check_snapshot(&self) -> Vec<crate::task_check::TaskCheckSnapshot> {
+        self.state.lock().await.task_check_ledger.snapshot()
+    }
+
     /// Returns the concrete identity for this thread.
     pub(crate) fn thread_id(&self) -> ThreadId {
         self.thread_id
@@ -647,6 +2102,52 @@ impl Session {
     /// Returns the identity shared by the root thread and all descendant threads.
     pub(crate) fn session_id(&self) -> SessionId {
         self.services.agent_control.session_id()
+    }
+
+    pub(crate) async fn store_rencrow_execution_evidence(
+        &self,
+        evidence: crate::rencrow_execution_guard::GuardExecutionEvidence,
+    ) {
+        let mut state = self.state.lock().await;
+        if state.last_started_turn_id.as_deref() == Some(evidence.turn_id.as_str()) {
+            state.rencrow_execution_evidence = Some(evidence);
+        }
+    }
+
+    pub(crate) async fn rencrow_execution_evidence_for_parent(
+        &self,
+        parent_thread_id: ThreadId,
+    ) -> Option<crate::rencrow_execution_guard::GuardExecutionEvidence> {
+        let state = self.state.lock().await;
+        let evidence = state.rencrow_execution_evidence.as_ref()?;
+        (state.last_started_turn_id.as_deref() == Some(evidence.turn_id.as_str())
+            && state.session_configuration.parent_thread_id == Some(parent_thread_id)
+            && evidence.parent_thread_id == parent_thread_id
+            && evidence.thread_id == self.thread_id
+            && evidence.has_diff
+            && evidence.checked)
+            .then(|| evidence.clone())
+    }
+
+    pub(crate) async fn consume_rencrow_child_execution_evidence(
+        &self,
+        evidence: &crate::rencrow_execution_guard::GuardExecutionEvidence,
+    ) -> bool {
+        if evidence.parent_thread_id != self.thread_id || !evidence.has_diff || !evidence.checked {
+            return false;
+        }
+        self.state
+            .lock()
+            .await
+            .rencrow_consumed_child_receipts
+            .insert((evidence.thread_id, evidence.turn_id.clone()))
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn rencrow_execution_evidence_for_test(
+        &self,
+    ) -> Option<crate::rencrow_execution_guard::GuardExecutionEvidence> {
+        self.state.lock().await.rencrow_execution_evidence.clone()
     }
 
     pub(crate) async fn originator(&self) -> String {
@@ -1484,6 +2985,8 @@ impl Session {
                     _ => None,
                 }
             });
+            state.rencrow_last_history_turn_completed =
+                history_ends_with_completed_turn(initial_history.get_rollout_items());
             state.base_instructions_provenance = base_instructions_provenance.clone();
             state.active_disabled_plugin_ids = session_configuration.disabled_plugin_ids.clone();
             let managed_network_requirements_configured = config

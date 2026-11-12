@@ -1,7 +1,9 @@
 // Modified by RenCrow Switch Core, 2026-09-22.
 //! Adapt owner-reconstructed history without guessing human provenance.
 use codex_history::CodexHarnessMetadata;
+use codex_history::ObservationReference;
 use codex_history::ResponseItemEnvelope;
+use codex_history::archive_reference::content_sha256;
 use codex_history::compaction_candidate::CandidateInput;
 use codex_history::compaction_candidate::CandidateRecord;
 use codex_history::compaction_candidate::Origin;
@@ -94,11 +96,44 @@ pub(super) fn capture(
                 );
             }
         }
+        let blocked = if let Some(blocked) = output
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.rencrow_blocked_tool_call.as_deref())
+        {
+            let (output_call_id, body) = match &output.item {
+                ResponseItem::FunctionCallOutput {
+                    call_id: Some(call_id),
+                    output,
+                    ..
+                }
+                | ResponseItem::CustomToolCallOutput {
+                    call_id, output, ..
+                } => (call_id.as_str(), output.text_content()),
+                _ => return Err("blocked tool output is not a textual result".into()),
+            };
+            let Some(body) = body else {
+                return Err("blocked tool output has no canonical text body".into());
+            };
+            let reference =
+                ObservationReference::new(thread_id, output_call_id, content_sha256(body));
+            if output_call_id != blocked.observation.call_id || !blocked.validates(&reference) {
+                return Err(
+                    "blocked tool metadata differs from its completed call and output".into(),
+                );
+            }
+            true
+        } else {
+            false
+        };
         if completed_work_records
-            .insert(pair.call_index, (pair.call_text.as_str(), true))
+            .insert(pair.call_index, (pair.call_text.as_str(), true, false))
             .is_some()
             || completed_work_records
-                .insert(pair.output_index, (pair.output_text.as_str(), false))
+                .insert(
+                    pair.output_index,
+                    (pair.output_text.as_str(), false, blocked),
+                )
                 .is_some()
         {
             return Err("completed work history index is duplicated".into());
@@ -210,7 +245,14 @@ pub(super) fn capture(
                 if text_only {
                     record.opaque = None;
                 }
-            } else if (role == "assistant" || summary) && text_only {
+            } else if (role == "assistant"
+                && assistant_metadata_is_ordinary(
+                    internal_chat_message_metadata_passthrough,
+                    metadata,
+                )
+                || summary)
+                && text_only
+            {
                 record.origin = Origin::Work;
                 record.opaque = None;
             } else if host && metadata.is_none_or(|m| !m.client_authored) {
@@ -278,12 +320,12 @@ pub(super) fn capture(
             });
             record.text = output.body.to_text().unwrap_or_default();
         }
-        if let Some((text, is_call)) = completed_work_records.get(&index) {
+        if let Some((text, is_call, blocked)) = completed_work_records.get(&index) {
             record.origin = Origin::Work;
             record.role = "assistant".into();
             record.text = (*text).to_owned();
             record.opaque = None;
-            if *is_call {
+            if *is_call || *blocked {
                 record.execution_evidence = false;
             }
         }
@@ -298,6 +340,30 @@ pub(super) fn capture(
     };
     input.snapshot()?;
     Ok(input)
+}
+
+fn assistant_metadata_is_ordinary(
+    passthrough: &Option<InternalChatMessageMetadataPassthrough>,
+    harness: Option<&CodexHarnessMetadata>,
+) -> bool {
+    let ordinary_passthrough = passthrough.as_ref().is_none_or(|metadata| {
+        let mut remaining = metadata.clone();
+        remaining.turn_id = None;
+        remaining.create_time = None;
+        // The Responses adapter uses this sole sentinel when an ordinary text item has no
+        // dedicated content kind. Preserve all meaningful/non-default kind metadata.
+        if remaining
+            .content_item_kinds
+            .as_ref()
+            .is_some_and(|kinds| kinds.iter().all(|kind| kind.0 == "unknown"))
+        {
+            remaining.content_item_kinds = None;
+        }
+        remaining == InternalChatMessageMetadataPassthrough::default()
+    });
+    let ordinary_harness =
+        harness.is_none_or(|metadata| metadata == &CodexHarnessMetadata::default());
+    ordinary_passthrough && ordinary_harness
 }
 
 #[cfg(test)]

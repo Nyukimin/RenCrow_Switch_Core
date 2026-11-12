@@ -11,6 +11,7 @@
 - 取込み: 2026-09-24、利用者が提示したv0.4・v0.5・v0.7の本文を保持し、見出しの階層だけ整えた。第1部の改訂箇所は見出しに明記し、付属Aには整合注記を付けた。旧`COMPACTION_V2_SPEC.md`（実装引き渡し仕様）はv0.4・v0.7が包含するため削除した。
 - 仕様凍結: 第2部 §80に従う。
 - 進捗・検査証拠: 工程別の状態・検査証拠は私有の`target/fork-bootstrap/compaction-check-plan.json`（`v2`）が正本。第3部はその証拠と本セッションの確認結果に基づく、公開可能な時点の要約であり、別の進捗台帳を設けない。未確認事項を仕様上の保証として扱わない。
+- 課題境界: task state、Switch parent toolのbegin/accept例、task_evidence連携、legacy V2互換とV3 backup/rollback限界は[課題境界コンテキスト再構成仕様](TASK_CONTEXT_COMPACTION_SPEC.md)を参照する。
 
 # 第1部 上位仕様 v0.5（v0.7 §69により改訂）
 
@@ -405,6 +406,12 @@ observation:"call_id"
 ```
 
 この表記は新しいIDではなく、既存call IDへのreferenceである。
+
+### 次の操作に必要な作業末尾
+
+accepted Normal summaryがObservationをsummary入力へ提示しただけでは、次turnで同じ値を使えるとは限らない。summaryが必要なexact値を残さず、important referenceも出さない場合、source pairは次のreplacement historyから消える。
+
+圧縮時は、最新のdeclared user入力（HumanまたはAutomation）より後に完了した直接readのうち最新のpairを1件だけ、またactive rootと一致する最新の`task_context_boundary` status/update pairを1件だけ、全原文のままbounded working tailとして保持できる。pairごとの上限12 KiBは、canonical call inputとtool output全体のUTF-8 byte数の合計に適用する。最新のreadが上限を超えるときは古い小さいreadへfallbackしない。保護されたpairはsummary coverageへ加えず、古いtool履歴を一括保持しない。この上限はmodel context windowや通常のtool出力上限を増やす設定ではない。
 
 ---
 
@@ -6001,3 +6008,74 @@ Failure / Problem: 圧縮が成功しても通常contextが大きく残る。Cau
 - 初回共有要約はworkstreamのstart-onlyログをexit0と誤記したため不合格。ログ一覧取得コマンドのexit0と対象テストの成否を分ける既存promptの4文補足を、同じ実入力のread-only比較で確認後に実装した。通常runtimeの追加review要求、新schema、新保存経路は増やしていない。誤checkpointの物理書換え・truncateはせず、正規入力で不具合を伝え、Qwenが実ログを再読して訂正した。
 - 新binaryでの再圧縮は89.65秒、input12,843/output5,068 token、replacement38項目。scheduler 3pkg成功・features/schedulerテストなし・workstream結果未確認・過去接続障害を過去観測とする区別をCodexが実要約で確認。原本prefix不変、確認用の新しい完了pair除去、正常終了/cold resume後に指定の「Step20まで終わらせて」だけで通常toolへ復帰。最初の通常入力18,485 token（直前旧観測87,117と要求内容が違うため厳密な削減率ではない）。
 - 現候補・source hash・binary hash・trace・受入境界は既存 `target/fork-bootstrap/compaction-runtime-deploy/candidate.json` と固定check-planが指す証拠を参照。長時間自動圧縮、remote、三OS、総費用、Step20の運用受入は未完了であり、今回の成功を全経路の無条件保証としない。
+
+## 2026-10-27 — Instruction Selection wire v2 と選別失敗の分離
+
+本節は先行する「選別失敗はNormal全体をEmergencyへ移す」実装記録を更新する。
+対象は opt-in `rencrow_compaction=true` のlocal Normal経路。CLI candidate v1の公開契約は変更しない。
+通常turnの履歴・モデル・推論強度・生成上限・認証・sandbox・approvalは変更しない。
+
+### 設計・所有境界
+
+`codex-history::compaction_selection_wire` がimmutable snapshotに結び付いた提示と応答の契約を所有する。
+入力には従来のsources/completion_linksに加えて、ホストが作成したpassagesを渡す。
+passageはwhole record又は文・行の候補単位であり、分割自体は意味判断や削除許可ではない。
+全文contextを併記し、重複して場所を特定できない断片は候補にしない。
+既知削除・保護範囲・opaque・Human/automationの由来は従来のhost検査を維持する。
+IDはsnapshotと原文にbindingし、別snapshotのIDを再利用しない。
+
+モデルの役割は意味判断と既知IDの選択だけにする。
+`drop_superseded` はsource/correctionのpassage ID、`replace_completed` はsource passage ID、
+既知evidence ID、短い事実resultを返す。原文の再転記、byte offset、hashを生成させない。
+原文はホストがIDから復元し、既存のsnapshot/提示binding、適用範囲、補正の時系列・由来、
+保護対象、completion linkと実終了根拠の検査へ渡す。新契約を別の削除権限にしない。
+
+coreの選別要求は`Prompt.output_schema`でstrict JSON Schemaを送る。
+不正JSONを構造化生成で防ぐ要求と、実返答の検査は別の責務とする。
+Gatewayがschemaを転送しても、任意backendでの制約実施を自動的に保証しない。
+実経路で受理と制約動作を検査する。未対応・無視・未完了は以下の保守的な扱いにする。
+ツール定義の追加や別modelへのfallback、reasoning/output budgetの縮小はしない。
+
+### 不正出力の扱い
+
+- 外側の単一Markdown fenceと前後空白だけを除去できる。変更はwarningで記録する。
+- JSONの途中切れ、重複するroot key、後続の別文書は推測補完しない。
+- 各操作の未知ID、未知field、重複field、型不一致、原文・根拠の不成立はその操作を不採用にする。
+- 採用済み操作を含む集合全体を追加のたびに検査する。別操作の補正・根拠を削除する操作は不採用。
+- 不採用操作の原文はそのまま残す。文書全体が壊れた場合は新しい選別を一切採用しない。
+- 選別に失敗しても、原文を保持した正規contextでWork要約を一度実行する。取消しは即時中断する。
+- 要約自体の失敗又は候補の不成立は、従来どおりEmergency/Blockedへ進む。
+  保存・snapshotのintegrity検査を弱めたり、元rolloutを直接修正したりしない。
+
+### 保存・再開
+
+V2 checkpointの`selection_mode`に`conservative_selection`を追加する。
+これは「Workの新しい要約は受理したが、選別全体の受理を主張しない」状態である。
+提示hashと、存在すれば受理済み操作のplan hashを保持する。
+完了した選別応答は不採用でもattempt receiptとして残し、summary成功receiptを必須とする。
+未完了transportに存在しないresponse IDやreceiptを作らない。
+
+再開・次回圧縮ではWorkのsemantic boundaryのみ進め、選別boundaryは進めない。
+選別未処理のHuman/automationが、次回に「既に検討済み」として飛ばされないようにする。
+既知の適用済み参照は引き継ぐ。diagnoseはconservative件数を通常成功・Emergencyと別集計する。
+
+新readerは従来のV2 checkpointを読める。新enumを知らない旧readerは新状態を拒否するため、
+切替はcodexとrencrow-compactionを同じsource revisionからbuildし、同時配備する。
+既存writerを止めてbinary・設定・rollout・DBをbackupする。
+新状態確定後の復旧をbinary差替えだけで済ませず、外部効果と保存状態を照合する。
+未対応版が新状態を通常成功と誤読するmigrationや、原ログの切詰めは行わない。
+
+### 受入検査
+
+純粋なwire検査に加え、実Responses loopでschema送信、選別失敗後のsummary要求、
+原文保持、conservative checkpoint、次回の再選別、resume後のboundaryを検査する。
+無効な操作と独立した有効操作の混在、補正根拠への削除干渉、日本語・重複原文、
+旧checkpoint読み込み、broken root JSON、tool出力、stream切断・取消しも検査対象とする。
+実Qwenは隔離CODEX_HOME/sessionで同一route/effortを維持し、再構築後の通常要求を確認する。
+正常に見える要約本文だけで完了にせず、原文・選別入力・返答・checkpoint・次要求を区別する。
+
+### 2026-11-11 — 次の操作に必要なtool pairの保持
+
+実threadの圧縮で、直近のread結果（UTF-8 9,852 bytes）と`task_context_boundary status`結果（6,605 bytes）がsummary coverageへ入りながら、replacement historyから外れ、important referenceも空だった。genericなcompletion snapshot案内は残ったが、exact status/read値は次の入力から取得できなかった。これは§3.4/§9/§13/§14の継続要件に反する。
+
+変更範囲をactive rootの最新status/update pairと、最新declared user input以降の最新直接read pairへ限定する。canonical call inputとtool output全体のUTF-8 byte数を合わせて各12 KiB以下、最大2 pair、latest選択後にsizeを判定し、oversize時にolder pairへfallbackしない。Automation user inputはtail境界に含めるが、Human instructionの権限・受理・失効判定には使わない。既存のprotected task-boundary IDとnative projectionを使い、tool履歴全体の保持や通常のcontext上限変更は行わない。

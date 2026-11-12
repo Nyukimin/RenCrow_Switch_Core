@@ -426,6 +426,7 @@ impl HistoryCell for ReasoningSummaryCell {
 pub(crate) struct AgentMessageCell {
     lines: Vec<HyperlinkLine>,
     is_first_line: bool,
+    source_item: Option<(String, String)>,
 }
 
 impl AgentMessageCell {
@@ -434,6 +435,7 @@ impl AgentMessageCell {
         Self {
             lines: plain_hyperlink_lines(lines),
             is_first_line,
+            source_item: None,
         }
     }
 
@@ -441,7 +443,18 @@ impl AgentMessageCell {
         Self {
             lines,
             is_first_line,
+            source_item: None,
         }
+    }
+
+    pub(crate) fn set_source_item(&mut self, turn_id: String, item_id: String) {
+        self.source_item = Some((turn_id, item_id));
+    }
+
+    pub(crate) fn source_item(&self) -> Option<(&str, &str)> {
+        self.source_item
+            .as_ref()
+            .map(|(turn_id, item_id)| (turn_id.as_str(), item_id.as_str()))
     }
 }
 
@@ -502,6 +515,7 @@ impl HistoryCell for AgentMessageCell {
 #[derive(Debug)]
 pub(crate) struct AgentMarkdownCell {
     markdown_source: String,
+    source_item: Option<(String, String)>,
     cwd: PathBuf,
     inline_visualization_context: Option<crate::inline_visualization::InlineVisualizationContext>,
     rendered_lines: Option<MarkdownRenderCache>,
@@ -509,6 +523,11 @@ pub(crate) struct AgentMarkdownCell {
 }
 
 impl AgentMarkdownCell {
+    #[cfg(test)]
+    pub(crate) fn markdown_source(&self) -> &str {
+        &self.markdown_source
+    }
+
     /// Create a finalized source-backed assistant message cell.
     ///
     /// `markdown_source` must be the raw source accumulated by the stream controller, not already
@@ -535,11 +554,22 @@ impl AgentMarkdownCell {
                 .then(MarkdownRenderCache::default);
         Self {
             markdown_source,
+            source_item: None,
             cwd: cwd.to_path_buf(),
             inline_visualization_context,
             rendered_lines,
             spoken_artifacts: false,
         }
+    }
+
+    pub(crate) fn set_source_item(&mut self, turn_id: String, item_id: String) {
+        self.source_item = Some((turn_id, item_id));
+    }
+
+    pub(crate) fn source_item(&self) -> Option<(&str, &str)> {
+        self.source_item
+            .as_ref()
+            .map(|(turn_id, item_id)| (turn_id.as_str(), item_id.as_str()))
     }
 
     pub(crate) fn new_spoken(markdown_source: String, cwd: &Path) -> Self {

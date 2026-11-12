@@ -222,6 +222,45 @@ fn valid_transaction_removes_marker_and_commits_checkpoint_metadata() -> Result<
 }
 
 #[test]
+fn committing_v3_capacity_updates_outer_and_inner_transaction_fences() -> Result<()> {
+    let checkpoint = prepared_with_metadata(json!({
+        "version": 3,
+        "mode": "capacity",
+        "transaction_following_items": 0,
+        "capacity_metadata": { "transaction_following_items": 0 }
+    }));
+    let hash = transaction_hash_for_test(std::slice::from_ref(&checkpoint))?;
+    let committed = committed_items_for_test(&[checkpoint, marker(hash.clone())])?;
+    let RolloutItem::Compacted(checkpoint) = &committed[0] else {
+        panic!("expected committed checkpoint");
+    };
+    let metadata = checkpoint
+        .replacement_history
+        .as_ref()
+        .unwrap()
+        .last()
+        .unwrap()
+        .metadata
+        .as_ref()
+        .unwrap()
+        .rencrow_compaction
+        .as_ref()
+        .unwrap();
+    assert_eq!(metadata["committed_transaction_hash"], json!(hash));
+    assert_eq!(
+        metadata["capacity_metadata"]["committed_transaction_hash"],
+        json!(hash)
+    );
+    assert!(metadata.get(TRANSACTION_FOLLOWING_ITEMS).is_none());
+    assert!(
+        metadata["capacity_metadata"]
+            .get(TRANSACTION_FOLLOWING_ITEMS)
+            .is_none()
+    );
+    Ok(())
+}
+
+#[test]
 fn every_truncated_transaction_prefix_discards_only_uncommitted_prefix() -> Result<()> {
     let batch = complete_batch()?;
     let hash = transaction_hash_for_test(&batch)?;

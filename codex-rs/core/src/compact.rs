@@ -810,6 +810,11 @@ fn build_compacted_history_with_limit(
 
 #[path = "compact_rencrow.rs"]
 mod rencrow;
+pub use rencrow::CommittedTaskCheckpointInfo;
+pub(crate) use rencrow::attach_task_boundary_metadata;
+pub use rencrow::inspect_committed_task_checkpoint_window;
+pub(crate) use rencrow::latest_task_state_in_history;
+pub(crate) use rencrow::task_boundary_work_indices;
 
 struct CompactionResponse {
     response_id: String,

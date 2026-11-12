@@ -2128,6 +2128,7 @@ fn thread_resume_params_from_config(
     if model_settings == ResumeModelSettings::PreserveExistingThread {
         return ThreadResumeParams {
             thread_id: thread_id.to_string(),
+            defer_autonomous_completion: Some(false),
             ..ThreadResumeParams::default()
         };
     }
@@ -2161,6 +2162,7 @@ fn thread_resume_params_from_config(
     };
     let mut params = ThreadResumeParams {
         thread_id: thread_id.to_string(),
+        defer_autonomous_completion: Some(false),
         model,
         model_provider,
         service_tier: service_tier_override_from_config(&config),
@@ -3493,6 +3495,7 @@ mod tests {
             params,
             ThreadResumeParams {
                 thread_id: thread_id.to_string(),
+                defer_autonomous_completion: Some(false),
                 ..ThreadResumeParams::default()
             }
         );

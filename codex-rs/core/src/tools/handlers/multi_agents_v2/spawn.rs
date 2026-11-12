@@ -124,6 +124,11 @@ async fn handle_spawn_agent(
     let turn = &step_context.turn;
     let arguments = function_arguments(payload)?;
     let args: SpawnAgentArgs = parse_arguments(&arguments)?;
+    if args.completion_review.is_some() {
+        return Err(FunctionCallError::RespondToModel(
+            "completion_review host evidence is supported only by multi_agent_v1 spawn/wait".into(),
+        ));
+    }
     let fork_mode = args.fork_mode()?;
     let message = message_content(args.message)?;
     let role_name = args
@@ -277,6 +282,7 @@ struct SpawnAgentArgs {
     reasoning_effort: Option<ReasoningEffort>,
     fork_turns: Option<String>,
     fork_context: Option<bool>,
+    completion_review: Option<serde_json::Value>,
 }
 
 impl SpawnAgentArgs {

@@ -22,6 +22,7 @@ use codex_protocol::models::ContentItemKind;
 use codex_protocol::models::ResponseItem;
 use codex_utils_output_truncation::approx_token_count;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::ops::Range;
 
 struct RetainedItem {
@@ -59,25 +60,51 @@ impl NativeProjection {
         initial_context: &'a [ResponseItemEnvelope],
         summary: &'a ResponseItemEnvelope,
     ) -> impl DoubleEndedIterator<Item = &'a ResponseItemEnvelope> + 'a {
+        let initial_sources = initial_context
+            .iter()
+            .filter_map(|item| internal_context_source(&item.item))
+            .collect::<HashSet<_>>();
+        let mut retained = self
+            .retained_native_items()
+            .filter(|item| {
+                internal_context_source(&item.item)
+                    .is_none_or(|source| !initial_sources.contains(source))
+            })
+            .collect::<Vec<_>>();
         let insertion_index =
-            host_insertion_index(self.retained_native_items().chain(std::iter::once(summary)))
-                .unwrap_or(self.retained.len())
-                .min(self.retained.len());
+            host_insertion_index(retained.iter().copied().chain(std::iter::once(summary)))
+                .unwrap_or(retained.len())
+                .min(retained.len());
 
-        self.retained_native_items()
-            .take(insertion_index)
-            .chain(initial_context.iter())
-            .chain(self.retained_native_items().skip(insertion_index))
-            .chain(self.timeline_note.iter())
-            .chain(std::iter::once(summary))
+        retained.splice(insertion_index..insertion_index, initial_context.iter());
+        retained.extend(self.timeline_note.iter());
+        retained.push(summary);
+        retained.into_iter()
     }
 }
 
 /// Apply the accepted map to the original native envelopes without copying unrelated Work.
+#[cfg(test)]
 pub(super) fn filter_retained_instructions(
     originals: &[ResponseItemEnvelope],
     input: &CandidateInput,
     application: InstructionSelectionApplication,
+) -> Result<NativeProjection, String> {
+    filter_retained_instructions_with_task_context(
+        originals,
+        input,
+        application,
+        None,
+        &HashSet::new(),
+    )
+}
+
+pub(super) fn filter_retained_instructions_with_task_context(
+    originals: &[ResponseItemEnvelope],
+    input: &CandidateInput,
+    application: InstructionSelectionApplication,
+    task_context: Option<usize>,
+    protected_task_boundary_call_ids: &HashSet<String>,
 ) -> Result<NativeProjection, String> {
     let snapshot = input.snapshot()?;
     if input.records.len() != originals.len() {
@@ -170,72 +197,91 @@ pub(super) fn filter_retained_instructions(
     }
     let mut retained = Vec::new();
     for (original_index, (record, original)) in input.records.iter().zip(originals).enumerate() {
-        if is_user_summary(original) && !record.origin.is_declared_input() {
+        let is_task_context = task_context == Some(original_index);
+        if is_user_summary(original) && !record.origin.is_declared_input() && !is_task_context {
             continue;
         }
-        let envelope = match record.origin {
-            Origin::Human | Origin::Automation => {
-                let mut envelope = original.clone();
-                let ResponseItem::Message { role, content, .. } = &mut envelope.item else {
-                    return Err("Human candidate no longer maps to a native message".into());
-                };
-                if role != "user" {
-                    return Err("Human candidate no longer has user role".into());
-                }
-                let original_text = content_text(content);
-                if original_text != record.text {
-                    return Err("native Human text differs from its captured snapshot".into());
-                }
-                let ranges = removals
-                    .get(&record.id)
-                    .map(Vec::as_slice)
-                    .unwrap_or_default();
-                if !ranges.is_empty() {
-                    let intake = envelope
-                        .metadata
-                        .as_mut()
-                        .and_then(|metadata| metadata.rencrow_input.as_mut())
-                        .ok_or_else(|| {
-                            "selected Human source lost its host intake record".to_owned()
-                        })?;
-                    if intake["selected_text"].as_str() != Some(record.text.as_str()) {
-                        return Err(
-                            "native Human intake text differs from its captured snapshot".into(),
-                        );
-                    }
-                    apply_ranges_to_content(content, ranges)?;
-                    let retained_text = content_text(content);
-                    if application.pruning.retained_human_text.get(&record.id)
-                        != Some(&retained_text)
-                    {
-                        return Err(
-                            "native Human projection differs from accepted exclusion map".into(),
-                        );
-                    }
-                    intake["selected_text"] = serde_json::json!(retained_text);
-                    intake["selection_hash"] = serde_json::json!(selection_hash);
-                    if !record.text.is_empty()
-                        && retained_text.is_empty()
-                        && record.opaque.is_none()
-                    {
-                        continue;
-                    }
-                }
-                envelope
+        let call_id = match &original.item {
+            ResponseItem::FunctionCall { call_id, .. }
+            | ResponseItem::CustomToolCall { call_id, .. } => Some(call_id.as_str()),
+            ResponseItem::FunctionCallOutput {
+                call_id: Some(call_id),
+                ..
             }
-            Origin::Host
-                if internal_context_source(&original.item).is_some_and(|source| {
-                    latest_internal_context.get(source) == Some(&original_index)
-                }) =>
-            {
-                original.clone()
+            | ResponseItem::CustomToolCallOutput { call_id, .. } => Some(call_id.as_str()),
+            _ => None,
+        };
+        let is_protected_task_boundary =
+            call_id.is_some_and(|call_id| protected_task_boundary_call_ids.contains(call_id));
+        let envelope = if is_task_context || is_protected_task_boundary {
+            original.clone()
+        } else {
+            match record.origin {
+                Origin::Human | Origin::Automation => {
+                    let mut envelope = original.clone();
+                    let ResponseItem::Message { role, content, .. } = &mut envelope.item else {
+                        return Err("Human candidate no longer maps to a native message".into());
+                    };
+                    if role != "user" {
+                        return Err("Human candidate no longer has user role".into());
+                    }
+                    let original_text = content_text(content);
+                    if original_text != record.text {
+                        return Err("native Human text differs from its captured snapshot".into());
+                    }
+                    let ranges = removals
+                        .get(&record.id)
+                        .map(Vec::as_slice)
+                        .unwrap_or_default();
+                    if !ranges.is_empty() {
+                        let intake = envelope
+                            .metadata
+                            .as_mut()
+                            .and_then(|metadata| metadata.rencrow_input.as_mut())
+                            .ok_or_else(|| {
+                                "selected Human source lost its host intake record".to_owned()
+                            })?;
+                        if intake["selected_text"].as_str() != Some(record.text.as_str()) {
+                            return Err(
+                                "native Human intake text differs from its captured snapshot"
+                                    .into(),
+                            );
+                        }
+                        apply_ranges_to_content(content, ranges)?;
+                        let retained_text = content_text(content);
+                        if application.pruning.retained_human_text.get(&record.id)
+                            != Some(&retained_text)
+                        {
+                            return Err(
+                                "native Human projection differs from accepted exclusion map"
+                                    .into(),
+                            );
+                        }
+                        intake["selected_text"] = serde_json::json!(retained_text);
+                        intake["selection_hash"] = serde_json::json!(selection_hash);
+                        if !record.text.is_empty()
+                            && retained_text.is_empty()
+                            && record.opaque.is_none()
+                        {
+                            continue;
+                        }
+                    }
+                    envelope
+                }
+                Origin::Host
+                    if internal_context_source(&original.item).is_some_and(|source| {
+                        latest_internal_context.get(source) == Some(&original_index)
+                    }) =>
+                {
+                    original.clone()
+                }
+                Origin::Work | Origin::Host
+                    if record.opaque.is_none() && record.protected.is_empty() =>
+                {
+                    continue;
+                }
+                Origin::Work | Origin::Host | Origin::Unknown => original.clone(),
             }
-            Origin::Work | Origin::Host
-                if record.opaque.is_none() && record.protected.is_empty() =>
-            {
-                continue;
-            }
-            Origin::Work | Origin::Host | Origin::Unknown => original.clone(),
         };
         retained.push(RetainedItem {
             original_index,
@@ -307,9 +353,17 @@ pub(super) fn build_native_replacement(
         }
     }
 
+    let initial_sources = initial_context
+        .iter()
+        .filter_map(|item| internal_context_source(&item.item))
+        .collect::<HashSet<_>>();
     let mut history = projection
         .retained
         .iter()
+        .filter(|item| {
+            internal_context_source(&item.envelope.item)
+                .is_none_or(|source| !initial_sources.contains(source))
+        })
         .map(|item| item.envelope.clone())
         .collect::<Vec<_>>();
     let summary_item = summary.clone();

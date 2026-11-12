@@ -9,6 +9,14 @@ impl ChatWidget {
         turn: &Turn,
         replay_kind: Option<ReplayKind>,
     ) -> Option<history_cell::FinalMessageSeparator> {
+        let recorded_completed_at = turn
+            .completed_at
+            .and_then(|timestamp| chrono::DateTime::from_timestamp(timestamp, /*nsecs*/ 0));
+        if replay_kind.is_some()
+            && let Some(completed_at) = recorded_completed_at.as_ref()
+        {
+            self.record_replay_activity_epoch(completed_at.timestamp());
+        }
         if self
             .turn_lifecycle
             .rendered_completion_turn_ids
@@ -30,9 +38,7 @@ impl ChatWidget {
                 }
             })
             .filter(|seconds| *seconds > 60);
-        let completed_at = turn
-            .completed_at
-            .and_then(|timestamp| chrono::DateTime::from_timestamp(timestamp, /*nsecs*/ 0))
+        let completed_at = recorded_completed_at
             .map(|timestamp| timestamp.with_timezone(&Local))
             .or_else(|| replay_kind.is_none().then(Local::now));
         if completed_at.is_none() && elapsed_seconds.is_none() {
@@ -44,7 +50,8 @@ impl ChatWidget {
         let cell = history_cell::FinalMessageSeparator::new(
             elapsed_seconds,
             /*runtime_metrics*/ None,
-        );
+        )
+        .with_jst_timestamps(self.local_settings.tui.rencrow_tui_jst_timestamps);
         Some(match completed_at {
             Some(completed_at) => {
                 cell.with_completed_at(completed_at, crate::clock_format::ClockFormat::system())

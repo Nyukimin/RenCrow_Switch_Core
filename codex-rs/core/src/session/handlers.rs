@@ -284,11 +284,26 @@ pub async fn set_thread_memory_mode(sess: &Arc<Session>, sub_id: String, mode: T
 }
 
 pub(super) async fn shutdown_session_runtime(sess: &Arc<Session>) {
+    sess.stop_completion_recovery_task_for_teardown().await;
     if let Some(startup_prewarm) = sess.take_session_startup_prewarm().await {
         startup_prewarm.abort().await;
     }
     let _ = sess.conversation.shutdown().await;
-    sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
+    let preserve_idle_autonomous_completion = sess.get_config().await.rencrow_autonomous_completion
+        && sess.autonomous_completion_current_state().await.is_some()
+        && sess.active_turn.lock().await.is_none()
+        && sess
+            .state
+            .lock()
+            .await
+            .rencrow_completion_uncollected_children
+            .is_empty()
+        && !sess
+            .autonomous_completion_has_unresolved_runtime_work()
+            .await;
+    if !preserve_idle_autonomous_completion {
+        sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
+    }
     let shell_snapshot_prewarm = sess.state.lock().await.shell_snapshot_prewarm.take();
     if let Some(shell_snapshot_prewarm) = shell_snapshot_prewarm {
         shell_snapshot_prewarm.abort();

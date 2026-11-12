@@ -14,8 +14,14 @@ use codex_history::compaction_candidate::digest;
 use codex_history::compaction_candidate::history_digest;
 use codex_history::input_intake::SubmissionIntake;
 use codex_history::input_intake::valid_intake_id;
+use codex_history::task_checkpoint_metadata::RenCrowTaskCheckpointMetadataV3;
+use codex_history::task_checkpoint_metadata::TaskBoundarySourceFence;
+use codex_history::task_checkpoint_metadata::TaskCheckpointMode;
+use codex_history::task_context::StoredTaskState;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ThreadSettingsAppliedEvent;
 use codex_protocol::protocol::ThreadSettingsSnapshot;
@@ -39,6 +45,61 @@ pub(crate) struct RenCrowCheckpoint {
 }
 
 impl Session {
+    pub(crate) async fn latest_rencrow_task_state(&self) -> Result<Option<StoredTaskState>> {
+        let history = self.clone_history().await;
+        crate::compact::latest_task_state_in_history(
+            history.annotated_items(),
+            &self.thread_id().to_string(),
+        )
+        .map_err(CodexErr::InvalidRequest)
+    }
+
+    /// Commit a host-validated task boundary at the session-owned persistence barrier.
+    pub(crate) async fn commit_task_boundary_checkpoint(
+        &self,
+        expected_history_hash: String,
+        expected_turn_id: String,
+        mut items: Vec<ResponseItemEnvelope>,
+        summary_text: String,
+        task_state: StoredTaskState,
+        source_fence: TaskBoundarySourceFence,
+    ) -> Result<()> {
+        let snapshot = self.clone_history().await;
+        let actual_history_hash =
+            history_digest(snapshot.annotated_items()).map_err(CodexErr::InvalidRequest)?;
+        if actual_history_hash != expected_history_hash
+            || source_fence.history_hash != expected_history_hash
+        {
+            return Err(CodexErr::InvalidRequest(
+                "task boundary snapshot changed before commit".into(),
+            ));
+        }
+        crate::compact::attach_task_boundary_metadata(
+            &mut items,
+            &expected_turn_id,
+            &summary_text,
+            &task_state,
+            source_fence,
+        )
+        .map_err(CodexErr::InvalidRequest)?;
+        let settings = self.thread_settings_snapshot().await;
+        let base = self.get_base_instructions().await;
+        let expected_world = snapshot.world_state_checkpoint();
+        self.commit_rencrow_checkpoint(RenCrowCheckpoint {
+            items,
+            expected_history_hash,
+            expected_settings: settings,
+            reference_context: None,
+            world_state: None,
+            summary: summary_text,
+            response_id: None,
+            expected_turn: expected_turn_id,
+            expected_base_text: base.text,
+            expected_world,
+        })
+        .await
+    }
+
     pub(crate) async fn check_rencrow_checkpoint(&self) -> Result<()> {
         if self.state.lock().await.rencrow_checkpoint_failed {
             return Err(CodexErr::Fatal("Compaction checkpoint persistence was uncertain; restart to recover the last readable owner checkpoint before continuing".into()));
@@ -158,6 +219,14 @@ impl Session {
                     "RenCrow compaction candidate is stale; history was not replaced".into(),
                 ));
             }
+            validate_task_boundary_source_fence(
+                state.history.annotated_items(),
+                &candidate.items,
+                &candidate.expected_history_hash,
+                &self.thread_id().to_string(),
+                &candidate.summary,
+            )
+            .map_err(CodexErr::InvalidRequest)?;
             let cancellation = cancellation.ok_or(CodexErr::TurnAborted)?;
             if cancellation.is_cancelled() {
                 return Err(CodexErr::TurnAborted);
@@ -190,6 +259,34 @@ impl Session {
                     CodexErr::InvalidRequest("missing validated compaction metadata".into())
                 })?;
             summary_metadata["transaction_following_items"] = json!(following);
+            if summary_metadata
+                .get("version")
+                .and_then(serde_json::Value::as_u64)
+                == Some(3)
+                && summary_metadata
+                    .get("mode")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("capacity")
+            {
+                summary_metadata["capacity_metadata"]["transaction_following_items"] =
+                    json!(following);
+                summary_metadata["capacity_metadata"]
+                    .as_object_mut()
+                    .ok_or_else(|| {
+                        CodexErr::InvalidRequest(
+                            "validated V3 capacity metadata is not an object".into(),
+                        )
+                    })?
+                    .remove("committed_transaction_hash");
+            }
+            summary_metadata
+                .as_object_mut()
+                .ok_or_else(|| {
+                    CodexErr::InvalidRequest(
+                        "validated compaction metadata is not an object".into(),
+                    )
+                })?
+                .remove("committed_transaction_hash");
             let mut next_history = state.history.clone();
             next_history.replace_compacted(candidate.items.clone(), None);
             let previous_ids = state.auto_compact_window_ids();
@@ -285,6 +382,205 @@ impl Session {
                 .mark_mcp_attribution_persisted(revision);
         }
         Ok(())
+    }
+}
+
+/// Verify that a task boundary is bound to this exact input snapshot and the exact removed items.
+/// V2 and V3 capacity checkpoints continue through the existing compaction contract.
+fn validate_task_boundary_source_fence(
+    originals: &[ResponseItemEnvelope],
+    replacement: &[ResponseItemEnvelope],
+    expected_history_hash: &str,
+    thread_id: &str,
+    summary_text: &str,
+) -> std::result::Result<(), String> {
+    let Some(value) = replacement
+        .last()
+        .and_then(|envelope| envelope.metadata.as_ref())
+        .and_then(|metadata| metadata.rencrow_compaction.as_ref())
+    else {
+        return Ok(());
+    };
+    if value.get("version").and_then(serde_json::Value::as_u64) != Some(3) {
+        return Ok(());
+    }
+    let checkpoint = RenCrowTaskCheckpointMetadataV3::parse_and_validate(
+        value.clone(),
+        thread_id,
+        summary_text,
+    )?;
+    if checkpoint.mode != TaskCheckpointMode::TaskBoundary {
+        return Ok(());
+    }
+    let fence = checkpoint
+        .source_fence
+        .as_ref()
+        .ok_or_else(|| "task boundary checkpoint has no source fence".to_owned())?;
+    let new_root_task_id = checkpoint
+        .task_state
+        .as_ref()
+        .and_then(|value| StoredTaskState::parse_and_validate(value.clone(), thread_id).ok())
+        .map(|state| state.boundary.root_task_id)
+        .ok_or_else(|| "task boundary checkpoint has no valid root task state".to_owned())?;
+    if fence.history_hash != expected_history_hash {
+        return Err(
+            "task boundary source fence does not match the checkpoint input snapshot".into(),
+        );
+    }
+
+    let mut removed_indices = std::collections::BTreeSet::new();
+    let mut removed_item_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for reference in &fence.removed_refs {
+        let Some(index_text) = reference.id.strip_prefix("item:") else {
+            return Err("task boundary source reference is not a host item index".into());
+        };
+        let index = index_text
+            .parse::<usize>()
+            .map_err(|_| "task boundary source reference index is invalid".to_owned())?;
+        if index_text != index.to_string() || !removed_indices.insert(index) {
+            return Err(
+                "task boundary source reference index is duplicated or noncanonical".into(),
+            );
+        }
+        let original = originals
+            .get(index)
+            .ok_or_else(|| "task boundary source reference is outside its snapshot".to_owned())?;
+        if digest(&(&original.item, &original.metadata))? != reference.hash {
+            return Err("task boundary source reference hash changed".into());
+        }
+        let item_hash = digest(&original.item)?;
+        *removed_item_counts.entry(item_hash).or_default() += 1;
+    }
+
+    let mut original_item_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for envelope in originals {
+        *original_item_counts
+            .entry(digest(&envelope.item)?)
+            .or_default() += 1;
+    }
+    let mut replacement_item_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for envelope in replacement {
+        *replacement_item_counts
+            .entry(digest(&envelope.item)?)
+            .or_default() += 1;
+    }
+    for (item_hash, original_count) in &original_item_counts {
+        let removed_count = original_count.saturating_sub(
+            replacement_item_counts
+                .get(item_hash)
+                .copied()
+                .unwrap_or_default(),
+        );
+        if removed_item_counts
+            .get(item_hash)
+            .copied()
+            .unwrap_or_default()
+            != removed_count
+        {
+            return Err(
+                "task boundary source fence does not match the exact removed item set".into(),
+            );
+        }
+    }
+    if removed_item_counts
+        .keys()
+        .any(|hash| !original_item_counts.contains_key(hash))
+    {
+        return Err("task boundary source fence references a non-source item".into());
+    }
+
+    for &index in &removed_indices {
+        if let Some((call_id, is_call)) = tool_call_pair(&originals[index].item) {
+            let matches = originals
+                .iter()
+                .enumerate()
+                .filter_map(|(other_index, envelope)| {
+                    (other_index != index
+                        && tool_call_pair(&envelope.item).is_some_and(
+                            |(other_id, other_is_call)| {
+                                other_id == call_id && other_is_call != is_call
+                            },
+                        ))
+                    .then_some(other_index)
+                })
+                .collect::<Vec<_>>();
+            if matches.len() != 1 || !removed_indices.contains(&matches[0]) {
+                return Err("task boundary must remove tool calls and results as a pair".into());
+            }
+        } else if !matches!(
+            &originals[index].item,
+            ResponseItem::Message { role, .. } if role == "assistant"
+        ) && is_replaceable_task_boundary_summary(&originals[index], thread_id)
+            .is_none_or(|root_task_id| root_task_id != new_root_task_id)
+        {
+            return Err(
+                "task boundary source fence includes a protected or unknown history item".into(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn is_replaceable_task_boundary_summary(
+    envelope: &ResponseItemEnvelope,
+    thread_id: &str,
+) -> Option<String> {
+    let ResponseItem::Message {
+        role,
+        content,
+        internal_chat_message_metadata_passthrough,
+        ..
+    } = &envelope.item
+    else {
+        return None;
+    };
+    if role != "user"
+        || !internal_chat_message_metadata_passthrough
+            .as_ref()
+            .and_then(|metadata| metadata.content_item_kinds.as_ref())
+            .is_some_and(|kinds| {
+                !kinds.is_empty()
+                    && kinds.len() == content.len()
+                    && kinds.iter().all(|kind| kind.0 == "compaction.summary")
+            })
+    {
+        return None;
+    }
+    let value = envelope
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.rencrow_compaction.as_ref())?;
+    let summary_text = content
+        .iter()
+        .map(|item| match item {
+            ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+                Some(text.as_str())
+            }
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?
+        .concat();
+    RenCrowTaskCheckpointMetadataV3::parse_and_validate(value.clone(), thread_id, &summary_text)
+        .ok()
+        .filter(|checkpoint| checkpoint.mode == TaskCheckpointMode::TaskBoundary)
+        .and_then(|checkpoint| checkpoint.task_state)
+        .and_then(|value| StoredTaskState::parse_and_validate(value, thread_id).ok())
+        .map(|state| state.boundary.root_task_id)
+}
+
+fn tool_call_pair(item: &ResponseItem) -> Option<(&str, bool)> {
+    match item {
+        ResponseItem::FunctionCall { call_id, .. }
+        | ResponseItem::CustomToolCall { call_id, .. } => Some((call_id, true)),
+        ResponseItem::FunctionCallOutput {
+            call_id: Some(call_id),
+            ..
+        }
+        | ResponseItem::CustomToolCallOutput { call_id, .. } => Some((call_id, false)),
+        _ => None,
     }
 }
 

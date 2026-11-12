@@ -203,6 +203,26 @@ fn spawn_agent_tool_v1_keeps_legacy_fork_context_field() {
 
     assert!(properties.contains_key("fork_context"));
     assert!(!properties.contains_key("fork_turns"));
+    let completion_review = properties
+        .get("completion_review")
+        .expect("V1 spawn exposes typed completion review request");
+    assert!(
+        completion_review
+            .description
+            .as_deref()
+            .is_some_and(|description| description.contains("must not edit files or rerun tests"))
+    );
+    assert_eq!(
+        completion_review.required.as_deref(),
+        Some(
+            [
+                "unit_id".to_string(),
+                "target_task_id".to_string(),
+                "target_task_revision".to_string(),
+            ]
+            .as_slice()
+        )
+    );
     assert_eq!(
         properties.get("agent_type"),
         Some(&JsonSchema::string(Some(format!(

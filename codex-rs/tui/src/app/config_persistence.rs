@@ -1849,6 +1849,31 @@ theme = "dracula"
     }
 
     #[tokio::test]
+    async fn rebuild_config_for_resume_keeps_jst_timestamp_cli_override() -> Result<()> {
+        let mut app = make_test_app().await;
+        let codex_home = tempdir()?;
+        app.config.codex_home = codex_home.path().to_path_buf().abs();
+        std::fs::write(
+            codex_home.path().join("config.toml"),
+            "[tui]\nrencrow_tui_jst_timestamps = false\n",
+        )?;
+        app.cli_kv_overrides = codex_utils_cli::CliConfigOverrides {
+            raw_overrides: vec!["tui.rencrow_tui_jst_timestamps=true".to_string()],
+        }
+        .parse_overrides()
+        .map_err(std::io::Error::other)?;
+        let current_cwd = app.config.cwd.clone();
+
+        let (config, local_settings) = app
+            .rebuild_config_for_resume_or_fallback(&current_cwd, current_cwd.to_path_buf())
+            .await?;
+
+        assert!(config.tui_rencrow_jst_timestamps);
+        assert!(local_settings.tui.rencrow_tui_jst_timestamps);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn rebuild_config_for_resume_or_fallback_errors_when_cwd_changes() -> Result<()> {
         let mut app = make_test_app().await;
         let codex_home = tempdir()?;

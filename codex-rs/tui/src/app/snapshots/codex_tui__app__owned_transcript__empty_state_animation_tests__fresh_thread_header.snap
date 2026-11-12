@@ -1,5 +1,6 @@
 ---
 source: tui/src/app/empty_state_animation_tests.rs
+assertion_line: 225
 expression: text(after)
 ---
 ╭───────────────────────────────────────────╮
@@ -39,7 +40,7 @@ expression: text(after)
 
 
 
-
+Subagents: 0 running / 0 total · /subagents details
                                               Tip: Start a fresh idea with /new; the previous session stays in history.
 
 › Ask Codex to do anything

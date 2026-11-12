@@ -533,6 +533,9 @@ impl Session {
     }
 
     pub async fn abort_all_tasks(self: &Arc<Self>, reason: TurnAbortReason) {
+        if reason == TurnAbortReason::Interrupted {
+            self.pause_autonomous_completion().await;
+        }
         let mut aborted_turn = false;
         let mut active_turn_to_clear = None;
         let mut turn_context = None;

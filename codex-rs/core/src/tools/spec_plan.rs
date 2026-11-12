@@ -49,6 +49,7 @@ use crate::tools::handlers::multi_agents_v2::ListAgentsHandler as ListAgentsHand
 use crate::tools::handlers::multi_agents_v2::SendMessageHandler as SendMessageHandlerV2;
 use crate::tools::handlers::multi_agents_v2::SpawnAgentHandler as SpawnAgentHandlerV2;
 use crate::tools::handlers::multi_agents_v2::WaitAgentHandler as WaitAgentHandlerV2;
+use crate::tools::handlers::task_context_boundary::TaskContextBoundaryHandler;
 use crate::tools::handlers::tool_search_spec::ToolSearchSourceListing;
 use crate::tools::handlers::view_image_spec::ViewImageToolOptions;
 use crate::tools::hosted_spec::WebSearchToolOptions;
@@ -1038,6 +1039,14 @@ fn add_shell_tools(context: &CoreToolPlanContext<'_>, registry: &mut ToolRegistr
     let turn_context = context.turn_context;
     let features = turn_context.config.features.get();
     let environment_mode = tool_environment_mode(context.environments);
+
+    let include_task_evidence = task_boundary_enabled(turn_context);
+    if include_task_evidence {
+        registry.add_with_exposure(
+            TaskContextBoundaryHandler::new(turn_context.config.rencrow_autonomous_completion),
+            ToolExposure::DirectModelOnly,
+        );
+    }
     if !environment_mode.has_environment()
         || !features.enabled(Feature::ShellTool)
         || matches!(context.model_info.shell_type, ConfigShellToolType::Disabled)
@@ -1057,6 +1066,7 @@ fn add_shell_tools(context: &CoreToolPlanContext<'_>, registry: &mut ToolRegistr
         allow_tty: features.enabled(Feature::UnifiedExecTty),
         exec_permission_approvals_enabled,
         include_environment_id,
+        include_task_evidence,
         include_shell_parameter: unified_exec_should_include_shell_parameter(
             turn_context,
             context.environments,
@@ -1072,6 +1082,16 @@ fn add_shell_tools(context: &CoreToolPlanContext<'_>, registry: &mut ToolRegistr
         // resumable process or write_stdin authority prohibited by policy.
         registry.add(ExecCommandHandler::one_shot(options));
     }
+}
+
+fn task_boundary_enabled(turn_context: &TurnContext) -> bool {
+    turn_context.config.rencrow_compaction
+        && matches!(
+            &turn_context.session_source,
+            codex_protocol::protocol::SessionSource::Cli
+                | codex_protocol::protocol::SessionSource::VSCode
+                | codex_protocol::protocol::SessionSource::Exec
+        )
 }
 
 fn unified_exec_should_include_shell_parameter(

@@ -6,6 +6,7 @@ use crate::exec::DEFAULT_EXEC_COMMAND_TIMEOUT_MS;
 use crate::exec_policy::prompt_is_rejected_by_policy;
 use crate::function_tool::FunctionCallError;
 use crate::maybe_emit_implicit_skill_invocation;
+use crate::task_check::TaskCheckExecution;
 use crate::tools::context::ExecCommandToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
@@ -62,6 +63,7 @@ pub(crate) struct ExecCommandHandlerOptions {
     pub(crate) allow_tty: bool,
     pub(crate) exec_permission_approvals_enabled: bool,
     pub(crate) include_environment_id: bool,
+    pub(crate) include_task_evidence: bool,
     pub(crate) include_shell_parameter: bool,
     pub(crate) include_windows_shell_guidance: bool,
 }
@@ -86,6 +88,7 @@ impl Default for ExecCommandHandler {
                 allow_tty: true,
                 exec_permission_approvals_enabled: false,
                 include_environment_id: false,
+                include_task_evidence: false,
                 include_shell_parameter: true,
                 include_windows_shell_guidance: cfg!(windows),
             },
@@ -123,6 +126,7 @@ impl ToolExecutor<ToolInvocation> for ExecCommandHandler {
             self.options.include_environment_id,
             self.options.include_shell_parameter,
             self.options.include_windows_shell_guidance,
+            self.options.include_task_evidence,
         );
         let mut spec = match self.lifetime {
             ExecCommandLifetime::Interactive => spec,
@@ -307,6 +311,7 @@ impl ExecCommandHandler {
             additional_permissions,
             justification,
             prefix_rule,
+            task_evidence,
             ..
         } = args;
         let completion_timeout = match self.lifetime {
@@ -414,6 +419,87 @@ impl ExecCommandHandler {
             fs.as_ref(),
         )
         .await;
+        let has_task_evidence = task_evidence.is_some();
+        let task_evidence_command = command.last().map(String::as_str).unwrap_or_default();
+        let task_evidence_command_error =
+            validate_task_evidence_check_command(task_evidence_command).err();
+        let task_evidence_result = match task_evidence {
+            Some(_request) if let Some(message) = task_evidence_command_error => {
+                Err(FunctionCallError::RespondToModel(format!(
+                    "{}; remove shell wrappers such as `;`, pipes, or exit-status masking and run the check directly",
+                    message
+                )))
+            }
+            Some(_request) if environment.is_remote() => Err(FunctionCallError::RespondToModel(
+                "task_evidence is supported only for local exec environments".to_string(),
+            )),
+            Some(request) => {
+                let active_scope = session.active_task_scope().await;
+                if !active_scope.as_ref().is_some_and(|scope| {
+                    scope.task_id == request.task_id && scope.task_revision == request.task_revision
+                }) {
+                    Err(FunctionCallError::RespondToModel(
+                        "task_evidence task ID and revision must match the active task scope"
+                            .into(),
+                    ))
+                } else {
+                    native_cwd
+                        .as_ref()
+                        .ok_or_else(|| {
+                            FunctionCallError::RespondToModel(
+                                "task_evidence requires a host-native local working directory"
+                                    .to_string(),
+                            )
+                        })
+                        .and_then(|workspace_root| {
+                            let read_policy =
+                                sandbox_context.permissions.file_system_sandbox_policy();
+                            let read_deny =
+                                codex_protocol::permissions::ReadDenyMatcher::try_new_for_local_paths(
+                                    &read_policy,
+                                    workspace_root.as_path(),
+                                )
+                                .map_err(FunctionCallError::RespondToModel)?;
+                            if request.artifact_paths.iter().any(|path| {
+                                read_deny.as_ref().is_some_and(|matcher| {
+                                    matcher.is_local_path_read_denied(&workspace_root.join(path))
+                                })
+                            }) {
+                                return Err(FunctionCallError::RespondToModel(
+                                    "task_evidence artifact is denied by the active filesystem read policy"
+                                        .to_string(),
+                                ));
+                            }
+                            TaskCheckExecution::new(request, workspace_root.as_path())
+                                .map(|mut execution| {
+                                    if turn.config.rencrow_autonomous_completion
+                                        && let Some(scope) = active_scope.clone()
+                                    {
+                                        execution.bind_obligation(
+                                            scope,
+                                            task_evidence_command,
+                                        );
+                                    }
+                                    Some(execution)
+                                })
+                                .ok_or_else(|| {
+                                    FunctionCallError::RespondToModel(
+                                        "task_evidence artifacts must be existing regular files inside the local workspace".to_string(),
+                                    )
+                                })
+                        })
+                }
+            }
+            None => Ok(None),
+        };
+        if has_task_evidence && task_evidence_result.is_err() {
+            crate::rencrow_execution_guard::cancel_unexecuted_task_evidence_check(
+                session.as_ref(),
+                &call_id,
+            )
+            .await;
+        }
+        let task_evidence = task_evidence_result?;
         // Preparation can be cancelled. Reserve a process only once it is done.
         let process_id = manager.allocate_process_id().await;
         let request = ExecCommandRequest {
@@ -435,6 +521,7 @@ impl ExecCommandHandler {
                 .permissions_preapproved,
             justification,
             prefix_rule,
+            task_evidence,
         };
         let result = match completion_timeout {
             Some(timeout) => {
@@ -478,6 +565,14 @@ impl ExecCommandHandler {
                 )))
             }
         }
+    }
+}
+
+pub(crate) fn validate_task_evidence_check_command(command: &str) -> Result<(), &'static str> {
+    if crate::rencrow_execution_guard::is_task_evidence_check_command(command) {
+        Ok(())
+    } else {
+        Err("task_evidence requires a direct recognized check command")
     }
 }
 

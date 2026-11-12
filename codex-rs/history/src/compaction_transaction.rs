@@ -117,6 +117,19 @@ fn committed_checkpoint(item: &RolloutItem, transaction_hash: &str) -> Result<Ro
         "committed_transaction_hash".into(),
         serde_json::Value::String(transaction_hash.to_owned()),
     );
+    if fields.get("version").and_then(serde_json::Value::as_u64) == Some(3)
+        && fields.get("mode").and_then(serde_json::Value::as_str) == Some("capacity")
+    {
+        let capacity = fields
+            .get_mut("capacity_metadata")
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or_else(|| "V3 capacity checkpoint has no V2 metadata".to_owned())?;
+        capacity.remove(TRANSACTION_FOLLOWING_ITEMS);
+        capacity.insert(
+            "committed_transaction_hash".into(),
+            serde_json::Value::String(transaction_hash.to_owned()),
+        );
+    }
     Ok(RolloutItem::Compacted(committed))
 }
 

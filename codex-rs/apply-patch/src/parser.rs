@@ -132,6 +132,12 @@ pub struct UpdateFileChunk {
 }
 
 impl UpdateFileChunk {
+    /// Whether this chunk contains additions or removals beyond its context lines.
+    pub(crate) fn has_changes(&self) -> bool {
+        self.old_lines.len() != self.context_line_indices.len()
+            || self.new_lines.len() != self.context_line_indices.len()
+    }
+
     /// Adds a context line to both sides while recording its corresponding
     /// indices so it remains distinguishable from identical changed lines.
     pub(crate) fn push_context_line(&mut self, line: String) {
@@ -424,6 +430,28 @@ fn test_parse_patch() {
             }],
         }]
     );
+}
+
+#[test]
+fn rejects_update_hunks_that_only_repeat_context() {
+    let patch = "*** Begin Patch\n*** Update File: file.txt\n@@\n unchanged\n*** End Patch";
+
+    assert!(parse_patch(patch).is_err());
+}
+
+#[test]
+fn accepts_context_only_anchor_after_a_real_update() {
+    let patch =
+        "*** Begin Patch\n*** Update File: file.txt\n@@\n-old\n+new\n@@\n anchor\n*** End Patch";
+
+    assert!(parse_patch(patch).is_ok());
+}
+
+#[test]
+fn accepts_context_only_update_when_moving_a_file() {
+    let patch = "*** Begin Patch\n*** Update File: old.txt\n*** Move to: new.txt\n@@\n unchanged\n*** End Patch";
+
+    assert!(parse_patch(patch).is_ok());
 }
 
 #[test]

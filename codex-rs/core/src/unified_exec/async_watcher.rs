@@ -174,6 +174,7 @@ pub(crate) fn spawn_exit_watcher(
     started_at: Instant,
     network_denial_monitor: Option<tokio::task::JoinHandle<()>>,
     plugin_metrics_sidecar: Option<SharedPluginMetricsSidecar>,
+    task_evidence: Option<crate::task_check::TaskCheckExecution>,
 ) {
     let session_ref = Arc::clone(&context.session);
     let turn_ref = Arc::clone(&context.step_context.turn);
@@ -214,6 +215,7 @@ pub(crate) fn spawn_exit_watcher(
                 String::new(),
                 message,
                 duration,
+                task_evidence,
             )
             .await;
         } else {
@@ -242,6 +244,7 @@ pub(crate) fn spawn_exit_watcher(
                 exit_code,
                 duration,
                 timed_out,
+                task_evidence,
             )
             .await;
         }
@@ -355,6 +358,7 @@ pub(crate) async fn emit_exec_end_for_unified_exec(
     exit_code: i32,
     duration: Duration,
     timed_out: bool,
+    task_evidence: Option<crate::task_check::TaskCheckExecution>,
 ) {
     let aggregated_output = resolve_aggregated_output(&transcript, fallback_output).await;
     let output = ExecToolCallOutput {
@@ -378,6 +382,7 @@ pub(crate) async fn emit_exec_end_for_unified_exec(
         ExecCommandSource::UnifiedExecStartup,
         process_id,
         plugin_attribution,
+        task_evidence,
     );
     emitter
         .emit(
@@ -404,6 +409,7 @@ pub(crate) async fn emit_failed_exec_end_for_unified_exec(
     fallback_output: String,
     message: String,
     duration: Duration,
+    task_evidence: Option<crate::task_check::TaskCheckExecution>,
 ) {
     let stdout = if fallback_output.is_empty() {
         resolve_aggregated_output(&transcript, fallback_output).await
@@ -436,6 +442,7 @@ pub(crate) async fn emit_failed_exec_end_for_unified_exec(
         ExecCommandSource::UnifiedExecStartup,
         process_id,
         plugin_attribution,
+        task_evidence,
     );
     emitter
         .emit(

@@ -330,6 +330,26 @@ fn has_subagent_notification<'a>(
     })
 }
 
+fn count_subagent_notifications<'a>(
+    history_items: impl IntoIterator<Item = &'a ResponseItem>,
+) -> usize {
+    history_items
+        .into_iter()
+        .filter(|item| {
+            let ResponseItem::Message { role, content, .. } = item else {
+                return false;
+            };
+            role == "user"
+                && content.iter().any(|content_item| match content_item {
+                    ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+                        SubagentNotification::matches_text(text)
+                    }
+                    ContentItem::InputImage { .. } | ContentItem::InputAudio { .. } => false,
+                })
+        })
+        .count()
+}
+
 /// Returns true when any message item contains `needle` in a text span.
 fn history_contains_text<'a>(
     history_items: impl IntoIterator<Item = &'a ResponseItem>,
@@ -731,6 +751,202 @@ async fn send_input_submits_user_message() {
         .expect("send_input should succeed");
     assert!(!submission_id.is_empty());
     wait_for_recorded_user_message(thread.as_ref(), "hello from tests").await;
+}
+
+#[tokio::test]
+async fn admitted_follow_up_is_running_and_late_previous_completion_cannot_regress_status() {
+    let harness = AgentControlHarness::new().await;
+    let (_, thread) = harness.start_thread().await;
+    let old_turn = thread.session.new_default_turn().await;
+    thread.session.record_started_turn(&old_turn.sub_id).await;
+    let old_completion = || {
+        EventMsg::TurnComplete(TurnCompleteEvent {
+            turn_id: old_turn.sub_id.clone(),
+            started_at: None,
+            last_agent_message: Some("old result".into()),
+            error: None,
+            completed_at: None,
+            duration_ms: None,
+            time_to_first_token_ms: None,
+        })
+    };
+    thread
+        .session
+        .send_event(old_turn.as_ref(), old_completion())
+        .await;
+    assert_eq!(
+        thread.agent_status().await,
+        AgentStatus::Completed(Some("old result".into()))
+    );
+
+    thread.session.record_started_turn("follow-up-turn").await;
+    assert_eq!(thread.agent_status().await, AgentStatus::Running);
+    thread
+        .session
+        .send_event(old_turn.as_ref(), old_completion())
+        .await;
+    assert_eq!(thread.agent_status().await, AgentStatus::Running);
+}
+
+#[tokio::test]
+async fn v1_completion_watcher_rearms_for_a_follow_up_turn() {
+    let harness = AgentControlHarness::new().await;
+    let (parent_thread_id, parent_thread) = harness.start_thread().await;
+    let (child_thread_id, child_thread) = harness.start_thread().await;
+    harness.control.maybe_start_completion_watcher(
+        child_thread_id,
+        Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            parent_thread_id,
+            depth: 1,
+            agent_path: None,
+            agent_nickname: None,
+            agent_role: Some("explorer".into()),
+        })),
+        child_thread_id.to_string(),
+        None,
+    );
+
+    for expected_count in [1, 2] {
+        let turn = child_thread.session.new_default_turn().await;
+        child_thread.session.record_started_turn(&turn.sub_id).await;
+        child_thread
+            .session
+            .send_event(
+                turn.as_ref(),
+                EventMsg::TurnComplete(TurnCompleteEvent {
+                    turn_id: turn.sub_id.clone(),
+                    started_at: None,
+                    last_agent_message: Some(format!("result {expected_count}")),
+                    error: None,
+                    completed_at: None,
+                    duration_ms: None,
+                    time_to_first_token_ms: None,
+                }),
+            )
+            .await;
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let history = parent_thread.session.clone_history().await;
+                if count_subagent_notifications(history.raw_items()) >= expected_count {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("watcher delivers each terminal generation");
+    }
+}
+
+#[tokio::test]
+async fn v2_terminal_result_uses_automatic_cas_to_wake_an_idle_parent() {
+    let harness = AgentControlHarness::new().await;
+    let mut config = harness.config.clone();
+    config.rencrow_autonomous_completion = true;
+    let _ = config.features.enable(Feature::MultiAgentV2);
+    let parent = harness
+        .manager
+        .start_thread(StartThreadOptions::new(config.clone()))
+        .await
+        .expect("start autonomous V2 parent");
+    let parent_turn = "parent-before-child".to_string();
+    parent
+        .thread
+        .session
+        .record_started_turn(&parent_turn)
+        .await;
+    parent
+        .thread
+        .session
+        .set_rencrow_completion_state(
+            "root".into(),
+            serde_json::json!({
+                "contract_revision": 1,
+                "conditions": [{
+                    "id": "AC-1",
+                    "revision": 1,
+                    "result": "The parent completes the requested feature",
+                    "scope": "repository",
+                    "verification": "Run the accepted checks",
+                    "acceptance_criteria": "The requested behavior passes",
+                    "status": "open"
+                }],
+                "units": [{
+                    "id": "unit-1",
+                    "purpose": "Integrate the completed child result",
+                    "status": "ready",
+                    "condition_refs": ["AC-1"]
+                }],
+                "next_action": "Integrate the child result"
+            }),
+        )
+        .await
+        .expect("register open completion state");
+
+    let child_path = AgentPath::root().join("worker").expect("child path");
+    let child_thread_id = harness
+        .control
+        .spawn_agent(
+            config,
+            text_input("child work"),
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: parent.thread_id,
+                depth: 1,
+                agent_path: Some(child_path.clone()),
+                agent_nickname: None,
+                agent_role: Some("explorer".into()),
+            })),
+        )
+        .await
+        .expect("spawn V2 child");
+    let child = harness
+        .manager
+        .get_thread(child_thread_id)
+        .await
+        .expect("child is registered");
+    let child_turn_id = child
+        .session
+        .autonomous_completion_previous_turn_id()
+        .await
+        .expect("spawned child turn id");
+
+    harness
+        .control
+        .notify_parent_of_terminal_turn(
+            crate::agent::api::AgentTurnOutcome {
+                thread_id: child_thread_id,
+                turn_id: child_turn_id,
+                source: SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                    parent_thread_id: parent.thread_id,
+                    depth: 1,
+                    agent_path: Some(child_path),
+                    agent_nickname: None,
+                    agent_role: Some("explorer".into()),
+                }),
+                parent_turn_id: Some(parent_turn.clone()),
+                initiating_agent_path: None,
+                status: AgentStatus::Completed(Some("child result".into())),
+            },
+            &codex_rollout_trace::ThreadTraceContext::disabled(),
+        )
+        .await;
+
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if parent
+                .thread
+                .session
+                .autonomous_completion_previous_turn_id()
+                .await
+                .is_some_and(|turn_id| turn_id != parent_turn.as_str())
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("accepted V2 result wakes the parent through Automatic CAS");
 }
 
 #[tokio::test]
@@ -4273,6 +4489,7 @@ async fn spawn_thread_subagent_uses_role_specific_nickname_candidates() {
     harness.config.agent_roles.insert(
         "researcher".to_string(),
         AgentRoleConfig {
+            enabled: None,
             description: Some("Research role".to_string()),
             config_file: None,
             nickname_candidates: Some(vec!["Atlas".to_string()]),
@@ -4345,10 +4562,26 @@ async fn resume_thread_subagent_restores_stored_metadata() {
     let agent_path = AgentPath::from_string("/root/explorer".to_string())
         .expect("test agent path should be valid");
 
+    // Modified by RenCrow: cold resume must not inherit the parent's model/effort.
+    let child_config = ConfigBuilder::without_managed_config_for_tests()
+        .codex_home(harness.config.codex_home.to_path_buf())
+        .cli_overrides(vec![
+            (
+                "model".into(),
+                TomlValue::String("gpt-5.1-codex-mini".into()),
+            ),
+            (
+                "model_reasoning_effort".into(),
+                TomlValue::String("medium".into()),
+            ),
+        ])
+        .build()
+        .await
+        .expect("child config");
     let child_thread_id = harness
         .control
         .spawn_agent(
-            harness.config.clone(),
+            child_config,
             text_input("hello child"),
             Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
                 parent_thread_id,
@@ -4396,6 +4629,7 @@ async fn resume_thread_subagent_restores_stored_metadata() {
         .expect("child should initialize before shutdown");
     }
     let original_snapshot = child_thread.config_snapshot().await;
+    assert_eq!(original_snapshot.model, "gpt-5.1-codex-mini");
     let original_nickname = original_snapshot
         .session_source
         .get_nickname()
@@ -4409,6 +4643,9 @@ async fn resume_thread_subagent_restores_stored_metadata() {
                     include_history: false,
                 })
                 .await
+                && stored_thread.model.as_deref() == Some("gpt-5.1-codex-mini")
+                && stored_thread.reasoning_effort
+                    == Some(codex_protocol::openai_models::ReasoningEffort::Medium)
                 && stored_thread.agent_nickname.is_some()
                 && stored_thread.agent_role.as_deref() == Some("explorer")
                 && stored_thread.agent_path.as_deref() == Some(agent_path.as_str())
@@ -4451,6 +4688,11 @@ async fn resume_thread_subagent_restores_stored_metadata() {
         .expect("resumed child thread should exist")
         .config_snapshot()
         .await;
+    assert_eq!(resumed_snapshot.model, "gpt-5.1-codex-mini");
+    assert_eq!(
+        resumed_snapshot.reasoning_effort,
+        Some(codex_protocol::openai_models::ReasoningEffort::Medium)
+    );
     let SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
         parent_thread_id: resumed_parent_thread_id,
         depth: resumed_depth,

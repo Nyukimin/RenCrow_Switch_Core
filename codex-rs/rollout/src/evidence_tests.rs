@@ -1,6 +1,7 @@
 use super::*;
 use codex_history::ArchiveReference;
 use codex_history::ArchiveTerminalStatus;
+use codex_history::BlockedToolCallReference;
 use codex_history::CodexHarnessMetadata;
 use codex_history::ResponseItemEnvelope;
 use codex_history::RolloutItem;
@@ -227,6 +228,124 @@ fn prepare_compaction_sources_projects_verified_nonadjacent_completed_pairs() {
         assert_eq!(prepared.protected_indices, vec![1]);
         assert_eq!(selected, selected_before);
         assert_eq!(serde_json::to_value(&canonical).unwrap(), canonical_before);
+    }
+}
+
+#[test]
+fn prepare_compaction_sources_accepts_only_exact_typed_pre_execution_blocks_without_terminal() {
+    let thread = ThreadId::from_u128(101);
+    let call_id = "blocked-call";
+    let body = "Command blocked by PreToolUse hook: denied. Command: rm -rf /tmp/x";
+    let mut blocked_output = output(call_id, body);
+    let reference = ObservationReference::new(thread.to_string(), call_id, content_sha256(body));
+    blocked_output
+        .metadata
+        .get_or_insert_default()
+        .rencrow_blocked_tool_call =
+        Some(Box::new(BlockedToolCallReference::new(reference.clone())));
+    let call = call(call_id, "exec_command");
+    let selected = vec![call.clone(), blocked_output.clone()];
+    let canonical = vec![
+        RolloutItem::ResponseItem(call.clone()),
+        RolloutItem::ResponseItem(blocked_output.clone()),
+    ];
+    let prepared =
+        prepare_compaction_sources(&selected, &canonical, &thread, &HashSet::new()).unwrap();
+    assert_eq!(prepared.pairs.len(), 1);
+    assert_eq!(prepared.pairs[0].reference, reference);
+    assert_eq!(prepared.pairs[0].terminal_reference, None);
+
+    let projection =
+        codex_history::project_observation(&reference, "exec_command", "{}", body).unwrap();
+    let mut marker_output = output(
+        call_id,
+        &codex_history::observation_marker::observation_marker_body(&projection),
+    );
+    marker_output.metadata = Some(
+        codex_history::observation_marker::observation_marker_metadata(
+            blocked_output.metadata.as_ref(),
+            &projection.coverage,
+        )
+        .unwrap(),
+    );
+    let marker_selected = vec![call.clone(), marker_output];
+    let marker_canonical = vec![
+        RolloutItem::ResponseItem(call.clone()),
+        RolloutItem::ResponseItem(blocked_output.clone()),
+    ];
+    let existing = prepare_compaction_sources(
+        &marker_selected,
+        &marker_canonical,
+        &thread,
+        &HashSet::new(),
+    )
+    .unwrap();
+    assert_eq!(existing.pairs.len(), 1);
+    assert_eq!(existing.pairs[0].reference, reference);
+    assert_eq!(existing.pairs[0].terminal_reference, None);
+
+    let untyped = output(call_id, "Command blocked by PreToolUse hook: denied.");
+    let untyped_selected = vec![call.clone(), untyped.clone()];
+    let untyped_canonical = vec![
+        RolloutItem::ResponseItem(call.clone()),
+        RolloutItem::ResponseItem(untyped),
+    ];
+    let protected = prepare_compaction_sources(
+        &untyped_selected,
+        &untyped_canonical,
+        &thread,
+        &HashSet::new(),
+    )
+    .unwrap();
+    assert!(protected.pairs.is_empty());
+    assert_eq!(protected.protected_indices, vec![0, 1]);
+
+    let mut wrong_version = BlockedToolCallReference::new(reference.clone());
+    wrong_version.version = 2;
+    for (label, forged) in [
+        (
+            "wrong thread",
+            BlockedToolCallReference::new(ObservationReference::new(
+                "other-thread",
+                call_id,
+                reference.sha256.clone(),
+            )),
+        ),
+        (
+            "wrong call",
+            BlockedToolCallReference::new(ObservationReference::new(
+                thread.to_string(),
+                "other-call",
+                reference.sha256.clone(),
+            )),
+        ),
+        (
+            "wrong hash",
+            BlockedToolCallReference::new(ObservationReference::new(
+                thread.to_string(),
+                call_id,
+                "f".repeat(64),
+            )),
+        ),
+        ("wrong version", wrong_version),
+    ] {
+        let mut invalid = output(call_id, body);
+        invalid
+            .metadata
+            .get_or_insert_default()
+            .rencrow_blocked_tool_call = Some(Box::new(forged.clone()));
+        let invalid_selected = vec![call.clone(), invalid.clone()];
+        let invalid_canonical = vec![
+            RolloutItem::ResponseItem(call.clone()),
+            RolloutItem::ResponseItem(invalid),
+        ];
+        let result = prepare_compaction_sources(
+            &invalid_selected,
+            &invalid_canonical,
+            &thread,
+            &HashSet::new(),
+        );
+        assert!(result.is_err(), "{label}");
     }
 }
 

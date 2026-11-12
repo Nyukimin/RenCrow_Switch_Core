@@ -2293,6 +2293,12 @@ impl BottomPane {
         }
     }
 
+    pub(crate) fn set_activity_context(&mut self, activity_context: Option<String>) {
+        if self.composer.set_activity_context(activity_context) {
+            self.request_redraw();
+        }
+    }
+
     pub(crate) fn set_side_conversation_context_label(&mut self, label: Option<String>) {
         if self.composer.set_side_conversation_context_label(label) {
             self.request_redraw();

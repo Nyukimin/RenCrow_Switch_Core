@@ -491,6 +491,44 @@ async fn function_tools_expose_default_hook_payloads_and_rewrites() -> anyhow::R
 }
 
 #[tokio::test]
+async fn only_host_blocked_before_handler_is_recorded_in_tool_call_state() -> anyhow::Result<()> {
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let invocation = test_invocation(
+        Arc::new(session),
+        Arc::new(turn),
+        "blocked-call",
+        codex_tools::ToolName::plain("exec_command"),
+    );
+    let blocked = crate::tools::context::ToolCallState::default();
+    assert!(
+        notify_tool_finish_if_unclaimed(&invocation, Some(&blocked), ToolCallOutcome::Blocked,)
+            .await
+    );
+    assert!(blocked.blocked_before_handler.load(Ordering::Acquire));
+
+    let failed = crate::tools::context::ToolCallState::default();
+    assert!(
+        notify_tool_finish_if_unclaimed(
+            &invocation,
+            Some(&failed),
+            ToolCallOutcome::Failed {
+                handler_executed: false,
+            },
+        )
+        .await
+    );
+    assert!(!failed.blocked_before_handler.load(Ordering::Acquire));
+
+    let aborted = crate::tools::context::ToolCallState::default();
+    assert!(
+        notify_tool_finish_if_unclaimed(&invocation, Some(&aborted), ToolCallOutcome::Aborted,)
+            .await
+    );
+    assert!(!aborted.blocked_before_handler.load(Ordering::Acquire));
+    Ok(())
+}
+
+#[tokio::test]
 async fn function_hook_input_defaults_empty_arguments_to_object() {
     let (session, turn) = crate::session::tests::make_session_and_context().await;
     let tool_name = codex_tools::ToolName::plain("echo");

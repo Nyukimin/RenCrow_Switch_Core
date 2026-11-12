@@ -84,6 +84,7 @@ pub use types::LoadThreadHistoryParams;
 pub use types::MoveThreadToSectionParams;
 pub use types::PrepareForkParams;
 pub use types::PreparedFork;
+pub use types::ReadCompactionSourcesParams;
 pub use types::ReadThreadByRolloutPathParams;
 pub use types::ReadThreadParams;
 pub use types::ResumeThreadParams;

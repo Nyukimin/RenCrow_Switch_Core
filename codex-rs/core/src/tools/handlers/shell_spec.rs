@@ -18,6 +18,7 @@ pub fn create_exec_command_tool(options: CommandToolOptions) -> ToolSpec {
         /*include_environment_id*/ false,
         /*include_shell_parameter*/ true,
         /*include_windows_shell_guidance*/ cfg!(windows),
+        /*include_task_evidence*/ false,
     )
 }
 
@@ -26,6 +27,7 @@ pub(crate) fn create_exec_command_tool_with_environment_id(
     include_environment_id: bool,
     include_shell_parameter: bool,
     include_windows_shell_guidance: bool,
+    include_task_evidence: bool,
 ) -> ToolSpec {
     let yield_time_ms_description = if cfg!(windows) {
         "Maximum time to wait before returning a session ID for a still-running command. Commands that finish sooner return immediately. For ordinary commands, omit this parameter to use the 10000 ms default. Effective range on Windows is 10000-30000 ms."
@@ -62,6 +64,9 @@ pub(crate) fn create_exec_command_tool_with_environment_id(
             )),
         ),
     ]);
+    if include_task_evidence {
+        properties.insert("task_evidence".to_string(), task_evidence_schema());
+    }
     if include_shell_parameter {
         properties.insert(
             "shell".to_string(),
@@ -112,6 +117,50 @@ pub(crate) fn create_exec_command_tool_with_environment_id(
         ),
         output_schema: Some(unified_exec_output_schema().into()),
     })
+}
+
+fn task_evidence_schema() -> JsonSchema {
+    let mut schema = JsonSchema::object(
+        BTreeMap::from([
+            (
+                "task_id".to_string(),
+                JsonSchema::string(Some("Host task identifier.".to_string())),
+            ),
+            (
+                "task_revision".to_string(),
+                JsonSchema::integer(Some("Revision of the host task.".to_string())),
+            ),
+            ("artifact_paths".to_string(), {
+                let mut schema = JsonSchema::array(
+                    JsonSchema::string(Some(
+                        "Workspace-relative regular file to verify.".to_string(),
+                    )),
+                    Some("Files whose unchanged hashes are required for the check.".to_string()),
+                );
+                schema.min_items = Some(1);
+                schema
+            }),
+            (
+                "check_kind".to_string(),
+                JsonSchema::string_enum(
+                    vec![json!("verification")],
+                    Some("Verification check kind.".to_string()),
+                ),
+            ),
+        ]),
+        Some(vec![
+            "task_id".to_string(),
+            "task_revision".to_string(),
+            "artifact_paths".to_string(),
+            "check_kind".to_string(),
+        ]),
+        Some(false.into()),
+    );
+    schema.description = Some(
+        "Optional host task reference for recording a verification receipt after this command exits."
+            .to_string(),
+    );
+    schema
 }
 
 pub fn create_write_stdin_tool() -> ToolSpec {

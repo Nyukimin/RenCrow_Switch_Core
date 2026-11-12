@@ -276,6 +276,12 @@ pub struct ConfigToml {
     /// Use the RenCrow validated local compaction pipeline.
     pub rencrow_compaction: Option<bool>,
 
+    /// Continue parent work from a persisted finite completion contract.
+    pub rencrow_autonomous_completion: Option<bool>,
+
+    /// Opt-in native tool-loop and executor completion guard (no external hooks).
+    pub rencrow_execution_guard: Option<crate::RencrowExecutionGuard>,
+
     /// Tools shown to the model and accepted when called (ROLE_TOOL_POLICY.md). Each entry is a
     /// default-namespace tool name or `namespace::name`. Unset keeps every tool; an agent role file
     /// narrows it and cannot add tools.
@@ -761,6 +767,9 @@ pub struct AgentsToml {
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct AgentRoleToml {
+    /// Whether the role may be selected by spawn_agent. Defaults to true.
+    pub enabled: Option<bool>,
+
     /// Human-facing role documentation used in spawn tool guidance.
     /// Required unless supplied by the referenced agent role file.
     pub description: Option<String>,

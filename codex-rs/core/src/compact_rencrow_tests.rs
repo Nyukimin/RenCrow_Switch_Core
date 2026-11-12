@@ -5,47 +5,72 @@ use codex_analytics::CompactionImplementation;
 use codex_analytics::CompactionPhase;
 use codex_analytics::CompactionReason;
 use codex_analytics::CompactionTrigger;
+use codex_history::compaction_candidate::CandidateInput;
+use codex_history::compaction_candidate::CandidateRecord;
+use codex_history::compaction_candidate::Origin;
 use codex_history::compaction_pipeline::PLAN_PROMPT;
 use codex_history::compaction_plan::ByteRange;
 use codex_history::compaction_plan::DerivedResult;
 use codex_history::compaction_plan::SourceRef;
+use codex_history::compaction_preprocess::InstructionPruning;
+use codex_history::compaction_preprocess::collect_instruction_candidates;
+use codex_history::compaction_selection_wire::SelectionRequest;
 use codex_login::CodexAuth;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use core_test_support::responses;
 use core_test_support::streaming_sse::StreamingSseChunk;
 use core_test_support::streaming_sse::start_streaming_sse_server;
+use serde_json::Value;
+use serde_json::json;
 use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
-const SNAPSHOT_HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-const PRESENTATION_HASH: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+fn selection_input() -> CandidateInput {
+    CandidateInput {
+        version: 1,
+        binding: "test-selection".into(),
+        records: [("human-a", "Old route."), ("human-b", "Use the new route.")]
+            .into_iter()
+            .map(|(id, text)| CandidateRecord {
+                id: id.into(),
+                origin: Origin::Human,
+                intake_ref: Some(format!("intake/{id}")),
+                scope: "thread".into(),
+                role: "user".into(),
+                text: text.into(),
+                protected: vec![],
+                execution_evidence: false,
+                opaque: None,
+            })
+            .collect(),
+        current_context: vec![],
+        prior_invalidations: vec![],
+    }
+}
 
 fn payload_with_two_candidates() -> Value {
-    json!({
-        "schema_version": 1,
-        "snapshot_hash": SNAPSHOT_HASH,
-        "presentation_hash": PRESENTATION_HASH,
-        "sources": [
-            {"id":"human-a","origin":"human","role":"user","text":"Old route.","protected":[],"has_opaque":false,"candidate":true},
-            {"id":"human-b","origin":"human","role":"user","text":"Old deploy step.","protected":[],"has_opaque":false,"candidate":true}
-        ],
-        "completion_links": [
-            {"instruction_id":"human-a","call_source_id":"call-a","output_source_id":"output-a","tool_call_id":"tool-a","call_text":"run old route","output_text":"Old route was checked.","terminal_status":"completed","terminal_exit_code":0,"candidate_only":true},
-            {"instruction_id":"human-b","call_source_id":"call-b","output_source_id":"output-b","tool_call_id":"tool-b","call_text":"run old deploy","output_text":"Deploy is waiting on approval.","terminal_status":"failed","terminal_exit_code":1,"candidate_only":true}
-        ]
-    })
+    collect_instruction_candidates(&selection_input(), &InstructionPruning::default(), &[])
+        .unwrap()
+        .unwrap()
+}
+
+fn fixture_request() -> SelectionRequest {
+    SelectionRequest::new(&selection_input(), &payload_with_two_candidates()).unwrap()
 }
 
 fn proposed_plan_json() -> String {
-    json!({"operations":[{
-        "action":"drop_superseded",
-        "source":"human-a",
-        "correction":"human-b",
-        "correction_text":"Use the new route."
-    }]})
-    .to_string()
+    let request = fixture_request();
+    let passages = request.data()["passages"].as_array().unwrap();
+    let id = |source: &str| {
+        passages
+            .iter()
+            .find(|p| p["source"] == source && p["whole"] == true)
+            .unwrap()["id"]
+            .clone()
+    };
+    json!({"operations":[{"action":"drop_superseded","source":id("human-a"),"correction":id("human-b")}]}).to_string()
 }
 
 fn compaction_metadata(phase: CompactionPhase) -> CompactionTurnMetadata {
@@ -87,7 +112,7 @@ async fn serialized_history(session: &Session) -> Value {
 #[tokio::test]
 async fn v2_selection_skips_request_when_candidates_are_absent() {
     let server = responses::start_mock_server().await;
-    let (session, turn) = test_context(server.uri().to_string(), true).await;
+    let (_session, _turn) = test_context(server.uri().to_string(), true).await;
     let mock = responses::mount_sse_once(
         &server,
         responses::sse(vec![
@@ -96,36 +121,13 @@ async fn v2_selection_skips_request_when_candidates_are_absent() {
         ]),
     )
     .await;
-    let cancellation = CancellationToken::new();
-
-    let result = select_obsolete_instructions(
-        &session,
-        &turn,
-        compaction_metadata(CompactionPhase::MidTurn),
-        None,
-        &mut Vec::new(),
-        &cancellation,
-    )
-    .await
-    .unwrap();
-
+    let result = selection_request(&selection_input(), None).unwrap();
     assert!(result.is_none());
-    assert!(mock.requests().is_empty());
-
     let mut protected = payload_with_two_candidates();
     for source in protected["sources"].as_array_mut().unwrap() {
         source["candidate"] = Value::Bool(false);
     }
-    let protected_result = select_obsolete_instructions(
-        &session,
-        &turn,
-        compaction_metadata(CompactionPhase::MidTurn),
-        Some(protected),
-        &mut Vec::new(),
-        &CancellationToken::new(),
-    )
-    .await
-    .unwrap();
+    let protected_result = selection_request(&selection_input(), Some(protected)).unwrap();
     assert!(protected_result.is_none());
     assert!(mock.requests().is_empty());
 }
@@ -133,7 +135,7 @@ async fn v2_selection_skips_request_when_candidates_are_absent() {
 #[tokio::test]
 async fn v2_selection_rejects_missing_or_invalid_presentation_binding_before_request() {
     let server = responses::start_mock_server().await;
-    let (session, turn) = test_context(server.uri().to_string(), true).await;
+    let (_session, _turn) = test_context(server.uri().to_string(), true).await;
     let mock = responses::mount_sse_once(
         &server,
         responses::sse(vec![
@@ -147,16 +149,7 @@ async fn v2_selection_rejects_missing_or_invalid_presentation_binding_before_req
     let mut invalid = payload_with_two_candidates();
     invalid["presentation_hash"] = Value::String("invalid".into());
     for payload in [missing, invalid] {
-        let result = select_obsolete_instructions(
-            &session,
-            &turn,
-            compaction_metadata(CompactionPhase::MidTurn),
-            Some(payload),
-            &mut Vec::new(),
-            &CancellationToken::new(),
-        )
-        .await;
-        assert!(result.is_err());
+        assert!(SelectionRequest::new(&selection_input(), &payload).is_err());
     }
     assert!(mock.requests().is_empty());
 }
@@ -182,17 +175,23 @@ async fn v2_selection_sends_only_candidates_once_and_keeps_host_snapshot_binding
         &session,
         &turn,
         compaction_metadata(CompactionPhase::MidTurn),
-        Some(original.clone()),
+        &SelectionRequest::new(&selection_input(), &original).unwrap(),
         &mut receipts,
         &cancellation,
     )
     .await
-    .unwrap()
     .unwrap();
 
-    assert_eq!(selected.snapshot_hash(), SNAPSHOT_HASH);
-    assert_eq!(selected.presentation_hash(), PRESENTATION_HASH);
-    assert_eq!(selected.proposed().operations.len(), 1);
+    let admitted = fixture_request()
+        .apply(
+            &selection_input(),
+            &InstructionPruning::default(),
+            &[],
+            &selected,
+        )
+        .unwrap();
+    assert_eq!(admitted.rejected, 0);
+    assert_eq!(admitted.application.pruning.applied.len(), 1);
     assert_eq!(
         receipts
             .iter()
@@ -221,8 +220,10 @@ async fn v2_selection_sends_only_candidates_once_and_keeps_host_snapshot_binding
     assert!(submitted.get("presentation_hash").is_none());
     assert!(submitted.get("current_context").is_none());
     let developer_text = request.message_input_texts("developer").join("");
-    assert!(developer_text.contains("exact unique"));
-    assert!(developer_text.contains("correction_text"));
+    assert!(developer_text.contains("opaque passage IDs"));
+    assert!(!developer_text.contains("correction_text"));
+    assert_eq!(body["text"]["format"]["type"], "json_schema");
+    assert_eq!(body["text"]["format"]["strict"], true);
     assert!(developer_text.contains("evidence"));
     assert!(developer_text.contains("output_source_id"));
     assert!(developer_text.contains("{\"operations\":"));
@@ -252,19 +253,30 @@ async fn assert_selection_rejected(events: Vec<Value>) {
         &session,
         &turn,
         compaction_metadata(CompactionPhase::PreTurn),
-        Some(payload_with_two_candidates()),
+        &fixture_request(),
         &mut Vec::new(),
         &CancellationToken::new(),
     )
     .await;
 
-    assert!(result.is_err());
+    match result {
+        Err(_) => {}
+        Ok(text) => {
+            let result = fixture_request().apply(
+                &selection_input(),
+                &InstructionPruning::default(),
+                &[],
+                &text,
+            );
+            assert!(result.is_err() || result.is_ok_and(|report| report.rejected > 0));
+        }
+    }
     assert_eq!(serialized_history(&session).await, before);
     assert_eq!(mock.requests().len(), 1);
 }
 
 #[tokio::test]
-async fn v2_selection_rejects_bad_json_missing_correction_text_and_tool_output() {
+async fn v2_selection_rejects_bad_json_unverified_ids_and_tool_output() {
     assert_selection_rejected(vec![
         responses::ev_assistant_message("bad-json", "not json"),
         responses::ev_completed("bad-json-response"),
@@ -342,7 +354,7 @@ async fn v2_selection_stream_failure_after_output_done_does_not_change_history()
         &session,
         &turn,
         compaction_metadata(CompactionPhase::PreTurn),
-        Some(payload_with_two_candidates()),
+        &fixture_request(),
         &mut Vec::new(),
         &CancellationToken::new(),
     )
@@ -386,7 +398,7 @@ async fn v2_selection_cancel_after_output_done_does_not_change_history() {
             &task_session,
             &task_turn,
             compaction_metadata(CompactionPhase::PreTurn),
-            Some(payload_with_two_candidates()),
+            &fixture_request(),
             &mut Vec::new(),
             &task_cancel,
         )
@@ -542,6 +554,44 @@ async fn v2_summary_request_normalizes_history_and_records_one_typed_receipt() {
     let developer_text = request.message_input_texts("developer").join("");
     assert!(developer_text.contains("authoritative exact text"));
     assert!(developer_text.contains("observation:\"<call_id>\""));
+}
+
+#[tokio::test]
+async fn v2_turn_prefix_summary_does_not_inherit_turn_output_schema() {
+    let server = responses::start_mock_server().await;
+    let (session, mut turn) = test_context(server.uri().to_string(), true).await;
+    Arc::get_mut(&mut turn).unwrap().final_output_json_schema =
+        Some(json!({"type":"object","properties":{"answer":{"type":"string"}}}));
+    let step_context = StepContext::for_test(Arc::clone(&turn));
+    let mock = responses::mount_sse_once(
+        &server,
+        responses::sse(vec![
+            responses::ev_assistant_message("summary", "Plain summary text."),
+            responses::ev_completed("turn-prefix-summary"),
+        ]),
+    )
+    .await;
+
+    model_request::request_compaction_summary(
+        &session,
+        &turn,
+        compaction_metadata(CompactionPhase::MidTurn),
+        Vec::new(),
+        &[],
+        Some(model_request::TurnPrefix {
+            step_context: &step_context,
+            input: vec![responses::user_message_item("Earlier turn context.")],
+            citations: Vec::new(),
+            hidden_observations: Vec::new(),
+        }),
+        &mut Vec::new(),
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    let body = mock.single_request().body_json();
+    assert!(body["text"]["format"].is_null());
 }
 
 #[test]

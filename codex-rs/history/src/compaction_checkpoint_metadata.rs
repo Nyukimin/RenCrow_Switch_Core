@@ -19,6 +19,9 @@ use std::collections::HashSet;
 pub enum CompactionSelectionMode {
     NoCandidates,
     ModelSelection,
+    /// Work was summarized, but not every selection decision was accepted. Retry selection;
+    /// do not advance its semantic boundary or claim rejected operations were processed.
+    ConservativeSelection,
     /// Host-only emergency checkpoint: no model request, selection, or new semantic summary.
     DeterministicEmergency,
 }
@@ -161,6 +164,37 @@ impl RenCrowCompactionMetadataV2 {
                     CheckpointResponseStage::InstructionSelection,
                     CheckpointResponseStage::Summary,
                 ]
+            }
+            CompactionSelectionMode::ConservativeSelection => {
+                if self
+                    .presentation_hash
+                    .as_deref()
+                    .is_none_or(|hash| !is_sha256(hash))
+                    || self
+                        .plan_hash
+                        .as_deref()
+                        .is_some_and(|hash| !is_sha256(hash))
+                    || (self.plan_hash.is_none() && !self.results.is_empty())
+                {
+                    return Err(
+                        "conservative selection must bind its presentation and any accepted plan"
+                            .into(),
+                    );
+                }
+                let has_attempt = self.responses.first().is_some_and(|receipt| {
+                    receipt.stage == CheckpointResponseStage::InstructionSelection
+                });
+                if self.plan_hash.is_some() && !has_attempt {
+                    return Err("accepted conservative plan requires its selection receipt".into());
+                }
+                if has_attempt {
+                    vec![
+                        CheckpointResponseStage::InstructionSelection,
+                        CheckpointResponseStage::Summary,
+                    ]
+                } else {
+                    vec![CheckpointResponseStage::Summary]
+                }
             }
             CompactionSelectionMode::DeterministicEmergency => {
                 if self.presentation_hash.is_some()

@@ -9,12 +9,16 @@ use futures::FutureExt;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch::Receiver;
 use tokio::time::Instant;
 
-use tokio::time::timeout_at;
+use crate::session::InputQueueActivity;
+use crate::state::TurnState;
+use tokio::sync::Mutex;
+use tokio::time::sleep_until;
 
 #[derive(Default)]
 pub(crate) struct Handler {
@@ -117,19 +121,33 @@ impl Handler {
             )
             .await;
 
+        let turn_state = session
+            .input_queue
+            .turn_state_for_sub_id(&session.active_turn, &turn.sub_id)
+            .await;
+        let (activity_rx, _) = session
+            .input_queue
+            .subscribe_activity(turn_state.as_deref())
+            .await;
+
         let mut status_rxs = Vec::with_capacity(receiver_thread_ids.len());
-        let mut initial_final_statuses = Vec::new();
+        let mut initial_final_statuses: Vec<(ThreadId, Option<String>, AgentStatus)> = Vec::new();
         for id in &receiver_thread_ids {
             match session.services.agent_control.subscribe_status(*id).await {
                 Ok(rx) => {
-                    let status = rx.borrow().clone();
+                    let (turn_id, status) = session
+                        .services
+                        .agent_control
+                        .get_agent_status_generation(*id)
+                        .await
+                        .unwrap_or_else(|_| (None, rx.borrow().clone()));
                     if is_final(&status) {
-                        initial_final_statuses.push((*id, status));
+                        initial_final_statuses.push((*id, turn_id, status));
                     }
                     status_rxs.push((*id, rx));
                 }
                 Err(err) if matches!(err.details(), CodexErrorDetails::ThreadNotFound(_)) => {
-                    initial_final_statuses.push((*id, AgentStatus::NotFound));
+                    initial_final_statuses.push((*id, None, AgentStatus::NotFound));
                 }
                 Err(err) => {
                     let mut statuses = HashMap::with_capacity(1);
@@ -156,44 +174,52 @@ impl Handler {
             }
         }
 
-        let statuses = if !initial_final_statuses.is_empty() {
-            initial_final_statuses
+        let pending_activity = session
+            .input_queue
+            .subscribe_activity(turn_state.as_deref())
+            .await
+            .1;
+
+        let (statuses, steered) = if pending_activity == Some(InputQueueActivity::Steer) {
+            (Vec::new(), true)
+        } else if !initial_final_statuses.is_empty() {
+            (initial_final_statuses, false)
         } else {
-            let mut futures = FuturesUnordered::new();
+            let futures = FuturesUnordered::new();
             for (id, rx) in status_rxs.into_iter() {
                 let session = session.clone();
                 futures.push(wait_for_final_status(session, id, rx));
             }
-            let mut results = Vec::new();
             let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
-            loop {
-                match timeout_at(deadline, futures.next()).await {
-                    Ok(Some(Some(result))) => {
-                        results.push(result);
-                        break;
-                    }
-                    Ok(Some(None)) => continue,
-                    Ok(None) | Err(_) => break,
-                }
+            match wait_for_statuses_or_steer(
+                Arc::clone(&session),
+                futures,
+                activity_rx,
+                turn_state,
+                pending_activity,
+                deadline,
+            )
+            .await
+            {
+                WaitStatusesOutcome::Completed(results) => (results, false),
+                WaitStatusesOutcome::Steered => (Vec::new(), true),
+                WaitStatusesOutcome::TimedOut => (Vec::new(), false),
             }
-            if !results.is_empty() {
-                loop {
-                    match futures.next().now_or_never() {
-                        Some(Some(Some(result))) => results.push(result),
-                        Some(Some(None)) => continue,
-                        Some(None) | None => break,
-                    }
-                }
-            }
-            results
         };
 
-        let timed_out = statuses.is_empty();
-        let statuses_by_id = statuses.clone().into_iter().collect::<HashMap<_, _>>();
+        session
+            .collect_completion_review_results(&call_id, &statuses)
+            .await;
+
+        let timed_out = statuses.is_empty() && !steered;
+        let statuses_by_id = statuses
+            .iter()
+            .map(|(thread_id, _, status)| (*thread_id, status.clone()))
+            .collect::<HashMap<_, _>>();
         let result = WaitAgentResult {
             status: statuses
                 .into_iter()
-                .filter_map(|(thread_id, status)| {
+                .filter_map(|(thread_id, _, status)| {
                     target_by_thread_id
                         .get(&thread_id)
                         .cloned()
@@ -201,6 +227,10 @@ impl Handler {
                 })
                 .collect(),
             timed_out,
+            message: steered.then(|| {
+                "Wait interrupted by pending parent input. No child completion was observed; child execution is unchanged."
+                    .to_string()
+            }),
         };
 
         session
@@ -284,6 +314,8 @@ struct WaitArgs {
 pub(crate) struct WaitAgentResult {
     pub(crate) status: HashMap<String, AgentStatus>,
     pub(crate) timed_out: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) message: Option<String>,
 }
 
 impl ToolOutput for WaitAgentResult {
@@ -308,20 +340,113 @@ async fn wait_for_final_status(
     session: Arc<Session>,
     thread_id: ThreadId,
     mut status_rx: Receiver<AgentStatus>,
-) -> Option<(ThreadId, AgentStatus)> {
-    let mut status = status_rx.borrow().clone();
-    if is_final(&status) {
-        return Some((thread_id, status));
+) -> Option<(ThreadId, Option<String>, AgentStatus)> {
+    let mut sample = session
+        .services
+        .agent_control
+        .get_agent_status_generation(thread_id)
+        .await
+        .ok();
+    if let Some((turn_id, status)) = sample.take()
+        && is_final(&status)
+    {
+        return Some((thread_id, turn_id, status));
     }
 
     loop {
         if status_rx.changed().await.is_err() {
-            let latest = session.services.agent_control.get_status(thread_id).await;
-            return is_final(&latest).then_some((thread_id, latest));
+            let (turn_id, status) = session
+                .services
+                .agent_control
+                .get_agent_status_generation(thread_id)
+                .await
+                .ok()?;
+            return is_final(&status).then_some((thread_id, turn_id, status));
         }
-        status = status_rx.borrow().clone();
-        if is_final(&status) {
-            return Some((thread_id, status));
+        if let Ok((turn_id, status)) = session
+            .services
+            .agent_control
+            .get_agent_status_generation(thread_id)
+            .await
+            && is_final(&status)
+        {
+            return Some((thread_id, turn_id, status));
         }
     }
+}
+
+enum WaitStatusesOutcome {
+    Completed(Vec<(ThreadId, Option<String>, AgentStatus)>),
+    Steered,
+    TimedOut,
+}
+
+async fn wait_for_statuses_or_steer<F>(
+    session: Arc<Session>,
+    mut futures: FuturesUnordered<F>,
+    mut activity_rx: Receiver<InputQueueActivity>,
+    turn_state: Option<Arc<Mutex<TurnState>>>,
+    pending_activity: Option<InputQueueActivity>,
+    deadline: Instant,
+) -> WaitStatusesOutcome
+where
+    F: Future<Output = Option<(ThreadId, Option<String>, AgentStatus)>>,
+{
+    if pending_activity == Some(InputQueueActivity::Steer) {
+        return WaitStatusesOutcome::Steered;
+    }
+
+    let mut results = Vec::new();
+    let timer = sleep_until(deadline);
+    tokio::pin!(timer);
+    loop {
+        tokio::select! {
+            changed = activity_rx.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                activity_rx.borrow_and_update();
+                let pending_activity = session
+                    .input_queue
+                    .subscribe_activity(turn_state.as_deref())
+                    .await
+                    .1;
+                if pending_activity == Some(InputQueueActivity::Steer) {
+                    return WaitStatusesOutcome::Steered;
+                }
+            }
+            status = futures.next() => match status {
+                Some(Some(status)) => {
+                    results.push(status);
+                    break;
+                }
+                Some(None) => continue,
+                None => break,
+            },
+            () = &mut timer => break,
+        }
+    }
+
+    if !results.is_empty() {
+        loop {
+            match futures.next().now_or_never() {
+                Some(Some(Some(result))) => results.push(result),
+                Some(Some(None)) => continue,
+                Some(None) | None => break,
+            }
+        }
+    }
+
+    let pending_activity = session
+        .input_queue
+        .subscribe_activity(turn_state.as_deref())
+        .await
+        .1;
+    if pending_activity == Some(InputQueueActivity::Steer) {
+        return WaitStatusesOutcome::Steered;
+    }
+    if !results.is_empty() {
+        return WaitStatusesOutcome::Completed(results);
+    }
+    WaitStatusesOutcome::TimedOut
 }

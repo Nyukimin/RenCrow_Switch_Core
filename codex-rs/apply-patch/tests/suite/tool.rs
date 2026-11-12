@@ -306,6 +306,56 @@ fn test_apply_patch_cli_rejects_empty_update_hunk() -> anyhow::Result<()> {
 }
 
 #[test]
+fn test_apply_patch_cli_rejects_replacement_without_file_changes() -> anyhow::Result<()> {
+    let tmp = tempdir()?;
+    fs::write(tmp.path().join("same.txt"), "same\n")?;
+
+    apply_patch_command(tmp.path())?
+        .arg("*** Begin Patch\n*** Update File: same.txt\n@@\n-same\n+same\n*** End Patch")
+        .assert()
+        .failure()
+        .stderr("Update for file same.txt does not change file contents.\n");
+
+    assert_eq!(fs::read_to_string(tmp.path().join("same.txt"))?, "same\n");
+    Ok(())
+}
+
+#[test]
+fn test_apply_patch_cli_rejects_context_only_update() -> anyhow::Result<()> {
+    let tmp = tempdir()?;
+    fs::write(tmp.path().join("same.txt"), "same\n")?;
+
+    apply_patch_command(tmp.path())?
+        .arg("*** Begin Patch\n*** Update File: same.txt\n@@\n same\n*** End Patch")
+        .assert()
+        .failure()
+        .stderr(
+            "Invalid patch hunk on line 5: Update file hunk for path 'same.txt' contains only context lines\n",
+        );
+
+    assert_eq!(fs::read_to_string(tmp.path().join("same.txt"))?, "same\n");
+    Ok(())
+}
+
+#[test]
+fn test_apply_patch_cli_moves_file_without_changing_contents() -> anyhow::Result<()> {
+    let tmp = tempdir()?;
+    let old_path = tmp.path().join("old.txt");
+    let new_path = tmp.path().join("new.txt");
+    fs::write(&old_path, "unchanged\n")?;
+
+    run_apply_patch_in_dir(
+        tmp.path(),
+        "*** Begin Patch\n*** Update File: old.txt\n*** Move to: new.txt\n@@\n unchanged\n*** End Patch",
+    )?
+    .success();
+
+    assert!(!old_path.exists());
+    assert_eq!(fs::read_to_string(new_path)?, "unchanged\n");
+    Ok(())
+}
+
+#[test]
 fn test_apply_patch_cli_requires_existing_file_for_update() -> anyhow::Result<()> {
     let tmp = tempdir()?;
     let missing_path = resolved_under(tmp.path(), "missing.txt")?;

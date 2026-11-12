@@ -10,6 +10,18 @@ use codex_utils_output_truncation::TruncationPolicy;
 use pretty_assertions::assert_eq;
 use std::sync::Arc;
 
+fn task_evidence_exec_handler() -> ExecCommandHandler {
+    ExecCommandHandler::new(ExecCommandHandlerOptions {
+        allow_login_shell: false,
+        allow_tty: true,
+        exec_permission_approvals_enabled: false,
+        include_environment_id: false,
+        include_task_evidence: true,
+        include_shell_parameter: true,
+        include_windows_shell_guidance: cfg!(windows),
+    })
+}
+
 use crate::environment_selection::TurnEnvironmentState;
 use crate::function_tool::FunctionCallError;
 use crate::session::step_context::StepContext;
@@ -213,6 +225,383 @@ async fn exec_command_rejects_login_when_selected_environment_disallows_it() {
         message,
         "login shell is disabled by config; omit `login` or set it to false."
     );
+}
+
+#[tokio::test]
+async fn task_evidence_tool_spec_reaches_terminal_receipt_through_exec_handler() {
+    let (session, turn) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    session
+        .begin_task_scope(
+            "root".into(),
+            "task-from-tool-spec".into(),
+            7,
+            "task-evidence-begin".into(),
+            false,
+        )
+        .await
+        .expect("task scope begins before verification");
+    let handler = task_evidence_exec_handler();
+    let spec = serde_json::to_value(handler.spec()).expect("exec spec serializes");
+    assert!(
+        spec.pointer("/parameters/properties/task_evidence")
+            .is_some()
+    );
+
+    let cwd = turn
+        .initial_environments
+        .primary()
+        .expect("primary environment")
+        .cwd()
+        .to_abs_path()
+        .expect("native test cwd");
+    let workspace = tempfile::tempdir_in(cwd.as_path()).expect("temporary workspace");
+    std::fs::write(workspace.path().join("artifact.txt"), "unchanged").expect("write artifact");
+    std::fs::write(
+        workspace.path().join("test_success.py"),
+        "import unittest\nclass Success(unittest.TestCase):\n def test_success(self): self.assertTrue(True)\n",
+    )
+    .expect("write passing test");
+    let relative_workspace = workspace
+        .path()
+        .strip_prefix(cwd.as_path())
+        .expect("temporary workspace is under cwd")
+        .to_string_lossy()
+        .into_owned();
+    let arguments = serde_json::json!({
+        "cmd": "python3 -B -m unittest -v test_success",
+        "workdir": relative_workspace,
+        "task_evidence": {
+            "task_id": "task-from-tool-spec",
+            "task_revision": 7,
+            "artifact_paths": ["artifact.txt"],
+            "check_kind": "verification"
+        }
+    });
+    let call_id = "task-evidence-short-exec";
+    let output = handler
+        .handle(ToolInvocation {
+            session: Arc::clone(&session),
+            step_context: StepContext::for_test(Arc::clone(&turn)),
+            turn,
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+            call_id: call_id.to_string(),
+            tool_name: codex_tools::ToolName::plain("exec_command"),
+            source: ToolCallSource::Direct,
+            payload: ToolPayload::Function {
+                arguments: arguments.to_string(),
+            },
+        })
+        .await
+        .expect("exec command succeeds");
+
+    let result = output.code_mode_result(&ToolPayload::Function {
+        arguments: arguments.to_string(),
+    });
+    let receipt = session
+        .task_check_receipt(call_id)
+        .await
+        .unwrap_or_else(|| panic!("terminal exec event records host receipt; result={result}"));
+    assert!(receipt.succeeded);
+    assert_eq!(receipt.task_id, "task-from-tool-spec");
+    assert_eq!(receipt.task_revision, 7);
+    assert_eq!(
+        receipt.workspace_root,
+        workspace
+            .path()
+            .canonicalize()
+            .expect("canonical workspace")
+    );
+    assert!(result["session_id"].is_null());
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn task_evidence_long_exec_waits_for_write_stdin_terminal_event() {
+    let (session, turn) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    session
+        .begin_task_scope(
+            "root".into(),
+            "long-task".into(),
+            4,
+            "long-task-begin".into(),
+            false,
+        )
+        .await
+        .expect("task scope begins before verification");
+    let handler = task_evidence_exec_handler();
+    let cwd = turn
+        .initial_environments
+        .primary()
+        .expect("primary environment")
+        .cwd()
+        .to_abs_path()
+        .expect("native test cwd");
+    let workspace = tempfile::tempdir_in(cwd.as_path()).expect("temporary workspace");
+    std::fs::write(workspace.path().join("artifact.txt"), "unchanged").expect("write artifact");
+    std::fs::write(
+        workspace.path().join("test_wait.py"),
+        "import time, unittest\nclass Wait(unittest.TestCase):\n def test_wait(self): time.sleep(1)\n",
+    )
+    .expect("write delayed test");
+    let relative_workspace = workspace
+        .path()
+        .strip_prefix(cwd.as_path())
+        .expect("temporary workspace is under cwd")
+        .to_string_lossy()
+        .into_owned();
+    let call_id = "task-evidence-long-exec";
+    let exec_arguments = serde_json::json!({
+        "cmd": "python3 -B -m unittest -v test_wait",
+        "workdir": relative_workspace,
+        "yield_time_ms": 250,
+        "task_evidence": {
+            "task_id": "long-task",
+            "task_revision": 4,
+            "artifact_paths": ["artifact.txt"],
+            "check_kind": "verification"
+        }
+    });
+    let output = handler
+        .handle(ToolInvocation {
+            session: Arc::clone(&session),
+            step_context: StepContext::for_test(Arc::clone(&turn)),
+            turn: Arc::clone(&turn),
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+            call_id: call_id.to_string(),
+            tool_name: codex_tools::ToolName::plain("exec_command"),
+            source: ToolCallSource::Direct,
+            payload: ToolPayload::Function {
+                arguments: exec_arguments.to_string(),
+            },
+        })
+        .await
+        .expect("long-running exec yields");
+    assert!(session.task_check_receipt(call_id).await.is_none());
+    let process_id = output.code_mode_result(&ToolPayload::Function {
+        arguments: exec_arguments.to_string(),
+    })["session_id"]
+        .as_i64()
+        .expect("initial response contains process id");
+
+    let stdin_arguments = serde_json::json!({
+        "session_id": process_id,
+        "chars": "",
+        "yield_time_ms": 5000
+    });
+    WriteStdinHandler
+        .handle(ToolInvocation {
+            session: Arc::clone(&session),
+            step_context: StepContext::for_test(Arc::clone(&turn)),
+            turn: Arc::clone(&turn),
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+            call_id: "task-evidence-long-poll".to_string(),
+            tool_name: codex_tools::ToolName::plain("write_stdin"),
+            source: ToolCallSource::Direct,
+            payload: ToolPayload::Function {
+                arguments: stdin_arguments.to_string(),
+            },
+        })
+        .await
+        .expect("write_stdin observes process completion");
+
+    let receipt = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if let Some(receipt) = session.task_check_receipt(call_id).await {
+                break receipt;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("watcher emits terminal event");
+    assert!(receipt.succeeded);
+    assert_eq!(receipt.task_id, "long-task");
+}
+
+#[tokio::test]
+async fn task_evidence_must_match_active_scope_before_exec_runs() {
+    let (session, turn) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    session
+        .begin_task_scope("root".into(), "task-a".into(), 1, "begin-a".into(), false)
+        .await
+        .expect("active task scope");
+    let cwd = turn
+        .initial_environments
+        .primary()
+        .expect("primary environment")
+        .cwd()
+        .to_abs_path()
+        .expect("native test cwd");
+    let workspace = tempfile::tempdir_in(cwd.as_path()).expect("temporary workspace");
+    std::fs::write(workspace.path().join("artifact.txt"), "unchanged").expect("write artifact");
+    let relative_workspace = workspace
+        .path()
+        .strip_prefix(cwd.as_path())
+        .expect("temporary workspace is under cwd")
+        .to_string_lossy()
+        .into_owned();
+    let call_id = "mismatched-task-evidence";
+    let arguments = serde_json::json!({
+        "cmd":"python3 -m unittest -v tests",
+        "workdir":relative_workspace,
+        "task_evidence":{
+            "task_id":"task-b", "task_revision":1,
+            "artifact_paths":["artifact.txt"], "check_kind":"verification"
+        }
+    });
+    let error = task_evidence_exec_handler()
+        .handle(ToolInvocation {
+            session: Arc::clone(&session),
+            step_context: StepContext::for_test(Arc::clone(&turn)),
+            turn,
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+            call_id: call_id.to_string(),
+            tool_name: codex_tools::ToolName::plain("exec_command"),
+            source: ToolCallSource::Direct,
+            payload: ToolPayload::Function {
+                arguments: arguments.to_string(),
+            },
+        })
+        .await
+        .err()
+        .expect("wrong scope evidence is rejected before exec");
+    assert!(
+        error
+            .to_string()
+            .contains("must match the active task scope")
+    );
+    assert!(!workspace.path().join("must-not-run.txt").exists());
+    assert!(session.task_check_receipt(call_id).await.is_none());
+}
+
+#[tokio::test]
+async fn task_evidence_rejects_exit_masking_before_execution() {
+    let (session, turn) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    session
+        .begin_task_scope("root".into(), "task-a".into(), 1, "begin-a".into(), false)
+        .await
+        .expect("active task scope");
+    let cwd = turn
+        .initial_environments
+        .primary()
+        .expect("primary environment")
+        .cwd()
+        .to_abs_path()
+        .expect("native test cwd");
+    let workspace = tempfile::tempdir_in(cwd.as_path()).expect("temporary workspace");
+    std::fs::write(workspace.path().join("artifact.txt"), "unchanged").expect("write artifact");
+    let relative_workspace = workspace
+        .path()
+        .strip_prefix(cwd.as_path())
+        .expect("temporary workspace is under cwd")
+        .to_string_lossy()
+        .into_owned();
+    let call_id = "masked-task-evidence";
+    let arguments = serde_json::json!({
+        "cmd":"touch must-not-run && python3 -m unittest -v tests; echo \"EXIT=$?\"",
+        "workdir":relative_workspace,
+        "task_evidence":{
+            "task_id":"task-a", "task_revision":1,
+            "artifact_paths":["artifact.txt"], "check_kind":"verification"
+        }
+    });
+    let error = task_evidence_exec_handler()
+        .handle(ToolInvocation {
+            session: Arc::clone(&session),
+            step_context: StepContext::for_test(Arc::clone(&turn)),
+            turn,
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+            call_id: call_id.to_string(),
+            tool_name: codex_tools::ToolName::plain("exec_command"),
+            source: ToolCallSource::Direct,
+            payload: ToolPayload::Function {
+                arguments: arguments.to_string(),
+            },
+        })
+        .await
+        .err()
+        .expect("exit-masking task evidence is rejected");
+    assert!(
+        error
+            .to_string()
+            .contains("direct recognized check command")
+    );
+    assert!(!workspace.path().join("must-not-run").exists());
+    assert!(session.task_check_receipt(call_id).await.is_none());
+}
+
+#[tokio::test]
+async fn failed_direct_task_evidence_check_does_not_create_a_success_receipt() {
+    let (session, turn) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    session
+        .begin_task_scope("root".into(), "task-a".into(), 1, "begin-a".into(), false)
+        .await
+        .expect("active task scope");
+    let cwd = turn
+        .initial_environments
+        .primary()
+        .expect("primary environment")
+        .cwd()
+        .to_abs_path()
+        .expect("native test cwd");
+    let workspace = tempfile::tempdir_in(cwd.as_path()).expect("temporary workspace");
+    std::fs::write(workspace.path().join("artifact.txt"), "unchanged").expect("write artifact");
+    std::fs::write(
+        workspace.path().join("test_failure.py"),
+        "import unittest\nclass Failure(unittest.TestCase):\n def test_failure(self): self.fail('expected')\n",
+    )
+    .expect("write failing test");
+    let relative_workspace = workspace
+        .path()
+        .strip_prefix(cwd.as_path())
+        .expect("temporary workspace is under cwd")
+        .to_string_lossy()
+        .into_owned();
+    let call_id = "failed-task-evidence-check";
+    let arguments = serde_json::json!({
+        "cmd":"python3 -B -m unittest -v test_failure",
+        "workdir":relative_workspace,
+        "task_evidence":{
+            "task_id":"task-a", "task_revision":1,
+            "artifact_paths":["artifact.txt"], "check_kind":"verification"
+        }
+    });
+    task_evidence_exec_handler()
+        .handle(ToolInvocation {
+            session: Arc::clone(&session),
+            step_context: StepContext::for_test(Arc::clone(&turn)),
+            turn,
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+            call_id: call_id.to_string(),
+            tool_name: codex_tools::ToolName::plain("exec_command"),
+            source: ToolCallSource::Direct,
+            payload: ToolPayload::Function {
+                arguments: arguments.to_string(),
+            },
+        })
+        .await
+        .expect("nonzero test process still returns its terminal output");
+    let receipt = session
+        .task_check_receipt(call_id)
+        .await
+        .expect("failed direct check is recorded");
+    assert!(!receipt.succeeded);
 }
 
 #[test]

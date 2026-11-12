@@ -28,7 +28,7 @@ fileは8-byte big-endian lengthとそのbyte数のwarning本文を時系列順�
 - [Contributor instructions](AGENTS.md)
 - [License](LICENSE) / [Attribution notices](NOTICE)
 
-A Linux `fork-deploy` build is installed locally as `rencrow-switch-core` for Codex-switch. Binary hash equality and Compaction V2 activation were verified in tmux `ren1` on 2026-10-05. No public fork binary release is available, and Windows/macOS runtime acceptance is not claimed. The original README below describes **official OpenAI Codex**, including its installers, services and support links; those commands do not install this fork.
+A Linux `fork-deploy` build is installed locally as `rencrow-switch-core` for Codex-switch. Binary hash equality and Compaction V2 activation were verified in tmux `ren1` on 2026-10-05. A native macOS ARM64 deployment on host 207 was verified on 2026-10-25: real tool execution, two Normal V2 compactions, instruction replacement, and same-thread resume. See the bounded [host 207 acceptance record](FORK_BUILD.md#macos-host-207). No public fork binary release or Windows runtime acceptance is claimed. The original README below describes **official OpenAI Codex**, including its installers, services and support links; those commands do not install this fork.
 
 ---
 

@@ -361,3 +361,30 @@ fn transaction_owner_fields_allow_candidate_prepared_or_committed_shapes_but_not
             .is_err()
     );
 }
+
+#[test]
+fn conservative_selection_distinguishes_rejected_attempts_from_accepted_work_summary() {
+    let mut kept = metadata(CompactionSelectionMode::NoCandidates);
+    kept.selection_mode = CompactionSelectionMode::ConservativeSelection;
+    kept.presentation_hash = Some("2".repeat(64));
+    assert!(kept.validate_for_checkpoint(THREAD_ID, SUMMARY).is_ok());
+    kept.responses.insert(
+        0,
+        receipt(CheckpointResponseStage::InstructionSelection, "attempt"),
+    );
+    assert!(kept.validate_for_checkpoint(THREAD_ID, SUMMARY).is_ok());
+    kept.responses.pop();
+    assert!(kept.validate_for_checkpoint(THREAD_ID, SUMMARY).is_err());
+    let mut partial = metadata(CompactionSelectionMode::ModelSelection);
+    partial.selection_mode = CompactionSelectionMode::ConservativeSelection;
+    assert!(partial.validate_for_checkpoint(THREAD_ID, SUMMARY).is_ok());
+    let mut missing_attempt = partial.clone();
+    missing_attempt.responses.remove(0);
+    assert!(
+        missing_attempt
+            .validate_for_checkpoint(THREAD_ID, SUMMARY)
+            .is_err()
+    );
+    partial.model = None;
+    assert!(partial.validate_for_checkpoint(THREAD_ID, SUMMARY).is_err());
+}

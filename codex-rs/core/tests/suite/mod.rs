@@ -48,6 +48,7 @@ mod apply_patch_serialization;
 mod approvals;
 mod audio_truncation;
 mod auto_review;
+mod autonomous_completion_loop;
 mod catalog_permission_messages;
 mod cli_stream;
 mod client;
@@ -203,6 +204,7 @@ mod stream_error_allows_next_turn;
 mod stream_no_completed;
 mod subagent_notifications;
 mod subagent_service_tier;
+mod task_context_boundary_loop;
 mod token_budget;
 mod token_usage_rollout;
 mod tool_harness;
@@ -234,3 +236,6 @@ mod worktree_trust;
 
 #[path = "guardian_sender_messages_tests.rs"]
 mod guardian_sender_messages;
+
+// Modified by RenCrow: native progress contract integration.
+mod rencrow_execution_guard;

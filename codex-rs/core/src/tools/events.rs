@@ -198,6 +198,7 @@ pub(crate) enum ToolEmitter {
         changes: HashMap<PathBuf, FileChange>,
         auto_approved: bool,
         environment_id: Option<String>,
+        local_environment: bool,
     },
     UnifiedExec {
         command: Vec<String>,
@@ -206,6 +207,7 @@ pub(crate) enum ToolEmitter {
         parsed_cmd: Vec<ParsedCommand>,
         process_id: Option<String>,
         plugin_attribution: Option<PluginCommandAttribution>,
+        task_evidence: Option<Box<crate::task_check::TaskCheckExecution>>,
     },
 }
 
@@ -214,11 +216,13 @@ impl ToolEmitter {
         changes: HashMap<PathBuf, FileChange>,
         auto_approved: bool,
         environment_id: String,
+        local_environment: bool,
     ) -> Self {
         Self::ApplyPatch {
             changes,
             auto_approved,
             environment_id: Some(environment_id),
+            local_environment,
         }
     }
 
@@ -228,6 +232,7 @@ impl ToolEmitter {
         source: ExecCommandSource,
         process_id: Option<String>,
         plugin_attribution: Option<PluginCommandAttribution>,
+        task_evidence: Option<crate::task_check::TaskCheckExecution>,
     ) -> Self {
         let parsed_cmd = parse_command(command);
         Self::UnifiedExec {
@@ -237,6 +242,7 @@ impl ToolEmitter {
             parsed_cmd,
             process_id,
             plugin_attribution,
+            task_evidence: task_evidence.map(Box::new),
         }
     }
 
@@ -246,10 +252,14 @@ impl ToolEmitter {
                 Self::ApplyPatch {
                     changes,
                     auto_approved,
+                    local_environment,
                     ..
                 },
                 ToolEventStage::Begin,
             ) => {
+                ctx.session
+                    .begin_task_patch_attempt(ctx.call_id, *local_environment)
+                    .await;
                 ctx.session
                     .emit_turn_item_started(
                         ctx.turn,
@@ -358,6 +368,7 @@ impl ToolEmitter {
                     parsed_cmd,
                     process_id,
                     plugin_attribution,
+                    task_evidence,
                 },
                 stage,
             ) => {
@@ -371,6 +382,7 @@ impl ToolEmitter {
                         /*interaction_input*/ None,
                         process_id.as_deref(),
                         plugin_attribution.as_ref(),
+                        task_evidence.as_deref(),
                     ),
                     stage,
                 )
@@ -483,6 +495,7 @@ struct ExecCommandInput<'a> {
     interaction_input: Option<&'a str>,
     process_id: Option<&'a str>,
     plugin_attribution: Option<&'a PluginCommandAttribution>,
+    task_evidence: Option<&'a crate::task_check::TaskCheckExecution>,
 }
 
 impl<'a> ExecCommandInput<'a> {
@@ -494,6 +507,7 @@ impl<'a> ExecCommandInput<'a> {
         interaction_input: Option<&'a str>,
         process_id: Option<&'a str>,
         plugin_attribution: Option<&'a PluginCommandAttribution>,
+        task_evidence: Option<&'a crate::task_check::TaskCheckExecution>,
     ) -> Self {
         Self {
             command,
@@ -503,6 +517,7 @@ impl<'a> ExecCommandInput<'a> {
             interaction_input,
             process_id,
             plugin_attribution,
+            task_evidence,
         }
     }
 }
@@ -580,6 +595,18 @@ async fn emit_exec_end(
     exec_input: ExecCommandInput<'_>,
     exec_result: ExecCommandResult,
 ) {
+    if let Some(evidence) = exec_input.task_evidence {
+        let after = evidence.hash_artifacts().unwrap_or_default();
+        let _ = ctx
+            .session
+            .finish_task_check(
+                ctx.call_id,
+                exec_result.exit_code,
+                exec_result.exit_code != -1 && exec_result.status != ExecCommandStatus::Declined,
+                after,
+            )
+            .await;
+    }
     let (plugin_id, script_path) = plugin_attribution_fields(exec_input.plugin_attribution);
     ctx.session
         .emit_turn_item_completed(
@@ -623,6 +650,25 @@ async fn emit_patch_end(
     status: PatchApplyStatus,
     tracker_update: TurnDiffTrackerUpdate<'_>,
 ) {
+    let mut changed_paths = Vec::with_capacity(changes.len());
+    for (path, change) in &changes {
+        changed_paths.push(path.clone());
+        if let FileChange::Update {
+            move_path: Some(move_path),
+            ..
+        } = change
+        {
+            changed_paths.push(move_path.clone());
+        }
+    }
+    ctx.session
+        .finish_task_patch_attempt(
+            ctx.call_id,
+            changed_paths,
+            status == PatchApplyStatus::Completed,
+        )
+        .await;
+
     ctx.session
         .emit_turn_item_completed(
             ctx.turn,
@@ -711,6 +757,7 @@ mod tests {
             changes: HashMap::new(),
             auto_approved: false,
             environment_id: None,
+            local_environment: true,
         }
         .finish(
             ToolEventCtx::new(

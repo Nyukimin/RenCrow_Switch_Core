@@ -1,6 +1,8 @@
 // Modified by RenCrow Switch Core, 2026-09-22.
 use super::*;
+use codex_history::BlockedToolCallReference;
 use codex_history::CodexHarnessMetadata;
+use codex_history::ObservationReference;
 use codex_history::SenderUserMessages;
 use codex_history::compaction_pipeline::InstructionSelection;
 use codex_history::compaction_pipeline::ProposedOperation;
@@ -138,6 +140,40 @@ fn plaintext_reasoning_is_summary_visible_and_not_retained() {
     assert_eq!(summary_items, items);
     assert!(retained(&input, &items).unwrap().is_empty());
     assert_eq!(items, original);
+}
+
+#[test]
+fn assistant_work_with_special_metadata_remains_opaque() {
+    let mut item = message("assistant", "progress with special metadata");
+    let ResponseItem::Message {
+        internal_chat_message_metadata_passthrough,
+        ..
+    } = &mut item.item
+    else {
+        unreachable!();
+    };
+    *internal_chat_message_metadata_passthrough = Some(InternalChatMessageMetadataPassthrough {
+        content_item_kinds: Some(vec![codex_protocol::models::ContentItemKind(
+            "special.provenance".into(),
+        )]),
+        ..Default::default()
+    });
+    let items = vec![item];
+    let input = capture(
+        &items,
+        "binding".into(),
+        "test-thread",
+        vec![json!({"current":true})],
+        &[],
+    )
+    .unwrap();
+    assert_eq!(input.records[0].origin, Origin::Unknown);
+    assert!(input.records[0].opaque.is_some());
+    assert!(
+        super::super::task_boundary_work_indices(&items, "test-thread", &[])
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -471,6 +507,63 @@ fn completed_nonadjacent_pair_is_work_and_removed_from_retained_history() {
     .unwrap();
     assert_eq!(resumed.records[0].origin, Origin::Unknown);
     assert_eq!(resumed.records[1].origin, Origin::Human);
+}
+
+#[test]
+fn typed_blocked_output_is_not_execution_evidence_and_must_match_its_observation() {
+    let thread = "test-thread";
+    let call_id = "blocked-call";
+    let body = "Command blocked by PreToolUse hook: denied.";
+    let items = vec![
+        command_call(call_id, "{\"cmd\":\"unsafe\"}"),
+        command_output(call_id, body),
+    ];
+    let mut items = items;
+    let reference = ObservationReference::new(
+        thread,
+        call_id,
+        codex_history::archive_reference::content_sha256(body),
+    );
+    items[1]
+        .metadata
+        .get_or_insert_default()
+        .rencrow_blocked_tool_call = Some(Box::new(BlockedToolCallReference::new(reference)));
+    let projection = CompletedWorkProjection {
+        call_index: 0,
+        output_index: 1,
+        call_text: "{\"cmd\":\"unsafe\"}".into(),
+        output_text: body.into(),
+    };
+    let input = capture(
+        &items,
+        "binding".into(),
+        thread,
+        vec![json!({"current":true})],
+        &[projection.clone()],
+    )
+    .unwrap();
+    assert!(!input.records[1].execution_evidence);
+    assert_eq!(input.records[1].text, body);
+
+    items[1]
+        .metadata
+        .as_mut()
+        .unwrap()
+        .rencrow_blocked_tool_call
+        .as_mut()
+        .unwrap()
+        .observation
+        .sha256 = "f".repeat(64);
+    assert!(
+        capture(
+            &items,
+            "binding".into(),
+            thread,
+            vec![json!({"current":true})],
+            &[projection]
+        )
+        .is_err()
+    );
 }
 
 #[test]

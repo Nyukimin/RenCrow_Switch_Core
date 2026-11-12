@@ -21,6 +21,10 @@
           "description": "Human-facing role documentation used in spawn tool guidance. Required unless supplied by the referenced agent role file.",
           "type": "string"
         },
+        "enabled": {
+          "description": "Whether the role may be selected by spawn_agent. Defaults to true.",
+          "type": "boolean"
+        },
         "nickname_candidates": {
           "description": "Candidate nicknames for agents spawned with this role.",
           "items": {
@@ -3745,6 +3749,59 @@
         }
       ]
     },
+    "RencrowExecutionGuard": {
+      "additionalProperties": false,
+      "description": "Native execution limits; role layers can tighten but never relax inherited limits.",
+      "properties": {
+        "deny_nested_agent_cli": {
+          "default": false,
+          "type": "boolean"
+        },
+        "max_read_only_calls": {
+          "default": 24,
+          "format": "uint16",
+          "minimum": 1.0,
+          "type": "integer"
+        },
+        "max_repeated_reads": {
+          "default": 3,
+          "format": "uint16",
+          "minimum": 1.0,
+          "type": "integer"
+        },
+        "require_check": {
+          "default": false,
+          "type": "boolean"
+        },
+        "require_child_results": {
+          "default": false,
+          "type": "boolean"
+        },
+        "require_edit": {
+          "default": false,
+          "type": "boolean"
+        },
+        "task_kind": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/RencrowTaskKind"
+            }
+          ],
+          "default": null
+        }
+      },
+      "type": "object"
+    },
+    "RencrowTaskKind": {
+      "description": "The work contract selected by a role or inherited from its parent.",
+      "enum": [
+        "implement",
+        "verify",
+        "read_only",
+        "orchestrate"
+      ],
+      "type": "string"
+    },
     "ResumeCwdMode": {
       "description": "Working directory to use when resuming or forking a session.",
       "oneOf": [
@@ -4504,6 +4561,11 @@
         "raw_output_mode": {
           "default": false,
           "description": "Start the TUI in raw scrollback mode for copy-friendly transcript output. Defaults to `false`.",
+          "type": "boolean"
+        },
+        "rencrow_tui_jst_timestamps": {
+          "default": false,
+          "description": "Show the last recorded TUI activity time and elapsed idle time in the footer. Defaults to `false`.",
           "type": "boolean"
         },
         "rendering": {
@@ -7399,9 +7461,21 @@
       "default": null,
       "description": "Experimental / do not use. Realtime websocket session selection. `version` controls v1/v2 and `type` controls conversational/transcription."
     },
+    "rencrow_autonomous_completion": {
+      "description": "Continue parent work from a persisted finite completion contract.",
+      "type": "boolean"
+    },
     "rencrow_compaction": {
       "description": "Use the RenCrow validated local compaction pipeline.",
       "type": "boolean"
+    },
+    "rencrow_execution_guard": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/RencrowExecutionGuard"
+        }
+      ],
+      "description": "Opt-in native tool-loop and executor completion guard (no external hooks)."
     },
     "rencrow_read_only": {
       "description": "Agent role files only: run the role's agents with a read-only sandbox (ROLE_TOOL_POLICY.md).",

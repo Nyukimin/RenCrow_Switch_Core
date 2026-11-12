@@ -354,6 +354,14 @@ pub struct ThreadSettingsUpdatedNotification {
 pub struct ThreadResumeParams {
     pub thread_id: String,
 
+    /// Keep autonomous completion idle when the caller will submit an initial turn or restore
+    /// runtime settings after the resume response. Clients that know the resume is idle may set
+    /// this to false. Missing values defer by default.
+    #[experimental("thread/resume.deferAutonomousCompletion")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub defer_autonomous_completion: Option<bool>,
+
     /// [UNSTABLE] FOR CODEX CLOUD - DO NOT USE.
     /// If specified, the thread will be resumed with the provided history
     /// instead of loaded from disk.

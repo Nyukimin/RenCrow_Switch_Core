@@ -8,6 +8,8 @@ use toml::Value as TomlValue;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AgentRoleConfig {
+    /// Whether this custom role may be selected. `None` preserves legacy behavior.
+    pub enabled: Option<bool>,
     /// Human-facing role documentation used in spawn tool guidance.
     /// Required for loaded user-defined roles after deprecated/new metadata precedence resolves.
     pub description: Option<String>,

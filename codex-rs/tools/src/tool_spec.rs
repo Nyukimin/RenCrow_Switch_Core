@@ -4,6 +4,8 @@ use crate::LoadableToolSpec;
 use crate::ResponsesApiNamespace;
 use crate::ResponsesApiNamespaceTool;
 use crate::ResponsesApiTool;
+use crate::concise_tool_descriptions;
+use crate::concise_tool_descriptions::ToolKind;
 use crate::default_namespace_description;
 use codex_protocol::DEFAULT_FUNCTION_NAMESPACE;
 use codex_protocol::config_types::WebSearchContextSize;
@@ -13,6 +15,7 @@ use codex_protocol::config_types::WebSearchUserLocationType;
 use serde::Serialize;
 use serde_json::Value;
 use serde_json::value::RawValue;
+use std::borrow::Cow;
 use std::sync::Arc;
 
 /// When serialized as JSON, this produces a valid "Tool" in the OpenAI
@@ -82,9 +85,20 @@ impl From<LoadableToolSpec> for ToolSpec {
 pub fn create_tools_json_for_responses_api(
     tools: &[ToolSpec],
 ) -> Result<Vec<Value>, serde_json::Error> {
+    create_tools_json_for_responses_api_with_description_policy(
+        tools,
+        concise_tool_descriptions::is_enabled(),
+    )
+}
+
+fn create_tools_json_for_responses_api_with_description_policy(
+    tools: &[ToolSpec],
+    use_concise_descriptions: bool,
+) -> Result<Vec<Value>, serde_json::Error> {
+    let tools = project_tool_descriptions(tools, use_concise_descriptions);
     let mut tools_json = Vec::new();
 
-    for tool in tools {
+    for tool in tools.iter() {
         let json = serde_json::to_value(tool)?;
         tools_json.push(json);
     }
@@ -95,6 +109,17 @@ pub fn create_tools_json_for_responses_api(
 pub fn create_tools_json_for_responses_lite(
     tools: &[ToolSpec],
 ) -> Result<Vec<Value>, serde_json::Error> {
+    create_tools_json_for_responses_lite_with_description_policy(
+        tools,
+        concise_tool_descriptions::is_enabled(),
+    )
+}
+
+fn create_tools_json_for_responses_lite_with_description_policy(
+    tools: &[ToolSpec],
+    use_concise_descriptions: bool,
+) -> Result<Vec<Value>, serde_json::Error> {
+    let tools = project_tool_descriptions(tools, use_concise_descriptions);
     let mut functions = ResponsesApiNamespace {
         name: DEFAULT_FUNCTION_NAMESPACE.to_string(),
         description: default_namespace_description(DEFAULT_FUNCTION_NAMESPACE),
@@ -103,7 +128,7 @@ pub fn create_tools_json_for_responses_lite(
     let mut functions_index = None;
     let mut tools_json = Vec::new();
 
-    for tool in tools {
+    for tool in tools.iter() {
         match tool {
             ToolSpec::Function(tool) => {
                 functions
@@ -145,7 +170,70 @@ pub fn create_tools_json_for_responses_lite(
 pub fn create_tools_raw_json_for_responses_api(
     tools: &[ToolSpec],
 ) -> Result<Arc<RawValue>, serde_json::Error> {
-    serde_json::value::to_raw_value(tools).map(Arc::from)
+    create_tools_raw_json_for_responses_api_with_description_policy(
+        tools,
+        concise_tool_descriptions::is_enabled(),
+    )
+}
+
+fn create_tools_raw_json_for_responses_api_with_description_policy(
+    tools: &[ToolSpec],
+    use_concise_descriptions: bool,
+) -> Result<Arc<RawValue>, serde_json::Error> {
+    let tools = project_tool_descriptions(tools, use_concise_descriptions);
+    serde_json::value::to_raw_value(tools.as_ref()).map(Arc::from)
+}
+
+fn project_tool_descriptions<'a>(
+    tools: &'a [ToolSpec],
+    use_concise_descriptions: bool,
+) -> Cow<'a, [ToolSpec]> {
+    if !use_concise_descriptions {
+        return Cow::Borrowed(tools);
+    }
+
+    let mut projected = tools.to_vec();
+    for tool in &mut projected {
+        match tool {
+            ToolSpec::Function(function) => {
+                apply_concise_description(
+                    ToolKind::Function,
+                    None,
+                    &function.name,
+                    &mut function.description,
+                );
+            }
+            ToolSpec::Namespace(namespace) => {
+                for nested in &mut namespace.tools {
+                    if let ResponsesApiNamespaceTool::Function(function) = nested {
+                        apply_concise_description(
+                            ToolKind::Function,
+                            Some(&namespace.name),
+                            &function.name,
+                            &mut function.description,
+                        );
+                    }
+                }
+            }
+            // Freeform descriptions may contain nested tool declarations. Keep
+            // their descriptions and grammar intact in every case.
+            ToolSpec::Freeform(_) | ToolSpec::ToolSearch { .. } | ToolSpec::WebSearch { .. } => {}
+        }
+    }
+    Cow::Owned(projected)
+}
+
+fn apply_concise_description(
+    kind: ToolKind,
+    namespace: Option<&str>,
+    name: &str,
+    description: &mut String,
+) {
+    if let Some(concise) =
+        concise_tool_descriptions::concise_description(kind, namespace, name, description)
+    {
+        *description = concise.to_string();
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]

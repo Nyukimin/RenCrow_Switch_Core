@@ -738,6 +738,7 @@ impl ChatComposer {
                 status_line_enabled: false,
                 side_conversation_context_label: None,
                 active_agent_label: None,
+                activity_context: None,
                 external_editor_key: default_keymap
                     .primary_hint(KeymapContext::Global, "open_external_editor"),
                 warning_notice_area: std::cell::Cell::default(),
@@ -3873,6 +3874,7 @@ impl ChatComposer {
                     .filter(|_| self.voice_command_enabled && !self.side_conversation_active),
             },
             active_agent_label: self.footer.active_agent_label.clone(),
+            activity_context: self.footer.activity_context.clone(),
         }
     }
 
@@ -4427,6 +4429,14 @@ impl ChatComposer {
     /// Returning `false` means the value was unchanged, so callers can skip redraw work. This
     /// field is intentionally just cached presentation state; `ChatComposer` does not infer which
     /// thread is active on its own.
+    pub(crate) fn set_activity_context(&mut self, activity_context: Option<String>) -> bool {
+        if self.footer.activity_context == activity_context {
+            return false;
+        }
+        self.footer.activity_context = activity_context;
+        true
+    }
+
     pub(crate) fn set_active_agent_label(&mut self, active_agent_label: Option<String>) -> bool {
         if self.footer.active_agent_label == active_agent_label {
             return false;

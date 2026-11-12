@@ -369,9 +369,24 @@ impl ChatWidget {
     }
 
     fn on_error(&mut self, message: String) {
+        self.on_error_with_timestamp(message, None);
+    }
+
+    fn on_error_at(&mut self, message: String, timestamp_epoch_seconds: i64) {
+        self.on_error_with_timestamp(message, Some(timestamp_epoch_seconds));
+    }
+
+    fn on_error_with_timestamp(&mut self, message: String, timestamp_epoch_seconds: Option<i64>) {
         self.input_queue.submit_pending_steers_after_interrupt = false;
         self.finalize_turn();
-        self.add_to_history(history_cell::new_error_event(message));
+        let error_cell = timestamp_epoch_seconds
+            .filter(|_| self.activity_timestamps_enabled())
+            .and_then(super::activity_clock::history_timestamp_label)
+            .map_or_else(
+                || history_cell::new_error_event(message.clone()),
+                |timestamp| history_cell::new_timestamped_error_event(timestamp, message.clone()),
+            );
+        self.add_to_history(error_cell);
         self.set_ambient_pet_notification(
             crate::pets::PetNotificationKind::Failed,
             /*body*/ None,
@@ -469,6 +484,28 @@ impl ChatWidget {
         message: String,
         codex_error_info: Option<AppServerCodexErrorInfo>,
     ) {
+        self.handle_non_retry_error_with_timestamp(message, codex_error_info, None);
+    }
+
+    pub(super) fn handle_non_retry_error_at(
+        &mut self,
+        message: String,
+        codex_error_info: Option<AppServerCodexErrorInfo>,
+        timestamp_epoch_seconds: i64,
+    ) {
+        self.handle_non_retry_error_with_timestamp(
+            message,
+            codex_error_info,
+            Some(timestamp_epoch_seconds),
+        );
+    }
+
+    fn handle_non_retry_error_with_timestamp(
+        &mut self,
+        message: String,
+        codex_error_info: Option<AppServerCodexErrorInfo>,
+        timestamp_epoch_seconds: Option<i64>,
+    ) {
         if codex_error_info == Some(AppServerCodexErrorInfo::MisalignmentPolicyViolation) {
             self.on_misalignment_policy_violation();
         } else if codex_error_info
@@ -504,7 +541,11 @@ impl ChatWidget {
                 }
             }
         } else {
-            self.on_error(message);
+            if let Some(timestamp) = timestamp_epoch_seconds {
+                self.on_error_at(message, timestamp);
+            } else {
+                self.on_error(message);
+            }
         }
     }
 

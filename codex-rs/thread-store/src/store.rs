@@ -30,6 +30,7 @@ use crate::MoveThreadToSectionParams;
 use crate::PrepareForkParams;
 use crate::PreparedFork;
 use crate::ProjectMoveOutcome;
+use crate::ReadCompactionSourcesParams;
 use crate::ReadThreadByRolloutPathParams;
 use crate::ReadThreadParams;
 use crate::RemoveThreadAttachmentOutcome;
@@ -188,6 +189,21 @@ pub trait ThreadStore: Any + Send + Sync {
         &self,
         params: LoadThreadHistoryParams,
     ) -> ThreadStoreFuture<'_, StoredThreadHistory>;
+
+    /// Reads canonical rollout evidence for selected compaction call IDs.
+    ///
+    /// Implementations without an owner-validated rollout lineage may leave this unsupported;
+    /// callers can then use their existing single-rollout source path.
+    fn read_compaction_sources(
+        &self,
+        _params: ReadCompactionSourcesParams,
+    ) -> ThreadStoreFuture<'_, StoredThreadHistory> {
+        Box::pin(async {
+            Err(ThreadStoreError::Unsupported {
+                operation: "read_compaction_sources",
+            })
+        })
+    }
 
     /// Loads the persisted rollout items needed to reconstruct the latest model-visible context.
     ///

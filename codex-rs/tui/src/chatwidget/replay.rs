@@ -190,7 +190,12 @@ impl ChatWidget {
                         Some((summary, content)),
                     );
                 } else {
-                    self.replay_thread_item(item, turn_id.clone(), replay_kind);
+                    self.replay_thread_item_with_timestamp(
+                        item,
+                        turn_id.clone(),
+                        replay_kind,
+                        completed_at,
+                    );
                 }
             }
             let status = if hidden_nested_review_turn {
@@ -245,6 +250,16 @@ impl ChatWidget {
         turn_id: String,
         replay_kind: ReplayKind,
     ) {
+        self.replay_thread_item_with_timestamp(item, turn_id, replay_kind, None);
+    }
+
+    fn replay_thread_item_with_timestamp(
+        &mut self,
+        item: ThreadItem,
+        turn_id: String,
+        replay_kind: ReplayKind,
+        completion_timestamp: Option<i64>,
+    ) {
         match item {
             // Snapshots contain the completed item, without the live start that renders its diff.
             ThreadItem::FileChange {
@@ -257,7 +272,12 @@ impl ChatWidget {
                 }
             }
             item => {
-                self.handle_thread_item(item, turn_id, ThreadItemRenderSource::Replay(replay_kind));
+                self.handle_thread_item(
+                    item,
+                    turn_id,
+                    ThreadItemRenderSource::Replay(replay_kind)
+                        .with_completion_timestamp(completion_timestamp),
+                );
             }
         }
     }
@@ -270,6 +290,7 @@ impl ChatWidget {
     ) {
         let from_replay = render_source.is_replay();
         let replay_kind = render_source.replay_kind();
+        let completion_timestamp = render_source.completion_timestamp();
         match item {
             ThreadItem::UserMessage {
                 content, client_id, ..
@@ -340,6 +361,7 @@ impl ChatWidget {
                     },
                     &turn_id,
                     from_replay,
+                    completion_timestamp,
                 );
             }
             ThreadItem::Plan { text, .. } => self.on_plan_item_completed(text),

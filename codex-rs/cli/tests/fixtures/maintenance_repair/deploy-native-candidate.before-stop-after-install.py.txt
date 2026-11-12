@@ -1,0 +1,639 @@
+#!/usr/bin/env python3
+"""Guarded native pair/config deployment; dry-run unless --apply is explicit."""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import fcntl
+import hashlib
+import importlib.util
+import json
+import os
+from pathlib import Path
+import shutil
+import shlex
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+import tomllib
+from contextlib import closing, contextmanager
+
+ROOT = Path("/Users/yukimi/RenCrow")
+HOME = Path("/Users/yukimi")
+SUPERVISION = ROOT / "Tmp/ren2-supervision/periodic"
+THREAD = "01a1c0b9-582b-71c0-a6d6-552f2d581a8e"
+CODEX_HOME = HOME / ".codex-switch"
+INSTALL = HOME / ".local/bin"
+TARGETS = {
+    "rencrow-switch-core": INSTALL / "rencrow-switch-core",
+    "rencrow-compaction": INSTALL / "rencrow-compaction",
+}
+CONFIG_TARGET = CODEX_HOME / "config.toml"
+SETTINGS_TARGET = SUPERVISION / "settings.json"
+SUPERVISOR_ACTIVATION = ROOT / "Tmp/autonomous-completion-20261111/candidate-11/supervisor-activation-result.json"
+MAINTENANCE_MARKER = (
+    "maintenance: root implementing AUTONOMOUS_COMPLETION_SPEC v1.1; "
+    "keep snapshots, do not inject competing repair/steer. ren2 product jobs continue. "
+    "Remove only this maintenance marker after verified deployment.\n"
+)
+
+
+def sha(path: Path) -> str:
+    value = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            value.update(block)
+    return value.hexdigest()
+
+
+def atomic_copy(source: Path, target: Path, mode: int | None = None) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=target.parent)
+    temp = Path(name)
+    try:
+        with os.fdopen(fd, "wb") as output, source.open("rb") as input_file:
+            shutil.copyfileobj(input_file, output)
+            output.flush()
+            os.fsync(output.fileno())
+        os.chmod(temp, mode if mode is not None else (source.stat().st_mode & 0o777))
+        os.replace(temp, target)
+        directory_fd = os.open(target.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+@contextmanager
+def temporarily_remove_maintenance_marker(path: Path, enabled: bool):
+    if not enabled:
+        yield
+        return
+    if not path.exists() or path.read_text() != MAINTENANCE_MARKER:
+        raise RuntimeError("maintenance marker changed; refusing to release another pause")
+    path.unlink()
+    try:
+        yield
+    finally:
+        if path.exists():
+            if path.read_text() != MAINTENANCE_MARKER:
+                raise RuntimeError("PAUSED changed during resume; refusing to overwrite another marker")
+        else:
+            with path.open("x") as marker_file:
+                marker_file.write(MAINTENANCE_MARKER)
+                marker_file.flush()
+                os.fsync(marker_file.fileno())
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+
+
+def changed_paths(before: object, after: object, prefix: str = "") -> set[str]:
+    if isinstance(before, dict) and isinstance(after, dict):
+        result: set[str] = set()
+        for key in set(before) | set(after):
+            path = f"{prefix}.{key}" if prefix else str(key)
+            if key not in before or key not in after:
+                result.add(path)
+            else:
+                result |= changed_paths(before[key], after[key], path)
+        return result
+    return set() if before == after else {prefix}
+
+
+def validate_second_pair_update_settings(
+    active_settings: dict,
+    candidate_settings: dict,
+    current_config: dict,
+    candidate_config: dict,
+) -> bool:
+    """Allow a second binary pair only under the already activated native supervisor."""
+    active_enabled = active_settings.get("native_completion_enabled", False)
+    candidate_enabled = candidate_settings.get("native_completion_enabled", False)
+    if active_enabled is False and candidate_enabled is False:
+        return False
+    if active_enabled is not True or candidate_enabled is not True:
+        raise RuntimeError("second native pair update requires native completion enabled in both settings")
+    active_without_flag = {
+        key: value for key, value in active_settings.items()
+        if key != "native_completion_enabled"
+    }
+    candidate_without_flag = {
+        key: value for key, value in candidate_settings.items()
+        if key != "native_completion_enabled"
+    }
+    if changed_paths(active_without_flag, candidate_without_flag):
+        raise RuntimeError("second native pair update must preserve all supervisor settings")
+    if changed_paths(current_config, candidate_config):
+        raise RuntimeError("second native pair update must preserve the active durable config")
+    if (current_config.get("rencrow_compaction") is not True
+            or current_config.get("rencrow_autonomous_completion") is not True):
+        raise RuntimeError("active durable config is not enabled for the native completion route")
+    if candidate_settings.get("allow_product_deployment") is not False:
+        raise RuntimeError("supervisor candidate must keep product deployment disabled")
+    return True
+
+
+def verify_second_pair_activation(
+    activation: dict,
+    *,
+    thread: str,
+    pid: int,
+    supervisor_script: Path,
+    installed_core: Path,
+) -> dict:
+    if activation.get("mode") != "apply":
+        raise RuntimeError("verified native supervisor activation record is required")
+    identity = activation.get("identity")
+    if not isinstance(identity, dict) or identity.get("thread") != thread or identity.get("pid") != pid:
+        raise RuntimeError("active native supervisor identity differs from its activation record")
+    source_hashes = activation.get("source_hashes")
+    expected_supervisor_hash = (
+        source_hashes.get("supervise.py") if isinstance(source_hashes, dict) else None
+    )
+    if (not isinstance(expected_supervisor_hash, str)
+            or not supervisor_script.is_file() or supervisor_script.is_symlink()
+            or sha(supervisor_script) != expected_supervisor_hash):
+        raise RuntimeError("active supervisor source hash differs from its activation record")
+    expected_binary_hash = identity.get("binary_sha256")
+    if (not isinstance(expected_binary_hash, str)
+            or not installed_core.is_file() or installed_core.is_symlink()
+            or sha(installed_core) != expected_binary_hash):
+        raise RuntimeError("installed native binary differs from the activation record")
+    return {
+        "pid": pid,
+        "thread": thread,
+        "supervisor_sha256": expected_supervisor_hash,
+        "installed_core_sha256": expected_binary_hash,
+    }
+
+
+def load_monitor(path: Path):
+    spec = importlib.util.spec_from_file_location("ren2_supervise", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load existing supervisor helper: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.path.insert(0, str(path.parent))
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.path.remove(str(path.parent))
+    return module
+
+
+def terminal_child_background_receipt(child: dict, session: dict) -> dict | None:
+    turn = child.get("turn_observation", {})
+    receipts = child.get("child_receipts", {})
+    pending_children = child.get("pending_children")
+    session_id = session.get("session_id")
+    turn_id = session.get("turn_id")
+    rollout = child.get("rollout")
+    if (turn.get("active") or turn.get("tool_running")
+            or not turn.get("completed_at")
+            or pending_children is None or pending_children
+            or receipts.get("pending") is None or receipts.get("pending")):
+        return None
+    if not isinstance(session_id, str) or not session_id or not isinstance(turn_id, str) or not turn_id:
+        return None
+    if not isinstance(rollout, str) or not rollout:
+        return None
+    path = Path(rollout)
+    try:
+        with path.open(encoding="utf-8") as stream:
+            for line in stream:
+                try:
+                    row = json.loads(line)
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                payload = row.get("payload", {})
+                if not isinstance(payload, dict):
+                    continue
+                item = payload.get("item", {})
+                if not isinstance(item, dict):
+                    continue
+                if (row.get("type") != "event_msg"
+                        or payload.get("type") != "item_completed"
+                        or payload.get("thread_id") != child.get("thread")
+                        or payload.get("turn_id") != turn_id
+                        or item.get("type") != "CommandExecution"
+                        or str(item.get("process_id")) != session_id
+                        or item.get("status") not in {"completed", "failed"}):
+                    continue
+                return {
+                    "session_id": session_id,
+                    "turn_id": turn_id,
+                    "terminal_status": item.get("status"),
+                    "exit_code": item.get("exit_code"),
+                    "item_id": item.get("id"),
+                }
+    except (OSError, UnicodeError):
+        return None
+    return None
+
+
+def runtime_preflight_blockers(snapshot: dict, monitor) -> list[str]:
+    """Require host-confirmed idle, non-aborted, readable rollout state."""
+    blockers = []
+    turn = snapshot.get("turn_observation")
+    if not isinstance(turn, dict):
+        blockers.append("turn observation is unknown")
+    else:
+        if turn.get("active") is not False:
+            blockers.append("turn is active or active state is unknown")
+        if turn.get("tool_running") is not False:
+            blockers.append("tool is running or tool state is unknown")
+        if turn.get("compacting") is not False:
+            blockers.append("compaction is active or compaction state is unknown")
+        if monitor.turn_was_user_aborted(turn):
+            blockers.append("latest turn was explicitly aborted by the user")
+    if "rollout_error" not in snapshot or snapshot.get("rollout_error") is not None:
+        blockers.append("rollout state is unreadable or unknown")
+    return blockers
+
+
+def apply_failure_report(args: argparse.Namespace, error: Exception) -> dict:
+    state = getattr(args, "deployment_state", {})
+    phase = state.get("phase", "preflight")
+    changed = "unknown" if args.apply and state.get("changed_may_have_started") else False
+    report = {"error": str(error), "changed": changed, "phase": phase}
+    if state.get("backup"):
+        report["backup"] = state["backup"]
+    if changed == "unknown":
+        report["retry"] = "do not retry until installed binaries, config, process state, and the backup are inspected"
+    return report
+
+
+def require_maintenance_marker(path: Path) -> tuple[str | None, str | None]:
+    if not path.exists():
+        return None, "exact root-maintenance PAUSED marker is required"
+    if path.read_text() != MAINTENANCE_MARKER:
+        return None, "PAUSED marker is not the exact root-owned maintenance ticket"
+    return "exact-root-maintenance-marker", None
+
+
+def preflight(args: argparse.Namespace) -> tuple[object, dict, dict]:
+    for source in (args.native, args.helper, args.manifest, args.config_candidate,
+                   args.settings_candidate, args.supervise_script):
+        if not source.is_file() or source.is_symlink():
+            raise RuntimeError(f"required regular file is missing or symlinked: {source}")
+    manifest = json.loads(args.manifest.read_text())
+    binaries = manifest.get("binaries", manifest)
+    expected = {
+        "rencrow-switch-core": binaries.get("rencrow-switch-core"),
+        "rencrow-compaction": binaries.get("rencrow-compaction"),
+    }
+    supplied = {"rencrow-switch-core": sha(args.native), "rencrow-compaction": sha(args.helper)}
+    if supplied != expected:
+        raise RuntimeError(f"candidate hashes do not match build manifest: {supplied}")
+
+    current_config = tomllib.loads(CONFIG_TARGET.read_text())
+    candidate_config = tomllib.loads(args.config_candidate.read_text())
+    config_changes = changed_paths(current_config, candidate_config)
+    if config_changes - {"rencrow_autonomous_completion"}:
+        raise RuntimeError(f"config candidate changes unrelated keys: {sorted(config_changes)}")
+    if candidate_config.get("rencrow_compaction") is not True or candidate_config.get("rencrow_autonomous_completion") is not True:
+        raise RuntimeError("durable config candidate must enable compaction and autonomous completion")
+
+    active_settings = json.loads(SETTINGS_TARGET.read_text())
+    candidate_settings = json.loads(args.settings_candidate.read_text())
+    second_pair_update = validate_second_pair_update_settings(
+        active_settings, candidate_settings, current_config, candidate_config
+    )
+    activation = None
+    if second_pair_update:
+        activation_path = args.supervisor_activation
+        if not activation_path.is_file() or activation_path.is_symlink():
+            raise RuntimeError(f"verified supervisor activation record is missing: {activation_path}")
+        activation = json.loads(activation_path.read_text())
+        if args.supervise_script.resolve() != (SUPERVISION / "supervise.py").resolve():
+            raise RuntimeError("second native pair update must observe the activated live supervisor")
+        recorded_identity = activation.get("identity", {})
+        verify_second_pair_activation(
+            activation,
+            thread=args.thread,
+            pid=recorded_identity.get("pid"),
+            supervisor_script=args.supervise_script,
+            installed_core=TARGETS["rencrow-switch-core"],
+        )
+    elif (active_settings.get("native_completion_enabled", False) is not False
+          or candidate_settings.get("native_completion_enabled", False) is not False):
+        raise RuntimeError("supervisor native completion must remain disabled during initial native pair deployment")
+    active_supervisor_settings = {
+        key: value for key, value in active_settings.items()
+        if key != "native_completion_enabled"
+    }
+    candidate_supervisor_settings = {
+        key: value for key, value in candidate_settings.items()
+        if key != "native_completion_enabled"
+    }
+    settings_changes = changed_paths(active_supervisor_settings, candidate_supervisor_settings)
+    if settings_changes:
+        raise RuntimeError("supervisor settings must remain unchanged until staged supervisor code is deployed")
+    if candidate_settings.get("allow_product_deployment") is not False:
+        raise RuntimeError("supervisor candidate must keep product deployment disabled")
+
+    monitor = load_monitor(args.supervise_script)
+    snapshot = monitor.snapshot()
+    if snapshot.get("thread") != args.thread:
+        raise RuntimeError("supervisor snapshot is bound to another thread")
+    pid = monitor.target_process_pid(snapshot)
+    activation_identity = None
+    if second_pair_update:
+        activation_identity = verify_second_pair_activation(
+            activation,
+            thread=args.thread,
+            pid=pid,
+            supervisor_script=args.supervise_script,
+            installed_core=TARGETS["rencrow-switch-core"],
+        )
+    turn = snapshot.get("turn_observation", {})
+    blockers = runtime_preflight_blockers(snapshot, monitor)
+    if snapshot.get("pending_children"):
+        blockers.append("pending children")
+    if snapshot.get("child_receipts", {}).get("unknown"):
+        blockers.append("unknown child receipts")
+    if turn.get("active") or turn.get("tool_running"):
+        blockers.append("active turn or tool")
+    if turn.get("exec_background_sessions"):
+        blockers.append("background exec sessions")
+    if turn.get("task_checkpoint_unknown") or turn.get("child_log_unknown"):
+        blockers.append("unknown checkpoint or child log state")
+    terminal_child_background_sessions = []
+    for child_id, child in snapshot.get("child_observations", {}).items():
+        child_turn = child.get("turn_observation", {})
+        if child_turn.get("active") or child_turn.get("tool_running"):
+            blockers.append("child has active turn/tool/background work")
+            continue
+        for session in child_turn.get("exec_background_sessions", []):
+            terminal_receipt = terminal_child_background_receipt(child, session)
+            if terminal_receipt is None:
+                blockers.append(f"child {child_id} has an unreconciled background exec session")
+            else:
+                terminal_child_background_sessions.append({"child_id": child_id, **terminal_receipt})
+    process_observation = snapshot.get("process_observation", {})
+    if process_observation.get("monitored_cli_processes"):
+        blockers.append("monitored product CLI process")
+    if (second_pair_update
+            and monitor.monitored_job_active_or_unknown(snapshot)):
+        blockers.append("monitored product CLI process is active or unknown")
+    if monitor.has_executing_subprocesses({pid}):
+        blockers.append("native process has executing subprocesses")
+    paused_path = SUPERVISION / "PAUSED"
+    maintenance_ticket, marker_error = require_maintenance_marker(paused_path)
+    if marker_error:
+        blockers.append(marker_error)
+    listeners = subprocess.run(
+        ["/usr/sbin/lsof", "-nP", "-iTCP:8090", "-sTCP:LISTEN", "-F", "pcn"],
+        text=True, capture_output=True, check=False,
+    ).stdout.splitlines()
+    system_service = subprocess.run(
+        ["/bin/launchctl", "print", "system/com.rencrow.llm-gateway"],
+        text=True, capture_output=True, check=False,
+    )
+    if blockers:
+        snapshot["deployment_blockers"] = blockers
+    return monitor, snapshot, {"pid": pid, "candidate_hashes": supplied,
+                               "native_second_pair_update": second_pair_update,
+                               "activation_identity": activation_identity,
+                               "config_changes": sorted(config_changes),
+                               "settings_changes": sorted(settings_changes),
+                               "unverified_diff": bool(turn.get("unverified_diff")),
+                               "diff_revision": turn.get("diff_revision"),
+                               "verified_diff_revision": turn.get("verified_diff_revision"),
+                               "last_edit_at": turn.get("last_edit_at"),
+                               "last_successful_check_at": turn.get("successful_check_at"),
+                               "maintenance_ticket": maintenance_ticket,
+                               "terminal_child_background_sessions": terminal_child_background_sessions,
+                               "gateway_8090_lsof": listeners,
+                               "system_gateway_launchctl_exit": system_service.returncode,
+                               "system_gateway_launchctl_detail": system_service.stdout[:2000]}
+
+
+def backup_databases(code_home: Path, backup: Path) -> list[str]:
+    copied = []
+    for source in sorted(code_home.glob("*.sqlite")):
+        target = backup / "sqlite" / source.name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with closing(sqlite3.connect(source.as_uri() + "?mode=ro", uri=True)) as read_db:
+            with closing(sqlite3.connect(target)) as write_db:
+                read_db.backup(write_db)
+        copied.append(str(target))
+    return copied
+
+
+def apply(args: argparse.Namespace, monitor, snapshot: dict, facts: dict) -> dict:
+    if snapshot.get("deployment_blockers"):
+        raise RuntimeError("apply refused: " + "; ".join(snapshot["deployment_blockers"]))
+    pid = facts["pid"]
+    pane = str(snapshot.get("pane", "")).split()
+    if not pane or not pane[0].startswith("%"):
+        raise RuntimeError("cannot identify the target tmux pane from the supervisor snapshot")
+    lock_path = SUPERVISION / "native-deployment.lock"
+    with (SUPERVISION / "supervisor.lock").open("a") as supervisor_lock, \
+            (SUPERVISION / "analysis.lock").open("a") as analysis_lock, \
+            lock_path.open("a") as lock:
+        fcntl.flock(supervisor_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(analysis_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        monitor, snapshot, facts = preflight(args)
+        if snapshot.get("thread") != args.thread:
+            raise RuntimeError("thread binding changed before apply")
+        if facts["pid"] != pid:
+            raise RuntimeError("native PID changed since dry-run; re-check state")
+        if snapshot.get("deployment_blockers"):
+            raise RuntimeError("apply preflight changed: " + "; ".join(snapshot["deployment_blockers"]))
+        timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        backup = args.backup_root / timestamp
+        args.deployment_state = {"phase": "creating_backup", "backup": str(backup),
+                                 "changed_may_have_started": True}
+        backup.mkdir(parents=True, exist_ok=False)
+        args.deployment_state["phase"] = "backup_created"
+        monitor.save(backup / "pre-deploy-snapshot.json", snapshot)
+        (backup / "pre-deploy-facts.json").write_text(json.dumps(facts, indent=2) + "\n")
+        active_task = json.loads((SUPERVISION / "completion-contract.json").read_text()).get("active_task", {})
+        resume_packet = {
+            "thread": args.thread,
+            "task_id": active_task.get("id"),
+            "task_spec": active_task.get("spec_file"),
+            "owner": active_task.get("owner"),
+            "worker_config_file": active_task.get("worker_config_file"),
+            "last_turn_id": snapshot.get("turn_observation", {}).get("turn_id"),
+            "unverified_diff": facts["unverified_diff"],
+            "diff_revision": facts["diff_revision"],
+            "verified_diff_revision": facts["verified_diff_revision"],
+            "last_edit_at": facts["last_edit_at"],
+            "last_successful_check_at": facts["last_successful_check_at"],
+            "terminal_error": snapshot.get("turn_observation", {}).get("terminal_error"),
+            "instruction": "Resume this same thread. Preserve existing diffs and SQLite-backed state; inspect the unverified diff, complete its required check, and report incomplete work honestly.",
+        }
+        (backup / "resume-packet.json").write_text(
+            json.dumps(resume_packet, ensure_ascii=False, indent=2) + "\n"
+        )
+        config_backup = backup / "config.toml"
+        settings_backup = backup / "settings.json"
+        shutil.copy2(CONFIG_TARGET, config_backup)
+        shutil.copy2(SETTINGS_TARGET, settings_backup)
+        binary_backups = {}
+        for name, target in TARGETS.items():
+            if target.is_symlink() or not target.is_file():
+                raise RuntimeError(f"installed binary is missing or symlinked: {target}")
+            backup_file = backup / name
+            shutil.copy2(target, backup_file)
+            binary_backups[name] = {"path": str(target), "sha256": sha(backup_file)}
+
+        # Close only the known idle TUI through its pane. Never signal/kill a writer.
+        args.deployment_state["phase"] = "stopping_native_process"
+        subprocess.run(["/opt/homebrew/bin/tmux", "send-keys", "-t", pane[0], "C-d"], check=True)
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            if subprocess.run(["/bin/ps", "-p", str(pid), "-o", "pid="],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode != 0:
+                break
+            time.sleep(0.25)
+        else:
+            raise RuntimeError("native process did not exit normally; no install was attempted")
+
+        database_backups = backup_databases(CODEX_HOME, backup)
+        installed = []
+        replacements = [
+            (args.native, TARGETS["rencrow-switch-core"], 0o755),
+            (args.helper, TARGETS["rencrow-compaction"], 0o755),
+        ]
+        if not facts.get("native_second_pair_update"):
+            replacements.append(
+                (args.config_candidate, CONFIG_TARGET, CONFIG_TARGET.stat().st_mode & 0o777)
+            )
+        try:
+            args.deployment_state["phase"] = "installing_native_pair_and_config"
+            for source, target, mode in replacements:
+                atomic_copy(source, target, mode)
+                installed.append({"path": str(target), "sha256": sha(target),
+                                  "inode": target.stat().st_ino})
+            for target in TARGETS.values():
+                subprocess.run([str(target), "--help"], check=True,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
+            if not CONFIG_TARGET.is_file() or not SETTINGS_TARGET.is_file():
+                raise RuntimeError("installed config or preserved supervisor settings are missing")
+        except Exception:
+            # Restore the old pair/config only before any new native process is started.
+            for name, target in TARGETS.items():
+                atomic_copy(backup / name, target, 0o755)
+            if not facts.get("native_second_pair_update"):
+                atomic_copy(config_backup, CONFIG_TARGET)
+            raise
+        paused_path = SUPERVISION / "PAUSED"
+        # resume.sh refuses to run while PAUSED exists. Hold the exact root marker
+        # aside until the same-thread turn is confirmed, then restore it in finally.
+        with temporarily_remove_maintenance_marker(paused_path, bool(facts["maintenance_ticket"])):
+            args.deployment_state["phase"] = "resuming_same_thread"
+            monitor.send(shlex.join(["/bin/sh", str(SUPERVISION / "resume.sh")]))
+            resumed = None
+            deadline = time.monotonic() + 60
+            while time.monotonic() < deadline:
+                time.sleep(1)
+                current = monitor.snapshot()
+                if current.get("thread") != args.thread:
+                    continue
+                try:
+                    new_pid = monitor.target_process_pid(current)
+                except (RuntimeError, ValueError, KeyError):
+                    continue
+                turn = current.get("turn_observation", {})
+                processes = current.get("target_processes", [])
+                process = next((item for item in processes if item.get("pid") == new_pid), None)
+                if new_pid == pid or not turn.get("active") or process is None:
+                    continue
+                command = process.get("command", "")
+                expected_worker = json.loads((SUPERVISION / "completion-contract.json").read_text())\
+                    .get("active_task", {}).get("worker_config_file")
+                if (process.get("codex_home") != str(CODEX_HOME)
+                        or "-m qwen38-flash--rtx5060" not in command
+                        or 'model_reasoning_effort="xhigh"' not in command
+                        or (expected_worker and expected_worker not in command)):
+                    raise RuntimeError("same-thread resume did not preserve model/effort/CODEX_HOME/worker override")
+                executable = TARGETS["rencrow-switch-core"]
+                opened = subprocess.run(
+                    ["/usr/sbin/lsof", "-a", "-p", str(new_pid), "-d", "txt", "-F", "in"],
+                    text=True, capture_output=True, check=False,
+                ).stdout.splitlines()
+                opened_paths = {line[1:] for line in opened if line.startswith("n")}
+                opened_inodes = {line[1:] for line in opened if line.startswith("i")}
+                if (str(executable) not in opened_paths
+                        or str(executable.stat().st_ino) not in opened_inodes):
+                    raise RuntimeError("resumed process is not running the installed native inode")
+                monitor.save(backup / "resumed-snapshot.json", current)
+                resumed = {"pid": new_pid, "turn_id": turn.get("turn_id"),
+                           "binary_inode": executable.stat().st_ino,
+                           "binary_sha256": sha(executable),
+                           "codex_home": process.get("codex_home"),
+                           "model_effort_worker_preserved": True}
+                break
+            if resumed is None:
+                raise RuntimeError("same-thread active turn not confirmed; inspect the pane, do not retry blindly")
+        return {
+            "backup": str(backup),
+            "database_backups": database_backups,
+            "old_pid": pid,
+            "installed": installed,
+            "resume_command": "/bin/sh " + str(SUPERVISION / "resume.sh"),
+            "resumed": resumed,
+            "preserved_unverified_diff": facts["unverified_diff"],
+        }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--native", type=Path, required=True, help="explicit candidate rencrow-switch-core")
+    parser.add_argument("--helper", type=Path, required=True, help="explicit candidate rencrow-compaction")
+    parser.add_argument("--manifest", type=Path, required=True, help="candidate binary hash manifest")
+    parser.add_argument("--config-candidate", type=Path, required=True, help="staged durable config.toml")
+    parser.add_argument("--settings-candidate", type=Path, required=True, help="staged supervisor settings JSON")
+    parser.add_argument(
+        "--supervisor-activation", type=Path, default=SUPERVISOR_ACTIVATION,
+        help="reviewed activation result that pins the live native-aware supervisor",
+    )
+    parser.add_argument("--thread", default=THREAD)
+    parser.add_argument("--supervise-script", type=Path, default=SUPERVISION / "supervise.py")
+    parser.add_argument("--backup-root", type=Path, default=ROOT / "Tmp/autonomous-completion-20261111/deployments")
+    parser.add_argument("--apply", action="store_true", help="perform deployment; default is read-only dry-run")
+    args = parser.parse_args()
+    try:
+        monitor, snapshot, facts = preflight(args)
+        blockers = snapshot.get("deployment_blockers", [])
+        result = {
+            "mode": "apply" if args.apply else "dry_run",
+            "deployment_route": "native_aware_second_pair" if facts.get("native_second_pair_update") else "initial_native_pair",
+            "thread": snapshot.get("thread"),
+            "target_pid": facts["pid"],
+            "candidate_hashes": facts["candidate_hashes"],
+            "unverified_diff": facts["unverified_diff"],
+            "diff_revision": facts["diff_revision"],
+            "verified_diff_revision": facts["verified_diff_revision"],
+            "config_changes": facts["config_changes"],
+            "supervisor_settings_changes": facts["settings_changes"],
+            "terminal_child_background_sessions": facts["terminal_child_background_sessions"],
+            "blockers": blockers,
+            "gateway_action": "none; already-deployed gateway and provider config are untouched",
+            "gateway_8090_lsof": facts["gateway_8090_lsof"],
+            "system_gateway_launchctl_exit": facts["system_gateway_launchctl_exit"],
+        }
+        if args.apply:
+            result["deployment"] = apply(args, monitor, snapshot, facts)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 3 if blockers else 0
+    except Exception as error:
+        print(json.dumps(apply_failure_report(args, error), ensure_ascii=False), file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

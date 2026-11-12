@@ -3288,6 +3288,30 @@ mod tests {
     }
 
     #[test]
+    fn resume_preserves_leaf_scoped_timestamp_effort_and_guard_overrides() {
+        let interactive = finalize_resume_from_args(&[
+            "codex",
+            "resume",
+            "--last",
+            "-c",
+            "tui.rencrow_tui_jst_timestamps=true",
+            "-c",
+            "model_reasoning_effort=\"xhigh\"",
+            "-c",
+            "rencrow_execution_guard.task_kind=\"orchestrate\"",
+        ]);
+
+        assert_eq!(
+            interactive.config_overrides.raw_overrides,
+            vec![
+                "tui.rencrow_tui_jst_timestamps=true".to_string(),
+                "model_reasoning_effort=\"xhigh\"".to_string(),
+                "rencrow_execution_guard.task_kind=\"orchestrate\"".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn later_approve_for_me_overrides_root_tui_approval_policy() {
         let interactive = finalize_resume_from_args(&[
             "codex",

@@ -616,6 +616,12 @@ async fn apply_hunks_to_files(
                     sandbox,
                 )
                 .await?;
+                if move_path.is_none() && original_contents == new_contents {
+                    anyhow::bail!(
+                        "Update for file {} does not change file contents.",
+                        affected_path.display()
+                    );
+                }
                 if let Some(dest) = move_path {
                     let dest_uri = cwd.join(&dest.to_string_lossy())?;
                     let overwritten_move_content = read_optional_file_text_for_delta(

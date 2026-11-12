@@ -728,6 +728,12 @@ pub struct Config {
     /// Select the fork-owned local compaction pipeline.
     pub rencrow_compaction: bool,
 
+    /// Opt-in parent continuation from host-verified completion state.
+    pub rencrow_autonomous_completion: bool,
+
+    /// Native, opt-in execution progress limits.
+    pub rencrow_execution_guard: Option<codex_config::RencrowExecutionGuard>,
+
     /// Tools shown to the model and accepted when called; `None` keeps every tool
     /// (ROLE_TOOL_POLICY.md).
     pub rencrow_tool_allowlist: Option<Vec<String>>,
@@ -811,6 +817,9 @@ pub struct Config {
 
     /// Whether to color status line items with colors from the active syntax theme.
     pub tui_status_line_use_colors: bool,
+
+    /// Show RenCrow's fixed-JST activity timestamp in the TUI footer.
+    pub tui_rencrow_jst_timestamps: bool,
 
     /// Ordered list of terminal title item identifiers for the TUI.
     ///
@@ -4254,6 +4263,8 @@ impl Config {
             developer_instructions,
             compact_prompt,
             rencrow_compaction: cfg.rencrow_compaction.unwrap_or(false),
+            rencrow_autonomous_completion: cfg.rencrow_autonomous_completion.unwrap_or(false),
+            rencrow_execution_guard: cfg.rencrow_execution_guard,
             rencrow_tool_allowlist: cfg.rencrow_tool_allowlist,
             // Only an agent role file narrows the sandbox; a top-level value is ignored.
             rencrow_read_only: false,
@@ -4468,6 +4479,10 @@ impl Config {
                 .as_ref()
                 .map(|t| t.status_line_use_colors)
                 .unwrap_or(true),
+            tui_rencrow_jst_timestamps: cfg
+                .tui
+                .as_ref()
+                .is_some_and(|tui| tui.rencrow_tui_jst_timestamps),
             tui_terminal_title: cfg.tui.as_ref().and_then(|t| t.terminal_title.clone()),
             tui_theme: cfg.tui.as_ref().and_then(|t| t.theme.clone()),
             tui_pet: cfg.tui.as_ref().and_then(|t| t.pet.clone()),

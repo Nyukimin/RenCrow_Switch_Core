@@ -9,8 +9,11 @@ pub mod compaction_checkpoint_metadata;
 pub mod compaction_pipeline;
 pub mod compaction_preprocess;
 pub mod compaction_selection;
+// Modified by RenCrow: ID-only model selection contract.
+pub mod compaction_selection_wire;
 pub use archive_reference::ArchiveReference;
 pub use archive_reference::ArchiveTerminalStatus;
+pub use archive_reference::BlockedToolCallReference;
 pub use archive_reference::ObservationReference;
 pub use compaction_checkpoint_metadata::CheckpointResponseStage;
 pub use compaction_checkpoint_metadata::CompactionModelResponseReceipt;
@@ -26,6 +29,8 @@ pub mod compaction_transaction;
 pub mod input_intake;
 pub mod observation_marker;
 pub mod observation_projection;
+pub mod task_checkpoint_metadata;
+pub mod task_context;
 pub use observation_projection::ObservationCoverage;
 pub use observation_projection::ObservationPartCoverage;
 pub use observation_projection::ObservationPartExcerpt;
@@ -33,6 +38,10 @@ pub use observation_projection::ObservationProjection;
 pub use observation_projection::ObservationSummaryExcerpt;
 pub use observation_projection::project_existing_observation;
 pub use observation_projection::project_observation;
+pub use task_checkpoint_metadata::RenCrowTaskCheckpointMetadataV3;
+pub use task_checkpoint_metadata::TaskBoundarySourceFence;
+pub use task_checkpoint_metadata::TaskBoundarySourceRef;
+pub use task_checkpoint_metadata::TaskCheckpointMode;
 
 mod compaction_checkpoint;
 pub use compaction_checkpoint::CompactionCheckpoint;
@@ -95,6 +104,10 @@ pub struct CodexHarnessMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rencrow_observation_projection: Option<Box<observation_projection::ObservationCoverage>>,
 
+    /// Host proof that this exact tool output was blocked before its handler ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rencrow_blocked_tool_call: Option<Box<archive_reference::BlockedToolCallReference>>,
+
     /// RenCrow accepted original-input reference; never sent as model instructions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rencrow_input: Option<serde_json::Value>,
@@ -102,6 +115,10 @@ pub struct CodexHarnessMetadata {
     /// Validated compaction provenance persisted with its summary checkpoint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rencrow_compaction: Option<serde_json::Value>,
+
+    /// Host-owned autonomous completion snapshot, never interpreted from model text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rencrow_completion: Option<serde_json::Value>,
 
     /// Whether a developer message was supplied by an app-server client.
     #[serde(default)]

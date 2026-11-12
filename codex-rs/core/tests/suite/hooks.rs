@@ -4796,6 +4796,82 @@ print(json.dumps({{
         "plugin hook should block shell command execution"
     );
 
+    let thread_id = test.session_configured.thread_id;
+    let rollout_path = codex_rollout::find_thread_path_by_id_str(
+        test.codex_home_path(),
+        &thread_id.to_string(),
+        /*state_db_ctx*/ None,
+    )
+    .await?
+    .expect("blocked tool call rollout should be persisted");
+    let (rollout_items, persisted_thread_id, parse_errors) =
+        codex_rollout::RolloutRecorder::load_rollout_items(&rollout_path).await?;
+    assert_eq!(persisted_thread_id, Some(thread_id));
+    assert_eq!(parse_errors, 0);
+    let selected = rollout_items
+        .iter()
+        .filter_map(|item| match item {
+            RolloutItem::ResponseItem(envelope) => match &envelope.item {
+                ResponseItem::FunctionCall {
+                    call_id: item_call_id,
+                    ..
+                } if item_call_id == call_id => Some(envelope.clone()),
+                ResponseItem::FunctionCallOutput {
+                    call_id: Some(item_call_id),
+                    ..
+                } if item_call_id == call_id => Some(envelope.clone()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(selected.len(), 2, "persisted call and output should match");
+    let blocked_output = selected
+        .iter()
+        .find(|envelope| matches!(&envelope.item, ResponseItem::FunctionCallOutput { .. }))
+        .expect("persisted blocked output");
+    let blocked_body = match &blocked_output.item {
+        ResponseItem::FunctionCallOutput { output, .. } => output
+            .text_content()
+            .expect("blocked output should be canonical text"),
+        _ => unreachable!(),
+    };
+    let blocked_reference = blocked_output
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.rencrow_blocked_tool_call.as_deref())
+        .expect("host should persist typed pre-handler block evidence");
+    assert_eq!(
+        blocked_reference.observation.thread_id,
+        thread_id.to_string()
+    );
+    assert_eq!(blocked_reference.observation.call_id, call_id);
+    assert_eq!(
+        blocked_reference.observation.sha256,
+        codex_history::archive_reference::content_sha256(blocked_body)
+    );
+
+    let prepared = codex_rollout::prepare_compaction_sources(
+        &selected,
+        &rollout_items,
+        &thread_id,
+        &Default::default(),
+    )
+    .map_err(anyhow::Error::msg)?;
+    assert_eq!(prepared.pairs.len(), 1);
+    assert_eq!(prepared.pairs[0].terminal_reference, None);
+    assert!(
+        prepared.pairs[0]
+            .canonical_output_text
+            .as_deref()
+            .is_some_and(|text| text.contains("Command blocked by PreToolUse hook"))
+    );
+    assert!(!rollout_items.iter().any(|item| matches!(
+        item,
+        RolloutItem::EventMsg(EventMsg::ItemCompleted(event))
+            if matches!(&event.item, codex_protocol::items::TurnItem::CommandExecution(command) if command.id == call_id)
+    )));
+
     let hook_inputs = read_hook_inputs_from_log(&log_path)?;
     assert_eq!(hook_inputs.len(), 1);
     assert_eq!(hook_inputs[0]["hook_event_name"], "PreToolUse");

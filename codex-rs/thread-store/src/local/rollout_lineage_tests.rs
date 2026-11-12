@@ -232,14 +232,32 @@ async fn rejects_missing_cycles_and_out_of_bounds_offsets() {
         Some(HistoryPosition {
             thread_id: root,
             end_ordinal_exclusive: 2,
-            end_byte_offset: fs::metadata(root_path).expect("root metadata").len() + 1,
+            end_byte_offset: fs::metadata(&root_path).expect("root metadata").len() + 1,
         }),
         /*next_ordinal*/ 2,
     );
     assert_invalid_lineage(
         &store,
         invalid_child,
-        "cutoff byte offset is past the source rollout",
+        "cutoff byte offset does not match the source rollout ordinal",
+    )
+    .await;
+
+    let mismatch_child = ThreadId::default();
+    write_rollout(
+        home.path(),
+        mismatch_child,
+        Some(HistoryPosition {
+            thread_id: root,
+            end_ordinal_exclusive: 2,
+            end_byte_offset: rollout_end_byte_offset(root_path.as_path(), 1),
+        }),
+        /*next_ordinal*/ 2,
+    );
+    assert_invalid_lineage(
+        &store,
+        mismatch_child,
+        "cutoff byte offset does not match the source rollout ordinal",
     )
     .await;
 }

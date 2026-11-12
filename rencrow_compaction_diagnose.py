@@ -39,8 +39,10 @@ def _preceding_usage_response(row, thread_id):
     if _safe_id(row.get("thread_id")) != thread_id:
         return None, "preceding_token_usage_thread_mismatch"
     response_id = _safe_id(row.get("response_id"))
-    return (response_id, "candidate_available") if response_id else (
-        None, "invalid_preceding_response_id"
+    return (
+        (response_id, "candidate_available")
+        if response_id
+        else (None, "invalid_preceding_response_id")
     )
 
 
@@ -98,6 +100,7 @@ def rollout_events(path):
                     "model_selection",
                     "no_candidates",
                     "deterministic_emergency",
+                    "conservative_selection",
                 ):
                     raise ValueError(f"{path}:{number}: unknown V2 selection mode")
                 responses = metadata.get("responses") or []
@@ -179,9 +182,7 @@ def v2_log_events(path, thread_id, checkpoints, capture_bodies=False):
             auto = AUTO_COMPACT.search(body_text)
             warning = {
                 "log_id": row[0],
-                "timestamp": datetime.fromtimestamp(
-                    row[1], timezone.utc
-                ).isoformat(),
+                "timestamp": datetime.fromtimestamp(row[1], timezone.utc).isoformat(),
                 "level": row[2],
                 "reason": _reason(body_text),
                 "trigger": _safe_id(auto.group(1)) if auto else None,
@@ -227,9 +228,7 @@ def _safe_bundle_file(root, relative):
     ):
         return None, "unsafe_payload_path"
     candidate = root.joinpath(*parts)
-    if any(
-        root.joinpath(*parts[:i]).is_symlink() for i in range(1, len(parts) + 1)
-    ):
+    if any(root.joinpath(*parts[:i]).is_symlink() for i in range(1, len(parts) + 1)):
         return None, "payload_path_symlink"
     try:
         resolved = candidate.resolve(strict=True)
@@ -383,7 +382,12 @@ def diagnose(rollout, logs_db=None, trace_bundle=None, warning_output=None):
         "v2_checkpoint_count": len(checkpoints),
         "normal_count": sum(
             c["commit_line"] is not None
-            and c["selection_mode"] != "deterministic_emergency"
+            and c["selection_mode"] in ("model_selection", "no_candidates")
+            for c in checkpoints
+        ),
+        "conservative_count": sum(
+            c["commit_line"] is not None
+            and c["selection_mode"] == "conservative_selection"
             for c in checkpoints
         ),
         "emergency_count": sum(
@@ -417,7 +421,8 @@ def diagnose(rollout, logs_db=None, trace_bundle=None, warning_output=None):
         targets = {c.get("_response_id") for c in emergency if c.get("_response_id")}
         trace_status, found, path_uses = (
             _trace_index(trace_bundle, thread_id, targets)
-            if targets else (None, {}, {})
+            if targets
+            else (None, {}, {})
         )
         try:
             root = (

@@ -211,6 +211,25 @@ async fn derive_legacy_sandbox_policy_for_test(
 }
 
 #[tokio::test]
+async fn load_config_autonomous_completion_is_explicit_opt_in() -> std::io::Result<()> {
+    let codex_home = tempdir()?;
+    for (source, expected) in [
+        ("", false),
+        ("rencrow_autonomous_completion = false", false),
+        ("rencrow_autonomous_completion = true", true),
+    ] {
+        let config = Config::load_from_base_config_with_overrides(
+            toml::from_str(source).expect("valid autonomous completion configuration"),
+            ConfigOverrides::default(),
+            codex_home.abs(),
+        )
+        .await?;
+        assert_eq!(config.rencrow_autonomous_completion, expected);
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn load_config_normalizes_relative_cwd_override() -> std::io::Result<()> {
     let expected_cwd = AbsolutePathBuf::relative_to_current_dir("nested")?;
     let codex_home = tempdir()?;
@@ -1266,6 +1285,7 @@ fn config_toml_deserializes_model_availability_nux() {
             alternate_screen: AltScreenMode::default(),
             status_line: None,
             status_line_use_colors: true,
+            rencrow_tui_jst_timestamps: false,
             terminal_title: None,
             theme: None,
             pet: None,
@@ -4396,6 +4416,7 @@ fn tui_config_missing_notifications_field_defaults_to_enabled() {
             alternate_screen: AltScreenMode::Auto,
             status_line: None,
             status_line_use_colors: true,
+            rencrow_tui_jst_timestamps: false,
             terminal_title: None,
             theme: None,
             pet: None,
@@ -8564,6 +8585,7 @@ async fn load_config_rejects_missing_agent_role_config_file() -> std::io::Result
             roles: BTreeMap::from([(
                 "researcher".to_string(),
                 AgentRoleToml {
+                    enabled: None,
                     description: Some("Research role".to_string()),
                     config_file: Some(missing_path.abs()),
                     nickname_candidates: None,
@@ -8608,6 +8630,7 @@ async fn agent_role_relative_config_file_resolves_against_config_toml() -> std::
         r#"[agents.researcher]
 description = "Research role"
 config_file = "./agents/researcher.toml"
+enabled = false
 nickname_candidates = ["Hypatia", "Noether"]
 "#,
     )
@@ -8632,6 +8655,13 @@ nickname_candidates = ["Hypatia", "Noether"]
             .and_then(|role| role.nickname_candidates.as_ref())
             .map(|candidates| candidates.iter().map(String::as_str).collect::<Vec<_>>()),
         Some(vec!["Hypatia", "Noether"])
+    );
+    assert_eq!(
+        config
+            .agent_roles
+            .get("researcher")
+            .and_then(|role| role.enabled),
+        Some(false)
     );
 
     Ok(())
@@ -9579,6 +9609,7 @@ async fn load_config_normalizes_agent_role_nickname_candidates() -> std::io::Res
             roles: BTreeMap::from([(
                 "researcher".to_string(),
                 AgentRoleToml {
+                    enabled: None,
                     description: Some("Research role".to_string()),
                     config_file: None,
                     nickname_candidates: Some(vec![
@@ -9625,6 +9656,7 @@ async fn load_config_rejects_empty_agent_role_nickname_candidates() -> std::io::
             roles: BTreeMap::from([(
                 "researcher".to_string(),
                 AgentRoleToml {
+                    enabled: None,
                     description: Some("Research role".to_string()),
                     config_file: None,
                     nickname_candidates: Some(Vec::new()),
@@ -9665,6 +9697,7 @@ async fn load_config_rejects_duplicate_agent_role_nickname_candidates() -> std::
             roles: BTreeMap::from([(
                 "researcher".to_string(),
                 AgentRoleToml {
+                    enabled: None,
                     description: Some("Research role".to_string()),
                     config_file: None,
                     nickname_candidates: Some(vec!["Hypatia".to_string(), " Hypatia ".to_string()]),
@@ -9705,6 +9738,7 @@ async fn load_config_rejects_unsafe_agent_role_nickname_candidates() -> std::io:
             roles: BTreeMap::from([(
                 "researcher".to_string(),
                 AgentRoleToml {
+                    enabled: None,
                     description: Some("Research role".to_string()),
                     config_file: None,
                     nickname_candidates: Some(vec!["Agent <One>".to_string()]),

@@ -6,7 +6,10 @@ use super::*;
 
 impl ChatComposer {
     pub(super) fn status_surface_height(&self, options: ComposerRenderOptions<'_>) -> u16 {
-        u16::from(options.separate_status_line && self.footer.status_line_enabled)
+        u16::from(
+            options.separate_status_line
+                && (self.footer.status_line_enabled || self.footer.activity_context.is_some()),
+        )
     }
 
     pub(super) fn hint_footer_props(&self, options: ComposerRenderOptions<'_>) -> FooterProps {
@@ -15,6 +18,7 @@ impl ChatComposer {
             props.status_line_enabled = false;
             props.status_line_value = None;
             props.active_agent_label = None;
+            props.activity_context = None;
         }
         props
     }

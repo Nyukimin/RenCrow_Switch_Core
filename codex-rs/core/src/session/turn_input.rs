@@ -245,10 +245,78 @@ pub(super) async fn handle(
             )
             .await
         }
+        TurnInputMode::AutonomousContinueIfIdle {
+            expected_previous_turn_id,
+        } => {
+            if !matches!(&request.input, SubmittedTurnInput::ResponseItem(_)) {
+                return Err(CodexErr::InvalidRequest(
+                    "autonomous continuation requires internal response input".to_string(),
+                ));
+            }
+            start_if_idle(
+                session,
+                request,
+                submission_id,
+                TurnStartKind::Automatic,
+                Some(expected_previous_turn_id),
+            )
+            .await
+        }
         TurnInputMode::Steer { expected_turn_id } => {
             steer(session, request, expected_turn_id, submission_id).await
         }
     }
+}
+
+async fn is_explicit_human_autonomous_resume(
+    session: &Session,
+    input: &SubmittedTurnInput,
+) -> bool {
+    let SubmittedTurnInput::UserInput { content, .. } = input else {
+        return false;
+    };
+    let SubmittedTurnInput::UserInput { client_id, .. } = input else {
+        return false;
+    };
+    let Some(client_id) = client_id
+        .as_deref()
+        .filter(|id| codex_history::input_intake::valid_intake_id(id))
+    else {
+        return false;
+    };
+    let [UserInput::Text { text, .. }] = content.as_slice() else {
+        return false;
+    };
+    let text = text.trim();
+    if !(text.eq_ignore_ascii_case("resume autonomous completion")
+        || text == "自律作業を再開"
+        || text == "続けて")
+    {
+        return false;
+    }
+    let config = session.get_config().await;
+    let thread_id = session.thread_id().to_string();
+    let path = config
+        .codex_home
+        .join("rencrow/input-intake")
+        .join(&thread_id)
+        .join(format!("{client_id}.json"));
+    let Ok(metadata) = tokio::fs::metadata(&path).await else {
+        return false;
+    };
+    if metadata.len() > 1_048_576 {
+        return false;
+    }
+    let Ok(bytes) = tokio::fs::read(path).await else {
+        return false;
+    };
+    let Ok(receipt) =
+        serde_json::from_slice::<codex_history::input_intake::SubmissionIntake>(&bytes)
+    else {
+        return false;
+    };
+    receipt.matches_accepted(&thread_id, client_id, text)
+        && receipt.original.author == codex_history::input_intake::InputAuthor::Human
 }
 
 pub(super) async fn handle_recovery(
@@ -380,6 +448,19 @@ async fn start_if_idle(
     kind: TurnStartKind,
     expected_previous_turn_id: Option<String>,
 ) -> CodexResult<TurnInputSubmission> {
+    let explicit_completion_resume = kind == TurnStartKind::User
+        && expected_previous_turn_id.is_none()
+        && session.get_config().await.rencrow_autonomous_completion
+        && is_explicit_human_autonomous_resume(session, &request.input).await
+        && matches!(
+            session
+                .state
+                .lock()
+                .await
+                .session_configuration
+                .session_source,
+            SessionSource::Cli | SessionSource::VSCode | SessionSource::Exec
+        );
     let TurnInputRequest {
         input,
         thread_settings,
@@ -388,6 +469,13 @@ async fn start_if_idle(
         responsesapi_client_metadata,
         ..
     } = request;
+    let autonomous_continuation = expected_previous_turn_id.is_some()
+        && session.get_config().await.rencrow_autonomous_completion;
+    if autonomous_continuation && session.autonomous_completion_paused().await {
+        return Err(CodexErr::InvalidRequest(
+            "autonomous completion is paused by an explicit stop".to_string(),
+        ));
+    }
     if session.input_queue.has_trigger_turn_mailbox_items().await {
         return Ok(TurnInputSubmission::NotSubmitted {
             reason: NotSubmittedReason::PendingTriggerTurn,
@@ -430,6 +518,11 @@ async fn start_if_idle(
             return Ok(TurnInputSubmission::NotSubmitted {
                 reason: NotSubmittedReason::NotIdle,
             });
+        }
+        if autonomous_continuation && session.autonomous_completion_paused().await {
+            return Err(CodexErr::InvalidRequest(
+                "autonomous completion was paused before turn admission".to_string(),
+            ));
         }
         if let Some(expected) = expected_previous_turn_id
             && session.state.lock().await.last_started_turn_id.as_ref() != Some(&expected)
@@ -504,6 +597,22 @@ async fn start_if_idle(
             }
         }
     }
+    if autonomous_continuation
+        && !session
+            .mark_autonomous_completion_turn(submission_id.clone())
+            .await
+    {
+        session.clear_reserved_idle_turn(&turn_state).await;
+        return Err(CodexErr::InvalidRequest(
+            "autonomous completion was paused during turn preparation".to_string(),
+        ));
+    }
+    if explicit_completion_resume
+        && let Err(error) = session.resume_autonomous_completion_from_user_turn().await
+    {
+        session.clear_reserved_idle_turn(&turn_state).await;
+        return Err(CodexErr::InvalidRequest(error));
+    }
     session
         .start_task(turn_context, task_input, RegularTask::new())
         .await;
@@ -553,7 +662,20 @@ async fn steer(
 impl Session {
     /// Called under the active-turn lock before running any task or lifecycle callback.
     pub(crate) async fn record_started_turn(&self, turn_id: &str) {
-        self.state.lock().await.last_started_turn_id = Some(turn_id.to_string());
+        let mut state = self.state.lock().await;
+        state.last_started_turn_id = Some(turn_id.to_string());
+        state.rencrow_execution_evidence = None;
+        // Publish admission before returning Started to callers that immediately inspect agent
+        // status. The later TurnStarted event remains the normal lifecycle event.
+        let current_status = self.agent_status.borrow().clone();
+        if !matches!(
+            &current_status,
+            codex_protocol::protocol::AgentStatus::Shutdown
+        ) && current_status != codex_protocol::protocol::AgentStatus::Running
+        {
+            self.agent_status
+                .send_replace(codex_protocol::protocol::AgentStatus::Running);
+        }
     }
 
     pub(crate) async fn route_realtime_text_input(

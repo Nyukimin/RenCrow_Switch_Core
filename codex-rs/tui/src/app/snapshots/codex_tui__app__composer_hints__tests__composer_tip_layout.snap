@@ -1,10 +1,11 @@
 ---
 source: tui/src/app/composer_hints_tests.rs
+assertion_line: 234
 expression: "crate::chatwidget::tests::helpers::normalize_snapshot_paths(snapshots.join(\"\\n\\n\"))"
 ---
 80 columns
-› question
 
+Subagents: 0 running / 0 total · /subagents details
                                     Tip: Press f12 to search this conversation.
 
 › Ask Codex to do anything
@@ -13,8 +14,8 @@ expression: "crate::chatwidget::tests::helpers::normalize_snapshot_paths(snapsho
   ? for shortcuts
 
 32 columns
-› question
 
+Subagents: 0 running / 0 tota...
 
 
 › Ask Codex to do anything

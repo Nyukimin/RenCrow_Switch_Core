@@ -27,6 +27,8 @@ pub(crate) mod request_user_input_spec;
 mod send_message_to_user_async;
 pub(crate) mod shell_spec;
 mod sleep;
+pub(crate) mod task_context_boundary;
+pub(crate) mod task_context_boundary_spec;
 mod test_sync;
 pub(crate) mod test_sync_spec;
 mod tool_search;

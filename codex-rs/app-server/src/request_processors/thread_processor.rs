@@ -3675,6 +3675,7 @@ impl ThreadRequestProcessor {
             developer_instructions,
             personality,
             exclude_turns,
+            defer_autonomous_completion,
             initial_turns_page,
         } = params.clone();
         let include_turns = !exclude_turns;
@@ -3926,7 +3927,7 @@ impl ThreadRequestProcessor {
 
         match self
             .thread_manager
-            .resume_thread_with_history(
+            .resume_thread_with_history_for_completion(
                 config,
                 thread_history,
                 self.auth_manager.clone(),
@@ -3937,6 +3938,8 @@ impl ThreadRequestProcessor {
                     ThreadResumeTarget::DaemonRecovery(_) => None,
                 },
                 client_mcp_extensions,
+                !defer_autonomous_completion.unwrap_or(true)
+                    && matches!(&target, ThreadResumeTarget::Client(_)),
             )
             .await
         {

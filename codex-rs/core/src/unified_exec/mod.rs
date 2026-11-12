@@ -129,6 +129,7 @@ pub(crate) struct ExecCommandRequest {
     pub additional_permissions_preapproved: bool,
     pub justification: Option<String>,
     pub prefix_rule: Option<Vec<String>>,
+    pub task_evidence: Option<crate::task_check::TaskCheckExecution>,
 }
 
 #[derive(Debug)]
@@ -202,6 +203,7 @@ struct ProcessEntry {
     network_approval: Option<DeferredNetworkApproval>,
     session: Weak<Session>,
     last_used: tokio::time::Instant,
+    task_evidence: Option<crate::task_check::TaskCheckExecution>,
 }
 
 type SharedPluginMetricsSidecar = Arc<std::sync::Mutex<Option<PluginMetricsSidecar>>>;

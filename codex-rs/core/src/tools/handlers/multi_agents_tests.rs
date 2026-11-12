@@ -18,6 +18,9 @@ use crate::session::tests::update_selected_settings_for_test;
 use crate::session::tests::update_turn_settings_for_test;
 use crate::session::turn_context::TurnContext;
 use crate::session_prefix::format_inter_agent_completion_message;
+use crate::state::TaskKind;
+use crate::tasks::SessionTask;
+use crate::tasks::SessionTaskResult;
 use crate::thread_manager::thread_store_from_config;
 use crate::tools::context::ToolOutput;
 use crate::tools::handlers::multi_agents_v2::FollowupTaskHandler as FollowupTaskHandlerV2;
@@ -83,6 +86,30 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
+
+#[derive(Clone, Copy)]
+struct PendingWaitTestTask;
+
+impl SessionTask for PendingWaitTestTask {
+    fn kind(&self) -> TaskKind {
+        TaskKind::Regular
+    }
+
+    fn span_name(&self) -> &'static str {
+        "multi_agents_tests.pending_wait_task"
+    }
+
+    async fn run(
+        self: Arc<Self>,
+        _session: Arc<crate::session::session::Session>,
+        _ctx: Arc<TurnContext>,
+        _input: Vec<crate::session::TurnInput>,
+        cancellation_token: CancellationToken,
+    ) -> SessionTaskResult {
+        cancellation_token.cancelled().await;
+        Ok(None)
+    }
+}
 
 fn invocation(
     session: Arc<crate::session::session::Session>,
@@ -166,6 +193,7 @@ model_reasoning_effort = "minimal"
     config.agent_roles.insert(
         role_name.clone(),
         AgentRoleConfig {
+            enabled: None,
             description: Some("Role with model overrides".to_string()),
             config_file: Some(role_config_path),
             nickname_candidates: None,
@@ -378,6 +406,135 @@ async fn spawn_agent_fork_context_rejects_agent_type_override() {
 }
 
 #[tokio::test]
+async fn spawn_agent_explicit_model_and_effort_override_role_defaults() {
+    let (mut session, mut turn) = make_session_and_context().await;
+    let role_name = install_role_with_model_override(&mut turn).await;
+    let role_path = turn.config.agent_roles[&role_name]
+        .config_file
+        .as_ref()
+        .expect("test role should have a config file");
+    std::fs::write(
+        role_path,
+        "model = \"gpt-5.4\"\nmodel_reasoning_effort = \"high\"\n",
+    )
+    .expect("update test role reasoning effort");
+    let manager = thread_manager();
+    let root = manager
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .await
+        .expect("root thread should start");
+    session.services.agent_control = manager.agent_control();
+    session.thread_id = root.thread_id;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+
+    let explicit_output = SpawnAgentHandler::default()
+        .handle(invocation(
+            session.clone(),
+            turn.clone(),
+            "spawn_agent",
+            function_payload(json!({
+                "message": "use explicit child settings",
+                "agent_type": role_name,
+                "model": "gpt-5.5",
+                "reasoning_effort": "low",
+                "fork_context": false
+            })),
+        ))
+        .await
+        .expect("spawn_agent should honor explicit settings");
+    let (content, _) = expect_text_output(explicit_output);
+    let explicit_result: serde_json::Value =
+        serde_json::from_str(&content).expect("spawn_agent result should be json");
+    let explicit_snapshot = manager
+        .get_thread(parse_agent_id(
+            explicit_result["agent_id"]
+                .as_str()
+                .expect("spawn result should contain an agent id"),
+        ))
+        .await
+        .expect("explicit child should exist")
+        .config_snapshot()
+        .await;
+    assert_eq!(explicit_snapshot.model, "gpt-5.5");
+    assert_eq!(
+        explicit_snapshot.reasoning_effort,
+        Some(ReasoningEffort::Low)
+    );
+
+    let mut effort_invocation = invocation(
+        session.clone(),
+        turn.clone(),
+        "spawn_agent",
+        function_payload(json!({
+            "message": "use explicit effort with role model",
+            "agent_type": role_name,
+            "reasoning_effort": "low",
+            "fork_context": false
+        })),
+    );
+    let settings = Arc::make_mut(
+        &mut Arc::get_mut(&mut effort_invocation.step_context)
+            .expect("step context should be uniquely owned")
+            .settings,
+    );
+    Arc::make_mut(&mut settings.model_info)
+        .supported_reasoning_levels
+        .clear();
+    let effort_output = SpawnAgentHandler::default()
+        .handle(effort_invocation)
+        .await
+        .expect("spawn_agent should validate explicit effort against the role model");
+    let (content, _) = expect_text_output(effort_output);
+    let effort_result: serde_json::Value =
+        serde_json::from_str(&content).expect("spawn_agent result should be json");
+    let effort_snapshot = manager
+        .get_thread(parse_agent_id(
+            effort_result["agent_id"]
+                .as_str()
+                .expect("spawn result should contain an agent id"),
+        ))
+        .await
+        .expect("effort child should exist")
+        .config_snapshot()
+        .await;
+    assert_eq!(effort_snapshot.model, "gpt-5.4");
+    assert_eq!(effort_snapshot.reasoning_effort, Some(ReasoningEffort::Low));
+
+    let default_output = SpawnAgentHandler::default()
+        .handle(invocation(
+            session,
+            turn,
+            "spawn_agent",
+            function_payload(json!({
+                "message": "use role defaults",
+                "agent_type": role_name,
+                "fork_context": false
+            })),
+        ))
+        .await
+        .expect("spawn_agent should keep role defaults when settings are omitted");
+    let (content, _) = expect_text_output(default_output);
+    let default_result: serde_json::Value =
+        serde_json::from_str(&content).expect("spawn_agent result should be json");
+    let default_snapshot = manager
+        .get_thread(parse_agent_id(
+            default_result["agent_id"]
+                .as_str()
+                .expect("spawn result should contain an agent id"),
+        ))
+        .await
+        .expect("default child should exist")
+        .config_snapshot()
+        .await;
+    assert_eq!(default_snapshot.model, "gpt-5.4");
+    assert_eq!(
+        default_snapshot.reasoning_effort,
+        Some(ReasoningEffort::High)
+    );
+}
+
+#[tokio::test]
 async fn multi_agent_v2_spawn_fork_turns_all_applies_agent_type_override() {
     let (mut session, mut turn) = make_session_and_context().await;
     let role_name = install_role_with_model_override(&mut turn).await;
@@ -577,6 +734,7 @@ service_tier = "priority"
         config.agent_roles.insert(
             role_name.clone(),
             AgentRoleConfig {
+                enabled: None,
                 description: Some("Role with a child service tier".to_string()),
                 config_file: Some(role_config_path),
                 nickname_candidates: None,
@@ -647,6 +805,7 @@ service_tier = "turbo"
     config.agent_roles.insert(
         role_name.clone(),
         AgentRoleConfig {
+            enabled: None,
             description: Some("Role with an unsupported child tier".to_string()),
             config_file: Some(role_config_path),
             nickname_candidates: None,
@@ -2939,6 +3098,191 @@ async fn wait_agent_rejects_empty_targets() {
     );
 }
 
+async fn start_parent_task_for_wait_test(
+    session: &Arc<crate::session::session::Session>,
+    turn: &Arc<TurnContext>,
+) -> Arc<Mutex<crate::state::TurnState>> {
+    session
+        .spawn_task(Arc::clone(turn), Vec::new(), PendingWaitTestTask)
+        .await;
+    session
+        .input_queue
+        .turn_state_for_sub_id(&session.active_turn, &turn.sub_id)
+        .await
+        .expect("parent task turn state should be registered")
+}
+
+async fn queue_parent_steer_for_wait_test(
+    session: &Arc<crate::session::session::Session>,
+    turn_state: &Mutex<crate::state::TurnState>,
+) {
+    session
+        .input_queue
+        .extend_pending_input_for_turn_state(
+            turn_state,
+            vec![crate::session::TurnInput::UserInput {
+                acceptance_order: None,
+                content: vec![UserInput::Text {
+                    text: "continue without waiting for the child".to_string(),
+                    text_elements: Vec::new(),
+                }],
+                client_id: None,
+            }],
+        )
+        .await;
+}
+
+#[tokio::test]
+async fn wait_agent_returns_for_existing_parent_steer_without_status_or_timeout() {
+    let (mut session, turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    session.services.agent_control = manager.agent_control();
+    let child = manager
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .await
+        .expect("child thread should start");
+    let child_id = child.thread_id;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let turn_state = start_parent_task_for_wait_test(&session, &turn).await;
+    queue_parent_steer_for_wait_test(&session, &turn_state).await;
+
+    let output = timeout(
+        Duration::from_millis(500),
+        WaitAgentHandler::default().handle(invocation(
+            session.clone(),
+            turn.clone(),
+            "wait_agent",
+            function_payload(json!({
+                "targets": [child_id.to_string()],
+                "timeout_ms": MIN_WAIT_TIMEOUT_MS
+            })),
+        )),
+    )
+    .await
+    .expect("wait_agent should see already pending parent input")
+    .expect("wait_agent should succeed");
+    let (content, success) = expect_text_output(output);
+    let result: wait::WaitAgentResult =
+        serde_json::from_str(&content).expect("wait_agent result should be json");
+    assert!(result.status.is_empty());
+    assert!(!result.timed_out);
+    assert_eq!(
+        result.message.as_deref(),
+        Some(
+            "Wait interrupted by pending parent input. No child completion was observed; child execution is unchanged."
+        )
+    );
+    assert_eq!(success, None);
+    assert_eq!(
+        session
+            .input_queue
+            .subscribe_activity(Some(turn_state.as_ref()))
+            .await
+            .1,
+        Some(crate::session::InputQueueActivity::Steer)
+    );
+    assert!(session.active_turn.lock().await.is_some());
+    assert!(!crate::agent::status::is_final(
+        &session.services.agent_control.get_status(child_id).await
+    ));
+
+    let _ = child
+        .thread
+        .submit(Op::Shutdown {})
+        .await
+        .expect("shutdown child");
+    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+}
+
+#[tokio::test]
+async fn wait_agent_rechecks_pending_parent_steer_after_mailbox_notification() {
+    let (mut session, turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    session.services.agent_control = manager.agent_control();
+    let child = manager
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .await
+        .expect("child thread should start");
+    let child_id = child.thread_id;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let turn_state = start_parent_task_for_wait_test(&session, &turn).await;
+
+    let wait_task = tokio::spawn({
+        let session = session.clone();
+        let turn = turn.clone();
+        async move {
+            WaitAgentHandler::default()
+                .handle(invocation(
+                    session,
+                    turn,
+                    "wait_agent",
+                    function_payload(json!({
+                        "targets": [child_id.to_string()],
+                        "timeout_ms": MIN_WAIT_TIMEOUT_MS
+                    })),
+                ))
+                .await
+        }
+    });
+    tokio::task::yield_now().await;
+
+    queue_parent_steer_for_wait_test(&session, &turn_state).await;
+    for contents in ["mailbox update one", "mailbox update two"] {
+        session
+            .input_queue
+            .enqueue_mailbox_communication(
+                InterAgentCommunication::new(
+                    AgentPath::root(),
+                    AgentPath::root(),
+                    Vec::new(),
+                    contents.to_string(),
+                    /*trigger_turn*/ false,
+                ),
+                Default::default(),
+            )
+            .await;
+    }
+
+    let output = timeout(Duration::from_millis(500), wait_task)
+        .await
+        .expect("wait_agent should wake and recheck pending input after mailbox notification")
+        .expect("wait task should join")
+        .expect("wait_agent should succeed");
+    let (content, success) = expect_text_output(output);
+    let result: wait::WaitAgentResult =
+        serde_json::from_str(&content).expect("wait_agent result should be json");
+    assert!(result.status.is_empty());
+    assert!(!result.timed_out);
+    assert_eq!(
+        result.message.as_deref(),
+        Some(
+            "Wait interrupted by pending parent input. No child completion was observed; child execution is unchanged."
+        )
+    );
+    assert_eq!(success, None);
+    assert_eq!(
+        session
+            .input_queue
+            .subscribe_activity(Some(turn_state.as_ref()))
+            .await
+            .1,
+        Some(crate::session::InputQueueActivity::Steer)
+    );
+    assert!(session.active_turn.lock().await.is_some());
+    assert!(!crate::agent::status::is_final(
+        &session.services.agent_control.get_status(child_id).await
+    ));
+
+    let _ = child
+        .thread
+        .submit(Op::Shutdown {})
+        .await
+        .expect("shutdown child");
+    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+}
+
 #[tokio::test]
 async fn multi_agent_v2_wait_agent_accepts_timeout_only_argument() {
     let (mut session, mut turn) = make_session_and_context().await;
@@ -3303,7 +3647,8 @@ async fn wait_agent_returns_not_found_for_missing_agents() {
                 (id_a.to_string(), AgentStatus::NotFound),
                 (id_b.to_string(), AgentStatus::NotFound),
             ]),
-            timed_out: false
+            timed_out: false,
+            message: None,
         }
     );
     assert_eq!(success, None);
@@ -3340,7 +3685,8 @@ async fn wait_agent_times_out_when_status_is_not_final() {
         result,
         wait::WaitAgentResult {
             status: HashMap::new(),
-            timed_out: true
+            timed_out: true,
+            message: None,
         }
     );
     assert_eq!(success, None);
@@ -3407,6 +3753,27 @@ async fn wait_agent_returns_final_status_without_timeout() {
         .await
         .expect("subscribe should succeed");
 
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let wait_task = tokio::spawn({
+        let session = session.clone();
+        let turn = turn.clone();
+        async move {
+            WaitAgentHandler::default()
+                .handle(invocation(
+                    session,
+                    turn,
+                    "wait_agent",
+                    function_payload(json!({
+                        "targets": [agent_id.to_string()],
+                        "timeout_ms": 10_000
+                    })),
+                ))
+                .await
+        }
+    });
+    tokio::task::yield_now().await;
+
     let _ = thread
         .thread
         .submit(Op::Shutdown {})
@@ -3416,18 +3783,9 @@ async fn wait_agent_returns_final_status_without_timeout() {
         .await
         .expect("shutdown status should arrive");
 
-    let invocation = invocation(
-        Arc::new(session),
-        Arc::new(turn),
-        "wait_agent",
-        function_payload(json!({
-            "targets": [agent_id.to_string()],
-            "timeout_ms": 10_000
-        })),
-    );
-    let output = WaitAgentHandler::default()
-        .handle(invocation)
+    let output = wait_task
         .await
+        .expect("wait task should join")
         .expect("wait_agent should succeed");
     let (content, success) = expect_text_output(output);
     let result: wait::WaitAgentResult =
@@ -3436,7 +3794,8 @@ async fn wait_agent_returns_final_status_without_timeout() {
         result,
         wait::WaitAgentResult {
             status: HashMap::from([(agent_id.to_string(), AgentStatus::Shutdown)]),
-            timed_out: false
+            timed_out: false,
+            message: None,
         }
     );
     assert_eq!(success, None);

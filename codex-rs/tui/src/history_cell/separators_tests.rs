@@ -4,6 +4,7 @@ use super::*;
 use chrono::NaiveDateTime;
 use chrono::TimeZone;
 use chrono::Timelike;
+use chrono::Utc;
 use codex_otel::RuntimeMetricTotals;
 use pretty_assertions::assert_eq;
 use ratatui::buffer::Buffer;
@@ -112,6 +113,23 @@ fn completion_uses_twenty_four_hour_time_with_dates_and_wrapping() {
         );
     }
     insta::assert_snapshot!(labels.join("\n"));
+}
+
+#[test]
+fn opt_in_completion_timestamp_uses_fixed_jst_with_seconds() {
+    let completed_at = Utc
+        .with_ymd_and_hms(2026, 11, 7, 15, 0, 3)
+        .single()
+        .expect("valid UTC timestamp")
+        .with_timezone(&Local);
+    let cell = FinalMessageSeparator::new(None, /*runtime_metrics*/ None)
+        .with_completed_at(completed_at, ClockFormat::TwelveHour)
+        .with_jst_timestamps(true);
+    insta::assert_snapshot!(
+        cell.label(NaiveDate::from_ymd_opt(2026, 11, 8).unwrap())
+            .expect("completion label"),
+        @"[11-08 00:00:03 JST]"
+    );
 }
 
 #[test]

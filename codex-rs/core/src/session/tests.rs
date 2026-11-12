@@ -1,4 +1,8 @@
 // Modified by RenCrow Switch Core, 2026-09-22: handle durable compaction markers.
+#[path = "autonomous_completion_tests.rs"]
+mod autonomous_completion_tests;
+#[path = "completion_recovery_tests.rs"]
+mod completion_recovery_tests;
 #[path = "notification_tests.rs"]
 mod notification_tests;
 
@@ -5422,6 +5426,7 @@ enabled = false
     child_config.agent_roles.insert(
         "custom".to_string(),
         crate::config::AgentRoleConfig {
+            enabled: None,
             description: None,
             config_file: Some(role_path.to_path_buf()),
             nickname_candidates: None,
@@ -8083,6 +8088,338 @@ async fn spawn_task_turn_span_inherits_dispatch_trace_context() {
     assert_ne!(
         task_context.span().span_context().span_id(),
         dispatch_span_id
+    );
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn normal_idle_shutdown_preserves_open_contract_and_active_scope() {
+    let (session, _turn_context, _rx_event) = make_session_and_context_with_auth_and_config_and_rx(
+        CodexAuth::from_api_key("Test API Key"),
+        Vec::new(),
+        |config| config.rencrow_autonomous_completion = true,
+    )
+    .await;
+    let open =
+        serde_json::from_value::<codex_history::task_context::CompletionState>(serde_json::json!({
+            "contract_revision": 1,
+            "paused": false,
+            "conditions": [{
+                "id": "AC-1", "revision": 1, "result": "requested behavior works",
+                "scope": "test", "verification": "host check passed",
+                "acceptance_criteria": "the host check succeeds", "status": "open"
+            }],
+            "units": [{"id": "unit-1", "purpose": "complete behavior", "status": "planned"}],
+            "blocker": null
+        }))
+        .expect("open host contract fixture");
+    let scope = crate::state::ActiveTaskScope {
+        root_task_id: "root".into(),
+        task_id: "unit-1".into(),
+        task_revision: 1,
+        begin_call_id: "begin-1".into(),
+        start_history_cursor: 0,
+    };
+    {
+        let mut state = session.state.lock().await;
+        state.rencrow_completion_state = Some(("root".into(), open.clone()));
+        state.active_task_scope = Some(scope.clone());
+    }
+
+    handlers::shutdown_session_runtime(&session).await;
+
+    assert!(
+        !session.autonomous_completion_paused().await,
+        "idle transport shutdown must not pause an open autonomous contract"
+    );
+    let (root_task_id, actual_contract) = session
+        .autonomous_completion_current_state()
+        .await
+        .expect("shutdown must retain the host contract");
+    assert_eq!(root_task_id, "root");
+    assert_eq!(actual_contract, open);
+    assert_eq!(session.active_task_scope().await, Some(scope));
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn normal_session_shutdown_does_not_pause_a_completed_autonomous_contract() {
+    let (session, _turn_context, _rx_event) = make_session_and_context_with_auth_and_config_and_rx(
+        CodexAuth::from_api_key("Test API Key"),
+        Vec::new(),
+        |config| config.rencrow_autonomous_completion = true,
+    )
+    .await;
+    let completed =
+        serde_json::from_value::<codex_history::task_context::CompletionState>(serde_json::json!({
+            "contract_revision": 1,
+            "paused": false,
+            "conditions": [{
+                "id": "AC-1",
+                "revision": 1,
+                "result": "requested behavior works",
+                "scope": "test",
+                "verification": "host check passed",
+                "acceptance_criteria": "the host check succeeds",
+                "status": "satisfied"
+            }],
+            "units": [{
+                "id": "unit-1",
+                "purpose": "complete the requested behavior",
+                "status": "done"
+            }],
+            "blocker": null
+        }))
+        .expect("completed host contract fixture");
+    session.state.lock().await.rencrow_completion_state = Some(("root".into(), completed));
+
+    handlers::shutdown_session_runtime(&session).await;
+
+    assert!(
+        !session.autonomous_completion_paused().await,
+        "normal shutdown of a completed idle contract must not be persisted as a pause"
+    );
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn shutdown_still_pauses_for_uncollected_children_or_disabled_completion_and_preserves_scope()
+{
+    let (session, _turn_context, _rx_event) = make_session_and_context_with_auth_and_config_and_rx(
+        CodexAuth::from_api_key("Test API Key"),
+        Vec::new(),
+        |config| config.rencrow_autonomous_completion = true,
+    )
+    .await;
+    let completed =
+        serde_json::from_value::<codex_history::task_context::CompletionState>(serde_json::json!({
+            "contract_revision": 1,
+            "paused": false,
+            "conditions": [{
+                "id": "AC-1", "revision": 1, "result": "requested behavior works",
+                "scope": "test", "verification": "host check passed",
+                "acceptance_criteria": "the host check succeeds", "status": "satisfied"
+            }],
+            "units": [{"id": "unit-1", "purpose": "complete behavior", "status": "done"}],
+            "blocker": null
+        }))
+        .expect("completed host contract fixture");
+    session.state.lock().await.rencrow_completion_state = Some(("root".into(), completed));
+    session
+        .state
+        .lock()
+        .await
+        .rencrow_completion_uncollected_children
+        .insert("child-1".into());
+
+    handlers::shutdown_session_runtime(&session).await;
+
+    assert!(
+        session.autonomous_completion_paused().await,
+        "uncollected child work must retain the existing shutdown pause behavior"
+    );
+
+    let (session, _turn_context, _rx_event) = make_session_and_context_with_auth_and_config_and_rx(
+        CodexAuth::from_api_key("Test API Key"),
+        Vec::new(),
+        |config| config.rencrow_autonomous_completion = true,
+    )
+    .await;
+    let completed =
+        serde_json::from_value::<codex_history::task_context::CompletionState>(serde_json::json!({
+            "contract_revision": 1,
+            "paused": false,
+            "conditions": [{
+                "id": "AC-1", "revision": 1, "result": "requested behavior works",
+                "scope": "test", "verification": "host check passed",
+                "acceptance_criteria": "the host check succeeds", "status": "satisfied"
+            }],
+            "units": [{"id": "unit-1", "purpose": "complete behavior", "status": "done"}],
+            "blocker": null
+        }))
+        .expect("completed host contract fixture");
+    let mut state = session.state.lock().await;
+    state.rencrow_completion_state = Some(("root".into(), completed));
+    state.active_task_scope = Some(crate::state::ActiveTaskScope {
+        root_task_id: "root".into(),
+        task_id: "unit-1".into(),
+        task_revision: 1,
+        begin_call_id: "begin-1".into(),
+        start_history_cursor: 0,
+    });
+    drop(state);
+
+    handlers::shutdown_session_runtime(&session).await;
+
+    assert!(
+        !session.autonomous_completion_paused().await,
+        "a logical active scope alone must not pause idle shutdown"
+    );
+    assert_eq!(
+        session
+            .active_task_scope()
+            .await
+            .expect("active scope retained")
+            .task_id,
+        "unit-1"
+    );
+
+    let (session, _turn_context, _rx_event) = make_session_and_context_with_auth_and_config_and_rx(
+        CodexAuth::from_api_key("Test API Key"),
+        Vec::new(),
+        |_| {},
+    )
+    .await;
+    let completed =
+        serde_json::from_value::<codex_history::task_context::CompletionState>(serde_json::json!({
+            "contract_revision": 1,
+            "paused": false,
+            "conditions": [{
+                "id": "AC-1", "revision": 1, "result": "requested behavior works",
+                "scope": "test", "verification": "host check passed",
+                "acceptance_criteria": "the host check succeeds", "status": "satisfied"
+            }],
+            "units": [{"id": "unit-1", "purpose": "complete behavior", "status": "done"}],
+            "blocker": null
+        }))
+        .expect("completed host contract fixture");
+    session.state.lock().await.rencrow_completion_state = Some(("root".into(), completed));
+
+    handlers::shutdown_session_runtime(&session).await;
+
+    assert!(
+        session.autonomous_completion_paused().await,
+        "autonomous completion OFF must preserve the legacy shutdown pause behavior"
+    );
+
+    let (session, _turn_context, _rx_event) = make_session_and_context_with_auth_and_config_and_rx(
+        CodexAuth::from_api_key("Test API Key"),
+        Vec::new(),
+        |config| config.rencrow_autonomous_completion = true,
+    )
+    .await;
+    let completed =
+        serde_json::from_value::<codex_history::task_context::CompletionState>(serde_json::json!({
+            "contract_revision": 1,
+            "paused": false,
+            "conditions": [{
+                "id": "AC-1", "revision": 1, "result": "requested behavior works",
+                "scope": "test", "verification": "host check passed",
+                "acceptance_criteria": "the host check succeeds", "status": "satisfied"
+            }],
+            "units": [{"id": "unit-1", "purpose": "complete behavior", "status": "done"}],
+            "blocker": null
+        }))
+        .expect("completed host contract fixture");
+    session.state.lock().await.rencrow_completion_state = Some(("root".into(), completed));
+    *session.active_turn.lock().await = Some(ActiveTurn::default());
+
+    handlers::shutdown_session_runtime(&session).await;
+
+    assert!(
+        session.autonomous_completion_paused().await,
+        "shutdown with an active turn must preserve the existing pause behavior"
+    );
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn explicit_interrupt_still_pauses_a_completed_autonomous_contract() {
+    let (session, _turn_context, _rx_event) = make_session_and_context_with_auth_and_config_and_rx(
+        CodexAuth::from_api_key("Test API Key"),
+        Vec::new(),
+        |config| config.rencrow_autonomous_completion = true,
+    )
+    .await;
+    let completed =
+        serde_json::from_value::<codex_history::task_context::CompletionState>(serde_json::json!({
+            "contract_revision": 1,
+            "paused": false,
+            "conditions": [{
+                "id": "AC-1", "revision": 1, "result": "requested behavior works",
+                "scope": "test", "verification": "host check passed",
+                "acceptance_criteria": "the host check succeeds", "status": "satisfied"
+            }],
+            "units": [{"id": "unit-1", "purpose": "complete behavior", "status": "done"}],
+            "blocker": null
+        }))
+        .expect("completed host contract fixture");
+    session.state.lock().await.rencrow_completion_state = Some(("root".into(), completed));
+
+    session.interrupt_task().await;
+
+    assert!(
+        session.autonomous_completion_paused().await,
+        "an explicit user interrupt must continue to pause completion"
+    );
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn idle_shutdown_stops_and_joins_completion_recovery_before_late_persist() {
+    let (session, _turn_context, _rx_event) = make_session_and_context_with_auth_and_config_and_rx(
+        CodexAuth::from_api_key("Test API Key"),
+        Vec::new(),
+        |config| config.rencrow_autonomous_completion = true,
+    )
+    .await;
+    let open =
+        serde_json::from_value::<codex_history::task_context::CompletionState>(serde_json::json!({
+            "contract_revision": 1,
+            "paused": false,
+            "conditions": [{
+                "id": "AC-1", "revision": 1, "result": "requested behavior works",
+                "scope": "test", "verification": "host check passed",
+                "acceptance_criteria": "the host check succeeds", "status": "open"
+            }],
+            "units": [{"id": "unit-1", "purpose": "complete behavior", "status": "planned"}],
+            "blocker": null
+        }))
+        .expect("open host contract fixture");
+    session.state.lock().await.rencrow_completion_state = Some(("root".into(), open));
+
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (continue_tx, continue_rx) = tokio::sync::oneshot::channel();
+    let (finished_tx, mut finished_rx) = tokio::sync::oneshot::channel();
+    let observer_session = Arc::clone(&session);
+    let observer = tokio::spawn(async move {
+        let _ = started_tx.send(());
+        if continue_rx.await.is_ok() {
+            observer_session
+                .note_autonomous_completion_unit_accepted()
+                .await;
+            let _ = finished_tx.send(());
+        }
+    });
+    assert!(
+        session
+            .install_completion_recovery_task(tokio_util::task::AbortOnDropHandle::new(observer))
+            .await
+    );
+    started_rx
+        .await
+        .expect("observer reached its in-flight wait");
+
+    handlers::shutdown_session_runtime(&session).await;
+
+    if continue_tx.send(()).is_ok() {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), &mut finished_rx).await;
+    }
+    assert!(
+        session
+            .state
+            .lock()
+            .await
+            .rencrow_completion_recovery_task
+            .is_none(),
+        "shutdown must take ownership of the completion recovery observer"
+    );
+    assert!(
+        matches!(
+            finished_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+        ),
+        "shutdown must abort and join the observer before returning"
     );
 }
 

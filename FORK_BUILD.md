@@ -101,3 +101,64 @@ filesystem transactionになるとは主張しない。原ログやDBを手動�
 
 配備前に隔離sessionで現在要求の維持、撤回部分の非復活、通常toolの利用、
 再起動と2回目のCompactionを確認する。共有sessionのwriterを二重に起動しない。
+
+<a id="macos-host-207"></a>
+## macOS host 207への配備 — 2026-10-25
+
+利用者の配置指示により、source `e8417aaea4352e3e77f529adaa13a41c7a653afb`を
+Rust 1.95.0、lockfile維持、`fork-deploy` profileでdarwin/arm64へnative buildした。
+`codex`と`rencrow-compaction`の両binaryをbuildし、前者を`rencrow-switch-core`として配置した。
+公式`codex`の実行fileは置換していない。公開release・Windows受入の記録ではない。
+
+- `--no-daemon --version`／`--help`、Mach-O ARM64、試験binaryと配置binaryのSHA-256一致を確認。
+- RenCrow_LLM所有のlauncherを配備し、207のGatewayを通して205のStrata model routeを使用した。
+  Gatewayがaliveと報告しないGinはcatalogから除外され、別modelへの暗黙fallbackは行わない。
+- 隔離CODEX_HOME／workspaceのTUIから実際の`exec_command`でfixtureを読み、応答内容を確認した。
+  操作主体は`--rencrow-input-author automation`と申告し、workspace-writeの境界とhook trustを維持した。
+- 同じthreadでNormal V2 checkpoint 2件、Emergency 0件、未commit 0件をowner診断CLIで確認した。
+  指示の撤回・置換後に2回目のCompactionを行い、旧合言葉ではなく最新の合言葉を回答した。
+  TUIを終了して同じthreadをresumeした後も、最新の合言葉を回答した。
+- 通常のSSH起動先は`<HOME>/.local/bin/codex-switch`。会話・DBは専用の
+  `<HOME>/.codex-switch`へ分離する。207上の既存認証は参照し、認証情報を複製しない。
+  認証の認識は確認済みだが、この試験はOpenAI modeの実inferenceや既存Linux threadの移植受入を含まない。
+- 配備templateはadvisor MCPの実pathを解決した。sourceから削除済みの旧delegate MCP参照は
+  配備側で無効とし、advisorのinitialize／tools/listとTUIからの起動を確認した。
+
+利用者が作業directoryから新しいsessionを開く場合は`codex-switch rencrow-safe --new`を使用する。
+CLIはSSH terminalから必要時に起動する。GatewayとBackendの自動起動は各service managerが所有する。
+privateな会話・ログ・認証・binary・build provenanceはGitへ取り込まない。
+
+## 2026-10-27 Compaction selection wire v2
+
+Instruction selection now transmits host-owned passage IDs with a JSON Schema.
+Invalid selection retains the affected original instructions while Work summarization
+continues; conservative checkpoints retry selection after resume. See COMPACTION_SPEC.md.
+The native CLI and rencrow-compaction helper must be deployed together: older readers
+cannot read the new conservative_selection checkpoint mode.
+Validation on macOS: history 149/149; focused compaction and native execution guard
+109/109; diagnosis Python tests 6/6; targeted clippy/fmt and both deployment builds passed.
+An isolated live Qwen xhigh run produced a normal checkpoint with two ID-selected
+source passages and answered the corrected label after compaction. Selection took
+139 seconds in this fixture; no general latency improvement is claimed.
+Whole-workspace acceptance was not run for this change. Private traces and deployment
+hashes remain outside the repository under Tmp/ren2-supervision.
+
+## 2026-10-28 子結果未回収時の継続修正
+
+`require_child_results`が有効で未回収子が残る場合、従来の即時ターンエラーの前に、
+親へ未回収IDと回収・明示close手順をdeveloper messageで返し、同じターンを最大2回継続する。
+待ちtimeoutを子の失敗とせず、子の再生成やtool再送、権限変更は自動実行しない。
+2回でも解消しない場合は従来の契約エラーを維持する。通常の編集・検査guardは省略しない。
+回帰は`rencrow_execution_guard_tests`の有界継続・timeout/terminal回収を対象にする。
+当初の環境不足は解消し、Rust 1.95.0 / just / nextestでbuildしローカル配備済み。
+対象guardテスト15件、compaction・子設定を含む関連132件が合格。全workspace試験は
+無関係なrusty_v8 150.4.0のmacOS prebuilt archiveがHTTP404のためbuild不可。
+実モデルを新launcherから起動し、workspace内GOCACHEへの書込成功を確認した。
+既存実行中processは旧binaryのまま継続し、更新は次回起動から適用する。
+
+### 複合readコマンドの回数制限
+
+`cat ...; echo ...; sed ...`等の表示用コマンドを含むread batchもreadとして計数する。
+表示専用のecho/printf/head/tail/cutを、shell parserが分離した既知commandに限り認識する。
+未知commandや実行・置換構文をreadと仮定せず、shellの検査成功判定とsandbox制約は維持する。
+同じ回数制限が実tool loopでも働くことを回帰テストで確認した。

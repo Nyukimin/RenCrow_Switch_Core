@@ -13,6 +13,30 @@ use crate::session_start::cancel_session_start;
 use crate::session_start::complete_session_start;
 use crate::unarchive_prompt::run_unarchive_prompt;
 
+pub(super) fn startup_has_pending_user_message(prompt: Option<String>, images: &[PathBuf]) -> bool {
+    crate::chatwidget::create_initial_user_message(prompt, images.to_vec(), Vec::new()).is_some()
+}
+
+fn log_jst_timestamp_config(
+    boundary: &'static str,
+    config: &Config,
+    local_settings: &crate::local_settings::LocalSettings,
+    cli_kv_overrides: &[(String, codex_config::TomlValue)],
+) {
+    let cli_override = cli_kv_overrides
+        .iter()
+        .find(|(key, _)| key == "tui.rencrow_tui_jst_timestamps");
+    tracing::info!(
+        target: "codex_tui::jst_timestamps",
+        boundary,
+        config_enabled = config.tui_rencrow_jst_timestamps,
+        local_settings_enabled = local_settings.tui.rencrow_tui_jst_timestamps,
+        cli_override_present = cli_override.is_some(),
+        cli_override_value = ?cli_override.and_then(|(_, value)| value.as_bool()),
+        "TUI JST timestamp configuration"
+    );
+}
+
 fn spawn_startup_thread_start(
     app_server: &AppServerSession,
     local_settings: crate::local_settings::LocalSettings,
@@ -196,6 +220,12 @@ impl App {
         // Adopt actual launch ownership before constructing session-local preferences.
         tui.prepare_owned_screen(config.tui_fullscreen_transcript)?;
         let mut local_settings = crate::local_settings::LocalSettings::for_tui(&config, tui);
+        log_jst_timestamp_config(
+            "startup_local_settings",
+            &config,
+            &local_settings,
+            &cli_kv_overrides,
+        );
         let startup_started_at = Instant::now();
         let (app_event_tx, mut app_event_rx) = unbounded_channel();
         let app_event_tx = AppEventSender::new(app_event_tx);
@@ -486,11 +516,15 @@ impl App {
                 let resumed = match startup_draft
                     .run_until(
                         tui,
-                        app_server.resume_thread(
+                        app_server.resume_thread_with_pending_initial_message(
                             &local_settings,
                             config.clone(),
                             target_session.thread_id,
                             model_settings,
+                            startup_has_pending_user_message(
+                                initial_prompt.clone(),
+                                &initial_images,
+                            ),
                         ),
                     )
                     .await
@@ -690,6 +724,12 @@ impl App {
                 (ChatWidget::new_with_app_event(init), forked)
             }
         };
+        log_jst_timestamp_config(
+            "startup_chat_widget_constructed",
+            &config,
+            &chat_widget.local_settings,
+            &cli_kv_overrides,
+        );
         let startup_session_cancelled = initial_started_thread.is_none()
             && !pending_startup_thread_start
             && !start_in_agents_overview;

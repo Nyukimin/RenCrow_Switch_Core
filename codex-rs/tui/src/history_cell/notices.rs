@@ -332,6 +332,11 @@ pub(crate) fn new_error_event(message: String) -> PlainHistoryCell {
     PlainHistoryCell { lines }
 }
 
+pub(crate) fn new_timestamped_error_event(timestamp: String, message: String) -> PlainHistoryCell {
+    let lines: Vec<Line<'static>> = vec![format!("{timestamp} ■ {message}").red().into()];
+    PlainHistoryCell { lines }
+}
+
 #[derive(Debug)]
 pub(crate) struct ThreadRecapLoadingCell {
     start_time: Instant,

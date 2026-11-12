@@ -26,9 +26,13 @@ use crate::tools::registry::AnyToolResult;
 use crate::tools::registry::ToolArgumentDiffConsumer;
 use crate::tools::router::ToolCall;
 use crate::tools::router::ToolCallSource;
+use codex_history::BlockedToolCallReference;
+use codex_history::ObservationReference;
 use codex_history::ResponseItemEnvelope;
+use codex_history::archive_reference::content_sha256;
 use codex_protocol::error::CodexErr;
 use codex_protocol::models::ResponseInputItem;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::models::ToolResultMetadata;
 
 struct ToolCallTimingGuard {
@@ -79,6 +83,8 @@ impl ToolCallRuntime {
         cancellation_token: CancellationToken,
     ) -> impl std::future::Future<Output = Result<ResponseItemEnvelope, CodexErr>> {
         let error_call = call.clone();
+        let response_call_id = call.call_id.clone();
+        let thread_id = self.session.thread_id.to_string();
         let source = call.direct_source();
         let recorder = self.session.services.executed_tool_calls.clone();
         let recorded_call = recorder.prepare_direct_call(&call, &source, &self.step_context);
@@ -114,6 +120,9 @@ impl ToolCallRuntime {
                     .metadata
                     .get_or_insert_default()
                     .delivered_assistant_message = Some(text.clone());
+            }
+            if call_state.blocked_before_handler.load(Ordering::Acquire) {
+                attach_blocked_tool_call_reference(&mut response, &thread_id, &response_call_id);
             }
             recorder.attach_direct_call_to_output(&mut response.item, recorded_call);
             Ok(response)
@@ -281,6 +290,35 @@ impl ToolCallRuntime {
     }
 }
 
+fn attach_blocked_tool_call_reference(
+    response: &mut ResponseItemEnvelope,
+    thread_id: &str,
+    expected_call_id: &str,
+) {
+    let (call_id, output) = match &response.item {
+        ResponseItem::FunctionCallOutput {
+            call_id: Some(call_id),
+            output,
+            ..
+        }
+        | ResponseItem::CustomToolCallOutput {
+            call_id, output, ..
+        } => (call_id.as_str(), output),
+        _ => return,
+    };
+    if call_id != expected_call_id {
+        return;
+    }
+    let Some(body) = output.text_content() else {
+        return;
+    };
+    let reference = ObservationReference::new(thread_id, call_id, content_sha256(body));
+    response
+        .metadata
+        .get_or_insert_default()
+        .rencrow_blocked_tool_call = Some(Box::new(BlockedToolCallReference::new(reference)));
+}
+
 impl ToolCallRuntime {
     fn tool_task_join_error(err: JoinError) -> FunctionCallError {
         FunctionCallError::Fatal(format!("tool task failed to receive: {err:?}"))
@@ -442,13 +480,52 @@ mod tests {
     use crate::tools::router::ToolRouter;
     use crate::turn_diff_tracker::TurnDiffTracker;
     use codex_extension_api::ToolCallOutcome;
+    use codex_history::BlockedToolCallReference;
+    use codex_history::ObservationReference;
+    use codex_history::ResponseItemEnvelope;
+    use codex_history::archive_reference::content_sha256;
     use codex_protocol::models::FunctionCallOutputBody;
     use codex_protocol::models::FunctionCallOutputPayload;
+    use codex_protocol::models::ResponseItem;
     use codex_protocol::openai_models::ToolMode;
     use pretty_assertions::assert_eq;
     use tokio::sync::Notify;
     use tokio::sync::oneshot;
     use tracing_test::internal::MockWriter;
+
+    #[test]
+    fn blocked_reference_attaches_only_to_exact_textual_tool_output() {
+        let body = "host rejected before handler";
+        let mut response = ResponseItemEnvelope::new(ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: Some("call-1".into()),
+            name: None,
+            namespace: None,
+            output: FunctionCallOutputPayload::from_text(body.into()),
+            internal_chat_message_metadata_passthrough: None,
+        });
+        attach_blocked_tool_call_reference(&mut response, "thread-1", "call-1");
+        let expected = BlockedToolCallReference::new(ObservationReference::new(
+            "thread-1",
+            "call-1",
+            content_sha256(body),
+        ));
+        assert_eq!(
+            response.metadata.unwrap().rencrow_blocked_tool_call,
+            Some(Box::new(expected))
+        );
+
+        let mut wrong_id = ResponseItemEnvelope::new(ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: Some("other-call".into()),
+            name: None,
+            namespace: None,
+            output: FunctionCallOutputPayload::from_text(body.into()),
+            internal_chat_message_metadata_passthrough: None,
+        });
+        attach_blocked_tool_call_reference(&mut wrong_id, "thread-1", "call-1");
+        assert_eq!(wrong_id.metadata, None);
+    }
 
     #[test]
     fn tool_call_timing_guard_ignores_code_mode_source() {

@@ -2,6 +2,7 @@ use crate::sandboxing::SandboxPermissions;
 use crate::shell::Shell;
 use crate::shell::ShellType;
 use crate::shell::get_shell_by_model_provided_path;
+use crate::task_check::TaskEvidenceRequest;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
@@ -47,6 +48,8 @@ pub(crate) struct ExecCommandArgs {
     justification: Option<String>,
     #[serde(default)]
     prefix_rule: Option<Vec<String>>,
+    #[serde(default)]
+    pub(crate) task_evidence: Option<TaskEvidenceRequest>,
 }
 
 #[derive(Debug, Deserialize)]

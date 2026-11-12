@@ -4,6 +4,11 @@
 mod agent_message_board_notification;
 mod approved_command_prefix_saved;
 mod apps_instructions;
+mod autonomous_completion;
+pub(crate) use autonomous_completion::AutonomousChildResult;
+pub(crate) use autonomous_completion::AutonomousCompletionContinue;
+pub(crate) use autonomous_completion::AutonomousCompletionRegister;
+pub(crate) use autonomous_completion::AutonomousCompletionSnapshot;
 mod available_plugins_instructions;
 mod base_instructions;
 mod compaction_observation;

@@ -421,7 +421,16 @@ pub fn prepare_compaction_sources<'a>(
                         Err(ArchiveEvidenceError::Invalid(reason)) => return Err(reason.into()),
                         Err(ArchiveEvidenceError::Ineligible(_)) => continue,
                     };
-                let terminal_reference = if canonical_observation.tool_name == "exec_command" {
+                let blocked = validate_blocked_tool_call_reference(
+                    canonical_observation.output.metadata.as_ref(),
+                    &canonical_reference,
+                )?;
+                let terminal_reference = if blocked {
+                    if canonical_observation.has_terminal() {
+                        return Err("blocked tool output conflicts with a command terminal".into());
+                    }
+                    None
+                } else if canonical_observation.tool_name == "exec_command" {
                     match canonical_index.terminal_reference_for_observation(
                         &canonical_reference,
                         &canonical_observation,
@@ -513,6 +522,20 @@ fn is_observation_marker(envelope: &ResponseItemEnvelope) -> bool {
         .is_some_and(|metadata| metadata.rencrow_observation_projection.is_some())
 }
 
+fn validate_blocked_tool_call_reference(
+    metadata: Option<&codex_history::CodexHarnessMetadata>,
+    observation: &ObservationReference,
+) -> Result<bool, String> {
+    let Some(blocked) = metadata.and_then(|metadata| metadata.rencrow_blocked_tool_call.as_deref())
+    else {
+        return Ok(false);
+    };
+    if !blocked.validates(observation) {
+        return Err("blocked tool metadata differs from its canonical observation".into());
+    }
+    Ok(true)
+}
+
 /// Verify an existing V2 observation marker against its canonical raw observation (§39–40).
 ///
 /// The marker body and metadata must be exactly regenerated from the canonical call and output,
@@ -581,7 +604,14 @@ fn prepare_observation_marker<'a>(
         output.metadata.as_ref(),
         marker_body,
     )?;
-    let terminal_reference = if observation.tool_name == "exec_command" {
+    let blocked =
+        validate_blocked_tool_call_reference(observation.output.metadata.as_ref(), &reference)?;
+    let terminal_reference = if blocked {
+        if observation.has_terminal() {
+            return Err("blocked tool output conflicts with a command terminal".into());
+        }
+        None
+    } else if observation.tool_name == "exec_command" {
         match canonical_index.terminal_reference_for_observation(&reference, &observation) {
             Ok(reference) => Some(reference),
             Err(ArchiveEvidenceError::Invalid(reason)) => return Err(reason.into()),

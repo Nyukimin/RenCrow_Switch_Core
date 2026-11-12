@@ -28,6 +28,7 @@ use codex_prompts::ResolvedModelMessages;
 use codex_protocol::intersect_effective_permission_profiles;
 use codex_protocol::protocol::EnvironmentConfigState;
 use codex_utils_path_uri::PathUri;
+use tokio::sync::oneshot;
 
 const AGENT_NAMES: &str = include_str!("../../../assets/agent/agent_names.txt");
 
@@ -264,6 +265,7 @@ impl LocalAgentControl {
             SpawnInitialInput::UserInput(initial_input),
             session_source,
             SpawnAgentOptions::default(),
+            None,
         ))
         .await?;
         Ok(spawned_agent.thread_id)
@@ -282,8 +284,29 @@ impl LocalAgentControl {
             SpawnInitialInput::UserInput(initial_input),
             session_source,
             options,
+            None,
         ))
         .await
+    }
+
+    /// Spawn a review child while retaining its ID if initial input delivery fails.
+    pub(crate) async fn spawn_agent_with_metadata_tracking_creation(
+        &self,
+        config: Config,
+        initial_input: Vec<UserInput>,
+        session_source: Option<SessionSource>,
+        options: SpawnAgentOptions,
+    ) -> (CodexResult<LiveAgent>, oneshot::Receiver<ThreadId>) {
+        let (created_tx, created_rx) = oneshot::channel();
+        let result = Box::pin(self.spawn_agent_internal(
+            config,
+            SpawnInitialInput::UserInput(initial_input),
+            session_source,
+            options,
+            Some(created_tx),
+        ))
+        .await;
+        (result, created_rx)
     }
 
     pub(crate) async fn spawn_agent_with_communication(
@@ -299,6 +322,7 @@ impl LocalAgentControl {
             SpawnInitialInput::InterAgentCommunication(communication, context),
             session_source,
             options,
+            None,
         ))
         .await
     }
@@ -637,6 +661,7 @@ impl LocalAgentControl {
         initial_input: SpawnInitialInput,
         session_source: Option<SessionSource>,
         options: SpawnAgentOptions,
+        created_thread_tx: Option<oneshot::Sender<ThreadId>>,
     ) -> CodexResult<LiveAgent> {
         let state = self.upgrade()?;
         let multi_agent_version = state
@@ -747,6 +772,9 @@ impl LocalAgentControl {
         reservation.commit(agent_metadata.clone());
         if let Some(residency_slot) = residency_slot {
             residency_slot.commit(new_thread.thread_id);
+        }
+        if let Some(created_thread_tx) = created_thread_tx {
+            let _ = created_thread_tx.send(new_thread.thread_id);
         }
 
         if let Some(SessionSource::SubAgent(
@@ -1245,7 +1273,7 @@ impl LocalAgentControl {
 
     async fn resume_single_agent_from_rollout(
         &self,
-        config: Config,
+        mut config: Config,
         thread_id: ThreadId,
         session_source: SessionSource,
     ) -> CodexResult<(ThreadId, MultiAgentVersion)> {
@@ -1265,6 +1293,15 @@ impl LocalAgentControl {
             .map_err(|err| CodexErr::InvalidRequest(format!("invalid stored agent path: {err}")))?;
         let resumed_agent_nickname = stored_thread.agent_nickname.clone();
         let resumed_agent_role = stored_thread.agent_role.clone();
+        crate::agent::child_config::restore_recorded_agent_config(
+            &mut config,
+            resumed_agent_role.as_deref(),
+            stored_thread.model.as_deref(),
+            &stored_thread.model_provider,
+            stored_thread.reasoning_effort,
+        )
+        .await
+        .map_err(CodexErr::InvalidRequest)?;
         let history = load_agent_model_context(&state, thread_id, stored_thread.history_mode)
             .await?
             .ok_or(CodexErr::ThreadNotFound(thread_id))?;

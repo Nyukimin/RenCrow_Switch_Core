@@ -420,6 +420,7 @@ async fn emit_failed_initial_exec_end_if_unstored(
         fallback_output,
         message,
         wall_time,
+        request.task_evidence.clone(),
     )
     .await;
 }
@@ -544,6 +545,19 @@ impl UnifiedExecProcessManager {
             permissions,
         } = attempt;
         let process = Arc::new(process);
+        let task_evidence = request.task_evidence.clone();
+        if let Some(evidence) = task_evidence.as_ref() {
+            context
+                .session
+                .begin_task_check_with_obligation(
+                    context.call_id.clone(),
+                    evidence.request.clone(),
+                    evidence.workspace_root.clone(),
+                    evidence.before.clone(),
+                    evidence.obligation.clone(),
+                )
+                .await;
+        }
         if let Some(completion) = completion.as_ref() {
             let _ = completion.process.set(Arc::clone(&process));
         }
@@ -590,6 +604,7 @@ impl UnifiedExecProcessManager {
             ExecCommandSource::UnifiedExecStartup,
             Some(request.process_id.to_string()),
             plugin_attribution.clone(),
+            None,
         );
         emitter.emit(event_ctx, ToolEventStage::Begin).await;
 
@@ -617,6 +632,7 @@ impl UnifiedExecProcessManager {
                 metrics_sidecar,
                 Arc::clone(&transcript),
                 Arc::clone(&initial_exec_command_active),
+                task_evidence.clone(),
             )
             .await;
             InitialExecCommandGuard {
@@ -808,6 +824,7 @@ impl UnifiedExecProcessManager {
                 exit,
                 wall_time,
                 process.timed_out(),
+                task_evidence,
             )
             .await;
 
@@ -1206,6 +1223,7 @@ impl UnifiedExecProcessManager {
         metrics_sidecar: Option<PluginMetricsSidecar>,
         transcript: Arc<tokio::sync::Mutex<HeadTailBuffer>>,
         initial_exec_command_active: Arc<AtomicBool>,
+        task_evidence: Option<crate::task_check::TaskCheckExecution>,
     ) {
         let plugin_metrics_sidecar =
             metrics_sidecar.map(|sidecar| Arc::new(std::sync::Mutex::new(Some(sidecar))));
@@ -1223,7 +1241,9 @@ impl UnifiedExecProcessManager {
             network_approval,
             session: Arc::downgrade(&context.session),
             last_used: started_at,
+            task_evidence: task_evidence.clone(),
         };
+        let watcher_task_evidence = entry.task_evidence.clone();
         let pruned_entry = {
             let mut store = self.process_store.lock().await;
             let pruned_entry = Self::prune_processes_if_needed(&mut store);
@@ -1248,6 +1268,7 @@ impl UnifiedExecProcessManager {
             started_at,
             network_denial_monitor,
             plugin_metrics_sidecar,
+            watcher_task_evidence,
         );
     }
 

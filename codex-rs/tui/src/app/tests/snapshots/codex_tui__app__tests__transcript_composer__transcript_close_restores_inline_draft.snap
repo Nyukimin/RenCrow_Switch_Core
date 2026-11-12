@@ -1,7 +1,9 @@
 ---
 source: tui/src/app/tests/transcript_composer.rs
-expression: "buffer_text(crate::custom_terminal::test_support::last_rendered_buffer(&tui.terminal))"
+assertion_line: 349
+expression: "buffer_text(crate::custom_terminal::test_support::last_rendered_buffer(&tui.terminal)).replace(&test_path_display(\"/tmp/project\"),\n\"/tmp/project\")"
 ---
+Subagents: 0 running / 0 total · /subagents details
 
 
 › EDGE-DRAFT-MUST-SURVIVE

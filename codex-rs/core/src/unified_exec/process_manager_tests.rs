@@ -475,6 +475,7 @@ async fn failed_initial_end_for_unstored_process_uses_fallback_output() {
         additional_permissions_preapproved: false,
         justification: None,
         prefix_rule: None,
+        task_evidence: None,
     };
 
     let transcript = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::default()));
@@ -647,6 +648,7 @@ async fn pruning_does_not_evict_live_process_while_exited_process_is_finalizing(
                 } else {
                     now
                 },
+                task_evidence: None,
             },
         );
     }

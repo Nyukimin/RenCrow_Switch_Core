@@ -1099,6 +1099,7 @@ pub(crate) enum AppEvent {
     /// transcript without first writing its provisional render to scrollback.
     ConsolidateAgentMessage {
         source: String,
+        source_item: Option<(String, String)>,
         cwd: PathBuf,
         inline_visualization_context: Option<InlineVisualizationContext>,
         scrollback_reflow: ConsolidationScrollbackReflow,

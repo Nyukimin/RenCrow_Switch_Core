@@ -22,6 +22,7 @@ pub struct FinalMessageSeparator {
     completed_at: Option<DateTime<Local>>,
     display_date: NaiveDate,
     clock_format: ClockFormat,
+    jst_timestamps: bool,
 }
 impl FinalMessageSeparator {
     /// Creates completion metadata using the protocol turn duration when available.
@@ -35,6 +36,7 @@ impl FinalMessageSeparator {
             completed_at: None,
             display_date: Local::now().date_naive(),
             clock_format: ClockFormat::TwelveHour,
+            jst_timestamps: false,
         }
     }
 
@@ -45,6 +47,11 @@ impl FinalMessageSeparator {
     ) -> Self {
         self.completed_at = Some(completed_at);
         self.clock_format = clock_format;
+        self
+    }
+
+    pub(crate) fn with_jst_timestamps(mut self, enabled: bool) -> Self {
+        self.jst_timestamps = enabled;
         self
     }
 
@@ -72,18 +79,25 @@ impl FinalMessageSeparator {
             label_parts.push(format!("Worked for {elapsed}"));
         }
         if let Some(completed_at) = self.completed_at {
-            let date_format = if completed_at.date_naive() == today {
-                ""
-            } else if completed_at.year() == today.year() {
-                "%b %-d at "
+            if self.jst_timestamps {
+                let jst = completed_at.with_timezone(
+                    &chrono::FixedOffset::east_opt(9 * 60 * 60).expect("valid JST offset"),
+                );
+                label_parts.push(jst.format("[%m-%d %H:%M:%S JST]").to_string());
             } else {
-                "%b %-d, %Y at "
-            };
-            label_parts.push(format!(
-                "{}{}",
-                completed_at.format(date_format),
-                completed_at.format(self.clock_format.time_format()),
-            ));
+                let date_format = if completed_at.date_naive() == today {
+                    ""
+                } else if completed_at.year() == today.year() {
+                    "%b %-d at "
+                } else {
+                    "%b %-d, %Y at "
+                };
+                label_parts.push(format!(
+                    "{}{}",
+                    completed_at.format(date_format),
+                    completed_at.format(self.clock_format.time_format()),
+                ));
+            }
         }
         if let Some(metrics_label) = self.runtime_metrics.and_then(runtime_metrics_label) {
             label_parts.push(metrics_label);

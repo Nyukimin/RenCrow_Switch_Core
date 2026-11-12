@@ -6,13 +6,12 @@ use codex_history::compaction_candidate::CandidateInput;
 use codex_history::compaction_candidate::history_digest;
 use codex_history::compaction_checkpoint_metadata::CheckpointResponseStage;
 use codex_history::compaction_checkpoint_metadata::CompactionModelResponseReceipt;
-use codex_history::compaction_pipeline::InstructionSelection;
-use codex_history::compaction_pipeline::ProposedOperation;
-use codex_history::compaction_pipeline::ProposedPlan;
 use codex_history::compaction_preprocess::InstructionObservationLink;
+use codex_history::task_context::StoredTaskState;
 use codex_rollout::RolloutRecorder;
+use codex_thread_store::ReadCompactionSourcesParams;
+use codex_thread_store::ThreadStoreError;
 use serde_json::Value;
-use serde_json::json;
 use std::collections::HashSet;
 
 #[path = "compact_rencrow_candidate.rs"]
@@ -36,13 +35,172 @@ mod timeline;
 
 use stages::StageFailure;
 
+pub(crate) use stages::attach_task_boundary_metadata;
 pub(super) use summary::should_apply_server_reasoning_included;
+
+pub(crate) fn latest_task_state_in_history(
+    items: &[codex_history::ResponseItemEnvelope],
+    thread_id: &str,
+) -> Result<Option<StoredTaskState>, String> {
+    let Some(adopted) = summary::find_adopted_v2_checkpoint(items, thread_id)? else {
+        return Ok(None);
+    };
+    adopted
+        .task_state
+        .map(|state| StoredTaskState::parse_and_validate(state, thread_id))
+        .transpose()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommittedTaskCheckpointInfo {
+    pub committed_transaction_hash: String,
+    pub task_boundary_index: usize,
+    pub task_boundary_summary_hash: String,
+    pub root_task_id: String,
+    pub closed_task_id: String,
+    pub task_revision: u64,
+    pub closed_task_revision: u64,
+}
+
+pub fn inspect_committed_task_checkpoint_window(
+    transaction_window: &[codex_history::RolloutItem],
+    expected_thread_id: &str,
+    expected_root_task_id: &str,
+) -> Result<CommittedTaskCheckpointInfo, String> {
+    let Some(codex_history::RolloutItem::Compacted(raw_target)) = transaction_window.first() else {
+        return Err("task checkpoint transaction does not begin with a compacted row".into());
+    };
+    let raw_replacement = raw_target
+        .replacement_history
+        .as_ref()
+        .ok_or_else(|| "task checkpoint target has no replacement history".to_owned())?;
+    let raw_capacity = raw_replacement
+        .last()
+        .and_then(|envelope| envelope.metadata.as_ref())
+        .and_then(|metadata| metadata.rencrow_compaction.as_ref())
+        .ok_or_else(|| "task checkpoint target has no capacity metadata".to_owned())?;
+    if raw_capacity.get("version").and_then(Value::as_u64) != Some(3)
+        || raw_capacity.get("mode").and_then(Value::as_str) != Some("capacity")
+        || raw_capacity.get("task_state").is_none_or(Value::is_null)
+        || raw_capacity
+            .get("transaction_following_items")
+            .and_then(Value::as_u64)
+            .is_none()
+        || raw_capacity
+            .get("committed_transaction_hash")
+            .is_some_and(|hash| !hash.is_null())
+    {
+        return Err(
+            "latest task checkpoint is not an owner-prepared V3 capacity transaction".into(),
+        );
+    }
+    let following_items = raw_capacity["transaction_following_items"]
+        .as_u64()
+        .and_then(|count| usize::try_from(count).ok())
+        .ok_or_else(|| "task checkpoint transaction window is invalid".to_owned())?;
+    let expected_window_len = following_items
+        .checked_add(2)
+        .ok_or_else(|| "task checkpoint transaction window is too large".to_owned())?;
+    if transaction_window.len() != expected_window_len {
+        return Err("task checkpoint transaction window is not exact".into());
+    }
+    let committed = codex_history::compaction_transaction::committed_items(transaction_window)?;
+    let Some(codex_history::RolloutItem::Compacted(target)) = committed.first() else {
+        return Err(
+            "latest task checkpoint transaction was not committed by the history owner".into(),
+        );
+    };
+    let replacement_history = target
+        .replacement_history
+        .as_deref()
+        .ok_or_else(|| "committed task checkpoint has no replacement history".to_owned())?;
+    let committed_transaction_hash = replacement_history
+        .last()
+        .and_then(|envelope| envelope.metadata.as_ref())
+        .and_then(|metadata| metadata.rencrow_compaction.as_ref())
+        .and_then(|metadata| metadata.get("committed_transaction_hash"))
+        .and_then(Value::as_str)
+        .filter(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or_else(|| "history owner did not attach a committed transaction hash".to_owned())?
+        .to_owned();
+    let adopted = summary::find_adopted_v2_checkpoint(replacement_history, expected_thread_id)?
+        .ok_or_else(|| "committed task checkpoint has no adopted task context".to_owned())?;
+    let task_boundary_index = adopted.task_context_index.ok_or_else(|| {
+        "committed task checkpoint has no selected task-boundary envelope".to_owned()
+    })?;
+    let boundary_envelope = replacement_history
+        .get(task_boundary_index)
+        .ok_or_else(|| "selected task-boundary index is outside replacement history".to_owned())?;
+    let boundary_value = boundary_envelope
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.rencrow_compaction.clone())
+        .ok_or_else(|| "selected task boundary has no V3 metadata".to_owned())?;
+    let boundary = codex_history::task_checkpoint_metadata::RenCrowTaskCheckpointMetadataV3::parse_and_validate(
+        boundary_value,
+        expected_thread_id,
+        summary::checkpoint_summary_body(boundary_envelope)?,
+    )?;
+    if boundary.mode != codex_history::task_checkpoint_metadata::TaskCheckpointMode::TaskBoundary {
+        return Err("selected task context is not a V3 task-boundary checkpoint".into());
+    }
+    let task_state = latest_task_state_in_history(replacement_history, expected_thread_id)?
+        .ok_or_else(|| "committed task checkpoint has no validated task state".to_owned())?;
+    if task_state.boundary.root_task_id != expected_root_task_id {
+        return Err("committed task checkpoint belongs to another root task".into());
+    }
+    Ok(CommittedTaskCheckpointInfo {
+        committed_transaction_hash,
+        task_boundary_index,
+        task_boundary_summary_hash: boundary.summary_hash,
+        root_task_id: task_state.boundary.root_task_id,
+        closed_task_id: task_state.boundary.closed_task_id,
+        task_revision: task_state.boundary.revision,
+        closed_task_revision: task_state.boundary.closed_task_revision,
+    })
+}
+
+/// Classify task-boundary source items through the same host-owned history projection used by
+/// ordinary compaction. Only explicitly supplied terminal work pairs are upgraded from Unknown.
+pub(crate) fn task_boundary_work_indices(
+    items: &[codex_history::ResponseItemEnvelope],
+    thread_id: &str,
+    completed_pairs: &[(usize, usize)],
+) -> Result<HashSet<usize>, String> {
+    let completed_work = completed_pairs
+        .iter()
+        .map(
+            |(call_index, output_index)| history::CompletedWorkProjection {
+                call_index: *call_index,
+                output_index: *output_index,
+                call_text: String::new(),
+                output_text: String::new(),
+            },
+        )
+        .collect::<Vec<_>>();
+    let input = history::capture(
+        items,
+        format!("task-boundary:{thread_id}"),
+        thread_id,
+        vec![serde_json::json!({"task_boundary_thread_id": thread_id})],
+        &completed_work,
+    )?;
+    Ok(input
+        .records
+        .iter()
+        .enumerate()
+        .filter(|(_, record)| {
+            record.origin == codex_history::compaction_candidate::Origin::Work
+                && record.protected.is_empty()
+                && record.opaque.is_none()
+        })
+        .map(|(index, _)| index)
+        .collect())
+}
 
 #[cfg(test)]
 #[path = "compact_rencrow_orchestration_tests.rs"]
 mod orchestration_tests;
-
-const INSTRUCTION_SELECTION_PROMPT: &str = "Select only explicit obsolete instructions from candidate:true sources. Each source has an origin: human is the person's own instruction; automation is a note from a supervising or proxy program. A human source can be superseded only by a later human correction; an automation source can be superseded by a later human or automation correction. An automation note that states a standing constraint (for example, not to operate another host) stays until a later correction withdraws it. Candidate:false sources are context only; never remove them. Use completion_links only for the source identified by instruction_id; a link is a candidate and does not prove success. Preserve failed, pending, ambiguous, protected, opaque, and continuing work. Do not infer completion from unrelated sources. For drop_superseded, correction_text is required and must be the exact unique correction passage that remains current; corrections must remain. source_text is optional only when the entire source is safe to remove; for a mixed instruction provide the exact unique source passage. Never remove protected portions or an entire partly protected source. For replace_completed, evidence must be the linked output_source_id; use it as factual grounding and do not claim more than the output and terminal status/exit establish. A successful command that inspects another job (such as ls or tail) does not prove that job succeeded. Keep unresolved conditions and uncertainty. Return only {\"operations\":[{\"action\":\"drop_superseded\",\"source\":\"<source id>\",\"source_text\":\"<optional exact unique passage>\",\"correction\":\"<later correction id>\",\"correction_text\":\"<exact unique passage>\"},{\"action\":\"replace_completed\",\"source\":\"<source id>\",\"source_text\":\"<optional exact unique passage>\",\"evidence\":\"<linked output_source_id>\",\"result\":\"<brief factual result supported by the output>\"}]}. Use only the fields shown for the chosen action. Omit source_text only when the whole source is safe to remove. Do not return a snapshot hash or extra keys. JSON only.";
 
 /// Decide whether instruction selection is needed at all (Annex A F13).
 ///
@@ -62,86 +220,44 @@ pub(super) fn selection_required(
         })
 }
 
+/// Deterministically skip inference when no source can be selected.
+pub(super) fn selection_request(
+    input: &CandidateInput,
+    payload: Option<Value>,
+) -> Result<Option<codex_history::compaction_selection_wire::SelectionRequest>, String> {
+    let Some(payload) = payload else {
+        return Ok(None);
+    };
+    if !payload["sources"]
+        .as_array()
+        .ok_or("missing sources")?
+        .iter()
+        .any(|source| source["candidate"] == true)
+    {
+        return Ok(None);
+    }
+    codex_history::compaction_selection_wire::SelectionRequest::new(input, &payload).map(Some)
+}
+
+// Modified by RenCrow: only the host-owned ID contract is sent to the model.
 pub(super) async fn select_obsolete_instructions(
     sess: &Session,
     ctx: &TurnContext,
     metadata: CompactionTurnMetadata,
-    candidate_payload: Option<Value>,
+    request: &codex_history::compaction_selection_wire::SelectionRequest,
     receipts: &mut Vec<CompactionModelResponseReceipt>,
     cancellation: &tokio_util::sync::CancellationToken,
-) -> CodexResult<Option<InstructionSelection>> {
-    let Some(payload) = candidate_payload else {
-        return Ok(None);
-    };
-    let invalid =
-        || CodexErr::InvalidRequest("RenCrow instruction selection payload is invalid".into());
-    let snapshot_hash = payload
-        .get("snapshot_hash")
-        .and_then(Value::as_str)
-        .filter(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        .ok_or_else(invalid)?
-        .to_owned();
-    let presentation_hash = payload
-        .get("presentation_hash")
-        .and_then(Value::as_str)
-        .filter(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        .ok_or_else(invalid)?
-        .to_owned();
-    let sources = payload
-        .get("sources")
-        .and_then(Value::as_array)
-        .ok_or_else(invalid)?;
-    let completion_links = payload
-        .get("completion_links")
-        .and_then(Value::as_array)
-        .ok_or_else(invalid)?;
-    if !sources.iter().all(Value::is_object) || !completion_links.iter().all(Value::is_object) {
-        return Err(invalid());
-    }
-    let has_candidate = sources.iter().any(|source| {
-        matches!(
-            source.get("origin").and_then(Value::as_str),
-            Some("human" | "automation")
-        ) && source.get("candidate").and_then(Value::as_bool) == Some(true)
-    });
-    if !has_candidate {
-        return Ok(None);
-    }
-
-    let input = json!({"sources": sources, "completion_links": completion_links});
-    let (response, seconds) = model_request::drain_json_stage(
-        sess,
-        ctx,
-        metadata,
-        "instruction_selection",
-        INSTRUCTION_SELECTION_PROMPT,
-        &input,
-        cancellation,
-    )
-    .await?;
-    let text = model_request::json_stage_text(response.output)?;
+) -> CodexResult<String> {
+    let (response, seconds) =
+        model_request::drain_instruction_selection(sess, ctx, metadata, request, cancellation)
+            .await?;
     receipts.push(CompactionModelResponseReceipt {
         stage: CheckpointResponseStage::InstructionSelection,
         response_id: response.response_id,
         seconds,
         usage: response.token_usage,
     });
-    let proposed: ProposedPlan = model_request::parse_json_stage("instruction_selection", &text)?;
-    if proposed.operations.iter().any(|operation| {
-        matches!(operation, ProposedOperation::DropSuperseded { correction_text, .. }
-            if correction_text
-                .as_deref()
-                .is_none_or(|text| text.trim().is_empty()))
-    }) {
-        return Err(CodexErr::InvalidRequest(
-            "RenCrow instruction selection requires exact correction_text".into(),
-        ));
-    }
-    Ok(Some(InstructionSelection::from_host(
-        snapshot_hash,
-        presentation_hash,
-        proposed,
-    )))
+    model_request::json_stage_text(response.output)
 }
 
 /// Error returned when an automatic compaction would repeat a failure on an unchanged history.
@@ -319,9 +435,10 @@ async fn compact_v2(
         }
         InitialContextInjection::DoNotInject => None,
     };
-    let (canonical, source_thread, active_call_ids) = load_canonical_rollout(sess)
-        .await
-        .map_err(StageFailure::into_error)?;
+    let (canonical, source_thread, active_call_ids) =
+        load_canonical_rollout(sess, snapshot.annotated_items())
+            .await
+            .map_err(StageFailure::into_error)?;
     let expected_world = snapshot.world_state_checkpoint();
     let (initial_context, world_state) = build_compaction_initial_context(sess, &injection).await;
     let prepared = stages::prepare_v2(
@@ -404,6 +521,7 @@ async fn compact_v2(
 /// Unreadable storage aborts; a malformed or foreign rollout is an integrity conflict.
 async fn load_canonical_rollout(
     sess: &Session,
+    selected: &[codex_history::ResponseItemEnvelope],
 ) -> Result<
     (
         Vec<codex_history::RolloutItem>,
@@ -432,6 +550,36 @@ async fn load_canonical_rollout(
             "RenCrow compaction blocked: rollout flush failed: {error}"
         ))
     })?;
+    let call_ids = compaction_source_call_ids(selected);
+    match sess
+        .services
+        .thread_store
+        .read_compaction_sources(ReadCompactionSourcesParams {
+            thread_id: sess.thread_id(),
+            call_ids,
+        })
+        .await
+    {
+        Ok(history) => {
+            if history.thread_id != sess.thread_id() {
+                return Err(StageFailure::Integrity(
+                    "compaction source history belongs to another thread".into(),
+                ));
+            }
+            return Ok((history.items, history.thread_id, active_call_ids));
+        }
+        Err(ThreadStoreError::Unsupported {
+            operation: "read_compaction_sources",
+        }) => {}
+        Err(ThreadStoreError::InvalidRequest { message }) => {
+            return Err(StageFailure::Integrity(message));
+        }
+        Err(error) => {
+            return Err(unavailable(format!(
+                "RenCrow compaction blocked: canonical source history read failed: {error}"
+            )));
+        }
+    }
     let (items, thread_id, parse_errors) = RolloutRecorder::load_rollout_items(&path)
         .await
         .map_err(|error| {
@@ -452,6 +600,27 @@ async fn load_canonical_rollout(
         ));
     }
     Ok((items, thread_id, active_call_ids))
+}
+
+fn compaction_source_call_ids(items: &[codex_history::ResponseItemEnvelope]) -> Vec<String> {
+    let mut call_ids = items
+        .iter()
+        .filter_map(|envelope| match &envelope.item {
+            codex_protocol::models::ResponseItem::FunctionCall { call_id, .. }
+            | codex_protocol::models::ResponseItem::CustomToolCall { call_id, .. }
+            | codex_protocol::models::ResponseItem::CustomToolCallOutput { call_id, .. } => {
+                Some(call_id.clone())
+            }
+            codex_protocol::models::ResponseItem::FunctionCallOutput {
+                call_id: Some(call_id),
+                ..
+            } => Some(call_id.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    call_ids.sort_unstable();
+    call_ids.dedup();
+    call_ids
 }
 
 #[cfg(test)]

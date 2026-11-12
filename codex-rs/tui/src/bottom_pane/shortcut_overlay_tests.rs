@@ -28,6 +28,7 @@ fn props() -> FooterProps {
             ..FooterKeyHints::default_bindings()
         },
         active_agent_label: None,
+        activity_context: None,
     }
 }
 

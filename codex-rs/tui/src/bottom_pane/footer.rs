@@ -90,6 +90,8 @@ pub(crate) struct FooterProps {
     /// When both this label and the configured status line are available, they are rendered on the
     /// same row separated by ` · `.
     pub(crate) active_agent_label: Option<String>,
+    /// RenCrow-owned activity time shown as passive footer context.
+    pub(crate) activity_context: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -827,11 +829,21 @@ pub(crate) fn passive_footer_status_line(props: &FooterProps) -> Option<Line<'st
         return None;
     }
 
-    let mut line = if props.status_line_enabled {
-        props.status_line_value.clone()
-    } else {
-        None
-    };
+    let mut line = props
+        .activity_context
+        .as_ref()
+        .map(|activity| Line::from(activity.clone()).set_style(secondary_text_style()));
+
+    if props.status_line_enabled
+        && let Some(status_line) = props.status_line_value.as_ref()
+    {
+        if let Some(existing) = line.as_mut() {
+            existing.spans.push(" · ".set_style(secondary_text_style()));
+            existing.spans.extend(status_line.spans.clone());
+        } else {
+            line = Some(status_line.clone());
+        }
+    }
 
     if let Some(active_agent_label) = props.active_agent_label.as_ref() {
         if let Some(existing) = line.as_mut() {
@@ -873,11 +885,11 @@ pub(crate) fn shows_passive_footer_line(props: &FooterProps) -> bool {
 
 /// Whether callers should reserve the dedicated status-line layout for a contextual footer row.
 ///
-/// The dedicated layout exists for the configurable `/statusline` row. An agent label by itself
-/// can be rendered by the standard footer flow, so this only becomes `true` when the status line
-/// feature is enabled and the current mode allows contextual footer content.
+/// The dedicated layout exists for configurable status content and RenCrow's optional activity
+/// context. An agent label by itself can be rendered by the standard footer flow.
 pub(crate) fn uses_passive_footer_status_layout(props: &FooterProps) -> bool {
-    props.status_line_enabled && shows_passive_footer_line(props)
+    (props.status_line_enabled || props.activity_context.is_some())
+        && shows_passive_footer_line(props)
 }
 
 pub(crate) fn footer_line_width(
@@ -1297,6 +1309,7 @@ mod tests {
                 status_line_enabled: false,
                 key_hints: FooterKeyHints::default_bindings(),
                 active_agent_label: None,
+                activity_context: None,
             },
         );
 
@@ -1317,6 +1330,7 @@ mod tests {
                     ..FooterKeyHints::default_bindings()
                 },
                 active_agent_label: None,
+                activity_context: None,
             },
         );
 
@@ -1334,6 +1348,7 @@ mod tests {
                 status_line_enabled: false,
                 key_hints: FooterKeyHints::default_bindings(),
                 active_agent_label: None,
+                activity_context: None,
             },
         );
 
@@ -1351,6 +1366,7 @@ mod tests {
                 status_line_enabled: false,
                 key_hints: FooterKeyHints::default_bindings(),
                 active_agent_label: None,
+                activity_context: None,
             },
         );
 
@@ -1368,6 +1384,7 @@ mod tests {
                 status_line_enabled: false,
                 key_hints: FooterKeyHints::default_bindings(),
                 active_agent_label: None,
+                activity_context: None,
             },
         );
 
@@ -1385,6 +1402,7 @@ mod tests {
                 status_line_enabled: false,
                 key_hints: FooterKeyHints::default_bindings(),
                 active_agent_label: None,
+                activity_context: None,
             },
         );
 
@@ -1402,6 +1420,7 @@ mod tests {
                 status_line_enabled: false,
                 key_hints: FooterKeyHints::default_bindings(),
                 active_agent_label: None,
+                activity_context: None,
             },
         );
 
@@ -1419,6 +1438,7 @@ mod tests {
                 status_line_enabled: false,
                 key_hints: FooterKeyHints::default_bindings(),
                 active_agent_label: None,
+                activity_context: None,
             },
         );
 
@@ -1436,6 +1456,7 @@ mod tests {
                 status_line_enabled: false,
                 key_hints: FooterKeyHints::default_bindings(),
                 active_agent_label: None,
+                activity_context: None,
             },
             Some(72),
             /*used_tokens*/ None,
@@ -1455,6 +1476,7 @@ mod tests {
                 status_line_enabled: false,
                 key_hints: FooterKeyHints::default_bindings(),
                 active_agent_label: None,
+                activity_context: None,
             },
             /*percent*/ None,
             Some(123_456),
@@ -1474,6 +1496,7 @@ mod tests {
                 status_line_enabled: false,
                 key_hints: FooterKeyHints::default_bindings(),
                 active_agent_label: None,
+                activity_context: None,
             },
         );
 
@@ -1489,6 +1512,7 @@ mod tests {
             status_line_enabled: false,
             key_hints: FooterKeyHints::default_bindings(),
             active_agent_label: None,
+            activity_context: None,
         };
 
         snapshot_footer_with_mode_indicator(
@@ -1517,6 +1541,7 @@ mod tests {
             status_line_enabled: false,
             key_hints: FooterKeyHints::default_bindings(),
             active_agent_label: None,
+            activity_context: None,
         };
 
         snapshot_footer_with_mode_indicator(
@@ -1538,6 +1563,7 @@ mod tests {
             status_line_enabled: true,
             key_hints: FooterKeyHints::default_bindings(),
             active_agent_label: None,
+            activity_context: None,
         };
 
         snapshot_footer("footer_status_line_overrides_shortcuts", props);
@@ -1554,6 +1580,7 @@ mod tests {
             status_line_enabled: true,
             key_hints: FooterKeyHints::default_bindings(),
             active_agent_label: None,
+            activity_context: None,
         };
 
         snapshot_footer("footer_status_line_yields_to_queue_hint", props);
@@ -1570,6 +1597,7 @@ mod tests {
             status_line_enabled: true,
             key_hints: FooterKeyHints::default_bindings(),
             active_agent_label: None,
+            activity_context: None,
         };
 
         snapshot_footer("footer_status_line_overrides_draft_idle", props);
@@ -1586,6 +1614,7 @@ mod tests {
             status_line_enabled: true,
             key_hints: FooterKeyHints::default_bindings(),
             active_agent_label: None,
+            activity_context: None,
         };
 
         snapshot_footer_with_mode_indicator_and_context(
@@ -1616,6 +1645,7 @@ mod tests {
             status_line_enabled: false,
             key_hints: FooterKeyHints::default_bindings(),
             active_agent_label: None,
+            activity_context: None,
         };
 
         snapshot_footer_with_mode_indicator_and_context(
@@ -1638,6 +1668,7 @@ mod tests {
             status_line_enabled: true,
             key_hints: FooterKeyHints::default_bindings(),
             active_agent_label: None,
+            activity_context: None,
         };
 
         // has status line and no collaboration mode
@@ -1663,6 +1694,7 @@ mod tests {
             status_line_enabled: true,
             key_hints: FooterKeyHints::default_bindings(),
             active_agent_label: None,
+            activity_context: None,
         };
 
         snapshot_footer_with_mode_indicator_and_context(
@@ -1685,6 +1717,7 @@ mod tests {
             status_line_enabled: false,
             key_hints: FooterKeyHints::default_bindings(),
             active_agent_label: Some("Robie [explorer]".to_string()),
+            activity_context: None,
         };
 
         snapshot_footer("footer_active_agent_label", props);
@@ -1701,9 +1734,41 @@ mod tests {
             status_line_enabled: true,
             key_hints: FooterKeyHints::default_bindings(),
             active_agent_label: Some("Robie [explorer]".to_string()),
+            activity_context: None,
         };
 
         snapshot_footer("footer_status_line_with_active_agent_label", props);
+    }
+
+    #[test]
+    fn activity_context_fits_narrow_footer_width() {
+        let props = FooterProps {
+            mode: FooterMode::ComposerEmpty,
+            esc_backtrack_hint: false,
+            is_task_running: false,
+            queue_submissions: false,
+            collaboration_modes_enabled: false,
+            is_wsl: false,
+            quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
+            status_line_value: Some(Line::from("Long configured status line")),
+            status_line_enabled: true,
+            key_hints: FooterKeyHints::default_bindings(),
+            active_agent_label: None,
+            activity_context: Some("13:21 JST · 1m05s · 11-08 13:21:03 JST".to_string()),
+        };
+        let rendered = render_footer_with_mode_indicator_and_context(
+            /*width*/ 20,
+            &props,
+            /*collaboration_mode_indicator*/ None,
+            context_window_line(/*percent*/ None, /*used_tokens*/ None),
+        );
+        assert!(rendered.contains("13:21 JST"));
+        assert!(rendered.contains("1m05s"));
+        assert!(
+            rendered
+                .lines()
+                .all(|line| unicode_width::UnicodeWidthStr::width(line) <= 20)
+        );
     }
 
     #[test]
@@ -1723,6 +1788,7 @@ mod tests {
             status_line_enabled: true,
             key_hints: FooterKeyHints::default_bindings(),
             active_agent_label: None,
+            activity_context: None,
         };
 
         let screen = render_footer_with_mode_indicator_and_context(

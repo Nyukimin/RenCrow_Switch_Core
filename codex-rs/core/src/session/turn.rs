@@ -409,6 +409,8 @@ pub(crate) async fn run_turn(
 
     let mut last_agent_message: Option<String> = None;
     let mut stop_hook_active = false;
+    let mut child_recovery_attempts = 0;
+    let mut completion_recovery_attempts = 0;
     // Although from the perspective of codex.rs, TurnDiffTracker has the lifecycle of a Task which contains
     // many turns, from the perspective of the user, it is a single turn.
     let turn_diff_tracker = Arc::new(tokio::sync::Mutex::new(
@@ -497,6 +499,76 @@ pub(crate) async fn run_turn(
                 .await?
             }
         };
+        if sess
+            .is_autonomous_completion_turn(&turn_context.sub_id)
+            .await
+            && sess.autonomous_completion_paused().await
+        {
+            return Err(CodexErr::TurnAborted);
+        }
+        if turn_context.config.rencrow_autonomous_completion
+            && matches!(
+                &turn_context.session_source,
+                SessionSource::Cli | SessionSource::VSCode | SessionSource::Exec
+            )
+            && sess.autonomous_completion_plan_review_due().await
+            && !sess
+                .autonomous_completion_has_unresolved_work(&turn_context.session_source)
+                .await
+        {
+            let root_task_id = match sess.active_task_scope().await {
+                Some(scope) => Some(scope.root_task_id),
+                None => sess
+                    .latest_rencrow_task_state()
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|state| state.boundary.root_task_id),
+            };
+            if let Some(root_task_id) = root_task_id
+                && let Some(contract) = sess.rencrow_completion_state(&root_task_id).await
+            {
+                let boundary_revision = sess
+                    .latest_rencrow_task_state()
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|state| state.boundary.revision)
+                    .unwrap_or(0);
+                let event_key = format!(
+                    "plan-review:{}:{}:{}:{}:{}",
+                    boundary_revision,
+                    contract.contract_revision,
+                    contract.units_completed_since_review,
+                    contract.plan_review_at.unwrap_or_default(),
+                    Session::autonomous_completion_action_digest(&contract),
+                );
+                if sess
+                    .mark_autonomous_completion_continued(&turn_context.sub_id, &event_key)
+                    .await
+                {
+                    let previous_plan = contract
+                        .next_action
+                        .as_deref()
+                        .unwrap_or("No plan recorded");
+                    let item = crate::context::ContextualUserFragment::into_boxed_response_item(
+                        Box::new(crate::context::AutonomousCompletionContinue {
+                            next_action: format!(
+                                "Review why acceptance conditions remain open. Call task_context_boundary plan_review with previous_plan exactly `{previous_plan}`, a distinct revised_plan, and an evidence-based reason. Do not reset product progress."
+                            ),
+                        }),
+                    );
+                    sess.record_response_item_and_emit_turn_item(
+                        &turn_context,
+                        &step_context.settings.model_info,
+                        item,
+                    )
+                    .await;
+                    last_agent_message = None;
+                    continue;
+                }
+            }
+        }
         let sampling_request_result: CodexResult<_> = async {
             super::time_reminder::maybe_record_current_time_reminder(
                 sess.as_ref(),
@@ -599,8 +671,13 @@ pub(crate) async fn run_turn(
                     );
                 }
 
+                let context_window_requested = sess.take_new_context_window_request().await;
+                let task_boundary_committed = sess
+                    .take_task_boundary_committed_turn(&turn_context.sub_id)
+                    .await;
                 let should_roll_over = needs_follow_up
-                    && (sess.take_new_context_window_request().await || token_limit_reached);
+                    && (token_limit_reached
+                        || (context_window_requested && !task_boundary_committed));
                 let allow_auto_compact_fallback = !should_roll_over && !token_limit_reached;
                 super::token_budget::maybe_record(
                     sess.as_ref(),
@@ -643,6 +720,200 @@ pub(crate) async fn run_turn(
 
                 if !needs_follow_up {
                     last_agent_message = sampling_request_last_agent_message;
+                    if let Some(prompt) = crate::rencrow_execution_guard::child_recovery_prompt(
+                        &sess,
+                        &turn_context,
+                        &mut child_recovery_attempts,
+                    )
+                    .await
+                    {
+                        sess.send_event(
+                            &turn_context,
+                            EventMsg::Warning(WarningEvent {
+                                message: prompt.clone(),
+                            }),
+                        )
+                        .await;
+                        let item = ResponseItem::Message {
+                            id: None,
+                            role: "developer".to_string(),
+                            content: vec![ContentItem::InputText { text: prompt }],
+                            phase: None,
+                            internal_chat_message_metadata_passthrough: None,
+                        };
+                        sess.record_response_item_and_emit_turn_item(
+                            &turn_context,
+                            &step_context.settings.model_info,
+                            item,
+                        )
+                        .await;
+                        last_agent_message = None;
+                        continue;
+                    }
+                    if turn_context.config.rencrow_autonomous_completion
+                        && matches!(
+                            &turn_context.session_source,
+                            SessionSource::Cli | SessionSource::VSCode | SessionSource::Exec
+                        )
+                        && let Some((root_task_id, _)) =
+                            sess.autonomous_completion_current_state().await
+                        && let Err(error) = sess
+                            .reconcile_rencrow_completion_evidence(&root_task_id)
+                            .await
+                    {
+                        tracing::warn!(%error, "autonomous completion evidence reconcile failed at turn end");
+                        return Err(CodexErr::Stream(error));
+                    }
+                    if turn_context.config.rencrow_autonomous_completion
+                        && matches!(
+                            &turn_context.session_source,
+                            SessionSource::Cli | SessionSource::VSCode | SessionSource::Exec
+                        )
+                        && sess.autonomous_completion_pending().await
+                        && !sess
+                            .autonomous_completion_has_unresolved_work(&turn_context.session_source)
+                            .await
+                    {
+                        let root_task_id = match sess.active_task_scope().await {
+                            Some(scope) => Some(scope.root_task_id),
+                            None => sess
+                                .latest_rencrow_task_state()
+                                .await
+                                .ok()
+                                .flatten()
+                                .map(|state| state.boundary.root_task_id),
+                        };
+                        let contract = if let Some(root_task_id) = root_task_id {
+                            sess.rencrow_completion_state(&root_task_id).await
+                        } else {
+                            None
+                        };
+                        if let Some(contract) = contract {
+                            let boundary_revision = sess
+                                .latest_rencrow_task_state()
+                                .await
+                                .ok()
+                                .flatten()
+                                .map(|state| state.boundary.revision)
+                                .unwrap_or(0);
+                            let plan_review_due =
+                                sess.autonomous_completion_plan_review_due().await;
+                            let event_key = if plan_review_due {
+                                format!(
+                                    "plan-review:{}:{}:{}:{}:{}",
+                                    boundary_revision,
+                                    contract.contract_revision,
+                                    contract.units_completed_since_review,
+                                    contract.plan_review_at.unwrap_or_default(),
+                                    Session::autonomous_completion_action_digest(&contract),
+                                )
+                            } else {
+                                format!(
+                                    "turn-end:{}:{}",
+                                    boundary_revision,
+                                    Session::autonomous_completion_action_digest(&contract),
+                                )
+                            };
+                            if sess
+                                .mark_autonomous_completion_continued(
+                                    &turn_context.sub_id,
+                                    &event_key,
+                                )
+                                .await
+                            {
+                                let action = if plan_review_due {
+                                    let previous_plan = contract
+                                        .next_action
+                                        .as_deref()
+                                        .unwrap_or("No plan recorded");
+                                    format!(
+                                        "Review why acceptance conditions remain open. Call task_context_boundary plan_review with previous_plan exactly `{previous_plan}`, a distinct revised_plan, and an evidence-based reason. Do not reset product progress."
+                                    )
+                                } else {
+                                    contract.next_action.clone().unwrap_or_else(||
+                                        "recover terminal child results, select the next ready unit, or review the plan".into(),
+                                    )
+                                };
+                                let item = crate::context::ContextualUserFragment::into_boxed_response_item(
+                                    Box::new(crate::context::AutonomousCompletionContinue {
+                                        next_action: action,
+                                    }),
+                                );
+                                sess.record_response_item_and_emit_turn_item(
+                                    &turn_context,
+                                    &step_context.settings.model_info,
+                                    item,
+                                )
+                                .await;
+                                last_agent_message = None;
+                                continue;
+                            }
+                        }
+                    }
+                    if turn_context.config.rencrow_autonomous_completion
+                        && matches!(
+                            &turn_context.session_source,
+                            SessionSource::Cli | SessionSource::VSCode | SessionSource::Exec
+                        )
+                        && !sess
+                            .autonomous_completion_has_unresolved_work(&turn_context.session_source)
+                            .await
+                        && sess
+                            .mark_autonomous_completion_bootstrap(&turn_context.sub_id)
+                            .await
+                            .is_some()
+                    {
+                        let item = crate::context::ContextualUserFragment::into_boxed_response_item(
+                            Box::new(crate::context::AutonomousCompletionRegister),
+                        );
+                        sess.record_response_item_and_emit_turn_item(
+                            &turn_context,
+                            &step_context.settings.model_info,
+                            item,
+                        )
+                        .await;
+                        last_agent_message = None;
+                        continue;
+                    }
+                    if let Some(prompt) =
+                        crate::rencrow_execution_guard::completion_recovery_prompt(
+                            &sess,
+                            &turn_context,
+                            &turn_diff_tracker,
+                            &mut completion_recovery_attempts,
+                        )
+                        .await
+                    {
+                        sess.send_event(
+                            &turn_context,
+                            EventMsg::Warning(WarningEvent {
+                                message: prompt.clone(),
+                            }),
+                        )
+                        .await;
+                        let item = ResponseItem::Message {
+                            id: None,
+                            role: "developer".to_string(),
+                            content: vec![ContentItem::InputText { text: prompt }],
+                            phase: None,
+                            internal_chat_message_metadata_passthrough: None,
+                        };
+                        sess.record_response_item_and_emit_turn_item(
+                            &turn_context,
+                            &step_context.settings.model_info,
+                            item,
+                        )
+                        .await;
+                        last_agent_message = None;
+                        continue;
+                    }
+                    // An unmet host-observed executor contract is an error, never completion.
+                    crate::rencrow_execution_guard::check_completion(
+                        &sess,
+                        &turn_context,
+                        &turn_diff_tracker,
+                    )
+                    .await?;
                     let stop_outcome = run_turn_stop_hooks(
                         &sess,
                         &step_context,
@@ -2421,6 +2692,14 @@ async fn drain_in_flight(
                 .await;
             }
             Err(err) => {
+                if matches!(
+                    err.details(),
+                    CodexErrorDetails::Fatal(message)
+                        if message.starts_with("RENCROW_READ_BUDGET_EXCEEDED: repeated host refusals stopped the turn;")
+                            || message.starts_with("RENCROW_PATCH_RETRY_EXCEEDED:")
+                ) {
+                    return Err(err);
+                }
                 error_or_panic(format!("in-flight tool future failed during drain: {err}"));
             }
         }
@@ -3058,6 +3337,11 @@ async fn try_run_sampling_request(
     if cancellation_token.is_cancelled() {
         return Err(CodexErr::TurnAborted);
     }
+
+    // Tool outputs are now in history. Commit a prepared task boundary before any follow-up
+    // model request can see the pre-boundary context.
+    sess.commit_prepared_task_boundary(&turn_context, &cancellation_token)
+        .await?;
 
     if should_emit_turn_diff {
         let unified_diff = {

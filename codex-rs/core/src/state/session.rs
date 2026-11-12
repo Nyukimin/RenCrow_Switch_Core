@@ -11,6 +11,7 @@ use codex_sandboxing::policy_transforms::merge_permission_profiles;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::path::PathBuf;
 
 use super::AdditionalContextStore;
 use super::auto_compact_window::AutoCompactWindow;
@@ -105,6 +106,35 @@ pub(crate) struct SessionState {
     /// Latest task admitted in this runtime, retained across completion and history edits.
     /// Cleared by standalone settings changes to invalidate pending continuation.
     pub(crate) last_started_turn_id: Option<String>,
+    /// True only when hydrated rollout history proves the last started turn completed normally.
+    pub(crate) rencrow_last_history_turn_completed: bool,
+    /// Host-confirmed implementation evidence for this thread's latest turn.
+    pub(crate) rencrow_execution_evidence:
+        Option<crate::rencrow_execution_guard::GuardExecutionEvidence>,
+    pub(crate) task_check_ledger: crate::task_check::TaskCheckLedger,
+    /// Host-owned start boundary for the current parent task scope.
+    pub(crate) active_task_scope: Option<ActiveTaskScope>,
+    pub(crate) rencrow_scope_needs_rebase: bool,
+    pub(crate) pending_task_boundary: Option<PendingTaskBoundary>,
+    pub(crate) task_boundary_committed_turn: Option<String>,
+    /// Opt-in acceptance ledger staged in the parent session and copied into accepted boundaries.
+    pub(crate) rencrow_completion_state:
+        Option<(String, codex_history::task_context::CompletionState)>,
+    pub(crate) rencrow_completion_paused: bool,
+    /// Serializes durable completion snapshots without holding session state across storage I/O.
+    pub(crate) rencrow_completion_persist_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    pub(crate) rencrow_completion_continued_for_turn: Option<String>,
+    /// Host-marked internal continuation turns, distinct from user-submitted turns.
+    pub(crate) rencrow_autonomous_turn_ids: HashSet<String>,
+    pub(crate) rencrow_completion_bootstrap_turn_ids: HashSet<String>,
+    pub(crate) rencrow_completion_resume_generation: u64,
+    /// Delegated children whose terminal result has not been collected or explicitly closed.
+    pub(crate) rencrow_completion_uncollected_children: HashSet<String>,
+    /// At most one external-blocker observer is owned by this live session.
+    pub(crate) rencrow_completion_recovery_task: Option<AbortOnDropHandle<()>>,
+    pub(crate) task_patch_attempts: HashMap<String, TaskPatchAttempt>,
+    /// Child implementation receipts already credited to this parent session.
+    pub(crate) rencrow_consumed_child_receipts: HashSet<(codex_protocol::ThreadId, String)>,
     /// Runtime accounting state for the active auto-compaction window.
     auto_compact_window: AutoCompactWindow,
     /// Original request effort for the current model while configuration updates remain active.
@@ -118,6 +148,47 @@ pub(crate) struct SessionState {
     pub(crate) pending_session_start_sources: VecDeque<codex_hooks::SessionStartSource>,
     granted_permissions_by_environment_id: HashMap<String, AdditionalPermissionProfile>,
     next_turn_is_first: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ActiveTaskScope {
+    pub(crate) root_task_id: String,
+    pub(crate) task_id: String,
+    pub(crate) task_revision: u64,
+    pub(crate) begin_call_id: String,
+    pub(crate) start_history_cursor: usize,
+}
+
+impl ActiveTaskScope {
+    /// Whether two scope records refer to the same execution scope. History cursors
+    /// are projection indexes and can change when a checkpoint rebases history.
+    pub(crate) fn same_execution(&self, other: &Self) -> bool {
+        self.root_task_id == other.root_task_id
+            && self.task_id == other.task_id
+            && self.task_revision == other.task_revision
+            && self.begin_call_id == other.begin_call_id
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PendingTaskBoundary {
+    pub(crate) state: codex_history::task_context::StoredTaskState,
+    pub(crate) accept_call_id: String,
+    pub(crate) accept_call_arguments: String,
+    pub(crate) expected_turn_id: String,
+    pub(crate) summary_text: String,
+    pub(crate) prepared_history_hash: String,
+    pub(crate) prepared_history_len: usize,
+    pub(crate) verification_workspace_root: PathBuf,
+    pub(crate) verified_artifacts: Vec<crate::task_check::TaskArtifactStamp>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct TaskPatchAttempt {
+    pub(crate) scope: ActiveTaskScope,
+    pub(crate) local_environment: bool,
+    pub(crate) paths: Vec<PathBuf>,
+    pub(crate) completed_successfully: bool,
 }
 
 impl SessionState {
@@ -151,6 +222,24 @@ impl SessionState {
             additional_context: AdditionalContextStore::default(),
             previous_turn_settings: None,
             last_started_turn_id: None,
+            rencrow_last_history_turn_completed: false,
+            rencrow_execution_evidence: None,
+            task_check_ledger: crate::task_check::TaskCheckLedger::default(),
+            active_task_scope: None,
+            rencrow_scope_needs_rebase: false,
+            pending_task_boundary: None,
+            task_boundary_committed_turn: None,
+            rencrow_completion_state: None,
+            rencrow_completion_paused: false,
+            rencrow_completion_persist_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            rencrow_completion_continued_for_turn: None,
+            rencrow_autonomous_turn_ids: HashSet::new(),
+            rencrow_completion_bootstrap_turn_ids: HashSet::new(),
+            rencrow_completion_resume_generation: 0,
+            rencrow_completion_uncollected_children: HashSet::new(),
+            rencrow_completion_recovery_task: None,
+            task_patch_attempts: HashMap::new(),
+            rencrow_consumed_child_receipts: HashSet::new(),
             auto_compact_window: AutoCompactWindow::new_with_ids(auto_compact_window_ids),
             reasoning_effort_pin: ReasoningEffortPin::Unset,
             startup_prewarm: None,
@@ -218,6 +307,7 @@ impl SessionState {
         reference_context_item: Option<TurnContextItem>,
         replacement: HistoryReplacement,
     ) {
+        let is_compaction = matches!(replacement, HistoryReplacement::Compaction { .. });
         let invalidate_reviews = match replacement {
             HistoryReplacement::Compaction {
                 reviewer_compaction_hash,
@@ -234,6 +324,18 @@ impl SessionState {
         }
         self.history
             .set_reference_context_item(reference_context_item);
+        if is_compaction
+            && let Some(scope) = self.active_task_scope.as_mut()
+            && let Some(begin_index) = self.history.annotated_items().iter().position(|envelope| {
+                matches!(
+                    &envelope.item,
+                    codex_protocol::models::ResponseItem::FunctionCall { call_id, .. }
+                        if call_id == &scope.begin_call_id
+                )
+            })
+        {
+            scope.start_history_cursor = begin_index;
+        }
         self.auto_compact_window.clear_prefill();
     }
 

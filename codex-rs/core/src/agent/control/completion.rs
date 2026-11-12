@@ -127,5 +127,11 @@ impl LocalAgentControl {
                 },
             );
         }
+        if let Ok(state) = self.upgrade()
+            && let Ok(parent_thread) = state.get_thread(parent_thread_id).await
+        {
+            let event_key = format!("child-result:{}:{}", outcome.thread_id, outcome.turn_id);
+            crate::agent::autonomous_completion::wake_parent(&parent_thread, &event_key).await;
+        }
     }
 }

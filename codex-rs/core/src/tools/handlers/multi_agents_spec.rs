@@ -71,6 +71,40 @@ pub fn create_spawn_agent_tool_v1(options: SpawnAgentToolOptions) -> ToolSpec {
     let return_value_description =
         "Returns the spawned agent id plus the user-facing nickname when available.";
     let mut properties = spawn_agent_common_properties_v1(&options.agent_type_description);
+    let mut completion_review = JsonSchema::object(
+        BTreeMap::from([
+            (
+                "unit_id".to_string(),
+                JsonSchema::string(Some(
+                    "Review completion unit id from the active completion contract.".to_string(),
+                )),
+            ),
+            (
+                "target_task_id".to_string(),
+                JsonSchema::string(Some(
+                    "Accepted task id whose current checked artifact the reviewer should inspect."
+                        .to_string(),
+                )),
+            ),
+            (
+                "target_task_revision".to_string(),
+                JsonSchema::number(Some(
+                    "Exact accepted revision of the task being reviewed.".to_string(),
+                )),
+            ),
+        ]),
+        Some(vec![
+            "unit_id".to_string(),
+            "target_task_id".to_string(),
+            "target_task_revision".to_string(),
+        ]),
+        Some(false.into()),
+    );
+    completion_review.description = Some(
+        "Optional typed host-tracked review request. Use only for a review unit in the active completion contract and a task revision with accepted host verification. The selected configured reviewer role must be read-only. Ask it to inspect the requested code and host evidence only; it must not edit files or rerun tests. This requests review; it does not itself complete or accept the unit."
+            .to_string(),
+    );
+    properties.insert("completion_review".to_string(), completion_review);
     if !options.expose_agent_type {
         properties.remove("agent_type");
     }

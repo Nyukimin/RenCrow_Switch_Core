@@ -2,6 +2,7 @@
 //! outside `codex-core`.
 
 mod code_mode;
+mod concise_tool_descriptions;
 mod dynamic_tool;
 mod function_call_error;
 mod image_detail;

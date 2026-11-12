@@ -75,6 +75,7 @@ impl LocalSettings {
                 alternate_screen: config.tui_alternate_screen,
                 status_line: config.tui_status_line.clone(),
                 status_line_use_colors: config.tui_status_line_use_colors,
+                rencrow_tui_jst_timestamps: config.tui_rencrow_jst_timestamps,
                 terminal_title: config.tui_terminal_title.clone(),
                 theme: config.tui_theme.clone(),
                 pet: config.tui_pet.clone(),

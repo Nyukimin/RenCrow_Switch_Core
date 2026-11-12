@@ -16,14 +16,26 @@ class DiagnoseTests(unittest.TestCase):
         logs = root / "logs.sqlite"
         rows = [
             {"type": "session_meta", "payload": {"id": "thread-1"}},
-            {"type": "token_usage_record", "payload": {
-                "thread_id": "thread-1", "response_id": "response-1"}},
+            {
+                "type": "token_usage_record",
+                "payload": {"thread_id": "thread-1", "response_id": "response-1"},
+            },
             {"type": "event_msg", "payload": {"type": "token_count"}},
-            {"type": "compacted", "payload": {
-                "replacement_history": [], "replacement_history_metadata": [{
-                    "rencrow_compaction": {"version": 2,
-                        "selection_mode": "deterministic_emergency",
-                        "responses": []}}]}},
+            {
+                "type": "compacted",
+                "payload": {
+                    "replacement_history": [],
+                    "replacement_history_metadata": [
+                        {
+                            "rencrow_compaction": {
+                                "version": 2,
+                                "selection_mode": "deterministic_emergency",
+                                "responses": [],
+                            }
+                        }
+                    ],
+                },
+            },
             {"type": "rencrow_compaction_commit", "payload": {}},
         ]
         rollout.write_text(
@@ -63,6 +75,26 @@ class DiagnoseTests(unittest.TestCase):
                 "response_payload": {"path": path},
             },
         }
+
+    def test_conservative_summary_is_not_counted_as_fully_accepted_selection(self):
+        with tempfile.TemporaryDirectory() as temp:
+            rollout, logs, _ = self._inputs(Path(temp))
+            rows = [json.loads(line) for line in rollout.read_text().splitlines()]
+            metadata = rows[3]["payload"]["replacement_history_metadata"][0][
+                "rencrow_compaction"
+            ]
+            metadata["selection_mode"] = "conservative_selection"
+            metadata["semantic_summary_hash"] = "1" * 64
+            rollout.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            report = diagnose(rollout, logs)
+            self.assertEqual(
+                (
+                    report["normal_count"],
+                    report["conservative_count"],
+                    report["emergency_count"],
+                ),
+                (0, 1, 0),
+            )
 
     def test_default_report_keeps_bodies_private_and_classifies_known_reason(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -177,7 +209,9 @@ class DiagnoseTests(unittest.TestCase):
                 self.assertEqual(
                     report["emergency_response_matches"][0]["status"], expected
                 )
-            self.assertEqual((root / "corrupt" / "bad.json").read_bytes(), b"{malformed")
+            self.assertEqual(
+                (root / "corrupt" / "bad.json").read_bytes(), b"{malformed"
+            )
             if os.name == "posix":
                 outside = root / "outside.json"
                 outside.write_bytes(b"{}")
@@ -204,7 +238,7 @@ class DiagnoseTests(unittest.TestCase):
             report = diagnose(rollout, logs, warning_output=output)
             framed = output.read_bytes()
             length = int.from_bytes(framed[:8], "big")
-            self.assertEqual(framed[8:8 + length], warning.encode("utf-8"))
+            self.assertEqual(framed[8 : 8 + length], warning.encode("utf-8"))
             self.assertEqual(len(framed), 8 + length)
             self.assertEqual(report["v2_warnings"][0]["reason"], "schema_rejected")
             self.assertNotIn(warning, json.dumps(report))

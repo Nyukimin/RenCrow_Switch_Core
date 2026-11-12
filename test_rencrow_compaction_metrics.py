@@ -203,6 +203,34 @@ class MeasurementTests(unittest.TestCase):
         self.assertEqual(checkpoint["result_count"], 0)
         self.assertIsNone(checkpoint["stage_total_tokens"])
 
+    def test_v3_task_boundary_with_inherited_v2_is_not_helper_compaction(self):
+        mixed = v2_prepared()
+        mixed["timestamp"] = "2026-09-24"
+        mixed["payload"]["replacement_history_metadata"].append(
+            {
+                "rencrow_compaction": {
+                    "version": 3,
+                    "mode": "task_boundary",
+                    "task_state": {"boundary": {"revision": 1}},
+                }
+            }
+        )
+        rows = [
+            usage("normal", 100),
+            v2_prepared(),
+            {"type": "rencrow_compaction_commit"},
+            mixed,
+            {"type": "rencrow_compaction_commit"},
+        ]
+        metrics = Metrics()
+        for row in rows:
+            metrics.consume(row)
+        report = metrics.report()
+        self.assertEqual(metrics.index, len(rows))
+        self.assertEqual(len(report["compactions"]), 1)
+        self.assertEqual(report["compactions"][0]["index"], 3)
+        self.assertFalse(report["prepared_checkpoint_without_marker"])
+
     def test_missing_v2_usage_is_unknown_and_rate_uses_real_output(self):
         m = Metrics()
         m.consume(

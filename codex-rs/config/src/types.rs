@@ -823,6 +823,11 @@ pub struct Tui {
     #[serde(default = "default_true")]
     pub status_line_use_colors: bool,
 
+    /// Show the last recorded TUI activity time and elapsed idle time in the footer.
+    /// Defaults to `false`.
+    #[serde(default)]
+    pub rencrow_tui_jst_timestamps: bool,
+
     /// Ordered list of terminal title item identifiers.
     ///
     /// When set, the TUI renders the selected items into the terminal window/tab title.

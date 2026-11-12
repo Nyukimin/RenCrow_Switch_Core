@@ -1,7 +1,15 @@
 use super::*;
 use crate::compact::SUMMARY_PREFIX;
 use crate::context_manager::ContextManager;
+use codex_history::RenCrowTaskCheckpointMetadataV3;
 use codex_history::ResponseItemEnvelope;
+use codex_history::task_checkpoint_metadata::TaskBoundarySourceFence;
+use codex_history::task_context::AcceptedTaskReceipt;
+use codex_history::task_context::BoundaryCandidate;
+use codex_history::task_context::BoundaryMode;
+use codex_history::task_context::StoredTaskState;
+use codex_history::task_context::TaskState;
+use codex_history::task_context::TaskStatus;
 use codex_protocol::ResponseItemId;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::models::BaseInstructions;
@@ -54,6 +62,56 @@ fn v2_metadata(summary_text: &str) -> Value {
             "usage": null
         }]
     })
+}
+
+fn stored_task_state() -> Value {
+    let boundary = BoundaryCandidate {
+        version: 1,
+        mode: BoundaryMode::Task,
+        thread_id: THREAD_ID.into(),
+        root_task_id: "root".into(),
+        closed_task_id: "task-a".into(),
+        revision: 1,
+        closed_task_revision: 1,
+        goal: "complete task A".into(),
+        tasks: vec![TaskState {
+            id: "task-a".into(),
+            purpose: "A".into(),
+            status: TaskStatus::Completed,
+            depends_on: vec![],
+        }],
+        current_task_id: None,
+        artifact_ref: "artifact:a".into(),
+        verification_ref: "check:a".into(),
+        decisions: vec![],
+        constraints: vec![],
+        completion_state: None,
+    };
+    let completed = [(
+        "task-a".into(),
+        AcceptedTaskReceipt {
+            revision: 1,
+            result: "verified".into(),
+            artifact_ref: "artifact:a".into(),
+            verification_ref: "check:a".into(),
+        },
+    )]
+    .into_iter()
+    .collect();
+    let candidate_hash = codex_history::archive_reference::content_sha256(
+        &serde_json::to_string(&boundary).unwrap(),
+    );
+    let state = StoredTaskState {
+        boundary,
+        completed,
+        parent_review_ref: "review:a".into(),
+        previous_revision: None,
+        previous_state_hash: None,
+        candidate_hash,
+        boundary_nonce: "nonce-a".into(),
+    };
+    state.validate(THREAD_ID).unwrap();
+    serde_json::to_value(state).unwrap()
 }
 
 fn checkpoint_metadata(summary: &ResponseItemEnvelope) -> &Value {
@@ -226,6 +284,63 @@ fn v2_candidate_accepts_shrunk_exact_native_projection_initial_context_and_check
         )
         .is_ok()
     );
+}
+
+#[test]
+fn capacity_candidate_accepts_v3_envelope_with_validated_task_state() {
+    let fixture = fixture(100_000, true);
+    let mut candidate = fixture.candidate.clone();
+    let summary = candidate.last_mut().unwrap();
+    let summary_text = summary_text(summary).to_owned();
+    let capacity = codex_history::RenCrowCompactionMetadataV2::parse_and_validate(
+        checkpoint_metadata(summary).clone(),
+        THREAD_ID,
+        &summary_text,
+    )
+    .unwrap();
+    super::super::stages::attach_summary_metadata(
+        &mut candidate,
+        "turn-candidate-test",
+        &summary_text,
+        &capacity,
+        Some(&stored_task_state()),
+    )
+    .unwrap();
+
+    validate(
+        &fixture,
+        &candidate,
+        AutoCompactTokenLimitScope::Total,
+        &limits(Some(i64::MAX), Some(i64::MAX)),
+    )
+    .unwrap_or_else(|error| panic!("V3 capacity candidate rejected: {error}"));
+}
+
+#[test]
+fn capacity_candidate_rejects_v3_task_boundary_mode() {
+    let fixture = fixture(100_000, true);
+    let mut candidate = fixture.candidate.clone();
+    let summary = candidate.last_mut().unwrap();
+    let summary_text = summary_text(summary).to_owned();
+    let checkpoint = RenCrowTaskCheckpointMetadataV3::task_boundary(
+        &summary_text,
+        stored_task_state(),
+        TaskBoundarySourceFence {
+            history_hash: "a".repeat(64),
+            removed_refs: vec![],
+        },
+    );
+    summary.metadata.get_or_insert_default().rencrow_compaction =
+        Some(serde_json::to_value(checkpoint).unwrap());
+
+    let error = validate(
+        &fixture,
+        &candidate,
+        AutoCompactTokenLimitScope::Total,
+        &limits(Some(i64::MAX), Some(i64::MAX)),
+    )
+    .expect_err("task boundary is not a capacity candidate");
+    assert!(error.contains("cannot be a task boundary checkpoint"));
 }
 
 #[test]

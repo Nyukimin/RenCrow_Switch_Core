@@ -6,6 +6,7 @@
 
 use crate::agent::role::DEFAULT_ROLE_NAME;
 use crate::agent::role::apply_role_to_config;
+use crate::agent::role::ensure_agent_role_enabled;
 use crate::config::Config;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
@@ -57,15 +58,23 @@ pub(crate) async fn prepare_agent_spawn_config(
     let turn = step_context.turn.as_ref();
     let mut config =
         build_agent_spawn_config(&session.get_base_instructions().await, step_context)?;
+    ensure_agent_role_enabled(&config, options.role_name)?;
     if options.version == SpawnConfigVersion::V1 && options.full_history_fork {
         reject_full_fork_agent_type_override(options.role_name)?;
     }
+    let role_applied_v1 = options.version == SpawnConfigVersion::V1 && !options.full_history_fork;
+    let (initial_model, initial_reasoning_effort) = if role_applied_v1 {
+        (None, None)
+    } else {
+        (options.model, options.reasoning_effort.clone())
+    };
     apply_requested_spawn_agent_model_overrides(
         session,
         step_context,
         &mut config,
-        options.model,
-        options.reasoning_effort,
+        initial_model,
+        initial_reasoning_effort,
+        /*include_configured_defaults*/ true,
     )
     .await?;
     if !options.full_history_fork
@@ -80,6 +89,19 @@ pub(crate) async fn prepare_agent_spawn_config(
                 .developer_instructions
                 .clone_from(&turn.developer_instructions);
         }
+    }
+    // V1's explicit tool arguments outrank the selected role. Apply them after role
+    // configuration, while leaving configured subagent defaults below the role layer.
+    if role_applied_v1 {
+        apply_requested_spawn_agent_model_overrides(
+            session,
+            step_context,
+            &mut config,
+            options.model,
+            options.reasoning_effort,
+            /*include_configured_defaults*/ false,
+        )
+        .await?;
     }
     apply_spawn_agent_service_tier(session, &mut config).await?;
     apply_spawn_agent_runtime_overrides(&mut config, turn)?;
@@ -98,8 +120,7 @@ pub(crate) async fn prepare_agent_spawn_config(
     let role_name = options
         .role_name
         .or_else(|| {
-            (options.version == SpawnConfigVersion::V2
-                && !options.full_history_fork
+            (!options.full_history_fork
                 && config
                     .agent_roles
                     .get(DEFAULT_ROLE_NAME)
@@ -210,11 +231,16 @@ async fn apply_requested_spawn_agent_model_overrides(
     config: &mut Config,
     requested_model: Option<&str>,
     requested_reasoning_effort: Option<ReasoningEffort>,
+    include_configured_defaults: bool,
 ) -> Result<(), String> {
     let turn = step_context.turn.as_ref();
-    let requested_model = requested_model.or(turn.config.agent_default_subagent_model.as_deref());
-    let requested_reasoning_effort = requested_reasoning_effort
-        .or_else(|| turn.config.agent_default_subagent_reasoning_effort.clone());
+    let (requested_model, requested_reasoning_effort) = resolve_spawn_agent_model_overrides(
+        requested_model,
+        requested_reasoning_effort,
+        turn.config.agent_default_subagent_model.as_deref(),
+        turn.config.agent_default_subagent_reasoning_effort.clone(),
+        include_configured_defaults,
+    );
     if requested_model.is_none() && requested_reasoning_effort.is_none() {
         return Ok(());
     }
@@ -252,15 +278,45 @@ async fn apply_requested_spawn_agent_model_overrides(
     }
 
     if let Some(reasoning_effort) = requested_reasoning_effort {
+        let model = config.model.as_deref().ok_or_else(|| {
+            "spawn_agent could not resolve the child model for reasoning effort validation"
+                .to_string()
+        })?;
+        let model_info = session
+            .services
+            .models_manager
+            .get_model_info(model, &config.to_models_manager_config())
+            .await;
         validate_spawn_agent_reasoning_effort(
-            &step_context.settings.model_info.slug,
-            &step_context.settings.model_info.supported_reasoning_levels,
+            model,
+            &model_info.supported_reasoning_levels,
             &reasoning_effort,
         )?;
         config.model_reasoning_effort = Some(reasoning_effort);
     }
 
     Ok(())
+}
+
+fn resolve_spawn_agent_model_overrides<'a>(
+    requested_model: Option<&'a str>,
+    requested_reasoning_effort: Option<ReasoningEffort>,
+    configured_model: Option<&'a str>,
+    configured_reasoning_effort: Option<ReasoningEffort>,
+    include_configured_defaults: bool,
+) -> (Option<&'a str>, Option<ReasoningEffort>) {
+    (
+        requested_model.or_else(|| {
+            include_configured_defaults
+                .then_some(configured_model)
+                .flatten()
+        }),
+        requested_reasoning_effort.or_else(|| {
+            include_configured_defaults
+                .then_some(configured_reasoning_effort)
+                .flatten()
+        }),
+    )
 }
 
 pub(crate) async fn apply_spawn_agent_service_tier(
@@ -374,3 +430,49 @@ fn validate_spawn_agent_reasoning_effort(
         "Reasoning effort `{requested_reasoning_effort}` is not supported for model `{model}`. Supported reasoning efforts: {supported}"
     ))
 }
+
+// Modified by RenCrow: a cold V1 resume keeps the child's recorded model, role and effort.
+pub(crate) async fn restore_recorded_agent_config(
+    config: &mut Config,
+    role: Option<&str>,
+    model: Option<&str>,
+    provider: &str,
+    effort: Option<ReasoningEffort>,
+) -> Result<(), String> {
+    let permissions = config.permissions.clone();
+    let reviewer = config.approvals_reviewer;
+    let cwd = config.cwd.clone();
+    if let Some(role) = role {
+        apply_role_to_config(config, Some(role)).await?;
+    }
+    // Retain current parent constraints and reapply only the role's narrowing.
+    config.permissions = permissions;
+    config.approvals_reviewer = reviewer;
+    config.cwd = cwd;
+    if config.rencrow_read_only {
+        let profile = crate::agent::rencrow_read_only::read_only_profile(
+            config.permissions.permission_profile(),
+        )?;
+        config
+            .permissions
+            .set_permission_profile(profile)
+            .map_err(|err| err.to_string())?;
+    }
+    if let Some(model) = model {
+        config.model = Some(model.to_owned());
+    }
+    config.model_reasoning_effort = effort;
+    if config.model_provider_id != provider {
+        config.model_provider = config
+            .model_providers
+            .get(provider)
+            .cloned()
+            .ok_or_else(|| format!("Recorded child model provider `{provider}` is unavailable"))?;
+        config.model_provider_id = provider.to_owned();
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "child_config_rencrow_tests.rs"]
+mod rencrow_tests;

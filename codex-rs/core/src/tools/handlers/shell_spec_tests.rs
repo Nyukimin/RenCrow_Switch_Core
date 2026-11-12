@@ -96,6 +96,37 @@ fn exec_command_tool_matches_expected_spec() {
             output_schema: Some(unified_exec_output_schema().into()),
         })
     );
+    assert!(!has_parameter(&tool, "task_evidence"));
+}
+
+#[test]
+fn task_evidence_is_optional_and_exposes_only_host_request_fields() {
+    let tool = create_exec_command_tool_with_environment_id(
+        CommandToolOptions {
+            allow_login_shell: false,
+            exec_permission_approvals_enabled: false,
+        },
+        /*include_environment_id*/ false,
+        /*include_shell_parameter*/ true,
+        /*include_windows_shell_guidance*/ cfg!(windows),
+        /*include_task_evidence*/ true,
+    );
+    let value = serde_json::to_value(tool).expect("tool schema serializes");
+    let evidence = value
+        .pointer("/parameters/properties/task_evidence")
+        .expect("optional task evidence is present in the exec schema");
+    assert_eq!(
+        evidence["required"],
+        serde_json::json!(["task_id", "task_revision", "artifact_paths", "check_kind"])
+    );
+    assert_eq!(
+        evidence["properties"]["check_kind"]["enum"],
+        serde_json::json!(["verification"])
+    );
+    assert_eq!(evidence["additionalProperties"], false);
+    assert!(evidence["properties"]["accepted"].is_null());
+    assert!(evidence["properties"]["hash"].is_null());
+    assert!(evidence["properties"]["status"].is_null());
 }
 
 #[test]
@@ -108,6 +139,7 @@ fn exec_command_tool_can_hide_shell_parameter() {
         /*include_environment_id*/ false,
         /*include_shell_parameter*/ false,
         /*include_windows_shell_guidance*/ cfg!(windows),
+        /*include_task_evidence*/ false,
     );
 
     assert!(!has_parameter(&tool, "shell"));
