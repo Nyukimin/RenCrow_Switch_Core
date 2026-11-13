@@ -690,6 +690,9 @@ impl Session {
     /// Called under the active-turn lock before running any task or lifecycle callback.
     pub(crate) async fn record_started_turn(&self, turn_id: &str) {
         let mut state = self.state.lock().await;
+        if state.last_started_turn_id.as_deref() != Some(turn_id) {
+            state.child_dispatch_book.clear();
+        }
         state.last_started_turn_id = Some(turn_id.to_string());
         state.rencrow_execution_evidence = None;
         // Publish admission before returning Started to callers that immediately inspect agent

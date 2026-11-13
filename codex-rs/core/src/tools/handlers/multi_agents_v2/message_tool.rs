@@ -10,8 +10,11 @@ use crate::agent::api::AgentInput;
 use crate::agent::api::AgentTarget;
 use crate::agent::api::SendRequest;
 use crate::agent::child_config::build_agent_resume_config;
+use crate::agent::child_dispatch::ChildDispatchKind;
+use crate::agent::child_dispatch::fingerprint as child_dispatch_fingerprint;
 use crate::agent::types::MessageDeliveryMode;
 use crate::tools::context::FunctionToolOutput;
+use codex_features::Feature;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -56,6 +59,20 @@ pub(super) async fn handle_message_string_tool(
     } = invocation;
     let receiver_thread_id = resolve_agent_target(&session, &turn, &target).await?;
     analytics.set_receiver(receiver_thread_id);
+    if mode == MessageDeliveryMode::TriggerTurn && session.enabled(Feature::RencrowChildMonitor) {
+        let key = child_dispatch_fingerprint(
+            receiver_thread_id,
+            ChildDispatchKind::V2FollowupTask,
+            &message,
+        )
+        .map_err(|error| {
+            FunctionCallError::RespondToModel(format!("could not reserve child dispatch: {error}"))
+        })?;
+        let reservation = session.reserve_child_dispatch(&turn.sub_id, key).await;
+        if let Some(reason) = reservation.refusal_message() {
+            return Err(FunctionCallError::RespondToModel(reason.to_string()));
+        }
+    }
     let resume_config =
         build_agent_resume_config(&turn).map_err(FunctionCallError::RespondToModel)?;
     let receipt = session

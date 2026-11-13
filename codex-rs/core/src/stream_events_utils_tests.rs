@@ -6,12 +6,16 @@ use super::handle_non_tool_response_item;
 use super::handle_output_item_done;
 use super::last_assistant_message_from_item;
 use super::response_item_may_include_external_context;
+use crate::session::TurnInput;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::session::tests::make_session_and_context;
 use crate::session::tests::make_session_and_context_with_auth_and_config_and_rx;
 use crate::session::tests::tool_registry_for_test_step;
 use crate::session::turn_context::TurnContext;
+use crate::state::TaskKind;
+use crate::tasks::SessionTask;
+use crate::tasks::SessionTaskResult;
 use crate::tools::ToolRouter;
 use crate::tools::parallel::ToolCallRuntime;
 use crate::turn_diff_tracker::TurnDiffTracker;
@@ -34,6 +38,29 @@ use pretty_assertions::assert_eq;
 use serde_json::json;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
+
+struct HeldOutputItemTask;
+
+impl SessionTask for HeldOutputItemTask {
+    fn kind(&self) -> TaskKind {
+        TaskKind::Regular
+    }
+
+    fn span_name(&self) -> &'static str {
+        "stream_events_utils_tests.held_output_item_task"
+    }
+
+    async fn run(
+        self: Arc<Self>,
+        _session: Arc<Session>,
+        _ctx: Arc<TurnContext>,
+        _input: Vec<TurnInput>,
+        cancellation_token: CancellationToken,
+    ) -> SessionTaskResult {
+        cancellation_token.cancelled().await;
+        Ok(None)
+    }
+}
 
 fn assistant_output_text(text: &str) -> ResponseItem {
     assistant_output_text_with_phase(text, /*phase*/ None)
@@ -381,7 +408,10 @@ async fn direct_results_keep_their_own_records_when_call_ids_repeat() {
         },
     )
     .await;
-    let mut ctx = output_context(Arc::clone(&session), turn_context);
+    session
+        .start_task(Arc::clone(&turn_context), Vec::new(), HeldOutputItemTask)
+        .await;
+    let mut ctx = output_context(Arc::clone(&session), Arc::clone(&turn_context));
     let mut pending = Vec::new();
     for step in ["read", "write"] {
         let arguments = json!({"plan": [{"step": step, "status": "in_progress"}]});
@@ -485,6 +515,9 @@ async fn direct_results_keep_their_own_records_when_call_ids_repeat() {
         .await
         .expect("plan result after capture re-enabled");
     assert!(result.item.executed_tool_call_metadata().is_none());
+    session
+        .abort_all_tasks(codex_protocol::protocol::TurnAbortReason::Interrupted)
+        .await;
 }
 
 #[tokio::test]

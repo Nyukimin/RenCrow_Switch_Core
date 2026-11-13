@@ -1,7 +1,10 @@
 use super::*;
+use crate::agent::control::monitor::ChildMonitorReport;
 use crate::session::InputQueueActivity;
 use crate::tools::handlers::multi_agents_spec::WaitAgentTimeoutOptions;
 use crate::tools::handlers::multi_agents_spec::create_wait_agent_tool_v2;
+use codex_features::Feature;
+use codex_protocol::ThreadId;
 use codex_tools::ToolSpec;
 use std::collections::HashMap;
 use std::time::Duration;
@@ -93,7 +96,27 @@ impl Handler {
 
         let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
         let outcome = wait_for_activity(&mut activity_rx, pending_activity, deadline).await;
-        let result = WaitAgentResult::from_outcome(outcome, requested_timeout_ms, timeout_ms);
+        let mut result = WaitAgentResult::from_outcome(outcome, requested_timeout_ms, timeout_ms);
+        if turn.config.features.enabled(Feature::RencrowChildMonitor) {
+            let mut report = session
+                .services
+                .agent_control
+                .open_child_monitor_report(session.thread_id)
+                .await;
+            let children = report
+                .children
+                .keys()
+                .filter_map(|reference| {
+                    ThreadId::from_string(reference)
+                        .ok()
+                        .map(|id| (id, reference.clone()))
+                })
+                .collect::<Vec<_>>();
+            session
+                .project_child_work_deadlines(&mut report, &children)
+                .await;
+            result.child_monitor = Some(report);
+        }
 
         session
             .emit_turn_item_completed(
@@ -133,6 +156,8 @@ struct WaitArgs {
 pub(crate) struct WaitAgentResult {
     pub(crate) message: String,
     pub(crate) timed_out: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) child_monitor: Option<ChildMonitorReport>,
 }
 
 impl WaitAgentResult {
@@ -153,6 +178,7 @@ impl WaitAgentResult {
             Some(_) | None => message.to_string(),
         };
         Self {
+            child_monitor: None,
             message,
             timed_out: outcome == WaitOutcome::TimedOut,
         }

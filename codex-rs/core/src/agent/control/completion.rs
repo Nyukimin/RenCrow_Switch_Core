@@ -95,13 +95,25 @@ impl LocalAgentControl {
         // `communication` owns the message. Keep a second copy only when the
         // recorder will actually need it after parent delivery succeeds.
         let trace_message = trace.is_enabled().then(|| message.clone());
-        let communication = InterAgentCommunication::new(
+        let mut communication = InterAgentCommunication::new(
             child_agent_path.clone(),
             parent_agent_path,
             Vec::new(),
             message,
             /*trigger_turn*/ false,
         );
+        if self
+            .get_child_monitor_snapshot(outcome.thread_id)
+            .await
+            .turn_id
+            .as_deref()
+            == Some(outcome.turn_id.as_str())
+        {
+            communication.id = Some(codex_protocol::ResponseItemId::with_suffix(
+                "rencrow_child_result",
+                format!("{}:{}", outcome.thread_id, outcome.turn_id),
+            ));
+        }
         let context =
             AgentCommunicationContext::new(AgentCommunicationKind::Result, outcome.thread_id);
         if let Err(err) = self

@@ -493,7 +493,14 @@ impl CodexErr {
     }
 
     pub fn to_error_event(&self, message_prefix: Option<String>) -> ErrorEvent {
-        let error_message = self.to_string();
+        let error_message = match self.details() {
+            CodexErrorDetails::IncompleteResponse { reason, .. } if reason == "content_filter" => {
+                format!(
+                    "stream disconnected before completion: Incomplete response returned, reason: {reason}"
+                )
+            }
+            _ => self.to_string(),
+        };
         let message: String = match message_prefix {
             Some(prefix) => format!("{prefix}: {error_message}"),
             None => error_message,

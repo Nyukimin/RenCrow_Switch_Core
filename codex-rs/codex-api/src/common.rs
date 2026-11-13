@@ -402,6 +402,8 @@ pub struct ResponseStream {
     pub rx_event: mpsc::Receiver<Result<ResponseEvent, ApiError>>,
     /// Server-assigned `x-request-id` response header, when present.
     pub upstream_request_id: Option<String>,
+    /// RenCrow Gateway's per-response verified model; absent for other transports/providers.
+    pub rencrow_verified_model: Option<String>,
 }
 
 impl Stream for ResponseStream {

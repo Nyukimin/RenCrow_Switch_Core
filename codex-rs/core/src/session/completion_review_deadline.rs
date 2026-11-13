@@ -101,6 +101,32 @@ impl Session {
             .min()
     }
 
+    /// Project a deadline only onto the exact reviewer generation that owns it.
+    pub(crate) async fn completion_review_deadline_for_turn(
+        &self,
+        reviewer: ThreadId,
+        reviewer_turn_id: &str,
+    ) -> Option<i64> {
+        let reviewer = reviewer.to_string();
+        let state = self.state.lock().await;
+        state
+            .rencrow_completion_state
+            .as_ref()?
+            .1
+            .units
+            .iter()
+            .filter(|unit| unit.kind == CompletionUnitKind::Review)
+            .filter_map(|unit| unit.review_evidence.as_ref())
+            .filter(|review| {
+                review.reviewer_thread_id == reviewer
+                    && review.reviewer_turn_id == reviewer_turn_id
+                    && review.deadline_escalation.is_none()
+                    && review.wait_result_ref.is_none()
+            })
+            .filter_map(|review| review.deadline_unix_ms)
+            .min()
+    }
+
     pub(crate) async fn completion_review_deadline_escalations(
         &self,
         reviewer_ids: &[ThreadId],

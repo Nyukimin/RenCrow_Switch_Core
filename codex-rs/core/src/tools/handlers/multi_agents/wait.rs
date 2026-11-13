@@ -1,8 +1,10 @@
 use super::*;
+use crate::agent::control::monitor::ChildMonitorReport;
 use crate::agent::status::is_final;
 use crate::session::session::Session;
 use crate::tools::handlers::multi_agents_spec::WaitAgentTimeoutOptions;
 use crate::tools::handlers::multi_agents_spec::create_wait_agent_tool_v1;
+use codex_features::Feature;
 use codex_protocol::error::CodexErrorDetails;
 use codex_tools::ToolSpec;
 use futures::FutureExt;
@@ -263,13 +265,48 @@ impl Handler {
         session
             .collect_completion_review_results(&call_id, &statuses)
             .await;
+        if turn.config.features.enabled(Feature::RencrowChildMonitor) {
+            for (child, child_turn, status) in &statuses {
+                if let Some(child_turn) = child_turn
+                    && matches!(status, AgentStatus::Completed(_) | AgentStatus::Errored(_))
+                {
+                    session
+                        .services
+                        .agent_control
+                        .mark_child_result_collected(
+                            *child,
+                            child_turn,
+                            crate::turn_timing::now_unix_timestamp_ms(),
+                        )
+                        .await;
+                }
+            }
+        }
 
         let timed_out = statuses.is_empty() && !steered;
         let statuses_by_id = statuses
             .iter()
             .map(|(thread_id, _, status)| (*thread_id, status.clone()))
             .collect::<HashMap<_, _>>();
+        let child_monitor = if turn.config.features.enabled(Feature::RencrowChildMonitor) {
+            let children = receiver_thread_ids
+                .iter()
+                .map(|id| (*id, target_by_thread_id[id].clone()))
+                .collect::<Vec<_>>();
+            let mut report = session
+                .services
+                .agent_control
+                .child_monitor_report(&children)
+                .await;
+            session
+                .project_child_work_deadlines(&mut report, &children)
+                .await;
+            Some(report)
+        } else {
+            None
+        };
         let result = WaitAgentResult {
+            child_monitor,
             status: statuses
                 .into_iter()
                 .filter_map(|(thread_id, _, status)| {
@@ -372,6 +409,8 @@ pub(crate) struct WaitAgentResult {
     pub(crate) timed_out: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) child_monitor: Option<ChildMonitorReport>,
 }
 
 impl ToolOutput for WaitAgentResult {

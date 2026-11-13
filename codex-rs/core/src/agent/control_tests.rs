@@ -204,6 +204,53 @@ fn spawn_agent_call(call_id: &str) -> ResponseItem {
     }
 }
 
+#[tokio::test]
+async fn child_monitor_health_notice_is_recorded_once_without_starting_parent_turn() {
+    use crate::agent::child_monitor::ChildMonitorPhase;
+    use crate::agent::child_monitor::health::ChildHealthNotice;
+    use crate::agent::child_monitor::health::ChildHealthNoticeKind;
+    let mut harness = AgentControlHarness::new().await;
+    harness
+        .config
+        .features
+        .enable(codex_features::Feature::RencrowChildMonitor)
+        .expect("monitor opt-in");
+    let (parent_id, parent) = harness.start_thread().await;
+    let child_id = ThreadId::new();
+    let status_before = parent.session.agent_status_generation().await;
+    let notice = ChildHealthNotice {
+        kind: ChildHealthNoticeKind::ProgressSuspected,
+        turn_id: Some("child-turn".to_string()),
+        phase: ChildMonitorPhase::Generating,
+        reason_code: "other_quiet".to_string(),
+        observed_at_ms: 300_000,
+        age_ms: Some(300_000),
+        progress_sequence: 3,
+    };
+    let mut delivery = super::health::HealthDeliveryState::default();
+    for _ in 0..2 {
+        super::health::deliver(
+            &harness.control,
+            parent_id,
+            child_id,
+            notice.clone(),
+            &mut delivery,
+        )
+        .await;
+    }
+    let history = parent.session.clone_history().await;
+    let occurrences = serde_json::to_string(&history.raw_items().collect::<Vec<_>>())
+        .expect("history JSON")
+        .matches("<child_health_notification>")
+        .count();
+    assert_eq!(occurrences, 1);
+    assert_eq!(
+        parent.session.agent_status_generation().await,
+        status_before
+    );
+    assert!(parent.session.active_turn.lock().await.is_none());
+}
+
 struct AgentControlHarness {
     _home: TempDir,
     config: Config,

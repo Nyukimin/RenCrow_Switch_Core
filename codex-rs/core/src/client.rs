@@ -197,6 +197,7 @@ fn session_telemetry_for_request(
 #[derive(Debug)]
 struct ModelClientState {
     thread_id: ThreadId,
+    child_monitor_enabled: AtomicBool,
     provider: SharedModelProvider,
     workspace_routing: WorkspaceRoutingContext,
     auth_env_telemetry: AuthEnvTelemetry,
@@ -521,6 +522,7 @@ impl ModelClient {
         Self {
             state: Arc::new(ModelClientState {
                 thread_id,
+                child_monitor_enabled: AtomicBool::new(false),
                 provider: model_provider,
                 workspace_routing,
                 auth_env_telemetry,
@@ -552,6 +554,33 @@ impl ModelClient {
         self.state.reasoning_effort_override_enabled
             && self.state.provider.info().is_openai()
             && model_info.supports_reasoning_effort_updates
+    }
+
+    pub(crate) fn enable_child_monitoring(&self) {
+        self.state
+            .child_monitor_enabled
+            .store(true, Ordering::Relaxed);
+    }
+
+    fn request_monitor(
+        &self,
+        metadata: &CodexResponsesMetadata,
+        model: &str,
+    ) -> Option<child_monitor::RequestMonitor> {
+        self.state
+            .child_monitor_enabled
+            .load(Ordering::Relaxed)
+            .then(|| {
+                child_monitor::RequestMonitor::new(
+                    self.state.thread_id,
+                    metadata.parent_thread_id,
+                    metadata.turn_id.as_deref(),
+                    metadata.parent_turn_id.as_deref(),
+                    metadata.root_turn_id.as_deref(),
+                    model,
+                    &self.state.provider.info().name,
+                )
+            })
     }
 
     pub(crate) fn with_restored_history(mut self, restored_history: bool) -> Self {
@@ -1716,6 +1745,9 @@ impl ModelClientSession {
                 client_setup.api_auth,
             )
             .with_telemetry(Some(request_telemetry), Some(sse_telemetry));
+            let mut request_monitor = self
+                .client
+                .request_monitor(responses_metadata, &model_info.slug);
             let stream_result = client.stream_request(request, options).await;
 
             match stream_result {
@@ -1725,6 +1757,7 @@ impl ModelClientSession {
                         request_session_telemetry,
                         inference_trace_attempt,
                         Arc::clone(&self.client.state.provider),
+                        request_monitor,
                     );
                     return Ok(stream);
                 }
@@ -1737,6 +1770,13 @@ impl ModelClientSession {
                 {
                     let response_debug_context =
                         extract_response_debug_context(&unauthorized_transport);
+                    if let Some(monitor) = request_monitor.as_mut() {
+                        monitor.headers(
+                            response_debug_context.request_id.as_deref(),
+                            /*verified_model*/ None,
+                        );
+                        monitor.failed("authentication recovery required");
+                    }
                     inference_trace_attempt.record_failed(
                         &unauthorized_transport,
                         response_debug_context.request_id.as_deref(),
@@ -1759,6 +1799,13 @@ impl ModelClientSession {
                 Err(err) => {
                     let response_debug_context =
                         extract_response_debug_context_from_api_error(&err);
+                    if let Some(monitor) = request_monitor.as_mut() {
+                        monitor.headers(
+                            response_debug_context.request_id.as_deref(),
+                            /*verified_model*/ None,
+                        );
+                        monitor.api_failed(&err);
+                    }
                     let err = self.client.state.provider.map_api_error(err);
                     inference_trace_attempt.record_failed(
                         &err,
@@ -1808,6 +1855,12 @@ impl ModelClientSession {
         let mut provider_auth_recovery_attempted = false;
         let mut pending_retry = PendingUnauthorizedRetry::default();
         loop {
+            let mut request_monitor = if warmup {
+                None
+            } else {
+                self.client
+                    .request_monitor(responses_metadata, &model_info.slug)
+            };
             let client_setup = self
                 .client
                 .current_client_setup(ClientRouting::Workspace)
@@ -1876,11 +1929,17 @@ impl ModelClientSession {
                 Err(ApiError::Transport(TransportError::Http { status, .. }))
                     if status == StatusCode::UPGRADE_REQUIRED =>
                 {
+                    if let Some(monitor) = request_monitor.as_mut() {
+                        monitor.cancelled("websocket upgrade unavailable; falling back to HTTP");
+                    }
                     return Ok(WebsocketStreamOutcome::FallbackToHttp);
                 }
                 Err(ApiError::Transport(unauthorized_transport))
                     if provider.is_recoverable_auth_error(&unauthorized_transport) =>
                 {
+                    if let Some(monitor) = request_monitor.as_mut() {
+                        monitor.failed("authentication recovery required");
+                    }
                     pending_retry = PendingUnauthorizedRetry::from_recovery(
                         handle_unauthorized(
                             unauthorized_transport,
@@ -1895,7 +1954,15 @@ impl ModelClientSession {
                     );
                     continue;
                 }
-                Err(err) => return Err(provider.map_api_error(err)),
+                Err(err) => {
+                    let context = extract_response_debug_context_from_api_error(&err);
+                    if let Some(monitor) = request_monitor.as_mut() {
+                        monitor
+                            .headers(context.request_id.as_deref(), /*verified_model*/ None);
+                        monitor.api_failed(&err);
+                    }
+                    return Err(provider.map_api_error(err));
+                }
             }
 
             // Measure the complete logical request, not only the websocket delta.
@@ -2017,6 +2084,13 @@ impl ModelClientSession {
             self.websocket_session.last_response_from_untraced_warmup = warmup;
             let stream_result = stream_result.map_err(|err| {
                 let response_debug_context = extract_response_debug_context_from_api_error(&err);
+                if let Some(monitor) = request_monitor.as_mut() {
+                    monitor.headers(
+                        response_debug_context.request_id.as_deref(),
+                        /*verified_model*/ None,
+                    );
+                    monitor.api_failed(&err);
+                }
                 let err = self.client.state.provider.map_api_error(err);
                 inference_trace_attempt.record_failed(
                     &err,
@@ -2030,6 +2104,7 @@ impl ModelClientSession {
                 request_session_telemetry,
                 inference_trace_attempt,
                 Arc::clone(&self.client.state.provider),
+                request_monitor,
             );
             self.websocket_session.last_response_rx = Some(last_request_rx);
             return Ok(WebsocketStreamOutcome::Stream(stream));
@@ -2255,6 +2330,8 @@ fn add_responses_lite_header(headers: &mut ApiHeaderMap, use_responses_lite: boo
     }
 }
 
+mod child_monitor;
+
 const RESPONSE_STREAM_CHANNEL_CAPACITY: usize = 1600;
 const STREAM_DROPPED_REASON: &str = "response stream dropped before provider terminal event";
 
@@ -2263,14 +2340,23 @@ fn map_response_stream(
     session_telemetry: SessionTelemetry,
     inference_trace_attempt: InferenceTraceAttempt,
     provider: SharedModelProvider,
+    mut request_monitor: Option<child_monitor::RequestMonitor>,
 ) -> (ResponseStream, oneshot::Receiver<LastResponse>) {
     let codex_api::ResponseStream {
         rx_event,
         upstream_request_id,
+        rencrow_verified_model,
     } = api_stream;
+    if let Some(monitor) = request_monitor.as_mut() {
+        monitor.headers(
+            upstream_request_id.as_deref(),
+            rencrow_verified_model.as_deref(),
+        );
+    }
     let api_stream = codex_api::ResponseStream {
         rx_event,
         upstream_request_id: None,
+        rencrow_verified_model: None,
     };
     map_response_events(
         upstream_request_id,
@@ -2278,6 +2364,7 @@ fn map_response_stream(
         session_telemetry,
         inference_trace_attempt,
         provider,
+        request_monitor,
     )
 }
 
@@ -2287,6 +2374,7 @@ fn map_response_events<S>(
     session_telemetry: SessionTelemetry,
     inference_trace_attempt: InferenceTraceAttempt,
     provider: SharedModelProvider,
+    mut request_monitor: Option<child_monitor::RequestMonitor>,
 ) -> (ResponseStream, oneshot::Receiver<LastResponse>)
 where
     S: futures::Stream<Item = std::result::Result<ResponseEvent, ApiError>>
@@ -2313,6 +2401,9 @@ where
         loop {
             let event = tokio::select! {
                 _ = consumer_dropped.cancelled() => {
+                    if let Some(monitor) = request_monitor.as_mut() {
+                        monitor.cancelled(STREAM_DROPPED_REASON);
+                    }
                     inference_trace_attempt.record_cancelled(
                         STREAM_DROPPED_REASON,
                         upstream_request_id,
@@ -2348,6 +2439,9 @@ where
                     end_turn,
                 }) => {
                     feedback_tags!(last_model_response_id = &response_id);
+                    if let Some(monitor) = request_monitor.as_mut() {
+                        monitor.completed(&response_id, token_usage.as_ref(), end_turn);
+                    }
                     if let Some(usage) = &token_usage {
                         session_telemetry.sse_event_completed(usage, ttft_ms);
                     }
@@ -2377,6 +2471,11 @@ where
                     }
                 }
                 Ok(event) => {
+                    if let ResponseEvent::ServerModel(model) = &event
+                        && let Some(monitor) = request_monitor.as_mut()
+                    {
+                        monitor.server_model(model);
+                    }
                     if matches!(&event, ResponseEvent::OutputItemAdded(_)) && ttft_ms.is_none() {
                         ttft_ms = Some(
                             i64::try_from(request_start.elapsed().as_millis()).unwrap_or(i64::MAX),
@@ -2399,6 +2498,10 @@ where
                     if let Some(upstream_request_id) = upstream_request_id {
                         feedback_tags!(last_model_request_id = upstream_request_id);
                     }
+                    if let Some(monitor) = request_monitor.as_mut() {
+                        monitor.headers(upstream_request_id, /*verified_model*/ None);
+                        monitor.api_failed(&err);
+                    }
                     let mapped = provider.map_api_error(err);
                     inference_trace_attempt.record_failed(
                         &mapped,
@@ -2414,6 +2517,9 @@ where
                     }
                 }
             }
+        }
+        if let Some(monitor) = request_monitor.as_mut() {
+            monitor.eof();
         }
         inference_trace_attempt.record_failed(
             "stream closed before response.completed",

@@ -208,6 +208,8 @@ pub enum Feature {
     MultiAgentV2,
     /// Enable shared discussion tools for an agent tree.
     AgentMessageBoard,
+    /// Track observed child-agent execution phases for parent wait results.
+    RencrowChildMonitor,
     /// Removed compatibility flag retained as a no-op.
     MultiAgentMode,
     /// Removed compatibility flag for the deleted agent-job tools.
@@ -1321,6 +1323,12 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::AgentMessageBoard,
         key: "agent_message_board",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::RencrowChildMonitor,
+        key: "rencrow_child_monitor",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
     },

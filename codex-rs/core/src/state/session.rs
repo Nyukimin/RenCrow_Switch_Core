@@ -17,6 +17,7 @@ use super::AdditionalContextStore;
 use super::auto_compact_window::AutoCompactWindow;
 use super::auto_compact_window::AutoCompactWindowIds;
 use super::auto_compact_window::AutoCompactWindowSnapshot;
+use crate::agent::child_dispatch::ChildDispatchBook;
 use crate::context_manager::ContextManager;
 use crate::context_manager::HistoryReplacement;
 use crate::session::PreviousTurnSettings;
@@ -106,6 +107,8 @@ pub(crate) struct SessionState {
     /// Latest task admitted in this runtime, retained across completion and history edits.
     /// Cleared by standalone settings changes to invalidate pending continuation.
     pub(crate) last_started_turn_id: Option<String>,
+    /// Same-turn child turn-start actions already reserved by the parent.
+    pub(crate) child_dispatch_book: ChildDispatchBook,
     /// True only when hydrated rollout history proves the last started turn completed normally.
     pub(crate) rencrow_last_history_turn_completed: bool,
     /// Host-confirmed implementation evidence for this thread's latest turn.
@@ -222,6 +225,7 @@ impl SessionState {
             additional_context: AdditionalContextStore::default(),
             previous_turn_settings: None,
             last_started_turn_id: None,
+            child_dispatch_book: ChildDispatchBook::default(),
             rencrow_last_history_turn_completed: false,
             rencrow_execution_evidence: None,
             task_check_ledger: crate::task_check::TaskCheckLedger::default(),

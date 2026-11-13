@@ -5,6 +5,7 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use crate::agent::child_monitor::SamplingTimingEvent;
 use crate::client::ModelClientSession;
 use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
@@ -1869,102 +1870,114 @@ async fn run_sampling_request(
     cancellation_token: CancellationToken,
 ) -> CodexResult<(SamplingRequestResult, Vec<ResponseItem>)> {
     let turn_context = Arc::clone(&step_context.turn);
-    let base_instructions = sess.get_prompt_base_instructions().await;
+    sess.observe_child_timing(&turn_context.sub_id, SamplingTimingEvent::SeriesStarted)
+        .await;
+    let result: CodexResult<(SamplingRequestResult, Vec<ResponseItem>)> = async {
+        let base_instructions = sess.get_prompt_base_instructions().await;
 
-    let tool_runtime = ToolCallRuntime::new(
-        Arc::clone(&sess),
-        Arc::clone(&step_context),
-        Arc::clone(&turn_diff_tracker),
-    );
-    let _code_mode_worker = sess.services.code_mode_service.start_turn_worker(
-        &sess,
-        Arc::clone(&step_context),
-        Arc::clone(&turn_diff_tracker),
-    );
-    let max_retries = turn_context.provider.info().stream_max_retries();
-    let mut retry_state = ResponsesStreamRetryState::default();
-    let mut initial_input = Some(input);
-    let mut original_input = None;
-    let mut executed_tool_calls_by_output = HashMap::new();
-    loop {
-        // Running code-mode cells can request review while this response is in flight.
-        // Keep the latest received ID until response.created replaces it.
-        let prompt_input = if let Some(input) = initial_input.take() {
-            input
-        } else {
-            sess.clone_history()
-                .await
-                .for_prompt(&step_context.settings.model_info.input_modalities)
-        };
-        let mut prompt_input = prompt_input;
-        sess.services
-            .executed_tool_calls
-            .attach_to_prompt(&mut prompt_input, &mut executed_tool_calls_by_output);
-        let prompt = build_prompt(
-            prompt_input,
-            step_context.as_ref(),
-            base_instructions.clone(),
-        );
-        let responses_metadata = sess
-            .responses_metadata(step_context.as_ref(), CodexResponsesRequestKind::Turn)
-            .await;
-        if crate::guardian::is_basic_session_source(&turn_context.session_source) {
-            crate::guardian::check_guardian_prompt_budget(
-                &sess,
-                &prompt,
-                &turn_context.config,
-                &step_context.settings.model_info,
-                &responses_metadata,
-            )?;
-        }
-        let err = match try_run_sampling_request(
-            tool_runtime.clone(),
+        let tool_runtime = ToolCallRuntime::new(
             Arc::clone(&sess),
             Arc::clone(&step_context),
-            Arc::clone(&turn_store),
-            client_session,
-            &responses_metadata,
             Arc::clone(&turn_diff_tracker),
-            &prompt,
-            cancellation_token.child_token(),
-        )
-        .await
-        {
-            Ok(output) => {
-                return Ok((output, original_input.unwrap_or(prompt.input)));
-            }
-            Err(err) => match err.details() {
-                CodexErrorDetails::ContextWindowExceeded => {
-                    sess.set_total_tokens_full(&turn_context).await;
-                    return Err(err);
-                }
-                CodexErrorDetails::UsageLimitReached(e) => {
-                    let rate_limits = e.rate_limits.clone();
-                    if let Some(rate_limits) = rate_limits {
-                        sess.update_rate_limits(&turn_context, *rate_limits).await;
-                    }
-                    return Err(err);
-                }
-                _ => err,
-            },
-        };
-
-        if original_input.is_none() {
-            original_input = Some(prompt.input);
-        }
-
-        handle_response_stream_error(
-            &mut retry_state,
-            max_retries,
-            err,
-            client_session,
+        );
+        let _code_mode_worker = sess.services.code_mode_service.start_turn_worker(
             &sess,
-            &turn_context,
-            ResponsesStreamRequest::Sampling,
-        )
-        .await?;
-        turn_context.turn_timing_state.record_sampling_retry();
+            Arc::clone(&step_context),
+            Arc::clone(&turn_diff_tracker),
+        );
+        let max_retries = turn_context.provider.info().stream_max_retries();
+        let mut retry_state = ResponsesStreamRetryState::default();
+        let mut initial_input = Some(input);
+        let mut original_input = None;
+        let mut executed_tool_calls_by_output = HashMap::new();
+        loop {
+            // Running code-mode cells can request review while this response is in flight.
+            // Keep the latest received ID until response.created replaces it.
+            let prompt_input = if let Some(input) = initial_input.take() {
+                input
+            } else {
+                sess.clone_history()
+                    .await
+                    .for_prompt(&step_context.settings.model_info.input_modalities)
+            };
+            let mut prompt_input = prompt_input;
+            sess.services
+                .executed_tool_calls
+                .attach_to_prompt(&mut prompt_input, &mut executed_tool_calls_by_output);
+            let prompt = build_prompt(
+                prompt_input,
+                step_context.as_ref(),
+                base_instructions.clone(),
+            );
+            let responses_metadata = sess
+                .responses_metadata(step_context.as_ref(), CodexResponsesRequestKind::Turn)
+                .await;
+            if crate::guardian::is_basic_session_source(&turn_context.session_source) {
+                crate::guardian::check_guardian_prompt_budget(
+                    &sess,
+                    &prompt,
+                    &turn_context.config,
+                    &step_context.settings.model_info,
+                    &responses_metadata,
+                )?;
+            }
+            let request_outcome = try_run_sampling_request(
+                tool_runtime.clone(),
+                Arc::clone(&sess),
+                Arc::clone(&step_context),
+                Arc::clone(&turn_store),
+                client_session,
+                &responses_metadata,
+                Arc::clone(&turn_diff_tracker),
+                &prompt,
+                cancellation_token.child_token(),
+            )
+            .await;
+            sess.observe_child_timing(&turn_context.sub_id, SamplingTimingEvent::RequestFinished)
+                .await;
+            let err = match request_outcome {
+                Ok(output) => {
+                    return Ok((output, original_input.unwrap_or(prompt.input)));
+                }
+                Err(err) => match err.details() {
+                    CodexErrorDetails::ContextWindowExceeded => {
+                        sess.set_total_tokens_full(&turn_context).await;
+                        return Err(err);
+                    }
+                    CodexErrorDetails::UsageLimitReached(e) => {
+                        let rate_limits = e.rate_limits.clone();
+                        if let Some(rate_limits) = rate_limits {
+                            sess.update_rate_limits(&turn_context, *rate_limits).await;
+                        }
+                        return Err(err);
+                    }
+                    _ => err,
+                },
+            };
+
+            if original_input.is_none() {
+                original_input = Some(prompt.input);
+            }
+
+            handle_response_stream_error(
+                &mut retry_state,
+                max_retries,
+                err,
+                client_session,
+                &sess,
+                &turn_context,
+                ResponsesStreamRequest::Sampling,
+            )
+            .await?;
+            turn_context.turn_timing_state.record_sampling_retry();
+            sess.observe_child_timing(&turn_context.sub_id, SamplingTimingEvent::RetryDecided)
+                .await;
+        }
     }
+    .await;
+    sess.observe_child_timing(&turn_context.sub_id, SamplingTimingEvent::SeriesFinished)
+        .await;
+    result
 }
 
 pub(crate) struct PreparedToolRecommendations {
@@ -2767,6 +2780,21 @@ async fn try_run_sampling_request(
         .features
         .enabled(Feature::ConcurrentReasoningSummaries)
         && turn_context.provider.info().is_openai();
+    let idle_timeout_ms = i64::try_from(
+        turn_context
+            .provider
+            .info()
+            .stream_idle_timeout()
+            .as_millis(),
+    )
+    .unwrap_or(i64::MAX);
+    sess.observe_child_timing(
+        &turn_context.sub_id,
+        SamplingTimingEvent::RequestStarted {
+            stream_idle_timeout_ms: idle_timeout_ms,
+        },
+    )
+    .await;
     let mut stream = client_session
         .stream(
             prompt,
@@ -2857,6 +2885,9 @@ async fn try_run_sampling_request(
             .session_telemetry
             .record_responses(&handle_responses, &event);
         record_turn_ttft_metric(&turn_context, &event).await;
+        // Observe real model data even when capped output remains passive until terminal success.
+        sess.observe_child_model_output(&turn_context.sub_id, &event)
+            .await;
 
         match event {
             ResponseEvent::Created { response_id } => {

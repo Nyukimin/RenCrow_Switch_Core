@@ -1,4 +1,6 @@
 // Modified by RenCrow Switch Core, 2026-09-22: intake and validated checkpoint integration.
+pub(crate) mod child_dispatch;
+mod child_monitor;
 mod rencrow_compaction;
 pub(crate) use rencrow_compaction::RenCrowCheckpoint;
 pub(crate) mod startup;
@@ -2420,6 +2422,7 @@ impl Session {
 
     /// Persist the event to rollout and send it to clients.
     pub(crate) async fn send_event(&self, turn_context: &TurnContext, msg: EventMsg) {
+        self.log_child_event(turn_context, &msg);
         let legacy_source = msg.clone();
         if let EventMsg::Error(error) = &legacy_source
             && error
@@ -2673,7 +2676,16 @@ impl Session {
 
     async fn deliver_event_raw(&self, event: Event) {
         // Record the last known agent status.
-        if let Some(status) = agent_status_from_event(&event.msg) {
+        let child_monitor_enabled = self.features.enabled(Feature::RencrowChildMonitor);
+        let status = if child_monitor_enabled
+            && matches!(&event.msg, EventMsg::Error(error) if !error.affects_turn_status())
+        {
+            None
+        } else {
+            agent_status_from_event(&event.msg)
+        };
+        if let Some(status) = status {
+            let state = self.state.lock().await;
             let turn_scoped = matches!(
                 &event.msg,
                 EventMsg::TurnStarted(_)
@@ -2681,18 +2693,30 @@ impl Session {
                     | EventMsg::TurnAborted(_)
                     | EventMsg::Error(_)
             );
-            let state = self.state.lock().await;
             let is_current_turn = !turn_scoped
                 || state
                     .last_started_turn_id
                     .as_deref()
                     .is_none_or(|turn_id| turn_id == event.id.as_str());
-            // A late status event may describe the previous turn after a follow-up has already
-            // been admitted. Keep the event and its history; only suppress the stale status write.
+            if is_current_turn && child_monitor_enabled {
+                self.child_monitor.lock().await.observe(
+                    &event.id,
+                    &event.msg,
+                    now_unix_timestamp_ms(),
+                );
+            }
             if is_current_turn {
                 self.agent_status.send_replace(status);
             }
-            drop(state);
+            // A late status event may describe the previous turn after a follow-up has already
+            // been admitted. Keep the event and its history; only suppress stale state writes.
+        } else if child_monitor_enabled {
+            // Non-status events may be emitted while SessionState is held by a producer. The
+            // monitor's own turn ID rejects stale events without acquiring that lock.
+            self.child_monitor
+                .lock()
+                .await
+                .observe(&event.id, &event.msg, now_unix_timestamp_ms());
         }
         if let Err(e) = self.tx_event.send(event).await {
             debug!("dropping event because channel is closed: {e}");
@@ -2704,6 +2728,20 @@ impl Session {
         (
             state.last_started_turn_id.clone(),
             self.agent_status.borrow().clone(),
+        )
+    }
+
+    pub(crate) async fn child_monitor_snapshot(
+        &self,
+    ) -> Option<crate::agent::child_monitor::ChildMonitorSnapshot> {
+        if !self.features.enabled(Feature::RencrowChildMonitor) {
+            return None;
+        }
+        Some(
+            self.child_monitor
+                .lock()
+                .await
+                .snapshot_at(now_unix_timestamp_ms()),
         )
     }
 
@@ -3294,6 +3332,9 @@ impl Session {
         };
         match entry {
             Some((tx_response, acceptance_order)) => {
+                if self.features.enabled(Feature::RencrowChildMonitor) {
+                    self.child_monitor.lock().await.input_received(sub_id);
+                }
                 tx_response
                     .send(AcceptedUserInputResponse {
                         response,
@@ -3344,6 +3385,9 @@ impl Session {
                     originating_turn_state.as_ref(),
                 )
                 .await;
+                if self.features.enabled(Feature::RencrowChildMonitor) {
+                    self.child_monitor.lock().await.input_received(call_id);
+                }
                 entry.tx_response.send(response).ok();
             }
             None => {
@@ -3492,6 +3536,9 @@ impl Session {
         };
         match entry {
             Some(tx_approve) => {
+                if self.features.enabled(Feature::RencrowChildMonitor) {
+                    self.child_monitor.lock().await.input_received(approval_id);
+                }
                 tx_approve.send(decision).ok();
             }
             None => {
@@ -4037,6 +4084,8 @@ impl Session {
         ])
         .await;
         self.send_raw_response_items(turn_context, items).await;
+        self.collect_child_communication(turn_context, &communication)
+            .await;
     }
 
     async fn maybe_warn_on_server_model_mismatch(

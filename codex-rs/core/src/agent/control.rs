@@ -74,9 +74,11 @@ mod budget;
 mod completion;
 mod delivery;
 mod execution;
+mod health;
 mod inspection;
 mod interrupt;
 mod legacy;
+pub(crate) mod monitor;
 mod residency;
 mod sender_context;
 mod service_tier;
@@ -650,13 +652,31 @@ impl LocalAgentControl {
         };
         let control = self.clone();
         tokio::spawn(async move {
-            let mut status_rx = match control.subscribe_status(child_thread_id).await {
-                Ok(status_rx) => status_rx,
+            let health_enabled =
+                health::enabled_for_parent_and_child(&control, parent_thread_id, child_thread_id)
+                    .await;
+            let mut health_delivery = health::HealthDeliveryState::default();
+            let Ok(manager) = control.upgrade() else {
+                return;
+            };
+            let child_thread = match manager.get_thread(child_thread_id).await {
+                Ok(child_thread) => child_thread,
                 Err(_) => {
-                    let Ok(manager) = control.upgrade() else {
-                        return;
-                    };
-                    if let Ok(parent_thread) = manager.get_thread(parent_thread_id).await {
+                    if health_enabled {
+                        health::deliver(
+                            &control,
+                            parent_thread_id,
+                            child_thread_id,
+                            health::observation_unavailable(
+                                None,
+                                0,
+                                now_unix_timestamp_ms(),
+                                "status_subscription_unavailable",
+                            ),
+                            &mut health_delivery,
+                        )
+                        .await;
+                    } else if let Ok(parent_thread) = manager.get_thread(parent_thread_id).await {
                         parent_thread
                             .inject_fragment_without_turn(SubagentNotification::new(
                                 child_reference.as_str(),
@@ -667,23 +687,83 @@ impl LocalAgentControl {
                     return;
                 }
             };
+            let watched_runtime = Arc::as_ptr(&child_thread) as usize;
+            let mut status_rx = child_thread.subscribe_status();
+            drop(child_thread);
+            drop(manager);
             let mut notified_terminal: Option<(String, AgentStatus)> = None;
             loop {
                 let Ok(manager) = control.upgrade() else {
                     return;
                 };
                 let Ok(child_thread) = manager.get_thread(child_thread_id).await else {
+                    let status = status_rx.borrow().clone();
+                    if health_enabled
+                        && matches!(status, AgentStatus::PendingInit | AgentStatus::Running)
+                    {
+                        health::deliver(
+                            &control,
+                            parent_thread_id,
+                            child_thread_id,
+                            health::observation_unavailable(
+                                None,
+                                0,
+                                now_unix_timestamp_ms(),
+                                "child_session_unavailable",
+                            ),
+                            &mut health_delivery,
+                        )
+                        .await;
+                    }
                     return;
                 };
                 let (turn_id, status) = child_thread.session.agent_status_generation().await;
+                let runtime_identity = Arc::as_ptr(&child_thread) as usize;
+                if health_enabled && watched_runtime != runtime_identity {
+                    return;
+                }
                 let child_uses_multi_agent_v2 =
                     child_thread.multi_agent_version() == Some(MultiAgentVersion::V2);
+                if health_enabled {
+                    health::observe(
+                        &control,
+                        parent_thread_id,
+                        child_thread_id,
+                        &child_thread,
+                        &status,
+                        &mut health_delivery,
+                    )
+                    .await;
+                }
                 drop(child_thread);
                 drop(manager);
                 if !is_final(&status) {
                     match tokio::time::timeout(Duration::from_secs(30), status_rx.changed()).await {
                         Ok(Ok(())) => continue,
-                        Ok(Err(_)) => return,
+                        Ok(Err(_)) => {
+                            // A loaded replacement has its own watcher; an unloaded active child
+                            // is an observation loss, not proof that its work stopped.
+                            if health_enabled
+                                && matches!(status, AgentStatus::PendingInit | AgentStatus::Running)
+                                && let Ok(manager) = control.upgrade()
+                                && manager.get_thread(child_thread_id).await.is_err()
+                            {
+                                health::deliver(
+                                    &control,
+                                    parent_thread_id,
+                                    child_thread_id,
+                                    health::observation_unavailable(
+                                        turn_id.clone(),
+                                        0,
+                                        now_unix_timestamp_ms(),
+                                        "status_observation_closed",
+                                    ),
+                                    &mut health_delivery,
+                                )
+                                .await;
+                            }
+                            return;
+                        }
                         Err(_) => {
                             let Ok(manager) = control.upgrade() else {
                                 return;

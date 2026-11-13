@@ -3,6 +3,8 @@ pub(crate) mod agent_resolver;
 pub(crate) mod api;
 pub(crate) mod autonomous_completion;
 pub(crate) mod child_config;
+pub(crate) mod child_dispatch;
+pub(crate) mod child_monitor;
 pub(crate) mod completion_recovery;
 pub(crate) mod completion_review_deadline;
 pub(crate) mod control;

@@ -59,6 +59,11 @@ pub fn spawn_response_stream(
         .get(REQUEST_ID_HEADER)
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
+    let rencrow_verified_model = stream_response
+        .headers
+        .get("x-rencrow-verified-model")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
     let safety_buffering_treatment =
         treatment_from_headers(&stream_response.headers).unwrap_or_default();
     if let Some(turn_state) = turn_state.as_ref()
@@ -98,6 +103,7 @@ pub fn spawn_response_stream(
     ResponseStream {
         rx_event,
         upstream_request_id,
+        rencrow_verified_model,
     }
 }
 
@@ -1787,6 +1793,10 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(REQUEST_ID_HEADER, HeaderValue::from_static("req-1"));
         headers.insert(
+            "x-rencrow-verified-model",
+            HeaderValue::from_static("verified-route"),
+        );
+        headers.insert(
             OPENAI_MODEL_HEADER,
             HeaderValue::from_static(CYBER_RESTRICTED_MODEL_FOR_TESTS),
         );
@@ -1804,6 +1814,10 @@ mod tests {
             /*turn_state*/ None,
         );
         assert_eq!(stream.upstream_request_id.as_deref(), Some("req-1"));
+        assert_eq!(
+            stream.rencrow_verified_model.as_deref(),
+            Some("verified-route")
+        );
         let event = stream
             .rx_event
             .recv()

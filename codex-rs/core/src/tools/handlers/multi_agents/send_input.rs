@@ -1,7 +1,10 @@
 use super::*;
 use crate::agent::child_config::build_agent_resume_config;
+use crate::agent::child_dispatch::ChildDispatchKind;
+use crate::agent::child_dispatch::fingerprint as child_dispatch_fingerprint;
 use crate::agent::control::render_input_preview;
 use crate::tools::handlers::multi_agents_spec::create_send_input_tool_v1;
+use codex_features::Feature;
 use codex_tools::ToolSpec;
 
 pub(crate) struct Handler;
@@ -47,6 +50,24 @@ impl Handler {
         let receiver_thread_id = parse_agent_id_target(&args.target)?;
         let input_items = parse_collab_input(args.message, args.items)?;
         let prompt = render_input_preview(&input_items);
+        if session.enabled(Feature::RencrowChildMonitor) {
+            let key = child_dispatch_fingerprint(
+                receiver_thread_id,
+                ChildDispatchKind::V1SendInput {
+                    interrupt: args.interrupt,
+                },
+                &input_items,
+            )
+            .map_err(|error| {
+                FunctionCallError::RespondToModel(format!(
+                    "could not reserve child dispatch: {error}"
+                ))
+            })?;
+            let reservation = session.reserve_child_dispatch(&turn.sub_id, key).await;
+            if let Some(reason) = reservation.refusal_message() {
+                return Err(FunctionCallError::RespondToModel(reason.to_string()));
+            }
+        }
         let receiver_agent = session
             .services
             .agent_control

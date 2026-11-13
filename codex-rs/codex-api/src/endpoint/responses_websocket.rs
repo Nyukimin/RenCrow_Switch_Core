@@ -332,6 +332,7 @@ impl ResponsesWebsocketConnection {
         Ok(ResponseStream {
             rx_event,
             upstream_request_id: None,
+            rencrow_verified_model: None,
         })
     }
 }

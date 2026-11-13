@@ -58,6 +58,7 @@ use codex_protocol::models::SandboxEnforcement;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::FileSystemAccessMode;
 use codex_protocol::protocol::FileSystemPath;
@@ -1638,13 +1639,30 @@ async fn multi_agent_v2_list_agents_returns_completed_status() {
         .get_thread(agent_id)
         .await
         .expect("child thread should exist");
-    let child_turn = child_thread.session.new_default_turn().await;
+    let mut status_rx = child_thread.subscribe_status();
+    if matches!(status_rx.borrow().clone(), AgentStatus::PendingInit) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                status_rx
+                    .changed()
+                    .await
+                    .expect("child status should advance past pending init");
+                if !matches!(status_rx.borrow().clone(), AgentStatus::PendingInit) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("spawned child should start before completion is delivered");
+    }
+    let (current_turn_id, _) = child_thread.session.agent_status_generation().await;
+    let turn_id = current_turn_id.expect("started child should have a current turn generation");
     child_thread
         .session
-        .send_event(
-            child_turn.as_ref(),
-            EventMsg::TurnComplete(TurnCompleteEvent {
-                turn_id: child_turn.sub_id.clone(),
+        .send_event_raw(Event {
+            id: turn_id.clone(),
+            msg: EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id,
                 started_at: None,
                 last_agent_message: Some("done".to_string()),
                 error: None,
@@ -1652,7 +1670,7 @@ async fn multi_agent_v2_list_agents_returns_completed_status() {
                 duration_ms: None,
                 time_to_first_token_ms: None,
             }),
-        )
+        })
         .await;
 
     let output = ListAgentsHandlerV2
@@ -2729,6 +2747,89 @@ async fn send_input_rejects_invalid_id() {
 }
 
 #[tokio::test]
+async fn child_dispatch_guard_keeps_failed_attempt_and_allows_changed_input() {
+    let (session, turn, _events) =
+        crate::session::tests::make_session_and_context_with_auth_and_config_and_rx(
+            CodexAuth::from_api_key("dummy"),
+            Vec::new(),
+            |config| {
+                config
+                    .features
+                    .enable(Feature::RencrowChildMonitor)
+                    .expect("monitor opt-in");
+            },
+        )
+        .await;
+    session.record_started_turn(&turn.sub_id).await;
+    let target = ThreadId::new();
+    for (call_id, message, duplicate) in [
+        ("first-attempt", "inspect status", false),
+        ("new-call-same-input", "inspect status", true),
+        (
+            "changed-input",
+            "inspect status and report the cause",
+            false,
+        ),
+    ] {
+        let mut call = invocation(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            "send_input",
+            function_payload(
+                json!({"target": target.to_string(), "message": message, "interrupt": true}),
+            ),
+        );
+        call.call_id = call_id.to_string();
+        let Err(FunctionCallError::RespondToModel(message)) = SendInputHandler.handle(call).await
+        else {
+            panic!("missing target or duplicate should be refused");
+        };
+        assert_eq!(message.contains("unchanged child dispatch"), duplicate);
+    }
+}
+
+#[tokio::test]
+async fn child_dispatch_guard_covers_followup_but_leaves_queued_messages_unchanged() {
+    let (session, turn, _events) =
+        crate::session::tests::make_session_and_context_with_auth_and_config_and_rx(
+            CodexAuth::from_api_key("dummy"),
+            Vec::new(),
+            |config| {
+                config
+                    .features
+                    .enable(Feature::RencrowChildMonitor)
+                    .expect("monitor opt-in");
+            },
+        )
+        .await;
+    session.record_started_turn(&turn.sub_id).await;
+    let target = ThreadId::new();
+    for (index, tool, duplicate) in [
+        (0, "followup_task", false),
+        (1, "followup_task", true),
+        (2, "send_message", false),
+        (3, "send_message", false),
+    ] {
+        let mut call = invocation(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            tool,
+            function_payload(json!({"target": target.to_string(), "message": "inspect status"})),
+        );
+        call.call_id = format!("attempt-{index}");
+        let result = if tool == "followup_task" {
+            FollowupTaskHandlerV2.handle(call).await
+        } else {
+            SendMessageHandlerV2.handle(call).await
+        };
+        let Err(FunctionCallError::RespondToModel(message)) = result else {
+            panic!("missing target or duplicate should be refused");
+        };
+        assert_eq!(message.contains("unchanged child dispatch"), duplicate);
+    }
+}
+
+#[tokio::test]
 async fn send_input_reports_missing_agent() {
     let (mut session, turn) = make_session_and_context().await;
     let manager = thread_manager();
@@ -3434,6 +3535,7 @@ async fn multi_agent_v2_wait_agent_accepts_timeout_only_argument() {
     assert_eq!(
         result,
         crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult {
+            child_monitor: None,
             message: "Wait completed.".to_string(),
             timed_out: false,
         }
@@ -3479,6 +3581,7 @@ async fn multi_agent_v2_wait_agent_clamps_timeout_below_configured_min() {
     assert_eq!(
         result,
         crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult {
+            child_monitor: None,
             message:
                 "Wait timed out.\n\nRequested timeout of 1ms was clamped to the minimum of 50ms."
                     .to_string(),
@@ -3516,6 +3619,7 @@ async fn multi_agent_v2_wait_agent_accepts_explicit_timeout_at_configured_min() 
     assert_eq!(
         result,
         crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult {
+            child_monitor: None,
             message: "Wait timed out.".to_string(),
             timed_out: true,
         }
@@ -3571,6 +3675,7 @@ async fn multi_agent_v2_wait_agent_uses_configured_default_timeout() {
     assert_eq!(
         result,
         crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult {
+            child_monitor: None,
             message: "Wait timed out.".to_string(),
             timed_out: true,
         }
@@ -3611,6 +3716,7 @@ async fn multi_agent_v2_wait_agent_allows_zero_configured_timeout() {
     assert_eq!(
         result,
         crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult {
+            child_monitor: None,
             message: "Wait timed out.".to_string(),
             timed_out: true,
         }
@@ -3676,11 +3782,69 @@ async fn multi_agent_v2_wait_agent_accepts_explicit_timeout_at_configured_max() 
     assert_eq!(
         result,
         crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult {
+            child_monitor: None,
             message: "Wait timed out.".to_string(),
             timed_out: true,
         }
     );
     assert_eq!(success, None);
+}
+
+#[tokio::test]
+async fn child_monitor_wait_reports_missing_child_as_unknown() {
+    let (mut session, mut turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    session.services.agent_control = manager.agent_control();
+    let mut config = (*turn.config).clone();
+    config
+        .features
+        .enable(Feature::RencrowChildMonitor)
+        .expect("monitor feature should be configurable");
+    set_turn_config(&mut turn, config);
+    let child = ThreadId::new();
+    let output = WaitAgentHandler::default()
+        .handle(invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "wait_agent",
+            function_payload(json!({"targets": [child.to_string()], "timeout_ms": 10_000})),
+        ))
+        .await
+        .expect("missing child should still yield an observation");
+    let (content, _) = expect_text_output(output);
+    let result: wait::WaitAgentResult = serde_json::from_str(&content).expect("valid result");
+    let report = result
+        .child_monitor
+        .expect("opt-in adds monitor observations");
+    assert_eq!(
+        report.children[&child.to_string()],
+        crate::agent::child_monitor::ChildMonitorSnapshot {
+            reason: Some("child session unavailable or monitoring disabled".to_string()),
+            ..Default::default()
+        }
+    );
+    assert_eq!(
+        result.status,
+        HashMap::from([(child.to_string(), AgentStatus::NotFound)])
+    );
+    let targets = (0..32)
+        .map(|_| {
+            let id = ThreadId::new();
+            (id, id.to_string())
+        })
+        .collect::<Vec<_>>();
+    let bounded = manager.agent_control().child_monitor_report(&targets).await;
+    assert!(
+        serde_json::to_vec(&bounded)
+            .expect("serializable report")
+            .len()
+            <= 4096
+    );
+    assert!(bounded.omitted_children > 0);
+    assert_eq!(
+        bounded.children.len() + bounded.omitted_children,
+        targets.len()
+    );
 }
 
 #[tokio::test]
@@ -3709,6 +3873,7 @@ async fn wait_agent_returns_not_found_for_missing_agents() {
     assert_eq!(
         result,
         wait::WaitAgentResult {
+            child_monitor: None,
             status: HashMap::from([
                 (id_a.to_string(), AgentStatus::NotFound),
                 (id_b.to_string(), AgentStatus::NotFound),
@@ -3750,6 +3915,7 @@ async fn wait_agent_times_out_when_status_is_not_final() {
     assert_eq!(
         result,
         wait::WaitAgentResult {
+            child_monitor: None,
             status: HashMap::new(),
             timed_out: true,
             message: None,
@@ -3859,6 +4025,7 @@ async fn wait_agent_returns_final_status_without_timeout() {
     assert_eq!(
         result,
         wait::WaitAgentResult {
+            child_monitor: None,
             status: HashMap::from([(agent_id.to_string(), AgentStatus::Shutdown)]),
             timed_out: false,
             message: None,
@@ -4124,6 +4291,7 @@ async fn multi_agent_v2_wait_agent_returns_summary_for_mailbox_activity() {
     assert_eq!(
         result,
         crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult {
+            child_monitor: None,
             message: "Wait completed.".to_string(),
             timed_out: false,
         }
@@ -4208,6 +4376,7 @@ async fn multi_agent_v2_wait_agent_returns_for_already_queued_mail() {
     assert_eq!(
         result,
         crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult {
+            child_monitor: None,
             message: "Wait completed.".to_string(),
             timed_out: false,
         }
@@ -4302,6 +4471,7 @@ async fn multi_agent_v2_wait_agent_wakes_on_any_mailbox_notification() {
     assert_eq!(
         result,
         crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult {
+            child_monitor: None,
             message: "Wait completed.".to_string(),
             timed_out: false,
         }
@@ -4393,6 +4563,7 @@ async fn multi_agent_v2_wait_agent_does_not_return_completed_content() {
     assert_eq!(
         result,
         crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult {
+            child_monitor: None,
             message: "Wait completed.".to_string(),
             timed_out: false,
         }

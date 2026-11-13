@@ -7,6 +7,7 @@ use super::step_settings::StepSettings;
 use super::step_settings::StepSettingsConstraints;
 use super::step_settings::StepSettingsUpdate;
 use super::*;
+use crate::agent::child_monitor::ChildMonitor;
 use crate::agents_md_manager::AgentsMdManager;
 use crate::agents_md_manager::SessionInstructions;
 use crate::config::ConstraintError;
@@ -61,6 +62,7 @@ pub(crate) struct Session {
     pub(crate) installation_id: String,
     pub(super) tx_event: Sender<Event>,
     pub(super) agent_status: watch::Sender<AgentStatus>,
+    pub(super) child_monitor: Mutex<ChildMonitor>,
     pub(super) state: Mutex<SessionState>,
     /// Orders accepted settings commits and their persisted events with compaction checkpoints.
     /// Keep this separate from `state` so storage I/O does not block runtime state access.
@@ -3224,7 +3226,8 @@ impl Session {
                 thread_store: Arc::clone(&thread_store),
                 attestation_provider: attestation_provider.clone(),
                 time_provider,
-                model_client: ModelClient::new(
+                model_client: {
+                    let model_client = ModelClient::new(
                     Some(Arc::clone(&auth_manager)),
                     if config.features.enabled(Feature::UseAgentIdentity) {
                         AgentIdentityAuthPolicy::ChatGptAuth
@@ -3260,7 +3263,12 @@ impl Session {
                     .or(fork_cache_key),
                     tx_event.clone(),
                     codex_responses_headers,
-                ),
+                );
+                    if config.features.enabled(Feature::RencrowChildMonitor) {
+                        model_client.enable_child_monitoring();
+                    }
+                    model_client
+                },
                 executed_tool_calls: executed_tool_calls.clone(),
                 code_mode_service: crate::tools::code_mode::CodeModeService::new(
                     thread_id,
@@ -3277,6 +3285,7 @@ impl Session {
                 installation_id,
                 tx_event: tx_event.clone(),
                 agent_status,
+                child_monitor: Mutex::new(ChildMonitor::default()),
                 state: Mutex::new(state),
                 thread_settings_persistence: Semaphore::new(/*permits*/ 1),
                 managed_network_proxy_refresh_lock: Semaphore::new(/*permits*/ 1),
