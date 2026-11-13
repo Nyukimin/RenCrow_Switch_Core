@@ -102,6 +102,28 @@ def v2_prepared(selection_mode="model_selection", responses=None):
     }
 
 
+def v3_capacity_prepared(
+    capacity_metadata=None, mode="capacity", include_capacity_metadata=True
+):
+    inner = capacity_metadata
+    if inner is None:
+        inner = v2_prepared()["payload"]["replacement_history_metadata"][0][
+            "rencrow_compaction"
+        ]
+    metadata = {
+        "version": 3,
+        "mode": mode,
+        "task_state": {"boundary": {"revision": 2}},
+    }
+    if include_capacity_metadata:
+        metadata["capacity_metadata"] = inner
+    return {
+        "type": "compacted",
+        "timestamp": "2026-09-25",
+        "payload": {"replacement_history_metadata": [{"rencrow_compaction": metadata}]},
+    }
+
+
 class MeasurementTests(unittest.TestCase):
     def test_deduplication_and_stage_cost_not_added_twice(self):
         m = Metrics()
@@ -230,6 +252,58 @@ class MeasurementTests(unittest.TestCase):
         self.assertEqual(len(report["compactions"]), 1)
         self.assertEqual(report["compactions"][0]["index"], 3)
         self.assertFalse(report["prepared_checkpoint_without_marker"])
+
+    def test_v3_capacity_reads_nested_responses_only_after_commit_marker(self):
+        compacted = v3_capacity_prepared()
+        metrics = Metrics()
+        metrics.consume(compacted)
+
+        self.assertEqual(metrics.report()["compactions"], [])
+        self.assertTrue(metrics.report()["prepared_checkpoint_without_marker"])
+
+        metrics.consume({"type": "rencrow_compaction_commit"})
+        checkpoint = metrics.report()["compactions"][0]
+        self.assertEqual(checkpoint["selection_mode"], "model_selection")
+        self.assertEqual(checkpoint["model"], "worker-v2")
+        self.assertEqual(checkpoint["effort"], "high")
+        self.assertEqual(checkpoint["applied_ref_count"], 2)
+        self.assertEqual(checkpoint["result_count"], 1)
+        self.assertEqual(checkpoint["stage_total_tokens"], 121)
+        self.assertEqual(checkpoint["seconds"], 5.0)
+
+    def test_v3_unknown_mode_or_invalid_capacity_metadata_is_skipped(self):
+        for compacted in (
+            v3_capacity_prepared(mode="future_mode"),
+            v3_capacity_prepared(include_capacity_metadata=False),
+            v3_capacity_prepared(capacity_metadata={"version": 3, "responses": []}),
+        ):
+            metrics = Metrics()
+            metrics.consume(compacted)
+            metrics.consume({"type": "rencrow_compaction_commit"})
+            self.assertEqual(metrics.report()["compactions"], [])
+            self.assertFalse(metrics.report()["prepared_checkpoint_without_marker"])
+
+    def test_v3_capacity_unknown_stage_units_remain_unknown(self):
+        inner = v2_prepared(
+            responses=[
+                {
+                    "stage": "summary",
+                    "response_id": "summary-unknown-seconds",
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 2,
+                        "total_tokens": 12,
+                    },
+                }
+            ]
+        )["payload"]["replacement_history_metadata"][0]["rencrow_compaction"]
+        metrics = Metrics()
+        metrics.consume(v3_capacity_prepared(capacity_metadata=inner))
+        metrics.consume({"type": "rencrow_compaction_commit"})
+
+        checkpoint = metrics.report()["compactions"][0]
+        self.assertIsNone(checkpoint["seconds"])
+        self.assertEqual(checkpoint["stage_total_tokens"], 12)
 
     def test_missing_v2_usage_is_unknown_and_rate_uses_real_output(self):
         m = Metrics()

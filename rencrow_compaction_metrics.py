@@ -124,12 +124,30 @@ class Metrics:
             )
             if not isinstance(latest, dict):
                 return
-            # V3 task-boundary snapshots inherit older replacement metadata.
-            # The latest checkpoint owns this commit; its inherited V2
-            # responses are not helper work performed for this checkpoint.
-            if latest.get("version") == 3 and latest.get("mode") == "task_boundary":
+            version = latest.get("version")
+            if version == 3:
+                # V3 task-boundary snapshots inherit older replacement metadata.
+                # The latest checkpoint owns this commit; its inherited V2
+                # responses are not helper work performed for this checkpoint.
+                mode = latest.get("mode")
+                if mode == "task_boundary":
+                    return
+                # Capacity helper responses live in a nested V2 metadata object.
+                # Unknown or malformed V3 records must not fall through to a
+                # legacy bundle or an inherited earlier checkpoint.
+                if mode != "capacity":
+                    return
+                capacity = latest.get("capacity_metadata")
+                if not isinstance(capacity, dict) or capacity.get("version") != 2:
+                    return
+                value = capacity
+            elif version == 2:
+                value = latest
+            elif version is None:
+                # Preserve support for legacy bundle metadata without a version.
+                value = latest
+            else:
                 return
-            value = latest
             if value.get("version") == 2:
                 applied_refs = value.get("applied_refs")
                 results = value.get("results")
