@@ -411,6 +411,18 @@ async fn start_or_steer(
             else {
                 unreachable!("explicit user input can enter Plan mode");
             };
+            let explicit_completion_resume = should_resume_autonomous_completion(
+                session,
+                TurnStartKind::User,
+                /*expected_previous_turn_id*/ None,
+                &input,
+            )
+            .await;
+            if explicit_completion_resume
+                && let Err(error) = session.resume_autonomous_completion_from_user_turn().await
+            {
+                return Err(CodexErr::InvalidRequest(error));
+            }
             if let Some(responsesapi_client_metadata) = responsesapi_client_metadata {
                 turn_context
                     .turn_metadata_state
@@ -448,19 +460,13 @@ async fn start_if_idle(
     kind: TurnStartKind,
     expected_previous_turn_id: Option<String>,
 ) -> CodexResult<TurnInputSubmission> {
-    let explicit_completion_resume = kind == TurnStartKind::User
-        && expected_previous_turn_id.is_none()
-        && session.get_config().await.rencrow_autonomous_completion
-        && is_explicit_human_autonomous_resume(session, &request.input).await
-        && matches!(
-            session
-                .state
-                .lock()
-                .await
-                .session_configuration
-                .session_source,
-            SessionSource::Cli | SessionSource::VSCode | SessionSource::Exec
-        );
+    let explicit_completion_resume = should_resume_autonomous_completion(
+        session,
+        kind,
+        expected_previous_turn_id.as_deref(),
+        &request.input,
+    )
+    .await;
     let TurnInputRequest {
         input,
         thread_settings,
@@ -619,6 +625,27 @@ async fn start_if_idle(
     Ok(TurnInputSubmission::Started {
         turn_id: submission_id,
     })
+}
+
+async fn should_resume_autonomous_completion(
+    session: &Session,
+    kind: TurnStartKind,
+    expected_previous_turn_id: Option<&str>,
+    input: &SubmittedTurnInput,
+) -> bool {
+    kind == TurnStartKind::User
+        && expected_previous_turn_id.is_none()
+        && session.get_config().await.rencrow_autonomous_completion
+        && is_explicit_human_autonomous_resume(session, input).await
+        && matches!(
+            session
+                .state
+                .lock()
+                .await
+                .session_configuration
+                .session_source,
+            SessionSource::Cli | SessionSource::VSCode | SessionSource::Exec
+        )
 }
 
 async fn steer(

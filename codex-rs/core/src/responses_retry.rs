@@ -13,6 +13,16 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::WarningEvent;
 use tracing::warn;
 
+/// Terminal Responses outcomes must not be retried as transport failures or switched to a fallback
+/// model, even when a caller has a broader recovery ladder.
+pub(crate) fn is_non_retryable_response_outcome(error: &CodexErrorDetails) -> bool {
+    matches!(
+        error,
+        CodexErrorDetails::IncompleteResponse { .. }
+            | CodexErrorDetails::ResponseProtocolFailure { .. }
+    )
+}
+
 const INITIAL_CONNECTION_RETRY_DELAY: Duration = Duration::from_secs(5);
 const MAX_CONNECTION_RETRY_DELAY: Duration = Duration::from_secs(60);
 

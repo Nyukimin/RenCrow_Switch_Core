@@ -65,6 +65,169 @@ use wiremock::matchers::path;
 const REMOTE_MODEL_SLUG: &str = "codex-test";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn capped_model_incomplete_response_never_dispatches_partial_tool_call() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let partial_server = start_mock_server().await;
+    let partial_call = "partial-output-limit-call";
+    let partial_args = json!({"cmd": "echo must-not-run", "yield_time_ms": 100});
+    let incomplete_response = sse(vec![
+        ev_response_created("resp-partial"),
+        ev_assistant_message("msg-partial", "partial answer must not be accepted"),
+        ev_function_call(
+            partial_call,
+            "exec_command",
+            &serde_json::to_string(&partial_args)?,
+        ),
+        json!({
+            "type": "response.incomplete",
+            "response": {
+                "id": "resp-partial",
+                "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 32_768,
+                    "total_tokens": 32_778
+                }
+            }
+        }),
+    ]);
+    let partial_mock = mount_sse_once(&partial_server, incomplete_response).await;
+    let partial_test = test_codex()
+        .with_model("gpt-5.5")
+        .with_model_info_override("gpt-5.5", |model| {
+            model.max_output_tokens = Some(32_768);
+        })
+        .build_with_auto_env(&partial_server)
+        .await?;
+    partial_test
+        .codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "run the partial tool call".to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+
+    let partial_events = timeout(Duration::from_secs(15), async {
+        let mut events = Vec::new();
+        loop {
+            let event = partial_test.codex.next_event().await?;
+            let terminal = matches!(&event.msg, EventMsg::Error(_) | EventMsg::TurnComplete(_));
+            events.push(event.msg);
+            if terminal {
+                return Ok::<_, anyhow::Error>(events);
+            }
+        }
+    })
+    .await??;
+    assert!(
+        partial_events
+            .iter()
+            .any(|event| matches!(event, EventMsg::Error(error)
+            if error.message.contains("OUTPUT_TOKEN_LIMIT"))),
+        "incomplete response should fail the turn with its output-limit reason: {partial_events:?}"
+    );
+    assert!(!partial_events.iter().any(
+        |event| matches!(event, EventMsg::ExecCommandBegin(begin) if begin.call_id == partial_call)
+    ));
+    assert!(!partial_events.iter().any(|event| matches!(event,
+        EventMsg::ItemCompleted(completed)
+            if matches!(&completed.item,
+                codex_protocol::items::TurnItem::AgentMessage(message)
+                    if message.content.iter().any(|content| matches!(content,
+                        codex_protocol::items::AgentMessageContent::Text { text }
+                            if text == "partial answer must not be accepted")))
+    )));
+    assert_eq!(partial_mock.requests().len(), 1);
+    assert_eq!(
+        partial_mock.single_request().body_json()["max_output_tokens"],
+        32_768
+    );
+    let total_response_requests = partial_server
+        .received_requests()
+        .await
+        .expect("mock server should capture response requests")
+        .iter()
+        .filter(|request| request.url.path().ends_with("/responses"))
+        .count();
+    assert_eq!(
+        total_response_requests, 1,
+        "incomplete response must not retry"
+    );
+
+    let completed_server = start_mock_server().await;
+    let completed_call = "completed-output-tool-call";
+    let completed_args = json!({"cmd": "echo completed-tool-ran", "yield_time_ms": 100});
+    let completed_mock = mount_sse_sequence(
+        &completed_server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-tool"),
+                ev_function_call(
+                    completed_call,
+                    "exec_command",
+                    &serde_json::to_string(&completed_args)?,
+                ),
+                ev_completed("resp-tool"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-final"),
+                ev_assistant_message("msg-final", "tool ran after terminal"),
+                ev_completed("resp-final"),
+            ]),
+        ],
+    )
+    .await;
+    let completed_test = test_codex()
+        .with_model("gpt-5.5")
+        .with_model_info_override("gpt-5.5", |model| {
+            model.max_output_tokens = Some(32_768);
+        })
+        .build_with_auto_env(&completed_server)
+        .await?;
+    completed_test
+        .codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "run the completed tool call".to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+
+    let completed_events = timeout(Duration::from_secs(15), async {
+        let mut events = Vec::new();
+        loop {
+            let event = completed_test.codex.next_event().await?;
+            let terminal = matches!(&event.msg, EventMsg::Error(_) | EventMsg::TurnComplete(_));
+            events.push(event.msg);
+            if terminal {
+                return Ok::<_, anyhow::Error>(events);
+            }
+        }
+    })
+    .await??;
+    assert!(
+        completed_events
+            .iter()
+            .any(|event| matches!(event, EventMsg::ExecCommandBegin(begin)
+                if begin.call_id == completed_call)),
+        "a tool call from a normally completed response should dispatch: {completed_events:?}"
+    );
+    assert!(
+        completed_events
+            .iter()
+            .any(|event| matches!(event, EventMsg::TurnComplete(_)))
+    );
+    assert_eq!(completed_mock.requests().len(), 2);
+    assert_eq!(
+        completed_mock.requests()[0].body_json()["max_output_tokens"],
+        32_768
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn disabled_update_plan_preserves_custom_catalog_instructions() -> Result<()> {
     skip_if_no_network!(Ok(()));
     const INSTRUCTIONS: &str = "## Plan tool\nNever deploy without explicit approval.\n";
@@ -615,6 +778,7 @@ async fn remote_models_remote_model_uses_unified_exec() -> Result<()> {
         context_window: Some(272_000),
         max_context_window: None,
         auto_compact_token_limit: None,
+        max_output_tokens: None,
         comp_hash: None,
         effective_context_window_percent: 95,
         experimental_supported_tools: Vec::new(),
@@ -893,6 +1057,7 @@ async fn remote_models_apply_legacy_instructions(auth: CodexAuth) -> Result<()> 
         context_window: Some(272_000),
         max_context_window: None,
         auto_compact_token_limit: None,
+        max_output_tokens: None,
         comp_hash: None,
         effective_context_window_percent: 95,
         experimental_supported_tools: Vec::new(),
@@ -1478,6 +1643,7 @@ fn test_remote_model_with_policy(
         context_window: Some(272_000),
         max_context_window: None,
         auto_compact_token_limit: None,
+        max_output_tokens: None,
         comp_hash: None,
         effective_context_window_percent: 95,
         experimental_supported_tools: Vec::new(),

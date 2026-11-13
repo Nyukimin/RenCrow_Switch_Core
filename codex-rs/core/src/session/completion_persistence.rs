@@ -945,11 +945,163 @@ impl Session {
 mod tests {
     use super::*;
     use crate::session::tests::make_session_and_context;
+    use crate::session::turn_context::TurnContext;
+    use crate::state::TaskKind;
+    use crate::tasks::SessionTask;
+    use crate::tasks::SessionTaskResult;
     use codex_history::task_context::AcceptanceCondition;
     use codex_history::task_context::AcceptanceStatus;
     use codex_history::task_context::CompletionUnit;
     use codex_history::task_context::UnitStatus;
     use pretty_assertions::assert_eq;
+    use std::future::Future;
+    use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
+
+    struct PendingBoundaryTask;
+
+    impl SessionTask for PendingBoundaryTask {
+        fn kind(&self) -> TaskKind {
+            TaskKind::Regular
+        }
+
+        fn span_name(&self) -> &'static str {
+            "completion_persistence_boundary_fixture"
+        }
+
+        fn run(
+            self: Arc<Self>,
+            _session: Arc<Session>,
+            _ctx: Arc<TurnContext>,
+            _input: Vec<crate::session::input_queue::TurnInput>,
+            cancellation_token: CancellationToken,
+        ) -> impl Future<Output = SessionTaskResult> + Send {
+            async move {
+                cancellation_token.cancelled().await;
+                Err(codex_protocol::error::CodexErr::TurnAborted)
+            }
+        }
+    }
+
+    async fn commit_accepted_task_boundary(
+        session: &Arc<Session>,
+        turn: Arc<TurnContext>,
+        artifact_ref: &str,
+    ) -> String {
+        let turn_id = turn.sub_id.clone();
+        session
+            .spawn_task(turn, Vec::new(), PendingBoundaryTask)
+            .await;
+        let history = session.clone_history().await;
+        let history_hash =
+            codex_history::compaction_candidate::history_digest(history.annotated_items())
+                .expect("hash source history for accepted boundary");
+        let removed_refs = history
+            .annotated_items()
+            .iter()
+            .enumerate()
+            .map(
+                |(index, item)| codex_history::task_checkpoint_metadata::TaskBoundarySourceRef {
+                    id: format!("item:{index}"),
+                    hash: codex_history::compaction_candidate::digest(&(
+                        &item.item,
+                        &item.metadata,
+                    ))
+                    .expect("hash source history item"),
+                },
+            )
+            .collect();
+        let boundary = codex_history::task_context::BoundaryCandidate {
+            version: 1,
+            mode: codex_history::task_context::BoundaryMode::Task,
+            thread_id: session.thread_id().to_string(),
+            root_task_id: "root".into(),
+            closed_task_id: "task-a".into(),
+            revision: 2,
+            closed_task_revision: 1,
+            goal: "review the accepted artifact".into(),
+            tasks: vec![codex_history::task_context::TaskState {
+                id: "task-a".into(),
+                purpose: "prepare the accepted review artifact".into(),
+                status: codex_history::task_context::TaskStatus::Completed,
+                depends_on: Vec::new(),
+            }],
+            current_task_id: None,
+            artifact_ref: artifact_ref.into(),
+            verification_ref: artifact_ref.into(),
+            decisions: Vec::new(),
+            constraints: Vec::new(),
+            completion_state: None,
+        };
+        let candidate_hash = codex_history::archive_reference::content_sha256(
+            &serde_json::to_string(&boundary).expect("serialize accepted boundary"),
+        );
+        let task_state = codex_history::task_context::StoredTaskState {
+            boundary,
+            completed: std::collections::BTreeMap::from([(
+                "task-a".into(),
+                codex_history::task_context::AcceptedTaskReceipt {
+                    revision: 1,
+                    result: "accepted review artifact is ready".into(),
+                    artifact_ref: artifact_ref.into(),
+                    verification_ref: artifact_ref.into(),
+                },
+            )]),
+            parent_review_ref: "review:task-a".into(),
+            previous_revision: None,
+            previous_state_hash: None,
+            candidate_hash,
+            boundary_nonce: "accepted-review-boundary".into(),
+        };
+        task_state
+            .validate(&session.thread_id().to_string())
+            .expect("accepted task boundary validates");
+
+        let summary_text = "Accepted artifact and verification receipt.";
+        let summary = codex_history::ResponseItemEnvelope::new(
+            codex_protocol::models::ResponseItem::Message {
+                id: None,
+                role: "user".into(),
+                content: vec![codex_protocol::models::ContentItem::InputText {
+                    text: summary_text.into(),
+                }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: Some(
+                    codex_protocol::models::InternalChatMessageMetadataPassthrough {
+                        content_item_kinds: Some(vec![codex_protocol::models::ContentItemKind(
+                            "compaction.summary".into(),
+                        )]),
+                        ..Default::default()
+                    },
+                ),
+            },
+        );
+        session
+            .commit_task_boundary_checkpoint(
+                history_hash.clone(),
+                turn_id.clone(),
+                vec![summary],
+                summary_text.to_string(),
+                task_state,
+                codex_history::task_checkpoint_metadata::TaskBoundarySourceFence {
+                    history_hash,
+                    removed_refs,
+                },
+            )
+            .await
+            .expect("persist accepted task boundary through owner checkpoint");
+        assert_eq!(
+            session
+                .latest_rencrow_task_state()
+                .await
+                .expect("read committed task state")
+                .expect("committed task state exists")
+                .completed["task-a"]
+                .artifact_ref,
+            artifact_ref
+        );
+        turn_id
+    }
 
     fn open_state(paused: bool) -> CompletionState {
         CompletionState {
@@ -1003,6 +1155,59 @@ mod tests {
                 ..Default::default()
             }),
         })
+    }
+
+    async fn record_test_artifact_receipt(
+        session: &Session,
+        workspace: &std::path::Path,
+        task_id: &str,
+        task_revision: u64,
+        call_id: &str,
+    ) -> codex_history::task_context::CompletionEvidenceRef {
+        let artifact_paths = vec![std::path::PathBuf::from("artifact.txt")];
+        let before = crate::task_check::hash_workspace_artifacts(workspace, &artifact_paths)
+            .expect("hash accepted artifact");
+        let request = crate::task_check::TaskEvidenceRequest {
+            task_id: task_id.to_string(),
+            task_revision,
+            artifact_paths,
+            check_kind: crate::task_check::TaskCheckKind::Verification,
+        };
+        session
+            .begin_task_check(
+                call_id.to_string(),
+                request,
+                workspace.to_path_buf(),
+                before.clone(),
+            )
+            .await;
+        let receipt = session
+            .finish_task_check(call_id, 0, true, before)
+            .await
+            .expect("successful accepted-task receipt");
+        let artifacts = receipt
+            .artifact_after
+            .iter()
+            .map(|stamp| {
+                serde_json::json!({
+                    "path": stamp.path.to_string_lossy(),
+                    "sha256": stamp.sha256,
+                })
+            })
+            .collect::<Vec<_>>();
+        let fingerprint = codex_history::compaction_candidate::digest(&serde_json::json!({
+            "task_id": receipt.task_id,
+            "task_revision": receipt.task_revision,
+            "workspace_root": receipt.workspace_root.to_string_lossy(),
+            "artifacts": artifacts,
+        }))
+        .expect("canonical accepted-task artifact fingerprint");
+        codex_history::task_context::CompletionEvidenceRef {
+            task_id: task_id.to_string(),
+            task_revision,
+            artifact_ref: format!("task-check:{call_id}:{fingerprint}"),
+            verification_ref: format!("task-check:{call_id}:{fingerprint}"),
+        }
     }
 
     fn maintenance_repair_history(
@@ -1290,6 +1495,7 @@ mod tests {
             Some(codex_history::task_context::CompletionReviewLaunchState {
                 spawn_call_id: "review-launch-call".into(),
                 status: codex_history::task_context::CompletionReviewLaunchStatus::Unknown,
+                deadline_unix_ms: Some(1_798_000_000_000),
                 reason: Some("spawn outcome could not be confirmed".into()),
             });
         {
@@ -1336,10 +1542,139 @@ mod tests {
             Some(codex_history::task_context::CompletionReviewLaunchState {
                 spawn_call_id: "review-launch-call".into(),
                 status: codex_history::task_context::CompletionReviewLaunchStatus::Unknown,
+                deadline_unix_ms: Some(1_798_000_000_000),
                 reason: Some("spawn outcome could not be confirmed".into()),
             })
         );
         assert!(!session.autonomous_completion_paused().await);
+    }
+
+    #[tokio::test]
+    async fn cold_restore_preserves_bound_review_deadline_without_extension() {
+        let (mut session, turn) = make_session_and_context().await;
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::write(workspace.path().join("artifact.txt"), "accepted artifact\n").unwrap();
+        let accepted_target =
+            record_test_artifact_receipt(&session, workspace.path(), "task-a", 1, "host-review")
+                .await;
+        let rollout_path = crate::session::tests::attach_thread_persistence(&mut session).await;
+        let session = Arc::new(session);
+        let turn_id =
+            commit_accepted_task_boundary(&session, Arc::new(turn), &accepted_target.artifact_ref)
+                .await;
+        let deadline_unix_ms = 1_798_000_000_000;
+        let mut contract = open_state(false);
+        let unit = &mut contract.units[0];
+        unit.id = "review-1".into();
+        unit.purpose = "Review task-a".into();
+        unit.status = UnitStatus::Running;
+        unit.kind = codex_history::task_context::CompletionUnitKind::Review;
+        unit.review_target = Some(codex_history::task_context::CompletionReviewTarget {
+            task_id: "task-a".into(),
+            task_revision: 1,
+        });
+        unit.review_evidence = Some(codex_history::task_context::CompletionReviewEvidence {
+            reviewer_thread_id: "01a1c606-48b8-7cf3-bb78-77b47f6b8c2f".into(),
+            reviewer_turn_id: "reviewer-turn-1".into(),
+            reviewer_role: "analyst".into(),
+            spawn_call_id: "host-review-call".into(),
+            deadline_unix_ms: Some(deadline_unix_ms),
+            deadline_escalation: None,
+            deadline_safety_fingerprint: None,
+            wait_result_ref: None,
+            terminal_status: None,
+            wait_call_id: None,
+            target_task_id: "task-a".into(),
+            target_task_revision: 1,
+            target_artifact_ref: accepted_target.artifact_ref.clone(),
+        });
+        contract.current_unit = Some("review-1".into());
+        contract.next_action = Some("Wait for the bound reviewer to finish task-a@1.".into());
+        session.state.lock().await.rencrow_completion_state = Some(("root".into(), contract));
+        session
+            .persist_autonomous_completion_snapshot()
+            .await
+            .expect("persist host-bound reviewer deadline");
+        session
+            .flush_rollout()
+            .await
+            .expect("flush deadline snapshot");
+        let codex_history::InitialHistory::Resumed(persisted) =
+            crate::rollout::recorder::RolloutRecorder::get_rollout_history(&rollout_path)
+                .await
+                .expect("read persisted snapshot")
+        else {
+            panic!("expected persisted rollout");
+        };
+        let snapshot = persisted
+            .history
+            .iter()
+            .find_map(|item| match item {
+                RolloutItem::ResponseItem(envelope) => envelope
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.rencrow_completion.clone()),
+                _ => None,
+            })
+            .expect("captured host snapshot");
+        assert_eq!(
+            snapshot["state"]["units"][0]["review_evidence"]["deadline_unix_ms"],
+            deadline_unix_ms
+        );
+        let persisted_response_items = persisted
+            .history
+            .iter()
+            .find_map(|item| match item {
+                RolloutItem::Compacted(compacted) => compacted.replacement_history.clone(),
+                _ => None,
+            })
+            .expect("persisted compaction checkpoint carries replacement history");
+        let accepted_task_state = crate::compact::latest_task_state_in_history(
+            &persisted_response_items,
+            &session.thread_id().to_string(),
+        )
+        .expect("parse persisted accepted task boundary")
+        .expect("accepted task boundary must be in the disk rollout");
+        let parsed_snapshot: Snapshot =
+            serde_json::from_value(snapshot.clone()).expect("parse persisted deadline snapshot");
+        let state_validation = codex_history::task_context::validate_completion_state(
+            Some(&parsed_snapshot.state),
+            &accepted_task_state.completed,
+        );
+        assert!(
+            state_validation.is_ok(),
+            "persisted completion state should validate against accepted task receipt: {state_validation:?}"
+        );
+        let payload_validation = validate_snapshot_payload(
+            &parsed_snapshot,
+            &session.thread_id().to_string(),
+            &accepted_task_state.completed,
+        );
+        assert!(
+            payload_validation.is_ok(),
+            "persisted deadline snapshot should validate against accepted task receipt: {payload_validation:?}; accepted task target={:?}",
+            accepted_task_state.completed.get("task-a")
+        );
+        session.state.lock().await.rencrow_completion_state = None;
+
+        session
+            .restore_autonomous_completion_snapshot(persisted.history.as_ref())
+            .await;
+        let restored = session.rencrow_completion_state("root").await.unwrap();
+        assert_eq!(
+            restored.units[0]
+                .review_evidence
+                .as_ref()
+                .and_then(|review| review.deadline_unix_ms),
+            Some(deadline_unix_ms),
+            "restore keeps the original absolute deadline"
+        );
+        session
+            .abort_turn_if_active(
+                &turn_id,
+                codex_protocol::protocol::TurnAbortReason::Interrupted,
+            )
+            .await;
     }
 
     #[tokio::test]

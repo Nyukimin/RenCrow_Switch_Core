@@ -165,6 +165,16 @@ pub struct CompletionReviewEvidence {
     pub reviewer_turn_id: String,
     pub reviewer_role: String,
     pub spawn_call_id: String,
+    /// Host-owned absolute deadline for this reviewer generation. Legacy reviews have no SLA
+    /// deadline and must not be cancelled by a deadline inferred during restore.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_unix_ms: Option<i64>,
+    /// Host escalation recorded when expiry could not safely stop the active reviewer turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_escalation: Option<String>,
+    /// Last unchanged safety observation; permits a retry only after runtime state changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_safety_fingerprint: Option<String>,
     /// `None` means the spawned review is pending or not yet collected.
     #[serde(default)]
     pub wait_result_ref: Option<String>,
@@ -186,6 +196,9 @@ pub struct CompletionReviewEvidence {
 pub struct CompletionReviewLaunchState {
     pub spawn_call_id: String,
     pub status: CompletionReviewLaunchStatus,
+    /// Host-owned absolute deadline reserved before attempting this spawn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_unix_ms: Option<i64>,
     #[serde(default)]
     pub reason: Option<String>,
 }
@@ -740,6 +753,23 @@ pub fn validate_completion_state(
                         || evidence.wait_call_id.as_ref().is_some_and(|call_id| {
                             call_id.trim().is_empty() || call_id.len() > MAX_TEXT_BYTES
                         })
+                        || evidence
+                            .deadline_unix_ms
+                            .is_some_and(|deadline| deadline <= 0)
+                        || evidence.deadline_escalation.as_ref().is_some_and(|reason| {
+                            reason.trim().is_empty() || reason.len() > MAX_TEXT_BYTES
+                        })
+                        || evidence
+                            .deadline_safety_fingerprint
+                            .as_ref()
+                            .is_some_and(|value| {
+                                value.len() != 64
+                                    || value.bytes().any(|byte| {
+                                        !byte.is_ascii_hexdigit() || byte.is_ascii_uppercase()
+                                    })
+                            })
+                        || (evidence.deadline_escalation.is_some()
+                            && evidence.deadline_unix_ms.is_none())
                         || evidence.wait_result_ref.is_some() != evidence.wait_call_id.is_some()
                         || evidence.target_task_id != target.task_id
                         || evidence.target_task_revision != target.task_revision
@@ -794,6 +824,9 @@ pub fn validate_completion_state(
                         || launch.reason.as_ref().is_some_and(|reason| {
                             reason.trim().is_empty() || reason.len() > MAX_TEXT_BYTES
                         })
+                        || launch
+                            .deadline_unix_ms
+                            .is_some_and(|deadline| deadline <= 0)
                         || (launch.status == CompletionReviewLaunchStatus::Unknown
                             && launch.reason.is_none()))
                 {

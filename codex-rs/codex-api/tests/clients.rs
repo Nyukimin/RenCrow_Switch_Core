@@ -339,6 +339,7 @@ async fn responses_client_stream_request_preserves_item_ids() -> Result<()> {
     let client = ResponsesClient::new(transport, provider("openai"), Arc::new(NoAuth));
     let request = ResponsesApiRequest {
         model: "gpt-test".into(),
+        max_output_tokens: Some(32_768),
         instructions: "Say hi".into(),
         input: vec![ResponseItem::Message {
             id: Some(ResponseItemId::with_suffix("msg", "1")),
@@ -433,6 +434,7 @@ async fn streaming_client_retries_on_transport_error() -> Result<()> {
 
     let request = ResponsesApiRequest {
         model: "gpt-test".into(),
+        max_output_tokens: None,
         instructions: "Say hi".into(),
         input: Vec::new(),
         tools: Some(empty_tools().into()),
@@ -548,6 +550,7 @@ async fn azure_store_sends_ids_and_headers() -> Result<()> {
 
     let request = ResponsesApiRequest {
         model: "gpt-test".into(),
+        max_output_tokens: None,
         instructions: "Say hi".into(),
         input: vec![ResponseItem::Message {
             id: Some(ResponseItemId::with_suffix("msg", "1")),

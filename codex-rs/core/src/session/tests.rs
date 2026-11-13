@@ -4571,7 +4571,7 @@ async fn open_thread_persistence(session: &mut Session) -> PathBuf {
         .expect("thread should have rollout path")
 }
 
-async fn attach_thread_persistence(session: &mut Session) -> PathBuf {
+pub(crate) async fn attach_thread_persistence(session: &mut Session) -> PathBuf {
     let rollout_path = open_thread_persistence(session).await;
     session
         .ensure_rollout_materialized(PersistContext::Standard)
@@ -6509,6 +6509,109 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
     session.mark_mcp_runtime_dirty();
     crate::guardian::test_host::install(&session, &turn_context.config);
     (session, turn_context)
+}
+
+/// Install and persist host-owned completion state for focused lifecycle tests.
+/// This bypasses the model-facing setter and is available only in test builds.
+pub(crate) async fn install_host_completion_fixture(
+    session: &Session,
+    root_task_id: &str,
+    completion_state: codex_history::task_context::CompletionState,
+) -> Result<(), String> {
+    if root_task_id.trim().is_empty() {
+        return Err("completion fixture requires a root task ID".into());
+    }
+    session.state.lock().await.rencrow_completion_state =
+        Some((root_task_id.to_string(), completion_state));
+    session.persist_autonomous_completion_snapshot().await
+}
+
+pub(crate) fn accepted_task_boundary_item(thread_id: &str, artifact_ref: &str) -> RolloutItem {
+    use codex_history::task_checkpoint_metadata::RenCrowTaskCheckpointMetadataV3;
+    use codex_history::task_checkpoint_metadata::TaskBoundarySourceFence;
+    use codex_history::task_context::AcceptedTaskReceipt;
+    use codex_history::task_context::BoundaryCandidate;
+    use codex_history::task_context::BoundaryMode;
+    use codex_history::task_context::StoredTaskState;
+    use codex_history::task_context::TaskState;
+    use codex_history::task_context::TaskStatus;
+    use std::collections::BTreeMap;
+
+    let boundary = BoundaryCandidate {
+        version: 1,
+        mode: BoundaryMode::Task,
+        thread_id: thread_id.into(),
+        root_task_id: "root".into(),
+        closed_task_id: "task-a".into(),
+        revision: 2,
+        closed_task_revision: 1,
+        goal: "review the accepted artifact".into(),
+        tasks: vec![TaskState {
+            id: "task-a".into(),
+            purpose: "prepare the accepted review artifact".into(),
+            status: TaskStatus::Completed,
+            depends_on: Vec::new(),
+        }],
+        current_task_id: None,
+        artifact_ref: artifact_ref.into(),
+        verification_ref: artifact_ref.into(),
+        decisions: Vec::new(),
+        constraints: Vec::new(),
+        completion_state: None,
+    };
+    let candidate_hash = codex_history::archive_reference::content_sha256(
+        &serde_json::to_string(&boundary).expect("serialize accepted task boundary"),
+    );
+    let task_state = StoredTaskState {
+        boundary,
+        completed: BTreeMap::from([(
+            "task-a".into(),
+            AcceptedTaskReceipt {
+                revision: 1,
+                result: "accepted review artifact is ready".into(),
+                artifact_ref: artifact_ref.into(),
+                verification_ref: artifact_ref.into(),
+            },
+        )]),
+        parent_review_ref: "review:task-a".into(),
+        previous_revision: None,
+        previous_state_hash: None,
+        candidate_hash,
+        boundary_nonce: "accepted-review-boundary".into(),
+    };
+    task_state
+        .validate(thread_id)
+        .expect("accepted task boundary should validate");
+
+    let summary_text = "Accepted artifact and verification receipt.";
+    let mut envelope =
+        codex_history::ResponseItemEnvelope::new(codex_protocol::models::ResponseItem::Message {
+            id: None,
+            role: "user".into(),
+            content: vec![codex_protocol::models::ContentItem::InputText {
+                text: summary_text.into(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: Some(
+                codex_protocol::models::InternalChatMessageMetadataPassthrough {
+                    content_item_kinds: Some(vec![codex_protocol::models::ContentItemKind(
+                        "compaction.summary".into(),
+                    )]),
+                    ..Default::default()
+                },
+            ),
+        });
+    let checkpoint = RenCrowTaskCheckpointMetadataV3::task_boundary(
+        summary_text,
+        serde_json::to_value(task_state).expect("serialize accepted task state"),
+        TaskBoundarySourceFence {
+            history_hash: "a".repeat(64),
+            removed_refs: Vec::new(),
+        },
+    );
+    envelope.metadata.get_or_insert_default().rencrow_compaction =
+        Some(serde_json::to_value(checkpoint).expect("serialize accepted checkpoint"));
+    RolloutItem::ResponseItem(envelope)
 }
 
 async fn make_session_with_config(
@@ -12568,6 +12671,7 @@ async fn tool_calls_reopen_mailbox_delivery_for_current_turn() {
         turn_store: Arc::new(codex_extension_api::ExtensionData::new(tc.sub_id.clone())),
         tool_runtime: test_tool_runtime(Arc::clone(&sess), Arc::clone(&tc)),
         cancellation_token: CancellationToken::new(),
+        response_terminal_state: crate::stream_events_utils::ResponseTerminalState::Confirmed,
     };
 
     let output = handle_output_item_done(&mut ctx, item, /*previously_active_item*/ None)

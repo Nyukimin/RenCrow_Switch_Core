@@ -13,6 +13,8 @@ use codex_protocol::ThreadId;
 use codex_protocol::protocol::AgentStatus;
 use serde_json::Value;
 
+pub(crate) const COMPLETION_REVIEWER_SLA_MS: i64 = 10 * 60 * 1000;
+
 #[derive(Clone, Debug)]
 pub(crate) struct CompletionReviewLaunch {
     pub(crate) root_task_id: String,
@@ -26,6 +28,7 @@ pub(crate) struct CompletionReviewLaunch {
     pub(crate) reviewer_turn_id: Option<String>,
     pub(crate) spawn_call_id: Option<String>,
     pub(crate) reviewer_role: Option<String>,
+    pub(crate) deadline_escalation: Option<String>,
     pub(crate) unresolved_launch: Option<CompletionReviewLaunchState>,
     pub(crate) should_spawn: bool,
 }
@@ -75,12 +78,16 @@ fn pending_completion_review_evidence(
     target_task_id: String,
     target_task_revision: u64,
     target_artifact_ref: String,
+    deadline_unix_ms: Option<i64>,
 ) -> CompletionReviewEvidence {
     CompletionReviewEvidence {
         reviewer_thread_id: reviewer_thread_id.to_string(),
         reviewer_turn_id: format!("pending-generation:{spawn_call_id}"),
         reviewer_role,
         spawn_call_id,
+        deadline_unix_ms,
+        deadline_escalation: None,
+        deadline_safety_fingerprint: None,
         wait_result_ref: None,
         terminal_status: None,
         wait_call_id: None,
@@ -257,6 +264,10 @@ impl Session {
                 .review_evidence
                 .as_ref()
                 .map(|evidence| evidence.reviewer_role.clone());
+            let deadline_escalation = unit
+                .review_evidence
+                .as_ref()
+                .and_then(|evidence| evidence.deadline_escalation.clone());
             let unresolved_launch = unit.review_launch.clone();
             let reviewer_turn_id = unit
                 .review_evidence
@@ -277,13 +288,20 @@ impl Session {
                     unit.review_launch = Some(CompletionReviewLaunchState {
                         spawn_call_id: launch_call_id.to_string(),
                         status: CompletionReviewLaunchStatus::Reserved,
+                        deadline_unix_ms: Some(
+                            chrono::Utc::now().timestamp_millis() + COMPLETION_REVIEWER_SLA_MS,
+                        ),
                         reason: None,
                     });
                     contract.current_unit = Some(unit.id.clone());
                     contract.activity_at = Some(chrono::Utc::now().timestamp());
                     true
                 }
-                UnitStatus::Running | UnitStatus::Ready | UnitStatus::Done => false,
+                UnitStatus::Running
+                | UnitStatus::Ready
+                | UnitStatus::Done
+                | UnitStatus::Blocked
+                | UnitStatus::Failed => false,
                 _ => {
                     return Err(format!(
                         "review unit {} is not available for launch ({:?})",
@@ -303,6 +321,7 @@ impl Session {
                 reviewer_turn_id,
                 spawn_call_id,
                 reviewer_role,
+                deadline_escalation,
                 unresolved_launch: unit.review_launch.clone().or(unresolved_launch),
                 should_spawn,
             }
@@ -390,6 +409,10 @@ impl Session {
             {
                 return Err("completion review launch changed after child spawn".into());
             }
+            let deadline_unix_ms = unit
+                .review_launch
+                .as_ref()
+                .and_then(|launch| launch.deadline_unix_ms);
             unit.review_evidence = Some(pending_completion_review_evidence(
                 reviewer_thread_id,
                 reviewer_role,
@@ -397,6 +420,7 @@ impl Session {
                 target_task_id.to_string(),
                 target_task_revision,
                 target_artifact_ref,
+                deadline_unix_ms,
             ));
             unit.review_launch = None;
         }
@@ -722,6 +746,9 @@ impl Session {
             unit.review_launch = Some(CompletionReviewLaunchState {
                 spawn_call_id: spawn_call_id.to_string(),
                 status: CompletionReviewLaunchStatus::Reserved,
+                deadline_unix_ms: Some(
+                    chrono::Utc::now().timestamp_millis() + COMPLETION_REVIEWER_SLA_MS,
+                ),
                 reason: None,
             });
             contract.current_unit = Some(unit_id.to_string());
@@ -791,6 +818,10 @@ impl Session {
                     "completion review unit changed while the reviewer was spawning".into(),
                 );
             }
+            let launch_deadline = unit
+                .review_launch
+                .as_ref()
+                .and_then(|launch| launch.deadline_unix_ms);
             let evidence = unit.review_evidence.get_or_insert_with(|| {
                 pending_completion_review_evidence(
                     reviewer_thread_id,
@@ -799,6 +830,7 @@ impl Session {
                     target_task_id.to_string(),
                     target_task_revision,
                     target_artifact_ref.clone(),
+                    launch_deadline,
                 )
             });
             if !bind_completion_review_generation(
@@ -1265,6 +1297,9 @@ mod tests {
                     reviewer_turn_id: turn_id.into(),
                     reviewer_role: "analyst".into(),
                     spawn_call_id: "spawn-review".into(),
+                    deadline_unix_ms: None,
+                    deadline_escalation: None,
+                    deadline_safety_fingerprint: None,
                     wait_result_ref: Some("sha256:old-result".into()),
                     terminal_status: Some(CompletionReviewTerminalStatus::Completed),
                     wait_call_id: Some("wait-old".into()),
@@ -1294,6 +1329,9 @@ mod tests {
             reviewer_turn_id: "review-turn-original".into(),
             reviewer_role: "analyst".into(),
             spawn_call_id: "spawn-review".into(),
+            deadline_unix_ms: None,
+            deadline_escalation: None,
+            deadline_safety_fingerprint: None,
             wait_result_ref: None,
             terminal_status: None,
             wait_call_id: None,
@@ -1558,6 +1596,7 @@ mod tests {
             "task-a".into(),
             1,
             "task-check:target".into(),
+            None,
         );
         assert!(bind_completion_review_generation(
             &mut direct,
@@ -1735,6 +1774,9 @@ mod tests {
             reviewer_turn_id: "reviewer-turn-1".into(),
             reviewer_role: "analyst".into(),
             spawn_call_id: "spawn-review".into(),
+            deadline_unix_ms: None,
+            deadline_escalation: None,
+            deadline_safety_fingerprint: None,
             wait_result_ref: None,
             terminal_status: None,
             wait_call_id: None,
@@ -1767,6 +1809,9 @@ mod tests {
             reviewer_turn_id: "reviewer-turn-1".into(),
             reviewer_role: "analyst".into(),
             spawn_call_id: "spawn-adopted-review".into(),
+            deadline_unix_ms: None,
+            deadline_escalation: None,
+            deadline_safety_fingerprint: None,
             wait_result_ref: Some("sha256:historical-result".into()),
             terminal_status: Some(CompletionReviewTerminalStatus::Completed),
             wait_call_id: Some("wait-adopted-review".into()),

@@ -118,10 +118,29 @@ struct Error {
 struct ResponseCompleted {
     id: String,
     #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    incomplete_details: Option<ResponseIncompleteDetails>,
+    #[serde(default)]
     usage: Option<ResponseCompletedUsage>,
     usage_metadata: Option<ResponseUsageMetadata>,
     #[serde(default)]
     end_turn: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponseIncompleteDetails {
+    reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponseIncomplete {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    incomplete_details: Option<ResponseIncompleteDetails>,
+    #[serde(default)]
+    usage: Option<ResponseCompletedUsage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -477,18 +496,43 @@ pub fn process_responses_event(
             )));
         }
         "response.incomplete" => {
-            let reason = event.response.as_ref().and_then(|response| {
-                response
-                    .get("incomplete_details")
-                    .and_then(|details| details.get("reason"))
-                    .and_then(Value::as_str)
-            });
-            let reason = reason.unwrap_or("unknown");
-            let message = format!("Incomplete response returned, reason: {reason}");
-            return Err(ResponsesEventError::Api(ApiError::Stream(message)));
+            let Some(response) = event.response else {
+                return Err(ResponsesEventError::Api(ApiError::IncompleteResponse {
+                    diagnostic_code: "RESPONSE_INCOMPLETE".to_string(),
+                    response_id: None,
+                    reason: "missing_response_payload".to_string(),
+                    token_usage: None,
+                }));
+            };
+            match serde_json::from_value::<ResponseIncomplete>(response) {
+                Ok(response) => {
+                    let reason = response
+                        .incomplete_details
+                        .and_then(|details| details.reason)
+                        .unwrap_or_else(|| "unknown".to_string());
+                    return Err(ResponsesEventError::Api(ApiError::IncompleteResponse {
+                        diagnostic_code: incomplete_diagnostic_code(&reason).to_string(),
+                        response_id: response.id,
+                        reason,
+                        token_usage: response.usage.map(Into::into),
+                    }));
+                }
+                Err(error) => {
+                    return Err(ResponsesEventError::Api(ApiError::IncompleteResponse {
+                        diagnostic_code: "RESPONSE_INCOMPLETE".to_string(),
+                        response_id: None,
+                        reason: format!("invalid_response_payload: {error}"),
+                        token_usage: None,
+                    }));
+                }
+            }
         }
         "response.completed" => {
             if let Some(resp_val) = event.response {
+                let response_id = resp_val
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string);
                 let metadata = resp_val
                     .get("usage")
                     .filter(|usage| !usage.is_null())
@@ -498,6 +542,31 @@ pub fn process_responses_event(
                         if let Some(metadata) = metadata {
                             resp.usage_metadata.get_or_insert_default().metadata = Some(metadata);
                         }
+                        let has_incomplete_details = resp.incomplete_details.is_some();
+                        let status = resp.status.as_deref();
+                        if status
+                            .is_some_and(|status| !matches!(status, "completed" | "incomplete"))
+                        {
+                            return Err(ResponsesEventError::Api(
+                                ApiError::ResponseProtocolFailure {
+                                    response_id: Some(resp.id),
+                                    reason: "response.completed carried unsupported status"
+                                        .to_string(),
+                                },
+                            ));
+                        }
+                        if status == Some("incomplete") || has_incomplete_details {
+                            let reason = resp
+                                .incomplete_details
+                                .and_then(|details| details.reason)
+                                .unwrap_or_else(|| "unknown".to_string());
+                            return Err(ResponsesEventError::Api(ApiError::IncompleteResponse {
+                                diagnostic_code: incomplete_diagnostic_code(&reason).to_string(),
+                                response_id: Some(resp.id),
+                                reason,
+                                token_usage: resp.usage.map(Into::into),
+                            }));
+                        }
                         return Ok(Some(ResponseEvent::Completed {
                             response_id: resp.id,
                             token_usage: resp.usage.map(Into::into),
@@ -506,11 +575,22 @@ pub fn process_responses_event(
                         }));
                     }
                     Err(err) => {
-                        let error = format!("failed to parse ResponseCompleted: {err}");
-                        debug!("{error}");
-                        return Err(ResponsesEventError::Api(ApiError::Stream(error)));
+                        debug!(error = %err, "failed to parse ResponseCompleted payload");
+                        return Err(ResponsesEventError::Api(
+                            ApiError::ResponseProtocolFailure {
+                                response_id,
+                                reason: "response.completed carried an invalid payload".to_string(),
+                            },
+                        ));
                     }
                 }
+            } else {
+                return Err(ResponsesEventError::Api(
+                    ApiError::ResponseProtocolFailure {
+                        response_id: None,
+                        reason: "response.completed omitted its response payload".to_string(),
+                    },
+                ));
             }
         }
         "response.output_item.added" => {
@@ -553,6 +633,14 @@ pub fn process_responses_event(
     }
 
     Ok(None)
+}
+
+fn incomplete_diagnostic_code(reason: &str) -> &'static str {
+    if reason == "max_output_tokens" {
+        "OUTPUT_TOKEN_LIMIT"
+    } else {
+        "RESPONSE_INCOMPLETE"
+    }
 }
 
 #[cfg(test)]
@@ -674,6 +762,10 @@ async fn process_sse_with_treatment(
         match process_responses_event(event) {
             Ok(Some(event)) => {
                 let is_completed = matches!(event, ResponseEvent::Completed { .. });
+                if is_completed && let Some(error) = response_error.take() {
+                    let _ = tx_event.send(Err(error)).await;
+                    return;
+                }
                 if tx_event.send(Ok(event)).await.is_err() {
                     return;
                 }
@@ -683,7 +775,15 @@ async fn process_sse_with_treatment(
             }
             Ok(None) => {}
             Err(error) => {
-                response_error = Some(error.into_api_error());
+                let error = error.into_api_error();
+                if matches!(
+                    &error,
+                    ApiError::IncompleteResponse { .. } | ApiError::ResponseProtocolFailure { .. }
+                ) {
+                    let _ = tx_event.send(Err(error)).await;
+                    return;
+                }
+                response_error = Some(error);
             }
         };
     }
@@ -908,6 +1008,155 @@ mod tests {
                 assert!(end_turn.is_none());
             }
             other => panic!("unexpected third event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn incomplete_response_is_typed_non_retryable_and_not_completed() {
+        let incomplete = json!({
+            "type": "response.incomplete",
+            "response": {
+                "id": "resp-output-limit",
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 32_768,
+                    "total_tokens": 32_778
+                }
+            }
+        });
+        let partial_item = json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "partial answer"}]
+            }
+        });
+        let completed =
+            json!({"type": "response.completed", "response": {"id": "resp-late-completed"}});
+        let chunk = format!(
+            "event: response.output_item.done\ndata: {partial_item}\n\nevent: response.incomplete\ndata: {incomplete}\n\nevent: response.completed\ndata: {completed}\n\n"
+        );
+        let events = collect_events(&[chunk.as_bytes()]).await;
+
+        assert_eq!(events.len(), 2);
+        assert!(matches!(&events[0], Ok(ResponseEvent::OutputItemDone(_))));
+        let Err(ApiError::IncompleteResponse {
+            diagnostic_code,
+            response_id,
+            reason,
+            token_usage,
+        }) = &events[1]
+        else {
+            panic!("expected typed incomplete response, got {:?}", events[1]);
+        };
+        assert_eq!(diagnostic_code, "OUTPUT_TOKEN_LIMIT");
+        assert_eq!(response_id.as_deref(), Some("resp-output-limit"));
+        assert_eq!(reason, "max_output_tokens");
+        assert_eq!(
+            token_usage.as_ref().map(|usage| usage.output_tokens),
+            Some(32_768)
+        );
+        assert!(
+            crate::api_bridge::map_api_error(events.into_iter().nth(1).unwrap().unwrap_err())
+                .retry_delay(1)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn response_completed_rejects_incomplete_or_contradictory_status() {
+        for (response, incomplete) in [
+            (
+                json!({
+                    "id": "resp-incomplete",
+                    "status": "incomplete",
+                    "incomplete_details": {"reason": "max_output_tokens"}
+                }),
+                true,
+            ),
+            (
+                json!({
+                    "id": "resp-details",
+                    "status": "completed",
+                    "incomplete_details": {"reason": "content_filter"}
+                }),
+                true,
+            ),
+            (
+                json!({"id": "resp-invalid-status", "status": "in_progress"}),
+                false,
+            ),
+        ] {
+            let event = json!({"type": "response.completed", "response": response});
+            let chunk = format!("event: response.completed\ndata: {event}\n\n");
+            let events = collect_events(&[chunk.as_bytes()]).await;
+            assert_eq!(events.len(), 1);
+            match (&events[0], incomplete) {
+                (
+                    Err(ApiError::IncompleteResponse {
+                        response_id: Some(id),
+                        ..
+                    }),
+                    true,
+                ) => {
+                    assert!(id.starts_with("resp-"));
+                }
+                (
+                    Err(ApiError::ResponseProtocolFailure {
+                        response_id: Some(id),
+                        ..
+                    }),
+                    false,
+                ) => {
+                    assert_eq!(id, "resp-invalid-status");
+                }
+                (other, _) => panic!("unexpected response.completed result: {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn response_completed_null_incomplete_details_remains_success() {
+        for response in [
+            json!({"id": "resp-null-details", "status": "completed", "incomplete_details": null}),
+            json!({"id": "resp-legacy", "incomplete_details": null}),
+        ] {
+            let event = json!({"type": "response.completed", "response": response});
+            let chunk = format!("event: response.completed\ndata: {event}\n\n");
+            let events = collect_events(&[chunk.as_bytes()]).await;
+            assert!(matches!(
+                events.as_slice(),
+                [Ok(ResponseEvent::Completed { .. })]
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_or_missing_completed_payload_is_terminal_protocol_failure() {
+        for (event, expected_id) in [
+            (
+                json!({
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp-malformed-details",
+                        "status": "completed",
+                        "incomplete_details": "not-an-object"
+                    }
+                }),
+                Some("resp-malformed-details"),
+            ),
+            (json!({"type": "response.completed"}), None),
+        ] {
+            let chunk = format!("event: response.completed\ndata: {event}\n\n");
+            let events = collect_events(&[chunk.as_bytes()]).await;
+            let Err(ApiError::ResponseProtocolFailure { response_id, .. }) =
+                events.into_iter().next().expect("terminal error event")
+            else {
+                panic!("expected terminal protocol error");
+            };
+            assert_eq!(response_id.as_deref(), expected_id);
         }
     }
 

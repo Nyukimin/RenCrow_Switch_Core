@@ -35,7 +35,12 @@ pub(crate) struct ModelReadiness {
 /// and an abort-on-drop handle stored in SessionState, so it cannot keep a closed session alive.
 pub(crate) async fn start(parent: &Arc<CodexThread>, defer_until_next_user_turn: bool) {
     let initial_config = parent.config().await;
-    if !initial_config.rencrow_autonomous_completion {
+    if !initial_config.rencrow_autonomous_completion
+        && !parent
+            .session
+            .has_pending_completion_review_deadline()
+            .await
+    {
         return;
     }
     let startup_turn_id = parent
@@ -54,7 +59,18 @@ pub(crate) async fn start(parent: &Arc<CodexThread>, defer_until_next_user_turn:
                 return;
             };
             let config = parent.config().await;
+            parent
+                .session
+                .enforce_due_completion_review_deadlines()
+                .await;
             if !config.rencrow_autonomous_completion {
+                if parent
+                    .session
+                    .has_pending_completion_review_deadline()
+                    .await
+                {
+                    continue;
+                }
                 parent.session.clear_completion_recovery_task().await;
                 return;
             }

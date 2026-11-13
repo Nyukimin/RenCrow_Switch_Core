@@ -458,6 +458,9 @@ pub struct ModelInfo {
     /// context window when available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_compact_token_limit: Option<i64>,
+    /// Maximum total output tokens for a single model response, including reasoning tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u64>,
     /// Opaque identifier for compaction-compatible model configurations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comp_hash: Option<String>,
@@ -1009,6 +1012,7 @@ mod tests {
             context_window: None,
             max_context_window: None,
             auto_compact_token_limit: None,
+            max_output_tokens: None,
             comp_hash: None,
             effective_context_window_percent: 95,
             experimental_supported_tools: vec![],
@@ -1028,6 +1032,23 @@ mod tests {
             multi_agent_reasoning_effort: None,
         }
     }
+    #[test]
+    fn output_token_limit_is_optional_and_does_not_alias_legacy_metadata() {
+        let mut current =
+            serde_json::to_value(test_model(/*spec*/ None)).expect("serialize model metadata");
+        current["max_output_tokens"] = serde_json::json!(32_768);
+        let current = serde_json::from_value::<ModelInfo>(current)
+            .expect("decode current output-token metadata");
+        assert_eq!(current.max_output_tokens, Some(32_768));
+
+        let mut legacy = serde_json::to_value(test_model(/*spec*/ None))
+            .expect("serialize legacy model metadata");
+        legacy["max_completion_tokens"] = serde_json::json!(16_384);
+        let legacy = serde_json::from_value::<ModelInfo>(legacy)
+            .expect("decode legacy metadata without the new typed limit");
+        assert_eq!(legacy.max_output_tokens, None);
+    }
+
     #[test]
     fn model_messages_deserialize_without_optional_sections() {
         let messages: ModelMessages = from_str(
@@ -1792,6 +1813,7 @@ mod tests {
             context_window: Some(272_000),
             max_context_window: Some(400_000),
             auto_compact_token_limit: Some(250_000),
+            max_output_tokens: None,
             effective_context_window_percent: 95,
             ..test_model(/*spec*/ None)
         };

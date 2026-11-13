@@ -18,6 +18,7 @@ pub(crate) use session::TaskPatchAttempt;
 pub(crate) use session::TokenUsageSource;
 pub(crate) use turn::AcceptedUserInputResponse;
 pub(crate) use turn::ActiveTurn;
+pub(crate) use turn::InFlightToolCallGuard;
 pub(crate) use turn::MailboxDeliveryPhase;
 pub(crate) use turn::PendingRequestPermissions;
 pub(crate) use turn::RunningTask;

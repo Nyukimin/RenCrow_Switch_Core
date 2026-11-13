@@ -1,7 +1,9 @@
 use super::ResponsesStreamRequest;
+use super::is_non_retryable_response_outcome;
 use super::log_retry;
 use crate::session::tests::make_session_and_context;
 use codex_protocol::error::CodexErr;
+use codex_protocol::error::CodexErrorDetails;
 use std::time::Duration;
 use tracing_test::internal::MockWriter;
 
@@ -40,4 +42,32 @@ async fn sampling_retry_logs_stream_error_context() {
     assert!(logs.contains(
         "sampling_error=stream disconnected before completion: websocket closed by server before response.completed"
     ));
+}
+
+#[test]
+fn incomplete_and_protocol_terminal_errors_are_not_retried() {
+    let errors = [
+        CodexErr::new(CodexErrorDetails::IncompleteResponse {
+            diagnostic_code: "OUTPUT_TOKEN_LIMIT".to_string(),
+            response_id: Some("resp-1".to_string()),
+            reason: "max_output_tokens".to_string(),
+            token_usage: None,
+        }),
+        CodexErr::new(CodexErrorDetails::ResponseProtocolFailure {
+            response_id: Some("resp-2".to_string()),
+            reason: "invalid terminal status".to_string(),
+        }),
+    ];
+
+    for error in errors {
+        assert!(is_non_retryable_response_outcome(error.details()));
+        assert!(error.retry_delay(1).is_none());
+        assert!(!crate::compact_model_fallback::should_retry_with_current_model(&error));
+    }
+
+    let transport_error = CodexErr::new(CodexErrorDetails::Stream("disconnected".to_string()));
+    assert!(!is_non_retryable_response_outcome(
+        transport_error.details()
+    ));
+    assert!(transport_error.retry_delay(1).is_some());
 }

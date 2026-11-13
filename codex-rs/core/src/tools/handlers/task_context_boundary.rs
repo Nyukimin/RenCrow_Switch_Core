@@ -524,7 +524,7 @@ impl ToolExecutor<ToolInvocation> for TaskContextBoundaryHandler {
                             Some(spawned.agent_id),
                             Some(spawned.reviewer_role),
                             Some(spawned.model_route),
-                            "spawned",
+                            "spawned".to_string(),
                         )
                     } else {
                         let model_route = if let Some(id) = launch
@@ -555,10 +555,20 @@ impl ToolExecutor<ToolInvocation> for TaskContextBoundaryHandler {
                                         .is_some_and(|evidence| evidence.wait_result_ref.is_some())
                             })
                         });
-                        let outcome = if launch.status == UnitStatus::Done {
-                            "already_adopted"
+                        let outcome = if let Some(escalation) =
+                            launch.deadline_escalation.as_deref()
+                        {
+                            format!(
+                                "review deadline escalated: {escalation}; do not repeatedly wait for or resubmit this reviewer generation"
+                            )
+                        } else if launch.status == UnitStatus::Blocked
+                            || launch.status == UnitStatus::Failed
+                        {
+                            "review is blocked or failed; inspect host completion state before authorizing another reviewer".to_string()
+                        } else if launch.status == UnitStatus::Done {
+                            "already_adopted".to_string()
                         } else if collected {
-                            "collected; call adopt_review(unit_id, reason)"
+                            "collected; call adopt_review(unit_id, reason)".to_string()
                         } else if let Some(unresolved) = launch.unresolved_launch.as_ref() {
                             return Ok(boxed_tool_output(FunctionToolOutput::from_text(
                                 serde_json::to_string(&serde_json::json!({
@@ -579,7 +589,7 @@ impl ToolExecutor<ToolInvocation> for TaskContextBoundaryHandler {
                                 Some(true),
                             )));
                         } else {
-                            "pending or unresolved; wait for the same reviewer child, then call adopt_review(unit_id, reason)"
+                            "pending or unresolved; wait for the same reviewer child, then call adopt_review(unit_id, reason)".to_string()
                         };
                         (
                             launch.reviewer_thread_id.clone(),
@@ -610,6 +620,7 @@ impl ToolExecutor<ToolInvocation> for TaskContextBoundaryHandler {
                         "model_route": model_route,
                         "status": format!("{:?}", launch.status).to_ascii_lowercase(),
                         "outcome": launch_outcome,
+                        "deadline_escalation": launch.deadline_escalation,
                     }))
                     .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
                     Ok(boxed_tool_output(FunctionToolOutput::from_text(

@@ -2419,6 +2419,8 @@ fn websocket_error_detail(err: &ApiError) -> String {
         | ApiError::CyberPolicy { .. }
         | ApiError::BioPolicy { .. }
         | ApiError::MisalignmentPolicyViolation { .. }
+        | ApiError::IncompleteResponse { .. }
+        | ApiError::ResponseProtocolFailure { .. }
         | ApiError::ServerOverloaded => format!("handshake error: {err}"),
     }
 }

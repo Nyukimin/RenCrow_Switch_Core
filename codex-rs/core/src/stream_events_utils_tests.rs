@@ -286,7 +286,14 @@ async fn handle_non_tool_response_item_runs_turn_item_contributors_only_when_req
 }
 
 fn output_context(session: Arc<Session>, turn_context: Arc<TurnContext>) -> HandleOutputCtx {
-    let step_context = StepContext::for_test(Arc::clone(&turn_context));
+    output_context_with_step(session, StepContext::for_test(Arc::clone(&turn_context)))
+}
+
+fn output_context_with_step(
+    session: Arc<Session>,
+    step_context: Arc<StepContext>,
+) -> HandleOutputCtx {
+    let turn_id = step_context.turn.sub_id.clone();
     let (registry, hosted_specs) = tool_registry_for_test_step(step_context.as_ref());
     let router = Arc::new(ToolRouter::from_registry(
         step_context.turn.as_ref(),
@@ -302,10 +309,43 @@ fn output_context(session: Arc<Session>, turn_context: Arc<TurnContext>) -> Hand
     HandleOutputCtx {
         sess: session,
         step_context,
-        turn_store: Arc::new(ExtensionData::new(turn_context.sub_id.clone())),
+        turn_store: Arc::new(ExtensionData::new(turn_id)),
         tool_runtime,
         cancellation_token: CancellationToken::new(),
+        response_terminal_state: super::ResponseTerminalState::Confirmed,
     }
+}
+
+#[tokio::test]
+async fn capped_response_tool_call_stays_passive_while_terminal_is_pending() {
+    let (session, turn_context, _events) = make_session_and_context_with_auth_and_config_and_rx(
+        CodexAuth::from_api_key("Test API Key"),
+        Vec::new(),
+        |config| config.update_plan_enabled = true,
+    )
+    .await;
+    let mut step_context = StepContext::for_test(Arc::clone(&turn_context));
+    let step_context_mut = Arc::get_mut(&mut step_context).expect("unique test step context");
+    let settings = Arc::make_mut(&mut step_context_mut.settings);
+    Arc::make_mut(&mut settings.model_info).max_output_tokens = Some(32_768);
+    let mut ctx = output_context_with_step(Arc::clone(&session), step_context);
+    ctx.response_terminal_state = super::ResponseTerminalState::Pending;
+    let call: ResponseItem = serde_json::from_value(json!({
+        "type": "function_call",
+        "call_id": "call-pending",
+        "name": "update_plan",
+        "arguments": serde_json::to_string(&json!({
+            "plan": [{"step": "hold", "status": "in_progress"}]
+        }))
+        .expect("serialize arguments")
+    }))
+    .expect("function call item");
+
+    let pending = handle_output_item_done(&mut ctx, call.clone(), None)
+        .await
+        .expect("pending call should be held as passive data");
+    assert_eq!(pending.deferred_tool_call, Some(call.clone()));
+    assert!(pending.tool_future.is_none());
 }
 
 #[tokio::test]

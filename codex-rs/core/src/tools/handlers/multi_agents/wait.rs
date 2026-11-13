@@ -70,6 +70,10 @@ impl Handler {
         let arguments = function_arguments(payload)?;
         let args: WaitArgs = parse_arguments(&arguments)?;
         let receiver_thread_ids = parse_agent_id_targets(args.targets)?;
+        session.enforce_due_completion_review_deadlines().await;
+        let mut review_deadline_escalations = session
+            .completion_review_deadline_escalations(&receiver_thread_ids)
+            .await;
         let mut receiver_agents = Vec::with_capacity(receiver_thread_ids.len());
         let mut target_by_thread_id = HashMap::with_capacity(receiver_thread_ids.len());
         for receiver_thread_id in &receiver_thread_ids {
@@ -132,6 +136,7 @@ impl Handler {
 
         let mut status_rxs = Vec::with_capacity(receiver_thread_ids.len());
         let mut initial_final_statuses: Vec<(ThreadId, Option<String>, AgentStatus)> = Vec::new();
+        let mut escalated_running_generation = false;
         for id in &receiver_thread_ids {
             match session.services.agent_control.subscribe_status(*id).await {
                 Ok(rx) => {
@@ -143,8 +148,18 @@ impl Handler {
                         .unwrap_or_else(|_| (None, rx.borrow().clone()));
                     if is_final(&status) {
                         initial_final_statuses.push((*id, turn_id, status));
+                    } else if review_deadline_escalations.get(id).is_some_and(
+                        |(reviewer_turn_id, _)| {
+                            turn_id.as_deref() == Some(reviewer_turn_id.as_str())
+                        },
+                    ) {
+                        // The host persisted an escalation for this same running generation.
+                        // Return it to the caller instead of entering another unbounded wait.
+                        escalated_running_generation = true;
+                        continue;
+                    } else {
+                        status_rxs.push((*id, rx));
                     }
-                    status_rxs.push((*id, rx));
                 }
                 Err(err) if matches!(err.details(), CodexErrorDetails::ThreadNotFound(_)) => {
                     initial_final_statuses.push((*id, None, AgentStatus::NotFound));
@@ -190,7 +205,19 @@ impl Handler {
                 let session = session.clone();
                 futures.push(wait_for_final_status(session, id, rx));
             }
-            let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
+            let requested_deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
+            let deadline = session
+                .next_completion_review_deadline(&receiver_thread_ids)
+                .await
+                .map(|deadline_ms| {
+                    let remaining_ms = deadline_ms
+                        .saturating_sub(chrono::Utc::now().timestamp_millis())
+                        .max(0) as u64;
+                    Instant::now() + Duration::from_millis(remaining_ms)
+                })
+                .map_or(requested_deadline, |review_deadline| {
+                    requested_deadline.min(review_deadline)
+                });
             match wait_for_statuses_or_steer(
                 Arc::clone(&session),
                 futures,
@@ -203,7 +230,33 @@ impl Handler {
             {
                 WaitStatusesOutcome::Completed(results) => (results, false),
                 WaitStatusesOutcome::Steered => (Vec::new(), true),
-                WaitStatusesOutcome::TimedOut => (Vec::new(), false),
+                WaitStatusesOutcome::TimedOut => {
+                    session.enforce_due_completion_review_deadlines().await;
+                    review_deadline_escalations = session
+                        .completion_review_deadline_escalations(&receiver_thread_ids)
+                        .await;
+                    let mut final_statuses = Vec::new();
+                    escalated_running_generation = false;
+                    for id in &receiver_thread_ids {
+                        if let Ok((turn_id, status)) = session
+                            .services
+                            .agent_control
+                            .get_agent_status_generation(*id)
+                            .await
+                        {
+                            if is_final(&status) {
+                                final_statuses.push((*id, turn_id, status));
+                            } else if review_deadline_escalations.get(id).is_some_and(
+                                |(reviewer_turn_id, _)| {
+                                    turn_id.as_deref() == Some(reviewer_turn_id.as_str())
+                                },
+                            ) {
+                                escalated_running_generation = true;
+                            }
+                        }
+                    }
+                    (final_statuses, false)
+                }
             }
         };
 
@@ -227,10 +280,13 @@ impl Handler {
                 })
                 .collect(),
             timed_out,
-            message: steered.then(|| {
-                "Wait interrupted by pending parent input. No child completion was observed; child execution is unchanged."
-                    .to_string()
-            }),
+            message: if steered {
+                Some("Wait interrupted by pending parent input. No child completion was observed; child execution is unchanged.".to_string())
+            } else if statuses_by_id.is_empty() && escalated_running_generation {
+                Some("A host-owned completion reviewer deadline expired. Cancellation was withheld because active tool or job state could not be proven safe; the host escalation is persisted. This reviewer generation will not be waited on or resubmitted again automatically.".to_string())
+            } else {
+                None
+            },
         };
 
         session

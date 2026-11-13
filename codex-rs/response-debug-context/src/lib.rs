@@ -74,6 +74,16 @@ pub fn telemetry_api_error_message(error: &ApiError) -> String {
         ApiError::Transport(transport) => telemetry_transport_error_message(transport),
         ApiError::Api { status, .. } => format!("api error {}", status.as_u16()),
         ApiError::Stream(err) => err.to_string(),
+        ApiError::IncompleteResponse {
+            diagnostic_code,
+            response_id,
+            reason,
+            ..
+        } => format!("{diagnostic_code}: response {response_id:?} incomplete ({reason})"),
+        ApiError::ResponseProtocolFailure {
+            response_id,
+            reason,
+        } => format!("response protocol failure for {response_id:?}: {reason}"),
         ApiError::ContextWindowExceeded => "context window exceeded".to_string(),
         ApiError::QuotaExceeded => "quota exceeded".to_string(),
         ApiError::UsageNotIncluded => "usage not included".to_string(),
@@ -171,5 +181,22 @@ mod tests {
             "invalid header value"
         );
         assert_eq!(telemetry_api_error_message(&stream), "socket closed");
+
+        assert_eq!(
+            telemetry_api_error_message(&ApiError::IncompleteResponse {
+                diagnostic_code: "OUTPUT_TOKEN_LIMIT".to_string(),
+                response_id: Some("resp-123".to_string()),
+                reason: "max_output_tokens".to_string(),
+                token_usage: None,
+            }),
+            "OUTPUT_TOKEN_LIMIT: response Some(\"resp-123\") incomplete (max_output_tokens)"
+        );
+        assert_eq!(
+            telemetry_api_error_message(&ApiError::ResponseProtocolFailure {
+                response_id: Some("resp-456".to_string()),
+                reason: "invalid terminal status".to_string(),
+            }),
+            "response protocol failure for Some(\"resp-456\"): invalid terminal status"
+        );
     }
 }

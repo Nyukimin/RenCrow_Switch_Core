@@ -39,6 +39,7 @@ use codex_extension_api::empty_extension_registry;
 use codex_features::Feature;
 use codex_history::CompactedItem;
 use codex_history::InitialHistory;
+use codex_history::ResponseItemEnvelope;
 use codex_history::ResumedHistory;
 use codex_history::RolloutItem;
 use codex_login::AuthManager;
@@ -92,6 +93,7 @@ use codex_thread_store::LocalThreadStoreConfig;
 use codex_thread_store::PersistContext;
 use codex_thread_store::ThreadStore;
 use codex_utils_path_uri::PathUri;
+use core_test_support::responses::start_mock_server;
 use core_test_support::responses::strip_response_item_ids;
 use pretty_assertions::assert_eq;
 use std::sync::RwLock;
@@ -101,6 +103,10 @@ use tokio::time::sleep;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use toml::Value as TomlValue;
+use wiremock::Mock;
+use wiremock::ResponseTemplate;
+use wiremock::matchers::method;
+use wiremock::matchers::path;
 
 async fn test_config_with_cli_overrides(
     mut cli_overrides: Vec<(String, TomlValue)>,
@@ -204,6 +210,189 @@ struct AgentControlHarness {
     state_db: Option<StateDbHandle>,
     manager: ThreadManager,
     control: LocalAgentControl,
+}
+
+#[derive(Clone, Copy)]
+struct PendingCompletionReceiptTask;
+
+impl crate::tasks::SessionTask for PendingCompletionReceiptTask {
+    fn kind(&self) -> crate::state::TaskKind {
+        crate::state::TaskKind::Regular
+    }
+
+    fn span_name(&self) -> &'static str {
+        "agent.control_tests.pending_completion_receipt_task"
+    }
+
+    async fn run(
+        self: Arc<Self>,
+        _session: Arc<crate::session::session::Session>,
+        _ctx: Arc<crate::session::turn_context::TurnContext>,
+        _input: Vec<crate::session::TurnInput>,
+        cancellation_token: CancellationToken,
+    ) -> crate::tasks::SessionTaskResult {
+        cancellation_token.cancelled().await;
+        Ok(None)
+    }
+}
+
+async fn record_accepted_review_target(
+    session: &Arc<crate::session::session::Session>,
+) -> (TempDir, String) {
+    let workspace = tempfile::tempdir().expect("accepted review workspace");
+    let artifact_path = std::path::PathBuf::from("artifact.txt");
+    std::fs::write(workspace.path().join(&artifact_path), "accepted artifact\n")
+        .expect("write accepted review artifact");
+    let artifact_paths = vec![artifact_path];
+    let before = crate::task_check::hash_workspace_artifacts(workspace.path(), &artifact_paths)
+        .expect("hash the accepted artifact before verification");
+    let call_id = "accepted-review-artifact-check";
+    session
+        .begin_task_check(
+            call_id.to_string(),
+            crate::task_check::TaskEvidenceRequest {
+                task_id: "task-a".into(),
+                task_revision: 1,
+                artifact_paths,
+                check_kind: crate::task_check::TaskCheckKind::Verification,
+            },
+            workspace.path().to_path_buf(),
+            before.clone(),
+        )
+        .await;
+    let receipt = session
+        .finish_task_check(call_id, 0, true, before.clone())
+        .await
+        .expect("successful accepted artifact verification receipt");
+    let artifact_stamps = receipt
+        .artifact_after
+        .iter()
+        .map(|stamp| {
+            serde_json::json!({
+                "path": stamp.path.to_string_lossy(),
+                "sha256": stamp.sha256,
+            })
+        })
+        .collect::<Vec<_>>();
+    let fingerprint = codex_history::compaction_candidate::digest(&serde_json::json!({
+        "task_id": receipt.task_id,
+        "task_revision": receipt.task_revision,
+        "workspace_root": receipt.workspace_root.to_string_lossy(),
+        "artifacts": artifact_stamps,
+    }))
+    .expect("accepted artifact fingerprint");
+    let target_artifact_ref = format!("task-check:{call_id}:{fingerprint}");
+
+    let boundary = codex_history::task_context::BoundaryCandidate {
+        version: 1,
+        mode: codex_history::task_context::BoundaryMode::Task,
+        thread_id: session.thread_id().to_string(),
+        root_task_id: "root".into(),
+        closed_task_id: "task-a".into(),
+        revision: 2,
+        closed_task_revision: 1,
+        goal: "review the accepted artifact".into(),
+        tasks: vec![codex_history::task_context::TaskState {
+            id: "task-a".into(),
+            purpose: "prepare the accepted review artifact".into(),
+            status: codex_history::task_context::TaskStatus::Completed,
+            depends_on: Vec::new(),
+        }],
+        current_task_id: None,
+        artifact_ref: target_artifact_ref.clone(),
+        verification_ref: target_artifact_ref.clone(),
+        decisions: Vec::new(),
+        constraints: Vec::new(),
+        completion_state: None,
+    };
+    let candidate_hash = codex_history::archive_reference::content_sha256(
+        &serde_json::to_string(&boundary).expect("serialize accepted task boundary"),
+    );
+    let accepted_task_state = codex_history::task_context::StoredTaskState {
+        boundary,
+        completed: std::collections::BTreeMap::from([(
+            "task-a".into(),
+            codex_history::task_context::AcceptedTaskReceipt {
+                revision: 1,
+                result: "accepted review artifact is ready".into(),
+                artifact_ref: target_artifact_ref.clone(),
+                verification_ref: target_artifact_ref.clone(),
+            },
+        )]),
+        parent_review_ref: "review:task-a".into(),
+        previous_revision: None,
+        previous_state_hash: None,
+        candidate_hash,
+        boundary_nonce: "accepted-review-boundary".into(),
+    };
+    accepted_task_state
+        .validate(&session.thread_id().to_string())
+        .expect("accepted task boundary must be valid");
+
+    let turn = session.new_default_turn().await;
+    let turn_id = turn.sub_id.clone();
+    session
+        .spawn_task(turn, Vec::new(), PendingCompletionReceiptTask)
+        .await;
+    let history = session.clone_history().await;
+    let history_hash =
+        codex_history::compaction_candidate::history_digest(history.annotated_items())
+            .expect("hash accepted task source history");
+    let removed_refs = history
+        .annotated_items()
+        .iter()
+        .enumerate()
+        .map(
+            |(index, item)| codex_history::task_checkpoint_metadata::TaskBoundarySourceRef {
+                id: format!("item:{index}"),
+                hash: codex_history::compaction_candidate::digest(&(&item.item, &item.metadata))
+                    .expect("hash accepted task source item"),
+            },
+        )
+        .collect();
+    let summary_text = "Accepted artifact and verification receipt.";
+    let summary = ResponseItemEnvelope::new(ResponseItem::Message {
+        id: None,
+        role: "user".into(),
+        content: vec![ContentItem::InputText {
+            text: summary_text.into(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: Some(InternalChatMessageMetadataPassthrough {
+            content_item_kinds: Some(vec![ContentItemKind("compaction.summary".into())]),
+            ..Default::default()
+        }),
+    });
+    session
+        .commit_task_boundary_checkpoint(
+            history_hash.clone(),
+            turn_id,
+            vec![summary],
+            summary_text.to_string(),
+            accepted_task_state,
+            codex_history::task_checkpoint_metadata::TaskBoundarySourceFence {
+                history_hash,
+                removed_refs,
+            },
+        )
+        .await
+        .expect("commit accepted task boundary for completion review");
+    let stored_task_state = session
+        .latest_rencrow_task_state()
+        .await
+        .expect("read accepted task boundary")
+        .expect("accepted task boundary should be present");
+    assert_eq!(
+        stored_task_state.completed["task-a"].artifact_ref,
+        target_artifact_ref
+    );
+    assert!(
+        session
+            .task_check_receipt(call_id)
+            .await
+            .is_some_and(|receipt| receipt.succeeded && receipt.exit_code == 0)
+    );
+    (workspace, target_artifact_ref)
 }
 
 impl AgentControlHarness {
@@ -4715,6 +4904,422 @@ async fn resume_thread_subagent_restores_stored_metadata() {
         .shutdown_live_agent(resumed_thread_id)
         .await
         .expect("resumed child shutdown should submit");
+}
+
+#[tokio::test]
+async fn expired_completion_review_deadline_aborts_only_the_bound_readonly_generation() {
+    const REVIEWER_ROLE: &str = "completion_reviewer";
+    const WORKER_ROLE: &str = "worker";
+
+    let server = start_mock_server().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(60)))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let (home, mut config) = test_config().await;
+    config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
+    config.model_provider.supports_websockets = false;
+    config.rencrow_execution_guard = Some(codex_config::RencrowExecutionGuard {
+        task_kind: Some(codex_config::RencrowTaskKind::ReadOnly),
+        ..Default::default()
+    });
+    config.agent_roles.insert(
+        REVIEWER_ROLE.to_string(),
+        AgentRoleConfig {
+            enabled: Some(true),
+            description: Some("Read-only completion reviewer".into()),
+            config_file: None,
+            nickname_candidates: None,
+        },
+    );
+    let harness = AgentControlHarness::new_with_config(home, config).await;
+    let (parent_thread_id, parent_thread) = harness.start_thread().await;
+    let control = parent_thread.session.services.agent_control.clone();
+    let (_accepted_review_workspace, target_artifact_ref) =
+        record_accepted_review_target(&parent_thread.session).await;
+
+    let reviewer_thread_id = control
+        .spawn_agent_with_metadata(
+            harness.config.clone(),
+            text_input("Review the accepted artifact. Stay read-only."),
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id,
+                depth: 1,
+                agent_path: Some(
+                    AgentPath::root()
+                        .join(REVIEWER_ROLE)
+                        .expect("reviewer agent path"),
+                ),
+                agent_nickname: None,
+                agent_role: Some(REVIEWER_ROLE.into()),
+            })),
+            SpawnAgentOptions {
+                parent_thread_id: Some(parent_thread_id),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("registered completion reviewer should start")
+        .thread_id;
+    assert_eq!(
+        control
+            .get_agent_metadata(reviewer_thread_id)
+            .and_then(|metadata| metadata.agent_role),
+        Some(REVIEWER_ROLE.to_string()),
+        "parent-bound registry should retain the reviewer role"
+    );
+    let worker_thread_id = control
+        .spawn_agent_with_metadata(
+            harness.config.clone(),
+            text_input("Inspect the test fixture."),
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id,
+                depth: 1,
+                agent_path: Some(
+                    AgentPath::root()
+                        .join(WORKER_ROLE)
+                        .expect("worker agent path"),
+                ),
+                agent_nickname: None,
+                agent_role: Some(WORKER_ROLE.into()),
+            })),
+            SpawnAgentOptions {
+                parent_thread_id: Some(parent_thread_id),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("registered ordinary worker should start")
+        .thread_id;
+
+    let reviewer_thread = harness
+        .manager
+        .get_thread(reviewer_thread_id)
+        .await
+        .expect("reviewer child remains registered");
+    let worker_thread = harness
+        .manager
+        .get_thread(worker_thread_id)
+        .await
+        .expect("worker child remains registered");
+
+    let requests_arrived = timeout(Duration::from_secs(5), async {
+        loop {
+            if server.received_requests().await.unwrap_or_default().len() == 2 {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    if requests_arrived.is_err() {
+        let reviewer_generation = reviewer_thread.session.agent_status_generation().await;
+        let worker_generation = worker_thread.session.agent_status_generation().await;
+        let reviewer_rollout_error = reviewer_thread
+            .read_thread(
+                /*include_archived*/ true, /*include_history*/ true,
+            )
+            .await
+            .err()
+            .map(|error| error.to_string());
+        let worker_rollout_error = worker_thread
+            .read_thread(
+                /*include_archived*/ true, /*include_history*/ true,
+            )
+            .await
+            .err()
+            .map(|error| error.to_string());
+        let requests = server.received_requests().await.unwrap_or_default();
+        panic!(
+            "both regular child turns should reach the mock model before timeout; requests={}, reviewer_generation={reviewer_generation:?}, reviewer_rollout_error={reviewer_rollout_error:?}, worker_generation={worker_generation:?}, worker_rollout_error={worker_rollout_error:?}",
+            requests.len(),
+        );
+    }
+    let requests = server.received_requests().await.unwrap_or_default();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.url.path() == "/v1/responses")
+    );
+
+    let (reviewer_turn_id, reviewer_status) =
+        reviewer_thread.session.agent_status_generation().await;
+    let reviewer_turn_id = reviewer_turn_id.expect("reviewer regular turn generation");
+    assert!(!crate::agent::status::is_final(&reviewer_status));
+    let (worker_turn_id, worker_status) = worker_thread.session.agent_status_generation().await;
+    let worker_turn_id = worker_turn_id.expect("worker regular turn generation");
+    assert!(!crate::agent::status::is_final(&worker_status));
+
+    let wrong_generation = format!("{reviewer_turn_id}-stale");
+    let wrong_generation_result = control
+        .abort_completion_review_turn_if_model_only(
+            parent_thread_id,
+            reviewer_thread_id,
+            &wrong_generation,
+            REVIEWER_ROLE,
+            None,
+        )
+        .await;
+    assert!(matches!(
+        wrong_generation_result,
+        crate::agent::CompletionReviewAbort::Unsafe { .. }
+    ));
+    assert_eq!(
+        reviewer_thread
+            .session
+            .agent_status_generation()
+            .await
+            .0
+            .as_deref(),
+        Some(reviewer_turn_id.as_str()),
+        "a stale deadline identity must not stop the active generation"
+    );
+
+    let now = chrono::Utc::now().timestamp_millis();
+    let completion_state: codex_history::task_context::CompletionState =
+        serde_json::from_value(serde_json::json!({
+            "contract_revision": 1,
+            "conditions": [{
+                "id": "AC-1",
+                "revision": 1,
+                "result": "The accepted artifact is reviewed",
+                "scope": "repository",
+                "verification": "Inspect the accepted artifact",
+                "acceptance_criteria": "The review result is host-collected",
+                "status": "open",
+                "evidence": [],
+                "unmet_reason": null
+            }],
+            "units": [{
+                "id": "review-unit-1",
+                "purpose": "Review task-a",
+                "status": "running",
+                "kind": "review",
+                "condition_refs": ["AC-1"],
+                "depends_on": [],
+                "evidence": [],
+                "task_refs": [],
+                "review_target": {"task_id": "task-a", "task_revision": 1},
+                "review_evidence": {
+                    "reviewer_thread_id": reviewer_thread_id.to_string(),
+                    "reviewer_turn_id": reviewer_turn_id,
+                    "reviewer_role": REVIEWER_ROLE,
+                    "spawn_call_id": "review-spawn-call-1",
+                    "deadline_unix_ms": now - 1,
+                    "deadline_escalation": null,
+                    "deadline_safety_fingerprint": null,
+                    "wait_result_ref": null,
+                    "terminal_status": null,
+                    "wait_call_id": null,
+                    "target_task_id": "task-a",
+                    "target_task_revision": 1,
+                        "target_artifact_ref": target_artifact_ref
+                },
+                "review_launch": null,
+                "review_decision_reason": null
+            }],
+            "current_unit": "review-unit-1",
+            "failed_approaches": [],
+            "blocker": null,
+            "next_action": "Wait for the reviewer",
+            "paused": false,
+            "consumed_host_events": [],
+            "units_completed_since_review": 0,
+            "plan_review_at": null,
+            "plan_reviews": [],
+            "product_progress_at": null,
+            "runtime_recovery_at": null,
+            "activity_at": null
+        }))
+        .expect("completion fixture should deserialize");
+    crate::session::tests::install_host_completion_fixture(
+        parent_thread.session.as_ref(),
+        "root",
+        completion_state,
+    )
+    .await
+    .expect("host test fixture should bind the exact review generation");
+
+    parent_thread
+        .session
+        .enforce_due_completion_review_deadlines()
+        .await;
+
+    let first = parent_thread
+        .session
+        .rencrow_completion_state("root")
+        .await
+        .expect("review deadline outcome should persist");
+    let deadline_evidence = first.units[0].review_evidence.as_ref();
+    let deadline_reason =
+        deadline_evidence.and_then(|evidence| evidence.deadline_escalation.as_deref());
+    let deadline_fingerprint =
+        deadline_evidence.and_then(|evidence| evidence.deadline_safety_fingerprint.as_deref());
+
+    let (observed_reviewer_turn_id, reviewer_status) = control
+        .get_agent_status_generation(reviewer_thread_id)
+        .await
+        .expect("reviewer status remains observable");
+    assert_eq!(
+        observed_reviewer_turn_id.as_deref(),
+        Some(reviewer_turn_id.as_str())
+    );
+    assert!(
+        matches!(
+            reviewer_status,
+            AgentStatus::Errored(ref reason) if reason == "ReviewEnded"
+        ),
+        "expected reviewer generation {reviewer_turn_id} to end with ReviewEnded; observed status: {reviewer_status:?}; persisted deadline escalation: {deadline_reason:?}; safety fingerprint: {deadline_fingerprint:?}"
+    );
+    let (observed_worker_turn_id, worker_status) = control
+        .get_agent_status_generation(worker_thread_id)
+        .await
+        .expect("ordinary worker status remains observable");
+    assert_eq!(
+        observed_worker_turn_id.as_deref(),
+        Some(worker_turn_id.as_str())
+    );
+    assert!(!crate::agent::status::is_final(&worker_status));
+
+    assert_eq!(
+        first.units[0].status,
+        codex_history::task_context::UnitStatus::Failed
+    );
+    let evidence = first.units[0]
+        .review_evidence
+        .as_ref()
+        .expect("review generation evidence remains bound");
+    assert_eq!(evidence.reviewer_turn_id, reviewer_turn_id);
+    assert_eq!(evidence.wait_result_ref, None);
+    assert!(
+        evidence
+            .deadline_escalation
+            .as_deref()
+            .is_some_and(|reason| reason.contains("exact model-only turn was stopped"))
+    );
+    let fingerprint = evidence
+        .deadline_safety_fingerprint
+        .as_deref()
+        .expect("durable deadline outcome has a safety fingerprint");
+    assert_eq!(fingerprint.len(), 64);
+    assert!(fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    assert!(
+        first
+            .next_action
+            .as_deref()
+            .is_some_and(|action| action.contains("Do not wait for or resubmit the same reviewer"))
+    );
+    assert!(
+        !parent_thread
+            .session
+            .has_pending_completion_review_deadline()
+            .await
+    );
+
+    let reviewer_deadline_escalations = parent_thread
+        .session
+        .completion_review_deadline_escalations(&[reviewer_thread_id])
+        .await;
+    assert_eq!(
+        reviewer_deadline_escalations
+            .get(&reviewer_thread_id)
+            .map(|(turn_id, _)| turn_id.as_str()),
+        Some(reviewer_turn_id.as_str())
+    );
+
+    let reviewer_send_error = control
+        .send_input(
+            reviewer_thread_id,
+            text_input("Please continue the expired review."),
+            Default::default(),
+        )
+        .await
+        .expect_err("same-generation reviewer input must be withheld after escalation");
+    assert!(matches!(
+        reviewer_send_error.details(),
+        CodexErrorDetails::InvalidRequest(message)
+            if message.contains("completion reviewer deadline expired")
+                && message.contains("input was withheld")
+    ));
+    let (reviewer_turn_after_send, reviewer_status_after_send) = control
+        .get_agent_status_generation(reviewer_thread_id)
+        .await
+        .expect("reviewer stays observable after denied input");
+    assert_eq!(
+        reviewer_turn_after_send.as_deref(),
+        Some(reviewer_turn_id.as_str())
+    );
+    assert!(matches!(
+        reviewer_status_after_send,
+        AgentStatus::Errored(ref reason) if reason == "ReviewEnded"
+    ));
+
+    let worker_submission = control
+        .send_input(
+            worker_thread_id,
+            text_input("Continue the ordinary worker task."),
+            Default::default(),
+        )
+        .await
+        .expect("ordinary worker steering must remain allowed");
+    assert!(!worker_submission.is_empty());
+    let (worker_turn_after_send, worker_status_after_send) = control
+        .get_agent_status_generation(worker_thread_id)
+        .await
+        .expect("ordinary worker stays observable after steering");
+    assert_eq!(
+        worker_turn_after_send.as_deref(),
+        Some(worker_turn_id.as_str())
+    );
+    assert!(!crate::agent::status::is_final(&worker_status_after_send));
+
+    reviewer_thread.ensure_rollout_materialized().await;
+    reviewer_thread
+        .flush_rollout()
+        .await
+        .expect("ReviewEnded rollout should be flushed");
+    let stored = reviewer_thread
+        .read_thread(
+            /*include_archived*/ true, /*include_history*/ true,
+        )
+        .await
+        .expect("read durable reviewer history");
+    assert!(stored.history.is_some_and(|history| {
+        history.items.iter().any(|item| {
+            matches!(
+                item,
+                RolloutItem::EventMsg(EventMsg::TurnAborted(event))
+                    if event.turn_id.as_deref() == Some(reviewer_turn_id.as_str())
+                        && event.reason == TurnAbortReason::ReviewEnded
+            )
+        })
+    }));
+
+    parent_thread
+        .session
+        .enforce_due_completion_review_deadlines()
+        .await;
+    let second = parent_thread
+        .session
+        .rencrow_completion_state("root")
+        .await
+        .expect("repeated deadline enforcement should remain observable");
+    assert_eq!(
+        second, first,
+        "same expired generation is not escalated twice"
+    );
+
+    assert!(
+        worker_thread
+            .session
+            .abort_turn_if_active(&worker_turn_id, TurnAbortReason::Interrupted)
+            .await,
+        "test cleanup should stop only the still-active worker generation"
+    );
 }
 
 #[tokio::test]

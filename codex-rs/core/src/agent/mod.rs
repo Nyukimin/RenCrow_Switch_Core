@@ -4,6 +4,7 @@ pub(crate) mod api;
 pub(crate) mod autonomous_completion;
 pub(crate) mod child_config;
 pub(crate) mod completion_recovery;
+pub(crate) mod completion_review_deadline;
 pub(crate) mod control;
 mod registry;
 pub(crate) mod rencrow_read_only;
@@ -12,6 +13,7 @@ pub(crate) mod status;
 pub(crate) mod types;
 
 pub(crate) use codex_protocol::protocol::AgentStatus;
+pub(crate) use completion_review_deadline::CompletionReviewAbort;
 pub(crate) use control::LocalAgentControl;
 pub(crate) use registry::exceeds_thread_spawn_depth_limit;
 pub(crate) use registry::next_thread_spawn_depth;

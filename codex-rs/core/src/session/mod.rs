@@ -232,6 +232,7 @@ mod code_mode_warning;
 mod completion_children;
 pub(crate) mod completion_persistence;
 mod completion_recovery;
+mod completion_review_deadline;
 pub(crate) mod context_window;
 mod daemon_recovery;
 mod environment;

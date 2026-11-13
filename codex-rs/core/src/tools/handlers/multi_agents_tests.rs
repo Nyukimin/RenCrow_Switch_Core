@@ -3132,6 +3132,72 @@ async fn queue_parent_steer_for_wait_test(
         .await;
 }
 
+async fn install_wait_test_review_escalation(
+    session: &crate::session::session::Session,
+    reviewer_thread_id: ThreadId,
+    reviewer_turn_id: &str,
+) {
+    let completion_state: codex_history::task_context::CompletionState =
+        serde_json::from_value(json!({
+            "contract_revision": 1,
+            "conditions": [{
+                "id": "AC-1",
+                "revision": 1,
+                "result": "The accepted artifact is reviewed",
+                "scope": "repository",
+                "verification": "Inspect the accepted artifact",
+                "acceptance_criteria": "The review result is host-collected",
+                "status": "open",
+                "evidence": [],
+                "unmet_reason": null
+            }],
+            "units": [{
+                "id": "review-unit-1",
+                "purpose": "Review task-a",
+                "status": "running",
+                "kind": "review",
+                "condition_refs": ["AC-1"],
+                "depends_on": [],
+                "evidence": [],
+                "task_refs": [],
+                "review_target": {"task_id": "task-a", "task_revision": 1},
+                "review_evidence": {
+                    "reviewer_thread_id": reviewer_thread_id.to_string(),
+                    "reviewer_turn_id": reviewer_turn_id,
+                    "reviewer_role": "analyst",
+                    "spawn_call_id": "review-spawn-call-1",
+                    "deadline_unix_ms": chrono::Utc::now().timestamp_millis() + 60_000,
+                    "deadline_escalation": "Cancellation was withheld because active state was not safe to stop",
+                    "deadline_safety_fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "wait_result_ref": null,
+                    "terminal_status": null,
+                    "wait_call_id": null,
+                    "target_task_id": "task-a",
+                    "target_task_revision": 1,
+                    "target_artifact_ref": "host-fixture:accepted-artifact"
+                },
+                "review_launch": null,
+                "review_decision_reason": null
+            }],
+            "current_unit": "review-unit-1",
+            "failed_approaches": [],
+            "blocker": null,
+            "next_action": "Review the existing escalation",
+            "paused": false,
+            "consumed_host_events": [],
+            "units_completed_since_review": 0,
+            "plan_review_at": null,
+            "plan_reviews": [],
+            "product_progress_at": null,
+            "runtime_recovery_at": null,
+            "activity_at": null
+        }))
+        .expect("test completion state should deserialize");
+    crate::session::tests::install_host_completion_fixture(session, "root", completion_state)
+        .await
+        .expect("host test fixture should persist the existing escalation");
+}
+
 #[tokio::test]
 async fn wait_agent_returns_for_existing_parent_steer_without_status_or_timeout() {
     let (mut session, turn) = make_session_and_context().await;
@@ -3799,6 +3865,177 @@ async fn wait_agent_returns_final_status_without_timeout() {
         }
     );
     assert_eq!(success, None);
+}
+
+#[tokio::test]
+async fn wait_agent_returns_persisted_same_generation_escalation_without_fake_terminal() {
+    let (mut session, turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    session.services.agent_control = manager.agent_control();
+    let thread = manager
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .await
+        .expect("reviewer thread should start");
+    let reviewer_turn = thread.thread.session.new_default_turn().await;
+    let reviewer_turn_id = reviewer_turn.sub_id.clone();
+    thread
+        .thread
+        .session
+        .spawn_task(reviewer_turn, Vec::new(), PendingWaitTestTask)
+        .await;
+    let (observed_turn_id, observed_status) = manager
+        .agent_control()
+        .get_agent_status_generation(thread.thread_id)
+        .await
+        .expect("reviewer generation should be observable");
+    assert_eq!(observed_turn_id.as_deref(), Some(reviewer_turn_id.as_str()));
+    assert_eq!(observed_status, AgentStatus::Running);
+
+    install_wait_test_review_escalation(&session, thread.thread_id, &reviewer_turn_id).await;
+    let output = timeout(
+        Duration::from_millis(500),
+        WaitAgentHandler::default().handle(invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "wait_agent",
+            function_payload(json!({
+                "targets": [thread.thread_id.to_string()],
+                "timeout_ms": 10_000
+            })),
+        )),
+    )
+    .await
+    .expect("matching persisted escalation should return without waiting again")
+    .expect("wait_agent should return an escalation result");
+    let (content, success) = expect_text_output(output);
+    let result: wait::WaitAgentResult =
+        serde_json::from_str(&content).expect("wait result should be JSON");
+    assert!(result.status.is_empty(), "running is not terminal evidence");
+    assert!(result.timed_out);
+    let message = result
+        .message
+        .expect("persisted escalation should be explained");
+    assert!(message.contains("Cancellation was withheld"));
+    assert!(message.contains("will not be waited on or resubmitted again automatically"));
+    assert_eq!(success, None);
+
+    let (turn_id_after_wait, status_after_wait) = manager
+        .agent_control()
+        .get_agent_status_generation(thread.thread_id)
+        .await
+        .expect("reviewer stays observable after early escalation return");
+    assert_eq!(
+        turn_id_after_wait.as_deref(),
+        Some(reviewer_turn_id.as_str())
+    );
+    assert_eq!(status_after_wait, AgentStatus::Running);
+    assert!(
+        thread
+            .thread
+            .session
+            .abort_turn_if_active(&reviewer_turn_id, TurnAbortReason::Interrupted)
+            .await,
+        "test cleanup should stop the exact still-running generation"
+    );
+}
+
+#[tokio::test]
+async fn wait_agent_ignores_stale_escalation_and_collects_current_terminal_generation() {
+    let (mut session, turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    session.services.agent_control = manager.agent_control();
+    let thread = manager
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .await
+        .expect("worker thread should start");
+    let worker_turn = thread.thread.session.new_default_turn().await;
+    let worker_turn_id = worker_turn.sub_id.clone();
+    thread
+        .thread
+        .session
+        .spawn_task(worker_turn, Vec::new(), PendingWaitTestTask)
+        .await;
+    let (observed_turn_id, observed_status) = manager
+        .agent_control()
+        .get_agent_status_generation(thread.thread_id)
+        .await
+        .expect("current worker generation should be observable");
+    assert_eq!(observed_turn_id.as_deref(), Some(worker_turn_id.as_str()));
+    assert_eq!(observed_status, AgentStatus::Running);
+    let stale_turn_id = format!("{worker_turn_id}-stale");
+    install_wait_test_review_escalation(&session, thread.thread_id, &stale_turn_id).await;
+    let worker_thread_id = thread.thread_id;
+
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let mut wait_task = tokio::spawn({
+        let session = session.clone();
+        let turn = turn.clone();
+        async move {
+            WaitAgentHandler::default()
+                .handle(invocation(
+                    session,
+                    turn,
+                    "wait_agent",
+                    function_payload(json!({
+                        "targets": [worker_thread_id.to_string()],
+                        "timeout_ms": 10_000
+                    })),
+                ))
+                .await
+        }
+    });
+    assert!(
+        timeout(Duration::from_millis(50), &mut wait_task)
+            .await
+            .is_err(),
+        "stale-generation escalation must not short-circuit the current running generation"
+    );
+
+    assert!(
+        thread
+            .thread
+            .session
+            .abort_turn_if_active(&worker_turn_id, TurnAbortReason::Replaced)
+            .await,
+        "replacement should emit a final event for the current generation"
+    );
+    let (_, terminal_status) = manager
+        .agent_control()
+        .get_agent_status_generation(worker_thread_id)
+        .await
+        .expect("terminal worker generation should remain observable");
+    assert!(crate::agent::status::is_final(&terminal_status));
+
+    let output = timeout(Duration::from_secs(1), wait_task)
+        .await
+        .expect("wait_agent should collect the newly terminal current generation")
+        .expect("wait task should join")
+        .expect("wait_agent should succeed");
+    let (content, success) = expect_text_output(output);
+    let result: wait::WaitAgentResult =
+        serde_json::from_str(&content).expect("wait result should be JSON");
+    assert_eq!(
+        result.status.get(&worker_thread_id.to_string()),
+        Some(&terminal_status),
+        "current terminal status should be returned despite a stale escalation"
+    );
+    assert!(!result.timed_out);
+    assert_eq!(result.message, None);
+    assert_eq!(success, None);
+
+    let completion = session
+        .rencrow_completion_state("root")
+        .await
+        .expect("host escalation should remain persisted");
+    let evidence = completion.units[0]
+        .review_evidence
+        .as_ref()
+        .expect("review evidence should remain bound to its older generation");
+    assert_eq!(evidence.reviewer_turn_id, stale_turn_id);
+    assert!(evidence.deadline_escalation.is_some());
+    assert_eq!(evidence.wait_result_ref, None);
+    assert_eq!(evidence.terminal_status, None);
 }
 
 #[tokio::test]

@@ -93,6 +93,18 @@ pub enum CodexErrorDetails {
     /// The Session loop treats this as a transient error and will automatically retry the turn.
     #[error("stream disconnected before completion: {0}")]
     Stream(String),
+    #[error("{diagnostic_code}: response {response_id:?} incomplete ({reason})")]
+    IncompleteResponse {
+        diagnostic_code: String,
+        response_id: Option<String>,
+        reason: String,
+        token_usage: Option<crate::protocol::TokenUsage>,
+    },
+    #[error("response protocol failure for {response_id:?}: {reason}")]
+    ResponseProtocolFailure {
+        response_id: Option<String>,
+        reason: String,
+    },
     /// A retryable upstream rate limit received inside the response stream.
     #[error("rate limit exceeded: {0}")]
     RateLimitExceeded(String),
@@ -402,7 +414,9 @@ impl CodexErr {
             | CodexErrorDetails::ServerOverloaded
             | CodexErrorDetails::CyberPolicy { .. }
             | CodexErrorDetails::BioPolicy { .. }
-            | CodexErrorDetails::MisalignmentPolicyViolation { .. } => None,
+            | CodexErrorDetails::MisalignmentPolicyViolation { .. }
+            | CodexErrorDetails::IncompleteResponse { .. }
+            | CodexErrorDetails::ResponseProtocolFailure { .. } => None,
             CodexErrorDetails::Stream(..)
             | CodexErrorDetails::RateLimitExceeded(_)
             | CodexErrorDetails::Timeout

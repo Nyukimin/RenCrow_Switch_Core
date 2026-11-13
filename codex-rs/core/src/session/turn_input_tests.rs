@@ -2,11 +2,13 @@ use super::*;
 use crate::config::Constrained;
 use crate::session::step_settings::StepSettingsUpdate;
 use crate::session::tests::make_session_and_context;
+use crate::session::tests::make_session_and_context_with_auth_and_config_and_rx;
 use crate::session::tests::make_session_and_context_with_rx;
 use crate::session::turn_context::TurnContext;
 use crate::state::TaskKind;
 use crate::tasks::SessionTask;
 use crate::tasks::SessionTaskResult;
+use codex_login::CodexAuth;
 use codex_protocol::AgentPath;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::CollaborationMode;
@@ -243,6 +245,359 @@ async fn autonomous_resume_requires_matching_human_intake_and_does_not_clear_pau
         .await
     );
     assert!(session.autonomous_completion_paused().await);
+}
+
+#[tokio::test]
+async fn idle_user_start_modes_resume_paused_completion_from_human_intake() {
+    use codex_history::input_intake::InputAuthor;
+    use codex_protocol::protocol::SessionSource;
+
+    let (mut session, turn_context, _rx) = make_session_and_context_with_auth_and_config_and_rx(
+        CodexAuth::from_api_key("Test API Key"),
+        Vec::new(),
+        |config| config.rencrow_autonomous_completion = true,
+    )
+    .await;
+    let rollout_path = attach_persistent_rollout(
+        Arc::get_mut(&mut session).expect("test session has unique ownership"),
+    )
+    .await;
+    session
+        .set_rencrow_completion_state(
+            "root".into(),
+            serde_json::json!({
+                "contract_revision": 1,
+                "paused": false,
+                "conditions": [{
+                    "id": "AC-1", "revision": 1, "result": "The requested feature works",
+                    "scope": "CLI", "verification": "Run the end-to-end command",
+                    "acceptance_criteria": "The command produces expected output",
+                    "status": "open", "evidence": [], "unmet_reason": null
+                }],
+                "units": [{
+                    "id": "unit-1", "purpose": "Implement the behavior", "status": "ready",
+                    "kind": "execution", "condition_refs": ["AC-1"], "depends_on": [],
+                    "evidence": [], "task_refs": [], "review_target": null,
+                    "review_evidence": null, "review_launch": null,
+                    "review_decision_reason": null
+                }],
+                "current_unit": "unit-1", "failed_approaches": [], "blocker": null,
+                "next_action": "Continue work"
+            }),
+        )
+        .await
+        .expect("register open completion contract");
+    session
+        .state
+        .lock()
+        .await
+        .session_configuration
+        .session_source = SessionSource::Cli;
+    session.pause_autonomous_completion().await;
+    let thread_id = session.thread_id().to_string();
+    let text = "続けて";
+    write_intake_receipt(
+        &session,
+        "start-or-steer-human-resume",
+        InputAuthor::Human,
+        &thread_id,
+        text,
+        text,
+    )
+    .await;
+
+    session
+        .spawn_task(
+            Arc::clone(&turn_context),
+            Vec::new(),
+            NeverEndingTask {
+                kind: TaskKind::Regular,
+                listen_to_cancellation_token: true,
+            },
+        )
+        .await;
+    let active_steer = handle(
+        &session,
+        TurnInputRequest::new(resume_user_input(text, "start-or-steer-human-resume")),
+        TurnInputMode::StartOrSteer,
+        "active-steer-human-resume-turn".to_string(),
+    )
+    .await
+    .expect("active turn accepts steer");
+    assert_eq!(
+        active_steer,
+        TurnInputSubmission::Steered {
+            turn_id: turn_context.sub_id.clone(),
+        }
+    );
+    assert!(session.autonomous_completion_paused().await);
+    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+
+    {
+        session
+            .state
+            .lock()
+            .await
+            .session_configuration
+            .session_source = SessionSource::Custom("not-human-cli".to_string());
+    }
+    let wrong_source = handle(
+        &session,
+        TurnInputRequest::new(resume_user_input(text, "start-or-steer-human-resume")),
+        TurnInputMode::StartOrSteer,
+        "wrong-source-resume-turn".to_string(),
+    )
+    .await
+    .expect("ordinary user input starts for another source");
+    assert!(matches!(wrong_source, TurnInputSubmission::Started { .. }));
+    assert!(session.autonomous_completion_paused().await);
+    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+
+    {
+        let mut state = session.state.lock().await;
+        state.session_configuration.session_source = SessionSource::Cli;
+        let mut config = (*state.session_configuration.original_config_do_not_use).clone();
+        config.rencrow_autonomous_completion = false;
+        state.session_configuration.original_config_do_not_use = Arc::new(config);
+    }
+    let disabled = handle(
+        &session,
+        TurnInputRequest::new(resume_user_input(text, "start-or-steer-human-resume")),
+        TurnInputMode::StartOrSteer,
+        "disabled-resume-turn".to_string(),
+    )
+    .await
+    .expect("ordinary user input starts with feature disabled");
+    assert!(matches!(disabled, TurnInputSubmission::Started { .. }));
+    assert!(session.autonomous_completion_paused().await);
+    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+
+    {
+        let mut state = session.state.lock().await;
+        let mut config = (*state.session_configuration.original_config_do_not_use).clone();
+        config.rencrow_autonomous_completion = true;
+        state.session_configuration.original_config_do_not_use = Arc::new(config);
+    }
+
+    for (resume_count, (mode, turn_id)) in [
+        (
+            TurnInputMode::StartOrSteer,
+            "start-or-steer-human-resume-turn",
+        ),
+        (
+            TurnInputMode::StartIfIdle,
+            "start-if-idle-human-resume-turn",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let submission = handle(
+            &session,
+            TurnInputRequest::new(resume_user_input(text, "start-or-steer-human-resume")),
+            mode,
+            turn_id.to_string(),
+        )
+        .await
+        .expect("normal idle user turn starts");
+        assert_eq!(
+            submission,
+            TurnInputSubmission::Started {
+                turn_id: turn_id.to_string(),
+            }
+        );
+        assert!(!session.autonomous_completion_paused().await);
+        let persisted = {
+            let state = session.state.lock().await;
+            state
+                .history
+                .annotated_items()
+                .iter()
+                .rev()
+                .find_map(|item| {
+                    item.metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.rencrow_completion.clone())
+                })
+                .expect("resume snapshot persisted to history")
+        };
+        assert_eq!(persisted["state"]["paused"], false);
+        assert_eq!(persisted["resume_generation"], resume_count + 1);
+        session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+        session.pause_autonomous_completion().await;
+    }
+    session
+        .flush_rollout()
+        .await
+        .expect("flush completion snapshots");
+    let codex_history::InitialHistory::Resumed(resumed) =
+        crate::rollout::recorder::RolloutRecorder::get_rollout_history(&rollout_path)
+            .await
+            .expect("read persisted rollout")
+    else {
+        panic!("expected resumed rollout history");
+    };
+    let persisted_resume = resumed
+        .history
+        .iter()
+        .rev()
+        .find_map(|item| {
+            let codex_rollout::RolloutItem::ResponseItem(item) = item else {
+                return None;
+            };
+            item.metadata
+                .as_ref()
+                .and_then(|metadata| metadata.rencrow_completion.as_ref())
+                .filter(|snapshot| {
+                    snapshot["state"]["paused"] == false && snapshot["resume_generation"] == 2
+                })
+        })
+        .expect("resume snapshot exists in persisted rollout");
+    assert_eq!(persisted_resume["state"]["paused"], false);
+    assert_eq!(persisted_resume["resume_generation"], 2);
+}
+
+async fn attach_persistent_rollout(session: &mut Session) -> std::path::PathBuf {
+    use codex_protocol::models::BaseInstructions;
+    use codex_protocol::protocol::ThreadMemoryMode;
+    use codex_thread_store::CreateThreadParams;
+    use codex_thread_store::LiveThread;
+    use codex_thread_store::ThreadPersistenceMetadata;
+
+    let config = session.get_config().await;
+    let live_thread = LiveThread::create(
+        Arc::clone(&session.services.thread_store),
+        CreateThreadParams {
+            creator_user_id: None,
+            creator_account_id: None,
+            session_id: session.session_id(),
+            thread_id: session.thread_id,
+            extra_config: None,
+            forked_from_id: None,
+            parent_thread_id: None,
+            source: codex_protocol::protocol::SessionSource::Cli,
+            thread_source: None,
+            originator: "turn_input_test".to_string(),
+            base_instructions: BaseInstructions::default(),
+            dynamic_tools: Vec::new(),
+            selected_capability_roots: Vec::new(),
+            multi_agent_version: None,
+            history_mode: Default::default(),
+            subagent_history_start_ordinal: None,
+            history_base: None,
+            initial_window_id: uuid::Uuid::now_v7().to_string(),
+            runtime_workspace_roots: None,
+            metadata: ThreadPersistenceMetadata {
+                cwd: Some(config.cwd.to_path_buf()),
+                model_provider: config.model_provider_id.clone(),
+                memory_mode: if config.memories.generate_memories {
+                    ThreadMemoryMode::Enabled
+                } else {
+                    ThreadMemoryMode::Disabled
+                },
+            },
+        },
+    )
+    .await
+    .expect("create persistent test thread");
+    session.services.live_thread = Some(live_thread);
+    session
+        .current_rollout_path()
+        .await
+        .expect("read test rollout path")
+        .expect("persistent thread has rollout path")
+}
+
+#[tokio::test]
+async fn start_or_steer_does_not_start_turn_when_resume_snapshot_persistence_fails() {
+    use codex_history::input_intake::InputAuthor;
+    use codex_protocol::protocol::SessionSource;
+
+    let (mut session, _, _rx) = make_session_and_context_with_auth_and_config_and_rx(
+        CodexAuth::from_api_key("Test API Key"),
+        Vec::new(),
+        |config| config.rencrow_autonomous_completion = true,
+    )
+    .await;
+    let _rollout_path = attach_persistent_rollout(
+        Arc::get_mut(&mut session).expect("test session has unique ownership"),
+    )
+    .await;
+    session
+        .set_rencrow_completion_state(
+            "root".into(),
+            serde_json::json!({
+                "contract_revision": 1,
+                "paused": false,
+                "conditions": [{
+                    "id": "AC-1", "revision": 1, "result": "The requested feature works",
+                    "scope": "CLI", "verification": "Run the end-to-end command",
+                    "acceptance_criteria": "The command produces expected output",
+                    "status": "open", "evidence": [], "unmet_reason": null
+                }],
+                "units": [{
+                    "id": "unit-1", "purpose": "Implement the behavior", "status": "ready",
+                    "kind": "execution", "condition_refs": ["AC-1"], "depends_on": [],
+                    "evidence": [], "task_refs": [], "review_target": null,
+                    "review_evidence": null, "review_launch": null,
+                    "review_decision_reason": null
+                }],
+                "current_unit": "unit-1", "failed_approaches": [], "blocker": null,
+                "next_action": "Continue work"
+            }),
+        )
+        .await
+        .expect("register open completion contract");
+    session
+        .state
+        .lock()
+        .await
+        .session_configuration
+        .session_source = SessionSource::Cli;
+    session.pause_autonomous_completion().await;
+    session
+        .services
+        .live_thread
+        .as_ref()
+        .expect("persistent thread exists")
+        .shutdown()
+        .await
+        .expect("close rollout writer before forced append failure");
+    let thread_id = session.thread_id().to_string();
+    let text = "続けて";
+    write_intake_receipt(
+        &session,
+        "failed-persist-human-resume",
+        InputAuthor::Human,
+        &thread_id,
+        text,
+        text,
+    )
+    .await;
+
+    let result = handle(
+        &session,
+        TurnInputRequest::new(resume_user_input(text, "failed-persist-human-resume")),
+        TurnInputMode::StartOrSteer,
+        "failed-persist-human-resume-turn".to_string(),
+    )
+    .await;
+    let error = result.expect_err("failed snapshot persistence rejects turn start");
+    assert!(matches!(
+        error.details(),
+        CodexErrorDetails::InvalidRequest(_)
+    ));
+    assert!(session.autonomous_completion_paused().await);
+    assert_eq!(
+        session
+            .state
+            .lock()
+            .await
+            .rencrow_completion_resume_generation,
+        1,
+        "resume must reach snapshot persistence before failing closed"
+    );
+    assert!(session.active_turn.lock().await.is_none());
 }
 
 #[tokio::test]

@@ -43,6 +43,7 @@ use crate::session::turn_context::TurnContext;
 use crate::skills::emit_explicit_skill_invocations;
 use crate::stream_events_utils::HandleOutputCtx;
 use crate::stream_events_utils::InFlightFuture;
+use crate::stream_events_utils::ResponseTerminalState;
 use crate::stream_events_utils::TurnItemContributorPolicy;
 use crate::stream_events_utils::finalize_non_tool_response_item;
 use crate::stream_events_utils::handle_non_tool_response_item;
@@ -2785,6 +2786,7 @@ async fn try_run_sampling_request(
         .or_cancel(&cancellation_token)
         .await??;
     let mut in_flight: FuturesOrdered<InFlightFuture<'static>> = FuturesOrdered::new();
+    let mut deferred_output_items = Vec::new();
     let mut needs_follow_up = false;
     let mut last_agent_message: Option<String> = None;
     let mut active_item: Option<TurnItem> = None;
@@ -2813,7 +2815,7 @@ async fn try_run_sampling_request(
         !sess.services.extensions.turn_item_contributors().is_empty();
     let mut active_item_is_streaming_to_client = false;
     let receiving_span = trace_span!("receiving_stream");
-    let outcome: CodexResult<SamplingRequestResult> = loop {
+    let outcome: CodexResult<SamplingRequestResult> = 'sampling: loop {
         let handle_responses = trace_span!(
             parent: &receiving_span,
             "handle_responses",
@@ -2907,29 +2909,6 @@ async fn try_run_sampling_request(
                     )
                     .await;
                 }
-                if let Some(state) = plan_mode_state.as_mut()
-                    && handle_assistant_item_done_in_plan_mode(
-                        &sess,
-                        &step_context,
-                        turn_store.as_ref(),
-                        &item,
-                        state,
-                        previously_streamed_item.as_ref(),
-                        &mut last_agent_message,
-                    )
-                    .await
-                {
-                    continue;
-                }
-
-                let mut ctx = HandleOutputCtx {
-                    sess: sess.clone(),
-                    step_context: Arc::clone(&step_context),
-                    turn_store: Arc::clone(&turn_store),
-                    tool_runtime: tool_runtime.clone(),
-                    cancellation_token: cancellation_token.child_token(),
-                };
-
                 let preempt_for_mailbox_mail = match &item {
                     ResponseItem::Message { role, phase, .. } => {
                         role == "assistant" && matches!(phase, Some(MessagePhase::Commentary))
@@ -2953,6 +2932,35 @@ async fn try_run_sampling_request(
                     | ResponseItem::Other => false,
                 };
 
+                if step_context.settings.model_info.max_output_tokens.is_some() {
+                    deferred_output_items.push((item, previously_streamed_item));
+                    continue;
+                }
+
+                if let Some(state) = plan_mode_state.as_mut()
+                    && handle_assistant_item_done_in_plan_mode(
+                        &sess,
+                        &step_context,
+                        turn_store.as_ref(),
+                        &item,
+                        state,
+                        previously_streamed_item.as_ref(),
+                        &mut last_agent_message,
+                    )
+                    .await
+                {
+                    continue;
+                }
+
+                let mut ctx = HandleOutputCtx {
+                    sess: sess.clone(),
+                    step_context: Arc::clone(&step_context),
+                    turn_store: Arc::clone(&turn_store),
+                    tool_runtime: tool_runtime.clone(),
+                    cancellation_token: cancellation_token.child_token(),
+                    response_terminal_state: ResponseTerminalState::Pending,
+                };
+
                 let output_result =
                     match handle_output_item_done(&mut ctx, item, previously_streamed_item)
                         .instrument(handle_responses)
@@ -2963,6 +2971,9 @@ async fn try_run_sampling_request(
                     };
                 if let Some(tool_future) = output_result.tool_future {
                     in_flight.push_back(tool_future);
+                }
+                if let Some(tool_call) = output_result.deferred_tool_call {
+                    deferred_output_items.push((tool_call, None));
                 }
                 if let Some(agent_message) = output_result.last_agent_message {
                     last_agent_message = Some(agent_message);
@@ -3115,6 +3126,54 @@ async fn try_run_sampling_request(
                 usage_metadata,
                 end_turn,
             } => {
+                flush_assistant_text_segments_all(
+                    &sess,
+                    &turn_context,
+                    plan_mode_state.as_mut(),
+                    &mut assistant_message_stream_parsers,
+                )
+                .await;
+                for (item, previously_streamed_item) in std::mem::take(&mut deferred_output_items) {
+                    if let Some(state) = plan_mode_state.as_mut()
+                        && handle_assistant_item_done_in_plan_mode(
+                            &sess,
+                            &step_context,
+                            turn_store.as_ref(),
+                            &item,
+                            state,
+                            previously_streamed_item.as_ref(),
+                            &mut last_agent_message,
+                        )
+                        .await
+                    {
+                        continue;
+                    }
+
+                    let mut ctx = HandleOutputCtx {
+                        sess: Arc::clone(&sess),
+                        step_context: Arc::clone(&step_context),
+                        turn_store: Arc::clone(&turn_store),
+                        tool_runtime: tool_runtime.clone(),
+                        cancellation_token: cancellation_token.child_token(),
+                        response_terminal_state: ResponseTerminalState::Confirmed,
+                    };
+                    let output_result =
+                        match handle_output_item_done(&mut ctx, item, previously_streamed_item)
+                            .instrument(handle_responses.clone())
+                            .await
+                        {
+                            Ok(output_result) => output_result,
+                            Err(err) => break 'sampling Err(err),
+                        };
+                    debug_assert!(output_result.deferred_tool_call.is_none());
+                    if let Some(tool_future) = output_result.tool_future {
+                        in_flight.push_back(tool_future);
+                    }
+                    if let Some(agent_message) = output_result.last_agent_message {
+                        last_agent_message = Some(agent_message);
+                    }
+                    needs_follow_up |= output_result.needs_follow_up;
+                }
                 sess.services
                     .analytics_events_client
                     .track_code_mode_tool_call(
@@ -3125,13 +3184,6 @@ async fn try_run_sampling_request(
                             tool_call_ids: std::mem::take(&mut analytics_tool_call_ids),
                         },
                     );
-                flush_assistant_text_segments_all(
-                    &sess,
-                    &turn_context,
-                    plan_mode_state.as_mut(),
-                    &mut assistant_message_stream_parsers,
-                )
-                .await;
                 sess.record_observed_response_completed(
                     &turn_context,
                     &response_id,
@@ -3309,6 +3361,30 @@ async fn try_run_sampling_request(
         }
     };
     drop(sampling_timing_guard);
+
+    let incomplete_response = outcome
+        .as_ref()
+        .err()
+        .and_then(|error| match error.details() {
+            CodexErrorDetails::IncompleteResponse {
+                response_id,
+                token_usage,
+                ..
+            } => Some((response_id.clone(), token_usage.clone())),
+            _ => None,
+        });
+    if let Some((response_id, token_usage)) = incomplete_response {
+        if let Some(response_id) = response_id {
+            turn_context
+                .extension_data
+                .insert(codex_api::ResponseId(response_id));
+        }
+        if let Some(token_usage) = token_usage {
+            sess.record_token_usage_info(&turn_context, &step_context.settings, Some(&token_usage))
+                .await?;
+            should_emit_token_count = true;
+        }
+    }
 
     flush_assistant_text_segments_all(
         &sess,

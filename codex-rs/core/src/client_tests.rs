@@ -535,6 +535,7 @@ fn responses_request_limits_internal_metadata_to_resolved_first_party_https_endp
         for responses_lite in [false, true] {
             let mut model = test_model_info();
             model.use_responses_lite = responses_lite;
+            model.max_output_tokens = Some(32_768);
             let request = client.build_responses_request(
                 &prompt,
                 &model,
@@ -544,6 +545,13 @@ fn responses_request_limits_internal_metadata_to_resolved_first_party_https_endp
                 &responses_metadata,
                 include_internal,
             )?;
+            assert_eq!(request.max_output_tokens, Some(32_768));
+            let mut different_output_cap = request.clone();
+            different_output_cap.max_output_tokens = Some(16_384);
+            assert!(!super::responses_request_properties_match(
+                &request,
+                &different_output_cap,
+            ));
             assert_eq!(
                 request.input.last(),
                 Some(if allowed {

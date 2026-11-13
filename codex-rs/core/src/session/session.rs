@@ -948,6 +948,25 @@ impl Session {
                 }) else {
                     continue;
                 };
+                let review_result_collected = old_unit
+                    .review_evidence
+                    .as_ref()
+                    .is_some_and(|evidence| evidence.wait_result_ref.is_some());
+                let host_deadline_pending = !review_result_collected
+                    && (old_unit
+                        .review_evidence
+                        .as_ref()
+                        .is_some_and(|evidence| evidence.deadline_unix_ms.is_some())
+                        || old_unit
+                            .review_launch
+                            .as_ref()
+                            .is_some_and(|launch| launch.deadline_unix_ms.is_some()));
+                if host_deadline_pending {
+                    object.insert(
+                        "status".into(),
+                        serde_json::to_value(old_unit.status).map_err(|error| error.to_string())?,
+                    );
+                }
                 if let Some(evidence) = old_unit.review_evidence.as_ref() {
                     object.insert(
                         "review_evidence".into(),

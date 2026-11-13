@@ -1,3 +1,4 @@
+use crate::responses_retry::is_non_retryable_response_outcome;
 use codex_analytics::CompactionImplementation;
 use codex_analytics::CompactionReason;
 use codex_otel::SessionTelemetry;
@@ -12,7 +13,7 @@ pub(crate) fn should_retry_with_current_model(error: &CodexErr) -> bool {
         CodexErrorDetails::TurnAborted
             | CodexErrorDetails::Interrupted
             | CodexErrorDetails::SessionBudgetExceeded
-    )
+    ) && !is_non_retryable_response_outcome(error.details())
 }
 
 pub(crate) fn record_model_fallback(

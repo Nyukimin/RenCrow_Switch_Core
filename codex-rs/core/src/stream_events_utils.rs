@@ -209,6 +209,13 @@ pub(crate) struct OutputItemResult {
     pub last_agent_message: Option<String>,
     pub needs_follow_up: bool,
     pub tool_future: Option<InFlightFuture<'static>>,
+    pub deferred_tool_call: Option<ResponseItem>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ResponseTerminalState {
+    Pending,
+    Confirmed,
 }
 
 pub(crate) struct HandleOutputCtx {
@@ -217,6 +224,7 @@ pub(crate) struct HandleOutputCtx {
     pub turn_store: Arc<ExtensionData>,
     pub tool_runtime: ToolCallRuntime,
     pub cancellation_token: CancellationToken,
+    pub response_terminal_state: ResponseTerminalState,
 }
 
 pub(crate) async fn apply_turn_item_contributors(
@@ -305,6 +313,19 @@ pub(crate) async fn handle_output_item_done(
     let mut output = OutputItemResult::default();
     let plan_mode = ctx.step_context.turn.mode() == ModeKind::Plan;
 
+    if ctx
+        .step_context
+        .settings
+        .model_info
+        .max_output_tokens
+        .is_some()
+        && ctx.response_terminal_state == ResponseTerminalState::Pending
+        && is_dispatchable_response_tool(&item)
+    {
+        output.deferred_tool_call = Some(item);
+        return Ok(output);
+    }
+
     match ToolRouter::build_tool_call(item.clone()) {
         // The model emitted a tool call; log it, persist the item immediately, and queue the tool execution.
         Ok(Some(call)) => {
@@ -334,11 +355,19 @@ pub(crate) async fn handle_output_item_done(
                 .await;
 
             let cancellation_token = ctx.cancellation_token.child_token();
-            let tool_future: InFlightFuture<'static> = Box::pin(
-                ctx.tool_runtime
-                    .clone()
-                    .handle_tool_call(call, cancellation_token),
-            );
+            let (tool_guard, _tool_dispatch_epoch) = ctx
+                .sess
+                .register_in_flight_tool_call(&ctx.step_context.turn.sub_id)
+                .await
+                .ok_or(CodexErr::TurnAborted)?;
+            let tool_future = ctx
+                .tool_runtime
+                .clone()
+                .handle_tool_call(call, cancellation_token);
+            let tool_future: InFlightFuture<'static> = Box::pin(async move {
+                let _tool_guard = tool_guard;
+                tool_future.await
+            });
 
             output.needs_follow_up = true;
             output.tool_future = Some(tool_future);
@@ -417,6 +446,14 @@ pub(crate) async fn handle_output_item_done(
     }
 
     Ok(output)
+}
+
+fn is_dispatchable_response_tool(item: &ResponseItem) -> bool {
+    match item {
+        ResponseItem::FunctionCall { .. } | ResponseItem::CustomToolCall { .. } => true,
+        ResponseItem::ToolSearchCall { execution, .. } => execution == "client",
+        _ => false,
+    }
 }
 
 pub(crate) async fn handle_non_tool_response_item(

@@ -251,6 +251,7 @@ async fn model_completion_update_cannot_clear_or_replace_unknown_review_launch()
     let launch = codex_history::task_context::CompletionReviewLaunchState {
         spawn_call_id: "host-review-call".into(),
         status: codex_history::task_context::CompletionReviewLaunchStatus::Unknown,
+        deadline_unix_ms: Some(1_798_000_000_000),
         reason: Some("ambiguous post-spawn failure".into()),
     };
     unit.review_launch = Some(launch.clone());
@@ -278,6 +279,7 @@ async fn model_completion_update_cannot_clear_or_replace_unknown_review_launch()
     let mut forged = serde_json::to_value(&contract).unwrap();
     forged["units"][0]["review_launch"]["spawn_call_id"] = serde_json::json!("model-call");
     forged["units"][0]["review_launch"]["status"] = serde_json::json!("reserved");
+    forged["units"][0]["review_launch"]["deadline_unix_ms"] = serde_json::json!(1);
     forged["units"][0]["review_launch"]["reason"] = serde_json::Value::Null;
     session
         .set_rencrow_completion_state("root".into(), forged)
@@ -313,6 +315,19 @@ async fn model_completion_update_cannot_clear_or_replace_unknown_review_launch()
 #[tokio::test]
 async fn pending_review_evidence_cannot_be_removed_or_retargeted() {
     let (session, _) = make_session_and_context().await;
+    let workspace = tempfile::tempdir().expect("workspace");
+    std::fs::write(workspace.path().join("artifact.txt"), "accepted artifact\n").unwrap();
+    let accepted_target =
+        record_test_artifact_receipt(&session, workspace.path(), "task-a", 1, "accepted-review")
+            .await;
+    session
+        .record_initial_history(codex_history::InitialHistory::Forked(vec![
+            crate::session::tests::accepted_task_boundary_item(
+                &session.thread_id().to_string(),
+                &accepted_target.artifact_ref,
+            ),
+        ]))
+        .await;
     let mut contract = open_contract();
     let unit = &mut contract.units[0];
     unit.kind = codex_history::task_context::CompletionUnitKind::Review;
@@ -326,14 +341,33 @@ async fn pending_review_evidence_cannot_be_removed_or_retargeted() {
         reviewer_turn_id: "pending-generation:review-call".into(),
         reviewer_role: "analyst".into(),
         spawn_call_id: "review-call".into(),
+        deadline_unix_ms: Some(1_798_000_000_000),
+        deadline_escalation: None,
+        deadline_safety_fingerprint: None,
         wait_result_ref: None,
         terminal_status: None,
         wait_call_id: None,
         target_task_id: "task-a".into(),
         target_task_revision: 1,
-        target_artifact_ref: "task-check:accepted-artifact".into(),
+        target_artifact_ref: accepted_target.artifact_ref,
     });
     session.state.lock().await.rencrow_completion_state = Some(("root".into(), contract.clone()));
+
+    let mut status_changed = serde_json::to_value(&contract).unwrap();
+    status_changed["units"][0]["status"] = serde_json::json!("blocked");
+    session
+        .set_rencrow_completion_state("root".into(), status_changed)
+        .await
+        .expect("model status cannot hide an unresolved host-bound review");
+    assert_eq!(
+        session
+            .rencrow_completion_state("root")
+            .await
+            .unwrap()
+            .units[0]
+            .status,
+        UnitStatus::Running
+    );
 
     let mut omitted = serde_json::to_value(&contract).unwrap();
     omitted["units"] = serde_json::json!([]);
@@ -358,6 +392,64 @@ async fn pending_review_evidence_cannot_be_removed_or_retargeted() {
         .await
         .expect_err("unresolved host-bound review cannot be retargeted");
     assert!(error.contains("cannot change the identity or target"));
+}
+
+#[tokio::test]
+async fn legacy_review_without_host_deadline_keeps_model_status_semantics() {
+    let (session, _) = make_session_and_context().await;
+    let workspace = tempfile::tempdir().expect("workspace");
+    std::fs::write(workspace.path().join("artifact.txt"), "accepted artifact\n").unwrap();
+    let accepted_target =
+        record_test_artifact_receipt(&session, workspace.path(), "task-a", 1, "legacy-review")
+            .await;
+    session
+        .record_initial_history(codex_history::InitialHistory::Forked(vec![
+            crate::session::tests::accepted_task_boundary_item(
+                &session.thread_id().to_string(),
+                &accepted_target.artifact_ref,
+            ),
+        ]))
+        .await;
+    let mut contract = open_contract();
+    let unit = &mut contract.units[0];
+    unit.kind = codex_history::task_context::CompletionUnitKind::Review;
+    unit.status = UnitStatus::Running;
+    unit.review_target = Some(CompletionReviewTarget {
+        task_id: "task-a".into(),
+        task_revision: 1,
+    });
+    unit.review_evidence = Some(CompletionReviewEvidence {
+        reviewer_thread_id: "01a1c77f-15cf-7491-9372-ce9a4d0c408a".into(),
+        reviewer_turn_id: "legacy-review-generation".into(),
+        reviewer_role: "analyst".into(),
+        spawn_call_id: "legacy-review".into(),
+        deadline_unix_ms: None,
+        deadline_escalation: None,
+        deadline_safety_fingerprint: None,
+        wait_result_ref: None,
+        terminal_status: None,
+        wait_call_id: None,
+        target_task_id: "task-a".into(),
+        target_task_revision: 1,
+        target_artifact_ref: accepted_target.artifact_ref,
+    });
+    session.state.lock().await.rencrow_completion_state = Some(("root".into(), contract.clone()));
+
+    let mut proposed = serde_json::to_value(&contract).unwrap();
+    proposed["units"][0]["status"] = serde_json::json!("blocked");
+    session
+        .set_rencrow_completion_state("root".into(), proposed)
+        .await
+        .expect("legacy review status retains its prior model-controlled behavior");
+    assert_eq!(
+        session
+            .rencrow_completion_state("root")
+            .await
+            .unwrap()
+            .units[0]
+            .status,
+        UnitStatus::Blocked
+    );
 }
 
 #[tokio::test]

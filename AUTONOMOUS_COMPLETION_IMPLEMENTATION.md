@@ -243,3 +243,15 @@ accept receiptと選択conditionだけをExecution unitへ反映する。Review/
 autonomous child acceptでは、既存のunit選択と `apply_host_acceptance` の後、BoundaryCandidate validation前に新host `AcceptedTaskReceipt` を最新task receipt mapへ反映し、Session setterと共通の `canonicalize_completion_state_evidence` を適用する。対象receiptはactive task ID/revision、accept result、検証済みartifact fingerprintから作る。既存のaccepted receipt mapは他taskのcanonical refsを解決するため保持する。
 
 共通canonicalizerの対象はcondition evidence、unit evidence/task_refs、blocker evidence。review-specific evidence/target、task/condition定義、status、他task revisionは触れない。新旧receiptを含むsame-revision integration testで、同じtask@revision・同じartifactの再accept後にcheckpointがcommitされ、persisted completion evidenceが最新receiptと一致することを検証する。
+
+## 人間入力による再開とレビュー期限（2026-11-12）
+
+通常TUIのアイドル時 `StartOrSteer` も、`StartIfIdle` と共通の明示再開判定を使う。有効なHuman intake receipt、本文・client ID・thread照合、対象source、機能ONを要求する。active turnへのsteerとautomation入力では解除しない。再開snapshotの保存失敗時はpauseを維持し、新規taskを開始しない。
+
+新規のhost管理レビューは、spawn予約時に10分後の絶対期限 `deadline_unix_ms` を保存し、同じspawn call・child・turn generationの証拠へ引き継ぐ。復元・計画更新で期限を延長せず、未回収の期限付きレビューのstatusもhostが保持する。旧snapshotで期限が無いレビューには期限を後付けせず、従来のstatus更新を維持する。
+
+期限は既存120秒observerと `wait_agent` の待機境界で検査する。親のpause・自律継続OFFは解除せず、保存済み期限だけを観測する。取消しは親のregistry、read-only設定、childの親・role・正確なgenerationを照合し、tool待機・background terminal・code cellが無いと確認できた場合に限る。tool futureの登録からdropまでRAIIで追跡し、inventory確認中の新規dispatchはepochの差で検出する。
+
+取消し後も、同じgenerationの `ReviewEnded` statusと永続化済み終了イベントを確認するまで失敗確定にしない。安全性・終了が不明なら、host証拠にescalationと固定長の観測fingerprintを保存し、同条件の再送・連続waitを止める。実際のterminal結果は回収でき、別generation・通常worker・hostの結果通知配送は妨げない。汎用followupの拒否は入力依頼の入口に置き、共通の通知transportには置かない。
+
+Rust 1.95.0の変更Core機能とhistory crateの限定検証は217/217成功。Human再開の永続化・失敗時停止、期限とhost所有権の保持、実checkpointとdisk snapshotからの復元、親に属する実childの取消しと終了証拠、worker保護、世代別waitを含む。全workspace検査とC01-v6総合E2Eの合格を意味しない。実機配置・同一thread再開の証拠は私有の `Tmp/ren2-supervision/periodic/human-resume-20261112/` に分けて保持する。

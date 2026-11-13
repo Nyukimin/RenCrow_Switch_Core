@@ -93,6 +93,11 @@ impl LocalAgentControl {
                 })?;
                 self.ensure_v2_agent_loaded(resume_config, target, /*parent*/ None)
                     .await?;
+                if mode == MessageDeliveryMode::TriggerTurn {
+                    let state = self.upgrade()?;
+                    let thread = state.get_thread(target).await?;
+                    self.ensure_completion_review_input_allowed(&thread).await?;
+                }
                 let communication = message.into_communication(author, receiver_path, mode);
                 let kind = match mode {
                     MessageDeliveryMode::QueueOnly => {

@@ -571,23 +571,105 @@ impl Session {
         turn_id: &str,
         reason: TurnAbortReason,
     ) -> bool {
+        self.abort_turn_if_active_with_mode_check(turn_id, reason, None)
+            .await
+    }
+
+    /// Register a tool future at output-item completion, before it can be queued without polling.
+    pub(crate) async fn register_in_flight_tool_call(
+        &self,
+        turn_id: &str,
+    ) -> Option<(crate::state::InFlightToolCallGuard, u64)> {
+        let active = self.active_turn.lock().await;
+        let active_turn = active.as_ref()?;
+        let task = active_turn.task.as_ref()?;
+        if task.turn_context.sub_id != turn_id {
+            return None;
+        }
+        let mut turn_state = active_turn.turn_state.lock().await;
+        turn_state.begin_in_flight_tool_call()
+    }
+
+    /// Snapshot tool dispatch state before consulting external job inventories.
+    pub(crate) async fn reviewer_tool_dispatch_snapshot(
+        &self,
+        turn_id: &str,
+    ) -> Option<(u64, usize)> {
+        let active = self.active_turn.lock().await;
+        let active_turn = active.as_ref()?;
+        let task = active_turn.task.as_ref()?;
+        if task.turn_context.sub_id != turn_id || task.kind != crate::state::TaskKind::Regular {
+            return None;
+        }
+        let turn_state = active_turn.turn_state.lock().await;
+        Some((
+            turn_state.tool_dispatch_epoch,
+            turn_state
+                .in_flight_tool_calls
+                .load(std::sync::atomic::Ordering::Acquire),
+        ))
+    }
+
+    /// Abort a reviewer generation only when no model-emitted tool future is in flight.
+    pub(crate) async fn abort_model_only_turn_if_active(
+        self: &Arc<Self>,
+        turn_id: &str,
+        expected_tool_dispatch_epoch: u64,
+        reason: TurnAbortReason,
+    ) -> Result<bool, String> {
+        let aborted = self
+            .abort_turn_if_active_with_mode_check(
+                turn_id,
+                reason,
+                Some(expected_tool_dispatch_epoch),
+            )
+            .await;
+        if aborted {
+            self.flush_rollout()
+                .await
+                .map_err(|error| format!("failed to flush reviewer abort event: {error}"))?;
+        }
+        Ok(aborted)
+    }
+
+    async fn abort_turn_if_active_with_mode_check(
+        self: &Arc<Self>,
+        turn_id: &str,
+        reason: TurnAbortReason,
+        expected_tool_dispatch_epoch: Option<u64>,
+    ) -> bool {
         let active_turn = {
             let mut active = self.active_turn.lock().await;
-            if active
-                .as_ref()
-                .and_then(|active_turn| active_turn.task.as_ref())
-                .is_some_and(|task| task.turn_context.sub_id == turn_id)
-            {
-                if matches!(
-                    reason,
-                    TurnAbortReason::Interrupted | TurnAbortReason::BudgetLimited
-                ) {
-                    self.mark_interrupted();
-                }
-                active.take()
-            } else {
-                None
+            let Some(current) = active.as_ref() else {
+                return false;
+            };
+            let Some(task) = current.task.as_ref() else {
+                return false;
+            };
+            if task.turn_context.sub_id != turn_id {
+                return false;
             }
+            if let Some(expected_tool_dispatch_epoch) = expected_tool_dispatch_epoch {
+                if task.kind != crate::state::TaskKind::Regular {
+                    return false;
+                }
+                let turn_state = current.turn_state.lock().await;
+                if turn_state.tool_dispatch_epoch != expected_tool_dispatch_epoch
+                    || turn_state
+                        .in_flight_tool_calls
+                        .load(std::sync::atomic::Ordering::Acquire)
+                        != 0
+                {
+                    return false;
+                }
+            }
+            if matches!(
+                reason,
+                TurnAbortReason::Interrupted | TurnAbortReason::BudgetLimited
+            ) {
+                self.mark_interrupted();
+            }
+            active.take()
         };
         let Some(mut active_turn) = active_turn else {
             return false;

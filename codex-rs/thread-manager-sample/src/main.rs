@@ -228,6 +228,7 @@ fn new_config(model: Option<String>, arg0_paths: Arg0DispatchPaths) -> anyhow::R
         compact_prompt: None,
         rencrow_compaction: false,
         rencrow_autonomous_completion: false,
+        rencrow_execution_guard: None,
         rencrow_tool_allowlist: None,
         rencrow_read_only: false,
         rencrow_thread_title_reasoning_effort: None,

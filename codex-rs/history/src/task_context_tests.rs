@@ -154,6 +154,7 @@ fn unknown_review_launch_is_typed_bounded_and_host_state_only() {
             review_launch: Some(CompletionReviewLaunchState {
                 spawn_call_id: "review-call".into(),
                 status: CompletionReviewLaunchStatus::Unknown,
+                deadline_unix_ms: None,
                 reason: Some("child creation could not be confirmed".into()),
             }),
             review_decision_reason: None,
@@ -260,6 +261,9 @@ fn review_unit_state(status: UnitStatus) -> CompletionState {
                 reviewer_turn_id: "reviewer-turn-1".into(),
                 reviewer_role: "analyst".into(),
                 spawn_call_id: "spawn-review".into(),
+                deadline_unix_ms: None,
+                deadline_escalation: None,
+                deadline_safety_fingerprint: None,
                 wait_result_ref: Some("sha256:review-result".into()),
                 terminal_status: Some(CompletionReviewTerminalStatus::Completed),
                 wait_call_id: Some("wait-review".into()),

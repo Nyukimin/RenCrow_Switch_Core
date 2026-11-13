@@ -2,6 +2,8 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
@@ -97,6 +99,10 @@ pub(crate) struct TurnState {
     granted_permissions_by_environment_id: HashMap<String, AdditionalPermissionProfile>,
     strict_auto_review_enabled: bool,
     pub(crate) tool_calls: u64,
+    /// Monotonic per-turn count of model tool futures registered for dispatch.
+    pub(crate) tool_dispatch_epoch: u64,
+    /// Tool futures that have been emitted by the model but have not completed or been dropped.
+    pub(crate) in_flight_tool_calls: Arc<AtomicUsize>,
     pub(crate) rencrow_execution_guard: crate::rencrow_execution_guard::GuardState,
     pub(crate) has_memory_citation: bool,
     pub(crate) token_usage_at_turn_start: TokenUsage,
@@ -104,6 +110,17 @@ pub(crate) struct TurnState {
     /// The last step captured for execution or selected from a speculative fallback.
     /// Remains absent until a step is captured; standalone local compaction has no step.
     pub(crate) last_known_step_context: Option<Arc<StepContext>>,
+}
+
+/// Keeps the generation marked as having an in-flight tool until its future is dropped.
+pub(crate) struct InFlightToolCallGuard {
+    count: Arc<AtomicUsize>,
+}
+
+impl Drop for InFlightToolCallGuard {
+    fn drop(&mut self) {
+        self.count.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// Host receipt metadata follows the response through the asynchronous tool waiter.
@@ -120,6 +137,13 @@ pub(crate) struct PendingRequestPermissions {
 }
 
 impl TurnState {
+    pub(crate) fn begin_in_flight_tool_call(&mut self) -> Option<(InFlightToolCallGuard, u64)> {
+        self.tool_dispatch_epoch = self.tool_dispatch_epoch.checked_add(1)?;
+        let count = Arc::clone(&self.in_flight_tool_calls);
+        count.fetch_add(1, Ordering::AcqRel);
+        Some((InFlightToolCallGuard { count }, self.tool_dispatch_epoch))
+    }
+
     pub(crate) fn insert_pending_approval(
         &mut self,
         key: String,
@@ -251,5 +275,27 @@ impl TurnState {
 
     pub(crate) fn strict_auto_review_enabled(&self) -> bool {
         self.strict_auto_review_enabled
+    }
+}
+
+#[cfg(test)]
+mod in_flight_tool_call_guard_tests {
+    use super::TurnState;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn guard_lives_with_an_unpolled_future_and_releases_on_drop() {
+        let mut turn_state = TurnState::default();
+        let (guard, epoch) = turn_state
+            .begin_in_flight_tool_call()
+            .expect("tool dispatch epoch should increment");
+        let future = Box::pin(async move {
+            let _guard = guard;
+        });
+
+        assert_eq!(turn_state.tool_dispatch_epoch, epoch);
+        assert_eq!(turn_state.in_flight_tool_calls.load(Ordering::Acquire), 1);
+        drop(future);
+        assert_eq!(turn_state.in_flight_tool_calls.load(Ordering::Acquire), 0);
     }
 }
