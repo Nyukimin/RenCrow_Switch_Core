@@ -1,6 +1,6 @@
 # 現状不具合 修正仕様・実装仕様
 
-- 版: v0.1（2026-11-12）
+- 版: v0.2（状態更新: 2026-11-14。初版の受入条件・修正契約は維持）
 - 対象: RenCrow Switch Core（`codex-rs/`）中心。監督・PORTAL は境界と受入のみ記載。
 - 正本との関係:
   - 容量圧縮: [COMPACTION_SPEC.md](../COMPACTION_SPEC.md) 第1〜2部が優先。本書は未解決運用ギャップへの**修正契約**。
@@ -15,12 +15,16 @@
 
 | ID | 不具合 | 優先 | 根因確度 | 修正 | 実装 |
 |---|---|:---:|:---:|---|---|
-| FIX-001 | 人間「続けて」で `paused` が解除されない | P0 | 確定 | 仕様確定 | 未実装 |
-| FIX-002 | Compaction 長時間化・反復による停滞 | P1 | 因果整理済み・効果未確認 | Phase0観測＋Phase1は承認後 | 部分（計測・抑止のみ） |
-| FIX-003 | レビュー子無応答・親 wait ループ | P1 | 運用観測・回収なし | 監督契約 | 進行中 |
-| FIX-004 | PORTAL 最終 review 未完 | P2 | 製品境界 | review 完了手順 | 実装済み・review未 |
-| FIX-005 | 画面脈動・ちらつき | P2 | 未確定 | tmux/描画 | 部分確認 |
-| FIX-006 | 自律完了 C01-v6 総合 E2E | P1 | タイムアウト | マトリクス継続 | 未完了 |
+| FIX-001 | 人間「続けて」で `paused` が解除されない | P0 | 確定 | 仕様実装済み | 実装・pause解除検証済み。自律mark受入は未確認 |
+| FIX-002 | Compaction 長時間化・反復による停滞 | P1 | 因果整理済み・優位性未確認 | Phase0観測済み。Phase1は承認後 | Phase0完了。1-Aは未採用、改善受入は未完了 |
+| FIX-003 | レビュー子無応答・親 wait ループ | P1 | 運用観測あり・全系受入未完了 | 実装境界とreviewer期限 | 実装・限定検証済み。reviewer無応答E2Eは未確認 |
+| FIX-004 | PORTAL 最終 review 未完 | P2 | 製品境界 | review 完了手順 | 2026-11-12時点: 実装済み・review未。今回未再検証 |
+| FIX-005 | 画面脈動・ちらつき | P2 | 未確定 | tmux/描画 | 2026-11-12時点: 部分確認。今回未再検証 |
+| FIX-006 | 自律完了 C01-v6 総合 E2E | P1 | 2026-11-12時点timeout | マトリクス継続 | 2026-11-12時点未完了。今回未再検証 |
+
+### 状態の読み分け（2026-11-14）
+
+「実装」はコードの存在、「限定検証」は記載したテスト/試行の結果、「実環境受入」は元の受入条件を満たす実行証拠を指す。これらを相互に代用しない。以下の `Tmp/...` はRenCrowワークスペース起点のprivate evidenceで、リポジトリには含まれない。本文には結論と参照先のみを記す。
 
 **部分解決（追認のみ・追加修正は条件付き）**
 
@@ -80,11 +84,13 @@ RenCrow 経路: `compaction_route` → `compact_rencrow::run` → `compact_v2`�
 - `rencrow_completion_paused == true`（契約 `paused` も true）のまま。
 - 人間が「続けて」等を送っても受付はされるが、pause が解除されない。
 
-### 根因（確定）
+### 根因（修正前に確定した欠落）
 
 - 明示再開は **`start_if_idle` のみ**で `resume_autonomous_completion_from_user_turn` を呼ぶ（[`turn_input.rs`](../codex-rs/core/src/session/turn_input.rs) L451–615）。
 - 通常 TUI / 既定 RPC は **`TurnInputMode::StartOrSteer` → `start_or_steer`**。アイドル時新規ターン開始（L385–434）は **resume 判定を通らない**。
 - `is_explicit_human_autonomous_resume` は intake receipt と `InputAuthor::Human` を要求（「続けて」/ 英語固定句）。認識だけでは pause を変えない（[`turn_input_tests.rs`](../codex-rs/core/src/session/turn_input_tests.rs) L160–185）。
+
+2026-11-14時点では共通resume判定を `start_if_idle` と `start_or_steer` のアイドル新規ターン開始の双方から呼ぶ実装。上記は修正前の根因記録である。
 
 ### 修正仕様（不変条件）
 
@@ -110,9 +116,11 @@ RenCrow 経路: `compaction_route` → `compact_rencrow::run` → `compact_v2`�
 
 ### 受入条件
 
-- [ ] 通常 TUI 経路（StartOrSteer）で「続けて」→ `paused=false`、snapshot 永続化成功。
+- [x] 通常 TUI 経路（StartOrSteer）で「続けて」→ `paused=false`、snapshot 永続化成功。
 - [ ] 再開後、自律継続ターンが `mark_autonomous_completion_turn` を通る（pause 中は拒否される現行契約を満たす）。
-- [ ] 検査・監督で「人間入力受付」と「pause 解除」を別イベントとして混同しない。
+- [x] 検査・監督で「人間入力受付」と「pause 解除」を別イベントとして混同しない。
+
+**2026-11-14 状態**: `turn_input.rs` の共通判定を両開始経路に接続済み。focused test green。status evidenceでhuman intake true、paused true→false、resume_generation 0→1を別々に確認。snapshotは `Tmp/autonomous-completion-20261111/candidate-18/post-composer-observation-1.json` の `completion_snapshots`、再開後の処理は同ディレクトリの `runtime-progress-verification.json` に記録。ただし `autonomous_mark_verified=false` のため、自律継続mark条件は未確認でFIX-001全体は閉じていない。根拠: `Tmp/ren2-supervision/periodic/human-resume-20261112/fix001-green-focused.log`, `Tmp/ren2-supervision/periodic/human-resume-20261112/status-verification.json`。
 
 ---
 
@@ -165,8 +173,10 @@ RenCrow 経路: `compaction_route` → `compact_rencrow::run` → `compact_v2`�
 
 ### 受入条件（Phase 0）
 
-- [ ] 停滞再現 thread で B4 観測表（プラン参照）が埋まる。
-- [ ] Normal/Emergency 比率と MidTurn 連続回数が数値で残る。
+- [x] 停滞再現 thread で B4 観測表（プラン参照）が埋まる。
+- [x] Normal/Emergency 比率と MidTurn 連続回数が数値で残る。
+
+**2026-11-14 状態**: Phase 0 baseline は20行（16 capacity / 4 task boundary）。summaryはNormal 16 / Emergency 0（16:0）。同一turn MidTurn回数は4/8/2/2、段別時間も記録済み。analytics の `turn_id` は `turn_context.sub_id` と一致する（`../codex-rs/core/src/compact.rs`）。1-Aの同一凍結fixture測定ではinput +160 (+3.03%)、total +826、所要時間は約12.8秒増で意味情報は保持されたが優位性は示されず未採用。定量値だけでは意味品質のACを証明しない。Phase 0受入は完了、本番の長時間化・反復改善は未確認。1-B/1-Cは未評価候補で、採用判断は別途。根拠: `Tmp/ren2-supervision/periodic/human-resume-20261112/fix002-phase0-baseline-v2.json`, `Tmp/ren2-supervision/periodic/human-resume-20261112/fix002-1a-live-rencrow-provider-v1/result-analysis-v2.json`。
 
 ---
 
@@ -187,11 +197,11 @@ RenCrow 経路: `compaction_route` → `compact_rencrow::run` → `compact_v2`�
 
 | 層 | 担当 |
 |---|---|
-| Core | 子 session の turn 終端・中断は既存。変更は FIX-001 等と競合しない範囲のみ。 |
-| 監督 CLI | timeout、子状態ポーリング上限、ledger 更新（RenCrow 監督 skill 手順に従う）。 |
+| Core | session/reviewer deadline enforcement、generation結合abort、durable terminal/escalation を実装済み。 |
+| 監督 CLI | 実際の親子回収、状態台帳、運用判断を含む受入は監督層。reviewer期限は通常10分。通常の子の作業期限は既定未設定（`CHILD_MONITOR.md`）。 |
 | 受入 | 子を意図的に無応答にした scenario で、親が N 分後に escalation し無限 wait しないログ |
 
-**現状**: 子結果未取得のため FIX-003 は**未完了**。Core 単体では閉じない。
+**現状（2026-11-14）**: scoped 17 tests と scripted loopback fault 3件はpass。通常のQwen 3.5 parent KAT childでprintf/wait/collectの実測あり。後続のログ/final timestamp記録も検証済み。元の受入条件であるreviewer無応答E2Eおよび実LLM hang注入は未実施のため、FIX-003は未完了。別件のdelegation full-fork diagnosticは要求KATと実行内容の不一致で不合格だったが、これはreviewer deadline E2EではなくFIX-003の受入証拠に含めない。reviewer期限は通常10分、通常child期限は既定未設定（`CHILD_MONITOR.md`）。本番ren2既存プロセスは最新pairへ未再起動（Gateway/Runtimeは再起動済み、新規起動分のみ適用）。user pauseを維持し、自動resumeしない。根拠: `Tmp/ren2-supervision/periodic/private/child-monitor-implementation-20261113/full-check/merged-test-outcomes.json`, `Tmp/ren2-supervision/periodic/private/simple-llm-live-20261114/acceptance.json`, `Tmp/ren2-supervision/periodic/private/residuals-1-4-20261114/core/feature-proof.json`, `Tmp/ren2-supervision/periodic/private/residuals-1-4-20261114/core/install.json`。
 
 ---
 
@@ -230,7 +240,7 @@ RenCrow 経路: `compaction_route` → `compact_rencrow::run` → `compact_v2`�
 
 ### 実装仕様
 
-- FIX-001 完了後に resume 系ケースを再実行。FIX-002 Phase 0 は圧縮ケースの計測に併用。
+- FIX-001の自律mark受入を確認後にresume系ケースを再実行。FIX-002 Phase 0 baselineは取得済みだが、性能改善の受入証拠には代用しない。
 
 ---
 
@@ -281,4 +291,5 @@ sequenceDiagram
 | 日付 | 内容 |
 |---|---|
 | 2026-11-12 | 初版。FIX-001 根因を turn_input 二経路に特定。Compaction は Phase0/1 分離。 |
+| 2026-11-14 | 状態・証拠を追記。FIX-001/002/003を実装・限定検証・実環境受入に分け、未確認ACを維持。 |
 | 2026-11-12 | `docs/` 配下へ配置。リンクをリポジトリ相対パスに修正。 |

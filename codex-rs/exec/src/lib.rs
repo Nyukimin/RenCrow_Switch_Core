@@ -103,6 +103,7 @@ use codex_protocol::protocol::ReviewTarget;
 use codex_protocol::protocol::SessionConfiguredEvent;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::user_input::UserInput;
+use codex_state::log_db;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::canonicalize_existing_preserving_symlinks;
 use codex_utils_cli::SharedCliOptions;
@@ -653,6 +654,14 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
     codex_core::otel_init::record_process_start(otel.as_ref(), "codex_exec");
     codex_core::otel_init::install_sqlite_telemetry(otel.as_ref(), "codex_exec");
 
+    // Initialize state before installing the subscriber so exec can attach the
+    // same filtered SQLite log sink as app-server.
+    let state_db = codex_core::init_state_db(&config).await;
+    let log_db = state_db.clone().map(log_db::start);
+    let log_db_layer = log_db
+        .clone()
+        .map(|layer| layer.with_filter(log_db::default_filter()));
+
     let otel_logger_layer = otel.as_ref().and_then(|o| o.logger_layer());
 
     let otel_tracing_layer = otel.as_ref().and_then(|o| o.tracing_layer());
@@ -661,6 +670,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         .with(fmt_layer)
         .with(otel_tracing_layer)
         .with(otel_logger_layer)
+        .with(log_db_layer)
         .try_init();
 
     let exec_span = exec_root_span();
@@ -685,7 +695,6 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
     let local_runtime_paths = local_runtime_paths.with_allowed_symlinked_codex_home(
         codex_config::allowed_symlinked_codex_home(&config.config_layer_stack, &config.codex_home),
     );
-    let state_db = codex_core::init_state_db(&config).await;
     let environment_manager = if run_loader_overrides.ignore_user_config {
         EnvironmentManager::from_env(Some(local_runtime_paths), config.http_client_factory())
             .await?
@@ -705,7 +714,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         strict_config,
         cloud_config_bundle: run_cloud_config_bundle,
         feedback: CodexFeedback::new(),
-        log_db: None,
+        log_db: log_db.clone(),
         state_db: state_db.clone(),
         environment_manager: std::sync::Arc::new(environment_manager),
         config_warnings,
@@ -718,7 +727,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         opt_out_notification_methods: Vec::new(),
         channel_capacity: DEFAULT_IN_PROCESS_CHANNEL_CAPACITY,
     };
-    run_exec_session(ExecRunArgs {
+    let result = run_exec_session(ExecRunArgs {
         in_process_start_args,
         state_db,
         command,
@@ -739,7 +748,11 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         thread_source: thread_source.map(Into::into).unwrap_or(ThreadSource::User),
     })
     .instrument(exec_span)
-    .await
+    .await;
+    if let Some(log_db) = log_db {
+        log_db.flush().await;
+    }
+    result
 }
 
 async fn build_exec_config<BuildConfig, BuildFuture>(

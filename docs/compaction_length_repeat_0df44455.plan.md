@@ -3,11 +3,11 @@ name: Compaction length repeat
 overview: COMPACTION_SPEC 正本に対する仕様整理・実装仕様提示（v0.7＋turn統合）を含み、運用達成状況と「長い・繰り返す」因果解析を同一プランに保持する。
 todos:
   - id: fix-001-start-or-steer-resume
-    content: "FIX-001: turn_input start_or_steer の新規ターン開始へ resume_autonomous_completion_from_user_turn を start_if_idle と同一ゲートで接続（仕様は CURRENT_FIX_IMPLEMENTATION_SPEC.md）"
+    content: "FIX-001: 実装・pause解除focused検証済み。autonomous mark受入は未確認（仕様は CURRENT_FIX_IMPLEMENTATION_SPEC.md）"
   - id: compaction-runtime-metrics
-    content: "FIX-002 Phase0: 実threadで段別秒数・MidTurn圧縮回数・同種tokenを Tmp 記録"
+    content: "FIX-002 Phase0完了。1-A比較済み・非採用、1-B/Cは未評価候補（仕様は CURRENT_FIX_IMPLEMENTATION_SPEC.md）"
   - id: human-resume-paused
-    content: FIX-001 受入・human-resume Tmp 再実測（実装後）
+    content: FIX-001 autonomous mark受入を確認（pause解除focused検証は済み）
   - id: portal-final-review
     content: "FIX-004: PORTAL 最終review完了。AC達成と混同しない"
 isProject: false
@@ -48,25 +48,24 @@ isProject: false
 
 ## A'. 限定範囲で直ったもの・最終確認が残るもの
 
-| テーマ | 直したこと | 残る境界 |
-|---|---|---|
+| テーマ | 直したこと | 残る境界 | 証拠（Tmpはprivateでrepo配布外） |
+|---|---|---|---|
 | Compaction 後の直近データ消失 | 最新 task status/update と直近の単独 `cat`（各組 12KiB 以内）を保持 | 任意の読取結果すべての保持は非保証。実装は [`protected_working_tail_call_ids`](../codex-rs/core/src/compact_rencrow_stages.rs) | `candidate-15/working-tail-source-review.json` |
 | 音声 fixture | 実音声・デコーダ・ハッシュ・定数照合。AC1 受理・review 採用まで | — | `voice-decode-proof/result.json` |
-| PORTAL browser 保存 | 製品 handler → StoryPlayer owner。ブラウザで選択→保存→再開実測 | **最終 review 未完了**。製品全体完了と言えない | `new-thread-20261111/ac3-browser-vertical.json` |
-| 画面脈動・ちらつき | tmux 寸法・追従調整。pane 内安定は確認 | 実画面での解消・真因確定は未完了 | `switch-redraw-20261111/verification.json` |
+| PORTAL browser 保存 | 製品 handler → StoryPlayer owner。ブラウザで選択→保存→再開実測 | 2026-11-12時点: **最終 review 未完了**。今回未再検証 | `new-thread-20261111/ac3-browser-vertical.json` |
+| 画面脈動・ちらつき | tmux 寸法・追従調整。pane 内安定は確認 | 2026-11-12時点: 実画面の解消・真因確定は未完了。今回未再検証 | `switch-redraw-20261111/verification.json` |
 
 ---
 
 ## A''. 解決していないもの
 
-| テーマ | 試したこと | 状態 |
-|---|---|---|
-| 「続けて」で paused 解除されない | 自動入力・model 更新・人間入力モード。受付は確認、解除は不可 | **通常 TUI 開始経路が解除判定を通らない欠落を特定。修正未実施** | `human-resume-20261112/status-verification.json` |
-| レビュー子の長時間無応答 | 再開・追加指示・承認後再依頼・切断再試行 | 最終結果未取得 |
-| 親の wait/再送ループ | 限定指示へ修正中 | 子結果なし、解消未確認 |
-| **Compaction 長時間化・反復による停滞** | 段階別計測・入力保持・失敗履歴抑止を整備 | **継続作業の所要時間・圧縮頻度の改善は未確認**（下記 B を実測で検証する段階） |
-| PORTAL 最終 review | AC1〜4 は達成表示 | review 単位 running。全体完了不可 |
-| 自律完了 C01-v6 総合 E2E | 最小再開・変更検知は成功 | 総合はタイムアウト。全経路合格未確認 |
+| テーマ | 試したこと | 状態 | 証拠（Tmpはprivateでrepo配布外） |
+|---|---|---|---|
+| FIX-001「続けて」で paused 解除 | 共通resume判定を両開始経路に接続、focused test green | human intakeとpause解除を確認。`autonomous_mark_verified=false` のため自律mark受入は未確認 | `Tmp/ren2-supervision/periodic/human-resume-20261112/fix001-green-focused.log`; `Tmp/ren2-supervision/periodic/human-resume-20261112/status-verification.json` |
+| FIX-003 reviewer deadline / parent wait | reviewer deadline enforcement、generation-bound abort、durable terminal/escalation実装。scoped 17 testsとscripted loopback faults 3件pass。通常Qwen parent/child KAT実測あり | 元のreviewer無応答E2Eと実LLM hang注入は未実施。別件full-fork delegation diagnostic不合格はFIX-003受入に含めない。reviewer期限は通常10分、通常child期限は既定未設定（[`CHILD_MONITOR.md`](../CHILD_MONITOR.md)）。本番ren2既存プロセスは最新pairへ未再起動（Gateway/Runtimeは再起動済み）、user pause維持 | `Tmp/ren2-supervision/periodic/private/child-monitor-implementation-20261113/full-check/merged-test-outcomes.json`; `Tmp/ren2-supervision/periodic/private/simple-llm-live-20261114/acceptance.json`; `Tmp/ren2-supervision/periodic/private/residuals-1-4-20261114/core/feature-proof.json`; `Tmp/ren2-supervision/periodic/private/residuals-1-4-20261114/core/install.json` |
+| **Compaction 長時間化・反復による停滞** | Phase 0 baseline取得、1-A凍結fixture比較実施 | Phase 0完了。1-Aは優位性なしで非採用。実運用の停滞改善未確認。1-B/1-Cは未評価候補 | — |
+| PORTAL 最終 review | AC1〜4 は達成表示 | 2026-11-12時点: review単位running。今回未再検証 | — |
+| 自律完了 C01-v6 総合 E2E | 最小再開・変更検知は成功 | 2026-11-12時点: 総合timeout、全経路合格未確認。今回未再検証 | — |
 
 ---
 
@@ -126,7 +125,7 @@ flowchart TD
 - `BodyAfterPrefix`: prefill 再設定でスコープ使用量いったん 0 → 次の sampling/tool で再び上限へ速い。
 - Normal 不成立が続くと reasoning/call が残り膨張（[`COMPACTION_SPEC.md`](../COMPACTION_SPEC.md) Failure Knowledge「Emergency 縮小不足」）。
 
-### B4. 実測で閉じる観測（未実施 → todo `compaction-runtime-metrics`）
+### B4. 実測で閉じる観測（baseline取得済み・停滞改善は未確認）
 
 | 観測 | 意味 |
 |---|---|
@@ -134,6 +133,8 @@ flowchart TD
 | `RenCrow compaction applied` vs `Normal semantic compaction was unavailable` | Normal 成立 vs Emergency |
 | 同一ターンで `applied` が采样間に複数 | 再計算後も上限直下 → MidTurn ループ |
 | 圧縮直後の `active_context_tokens` と次采样までの増分 | 反復間隔 |
+
+2026-11-14時点でPhase 0 baselineは20行（16 capacity / 4 task boundary）、Normal 16 / Emergency 0（16:0）。同一turn MidTurn回数は4/8/2/2、段別時間を記録済み。1-A同一凍結fixtureはinput +160 (+3.03%)、total +826、時間は約12.8秒増で意味情報を保持したが、優位性が示されず非採用。定量値は意味品質ACを証明せず、単一fixtureを本番性能改善とみなさない。1-B/1-Cは未評価候補。証拠: `Tmp/ren2-supervision/periodic/human-resume-20261112/fix002-phase0-baseline-v2.json`, `Tmp/ren2-supervision/periodic/human-resume-20261112/fix002-1a-live-rencrow-provider-v1/result-analysis-v2.json`。
 
 課題境界の履歴整理は [`TASK_CONTEXT_COMPACTION_SPEC.md`](../TASK_CONTEXT_COMPACTION_SPEC.md)（容量反復とは別）。
 
@@ -152,9 +153,9 @@ flowchart TD
 
 ## D. 推奨する次の作業順（実行は別承認）
 
-1. **Compaction 実測**（todo `compaction-runtime-metrics`）: 停滞再現 thread で B4 表を埋める。改善要否はこの後に判断。
-2. **人間 resume**（todo `human-resume-paused`）: 監督・自律再開と独立。TUI 開始経路の欠落修正。
-3. **レビュー子・親 wait**（未解決）: Compaction 実測と並行可。子結果回収まで親ループ修正の完了判定は保留。
+1. **FIX-001受入**（todo `human-resume-paused`）: 自律mark条件を確認。pause解除のfocused検証は済み。
+2. **Compaction改善の必要性を判断**: Phase 0は完了、1-A比較済み・非採用。1-B/1-Cは未評価候補であり、実測や実装を自動着手しない。
+3. **FIX-003 reviewer無応答E2E**: 元のACを検証し、子結果回収まで完了判定を保留。
 4. **PORTAL**（todo `portal-final-review`）: 内部 AC と製品 review 完了を分離して締める。
 
 ---
@@ -179,6 +180,8 @@ Codex-switch・Compaction・監督・PORTAL を解決 / 部分 / 未解決に統
 ## 課題対応
 
 - **未解決のまま明示**: Compaction 全体所要・頻度、paused「続けて」、レビュー子、C01-v6、PORTAL 最終 review、画面ちらつき実画面。
+
+2026-11-14追記（上記「整理フェーズ」報告は2026-11-12時点の履歴）: FIX-001 pause解除focused検証済みだが自律mark受入は未確認。FIX-002 Phase 0完了、実運用の性能改善未確認。FIX-003実装と限定検証済みだが、reviewer無応答E2E/実LLM hang注入は未実施。PORTAL・画面脈動・C01-v6は2026-11-12時点の状態を保持し、今回未再検証。
 
 ## 注意点
 

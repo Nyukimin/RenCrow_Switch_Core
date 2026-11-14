@@ -84,6 +84,90 @@ fn child_monitor_ignores_events_from_an_older_turn() {
 }
 
 #[test]
+fn child_monitor_timestamps_untagged_final_messages_but_not_commentary() {
+    use codex_protocol::models::MessagePhase;
+    use codex_protocol::protocol::AgentMessageEvent;
+
+    let mut explicit_final = ChildMonitor::default();
+    explicit_final.observe("turn-1", &started_event("turn-1"), 1);
+    explicit_final.observe(
+        "turn-1",
+        &EventMsg::AgentMessage(AgentMessageEvent {
+            message: "explicit final answer".to_string(),
+            phase: Some(MessagePhase::FinalAnswer),
+            memory_citation: None,
+            delivery: None,
+            questions: None,
+        }),
+        2,
+    );
+    assert_eq!(explicit_final.snapshot().final_output_at_ms, Some(2));
+
+    let mut untagged = ChildMonitor::default();
+    untagged.observe("turn-1", &started_event("turn-1"), 1);
+    untagged.observe(
+        "turn-1",
+        &EventMsg::AgentMessage(AgentMessageEvent {
+            message: "answer".to_string(),
+            phase: None,
+            memory_citation: None,
+            delivery: None,
+            questions: None,
+        }),
+        2,
+    );
+    assert_eq!(untagged.snapshot().final_output_at_ms, Some(2));
+
+    let mut commentary = ChildMonitor::default();
+    commentary.observe("turn-1", &started_event("turn-1"), 1);
+    commentary.observe(
+        "turn-1",
+        &EventMsg::AgentMessage(AgentMessageEvent {
+            message: "progress update".to_string(),
+            phase: Some(MessagePhase::Commentary),
+            memory_citation: None,
+            delivery: None,
+            questions: None,
+        }),
+        2,
+    );
+    assert_eq!(commentary.snapshot().final_output_at_ms, None);
+}
+
+#[test]
+fn child_monitor_timestamps_untagged_completed_message_items() {
+    use codex_protocol::ThreadId;
+    use codex_protocol::items::AgentMessageContent;
+    use codex_protocol::items::AgentMessageItem;
+    use codex_protocol::items::TurnItem;
+    use codex_protocol::protocol::ItemCompletedEvent;
+
+    let mut monitor = ChildMonitor::default();
+    monitor.observe("turn-1", &started_event("turn-1"), 1);
+    monitor.observe(
+        "turn-1",
+        &EventMsg::ItemCompleted(ItemCompletedEvent {
+            thread_id: ThreadId::new(),
+            turn_id: "turn-1".to_string(),
+            item: TurnItem::AgentMessage(AgentMessageItem {
+                id: "message-1".to_string(),
+                content: vec![AgentMessageContent::Text {
+                    text: "answer".to_string(),
+                }],
+                phase: None,
+                memory_citation: None,
+                delivery: None,
+                questions: None,
+            }),
+            started_at_ms: Some(1),
+            completed_at_ms: 2,
+        }),
+        3,
+    );
+    assert_eq!(monitor.snapshot().final_output_at_ms, Some(3));
+}
+
+#[test]
 fn child_monitor_distinguishes_generation_input_compaction_and_terminal_events() {
     use codex_protocol::ThreadId;
     use codex_protocol::items::ContextCompactionItem;

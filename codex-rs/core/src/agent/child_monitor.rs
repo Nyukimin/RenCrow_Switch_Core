@@ -160,7 +160,7 @@ impl ChildMonitor {
             }
             EventMsg::AgentMessage(event) if !event.message.is_empty() => {
                 self.model_output(event_id, observed_at_ms);
-                if event.phase == Some(codex_protocol::models::MessagePhase::FinalAnswer) {
+                if event.phase != Some(codex_protocol::models::MessagePhase::Commentary) {
                     self.snapshot
                         .final_output_at_ms
                         .get_or_insert(observed_at_ms);
@@ -228,8 +228,7 @@ impl ChildMonitor {
                         }
                     }) {
                         self.model_output(&event.turn_id, observed_at_ms);
-                        if message.phase == Some(codex_protocol::models::MessagePhase::FinalAnswer)
-                        {
+                        if message.phase != Some(codex_protocol::models::MessagePhase::Commentary) {
                             self.snapshot
                                 .final_output_at_ms
                                 .get_or_insert(observed_at_ms);
