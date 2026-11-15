@@ -498,9 +498,11 @@ fn validate_evidence_content(kind: &str, text: &str, thread_id: &str) -> Result<
 
 fn validate_deployer_source_pair(root: &Path, source: &Path, sha256: &str) -> Result<()> {
     ensure!(
-        REVIEWED_DEPLOYER_SOURCES.iter().any(|(relative_path, expected_sha256)| {
-            source == root.join(relative_path) && sha256 == *expected_sha256
-        }),
+        REVIEWED_DEPLOYER_SOURCES
+            .iter()
+            .any(|(relative_path, expected_sha256)| {
+                source == root.join(relative_path) && sha256 == *expected_sha256
+            }),
         "deployer source does not match a reviewed deployer source path/hash pair"
     );
     Ok(())

@@ -245,7 +245,10 @@ async fn write_repair_fixture(
     } else {
         "6c7fb349b0e30ec25ed55d2669762c154f0ccb5a4919e9627d63f4d1e04a1889"
     };
-    assert_eq!(source_hash, expected_source_hash, "source fixture hash must match its pinned copy");
+    assert_eq!(
+        source_hash, expected_source_hash,
+        "source fixture hash must match its pinned copy"
+    );
     evidence_files.push((
         "deployer_source".into(),
         Value::Null,
@@ -368,7 +371,10 @@ async fn candidate17_deployer_source_is_exactly_pinned_and_mispair_is_rejected()
     run(home.clone(), THREAD.into(), request.clone(), false)
         .await
         .expect("candidate17 source pair should pass dry-run");
-    assert_eq!(std::fs::read(&rollout).expect("read after candidate17 dry-run"), before);
+    assert_eq!(
+        std::fs::read(&rollout).expect("read after candidate17 dry-run"),
+        before
+    );
 
     let mut request_value: Value =
         serde_json::from_slice(&std::fs::read(&request).expect("read request"))
@@ -391,12 +397,20 @@ async fn candidate17_deployer_source_is_exactly_pinned_and_mispair_is_rejected()
     let error = run(home.clone(), THREAD.into(), request.clone(), false)
         .await
         .expect_err("candidate17 path must reject historical source hash");
-    assert!(error.to_string().contains("reviewed deployer source path/hash pair"));
-    assert_eq!(std::fs::read(&rollout).expect("read after rejected source"), before);
+    assert!(
+        error
+            .to_string()
+            .contains("reviewed deployer source path/hash pair")
+    );
+    assert_eq!(
+        std::fs::read(&rollout).expect("read after rejected source"),
+        before
+    );
 
     let reviewed_source = Path::new(env!("CARGO_MANIFEST_DIR")).join(CANDIDATE17_SOURCE_FIXTURE);
     let unreviewed_path = root.path().join("candidate-17/deployer-copy.py");
-    std::fs::copy(reviewed_source, &unreviewed_path).expect("copy reviewed bytes to unreviewed path");
+    std::fs::copy(reviewed_source, &unreviewed_path)
+        .expect("copy reviewed bytes to unreviewed path");
     let reviewed_hash = codex_history::archive_reference::content_sha256(
         &std::fs::read_to_string(&unreviewed_path).expect("read reviewed bytes"),
     );

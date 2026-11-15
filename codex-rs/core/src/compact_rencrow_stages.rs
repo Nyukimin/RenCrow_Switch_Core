@@ -231,18 +231,22 @@ pub(super) fn protected_working_tail_call_ids(
     // Preserve only the latest current-root status/update pair. The task ID binds this tail
     // protection; it does not make the output authoritative or change its acceptance rules.
     if let Some(root_task_id) = active_root_task_id
-        && let Some(pair) = sources.pairs.iter().rev().find(|pair| {
-            pair.tool_name == "task_context_boundary"
-                && pair.reference_kind == codex_rollout::PreparedCompactionReferenceKind::Fresh
-                && pair
-                    .canonical_call_input
-                    .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
-                    .is_some_and(|args| {
-                        matches!(args["action"].as_str(), Some("status" | "update"))
-                            && args["root_task_id"].as_str() == Some(root_task_id)
-                    })
-        })
-        .filter(|pair| pair_fits(pair))
+        && let Some(pair) = sources
+            .pairs
+            .iter()
+            .rev()
+            .find(|pair| {
+                pair.tool_name == "task_context_boundary"
+                    && pair.reference_kind == codex_rollout::PreparedCompactionReferenceKind::Fresh
+                    && pair
+                        .canonical_call_input
+                        .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+                        .is_some_and(|args| {
+                            matches!(args["action"].as_str(), Some("status" | "update"))
+                                && args["root_task_id"].as_str() == Some(root_task_id)
+                        })
+            })
+            .filter(|pair| pair_fits(pair))
     {
         protected.insert(pair.reference.call_id.clone());
     }
@@ -253,9 +257,7 @@ pub(super) fn protected_working_tail_call_ids(
     let latest_declared_input = input
         .records
         .iter()
-        .rposition(|record| {
-            record.origin == Origin::Human || record.origin == Origin::Automation
-        });
+        .rposition(|record| record.origin == Origin::Human || record.origin == Origin::Automation);
     if let Some(boundary) = latest_declared_input {
         let latest_read = sources
             .pairs
@@ -284,9 +286,12 @@ fn is_direct_cat_read(command: &str) -> bool {
         return false;
     };
     !path.trim().is_empty()
-        && !command
-            .chars()
-            .any(|ch| matches!(ch, ';' | '|' | '&' | '>' | '<' | '`' | '$' | '\\' | '\n' | '\r'))
+        && !command.chars().any(|ch| {
+            matches!(
+                ch,
+                ';' | '|' | '&' | '>' | '<' | '`' | '$' | '\\' | '\n' | '\r'
+            )
+        })
 }
 
 /// Prepare the deterministic state shared by Normal and Emergency (Annex A F01 Prepare).

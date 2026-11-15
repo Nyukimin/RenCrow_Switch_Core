@@ -1931,7 +1931,10 @@ fn output_with_utf8_size(size: usize) -> String {
 
 fn named_function_call(call_id: &str, name: &str, arguments: &str) -> ResponseItemEnvelope {
     let mut call = function_call(call_id, arguments);
-    let ResponseItem::FunctionCall { name: tool_name, .. } = &mut call.item else {
+    let ResponseItem::FunctionCall {
+        name: tool_name, ..
+    } = &mut call.item
+    else {
         unreachable!();
     };
     *tool_name = name.into();
@@ -1942,7 +1945,8 @@ fn named_function_output(call_id: &str, name: &str, output: &str) -> ResponseIte
     let mut item = function_output(call_id, output);
     let ResponseItem::FunctionCallOutput {
         name: tool_name, ..
-    } = &mut item.item else {
+    } = &mut item.item
+    else {
         unreachable!();
     };
     *tool_name = Some(name.into());
@@ -1976,9 +1980,17 @@ fn latest_task_state_and_read_working_tail_survive_native_replacement() {
     let status_output = output_with_utf8_size(6_605);
     let read_args = r#"{"cmd":"cat /tmp/prepared-update.json"}"#;
     let exact_update_output = output_with_utf8_size(9_852);
-    let mut automation = human("Read the prepared update and then apply it.", "automation-request");
-    automation.metadata.as_mut().unwrap().rencrow_input.as_mut().unwrap()["author"] =
-        json!("automation");
+    let mut automation = human(
+        "Read the prepared update and then apply it.",
+        "automation-request",
+    );
+    automation
+        .metadata
+        .as_mut()
+        .unwrap()
+        .rencrow_input
+        .as_mut()
+        .unwrap()["author"] = json!("automation");
     let originals = vec![
         function_call("old-go-call", r#"{"cmd":"go test ./..."}"#),
         function_output("old-go-call", &old_go_output),
@@ -1990,9 +2002,27 @@ fn latest_task_state_and_read_working_tail_survive_native_replacement() {
     ];
     let mut sources = PreparedCompactionSources {
         pairs: vec![
-            named_prepared_pair(0, "old-go-call", "exec_command", r#"{"cmd":"go test ./..."}"#, &old_go_output),
-            named_prepared_pair(3, "latest-status", "task_context_boundary", status_args, &status_output),
-            named_prepared_pair(5, "latest-read", "exec_command", read_args, &exact_update_output),
+            named_prepared_pair(
+                0,
+                "old-go-call",
+                "exec_command",
+                r#"{"cmd":"go test ./..."}"#,
+                &old_go_output,
+            ),
+            named_prepared_pair(
+                3,
+                "latest-status",
+                "task_context_boundary",
+                status_args,
+                &status_output,
+            ),
+            named_prepared_pair(
+                5,
+                "latest-read",
+                "exec_command",
+                read_args,
+                &exact_update_output,
+            ),
         ],
         protected_indices: vec![],
     };
@@ -2011,7 +2041,8 @@ fn latest_task_state_and_read_working_tail_survive_native_replacement() {
         &originals,
         &super::history::verified_pair_projections(&sources),
     );
-    let projections = super::observation::project_unhandled_observations(&originals, &sources, &[]).unwrap();
+    let projections =
+        super::observation::project_unhandled_observations(&originals, &sources, &[]).unwrap();
     let covered = super::observation::summary_covered_after_normal(&[], &projections);
     let native = super::native::filter_retained_instructions_with_task_context(
         &originals,
@@ -2024,18 +2055,41 @@ fn latest_task_state_and_read_working_tail_survive_native_replacement() {
     let rebuilt = super::native::build_native_replacement(&native, "next action", vec![]).unwrap();
     let output_for = |call_id: &str| {
         rebuilt.iter().find_map(|item| match &item.item {
-            ResponseItem::FunctionCallOutput { call_id: Some(id), output, .. } if id == call_id => output.text_content(),
+            ResponseItem::FunctionCallOutput {
+                call_id: Some(id),
+                output,
+                ..
+            } if id == call_id => output.text_content(),
             _ => None,
         })
     };
     assert_eq!(output_for("latest-status"), Some(status_output.as_str()));
-    assert_eq!(output_for("latest-read"), Some(exact_update_output.as_str()));
-    assert_eq!(protected, ["latest-status", "latest-read"].into_iter().map(str::to_owned).collect());
     assert_eq!(
-        sources.pairs.iter().map(|pair| pair.reference.call_id.as_str()).collect::<Vec<_>>(),
+        output_for("latest-read"),
+        Some(exact_update_output.as_str())
+    );
+    assert_eq!(
+        protected,
+        ["latest-status", "latest-read"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    );
+    assert_eq!(
+        sources
+            .pairs
+            .iter()
+            .map(|pair| pair.reference.call_id.as_str())
+            .collect::<Vec<_>>(),
         ["old-go-call"]
     );
-    assert_eq!(covered.iter().map(|reference| reference.call_id.as_str()).collect::<Vec<_>>(), ["old-go-call"]);
+    assert_eq!(
+        covered
+            .iter()
+            .map(|reference| reference.call_id.as_str())
+            .collect::<Vec<_>>(),
+        ["old-go-call"]
+    );
     assert!(!rebuilt.iter().any(|item| matches!(
         &item.item,
         ResponseItem::FunctionCallOutput { call_id: Some(id), .. } if id == "old-go-call"
@@ -2045,8 +2099,16 @@ fn latest_task_state_and_read_working_tail_survive_native_replacement() {
 #[test]
 fn working_tail_uses_latest_read_before_size_check_and_requires_active_root() {
     let request = {
-        let mut item = human("Use the latest status and read result.", "automation-request");
-        item.metadata.as_mut().unwrap().rencrow_input.as_mut().unwrap()["author"] = json!("automation");
+        let mut item = human(
+            "Use the latest status and read result.",
+            "automation-request",
+        );
+        item.metadata
+            .as_mut()
+            .unwrap()
+            .rencrow_input
+            .as_mut()
+            .unwrap()["author"] = json!("automation");
         item
     };
     let small = "small previous read";
@@ -2068,18 +2130,24 @@ fn working_tail_uses_latest_read_before_size_check_and_requires_active_root() {
         pairs: vec![
             named_prepared_pair(1, "older-read", "exec_command", read_a, small),
             named_prepared_pair(3, "latest-read", "exec_command", read_b, &oversized),
-            named_prepared_pair(5, "wrong-status", "task_context_boundary", wrong_root_args, status),
+            named_prepared_pair(
+                5,
+                "wrong-status",
+                "task_context_boundary",
+                wrong_root_args,
+                status,
+            ),
         ],
         protected_indices: vec![],
     };
-    let input = candidate_input(&originals, &super::history::verified_pair_projections(&sources));
-    assert!(super::stages::protected_working_tail_call_ids(
+    let input = candidate_input(
         &originals,
-        &input,
-        &sources,
-        Some("root"),
-    )
-    .is_empty());
+        &super::history::verified_pair_projections(&sources),
+    );
+    assert!(
+        super::stages::protected_working_tail_call_ids(&originals, &input, &sources, Some("root"),)
+            .is_empty()
+    );
 }
 
 #[test]

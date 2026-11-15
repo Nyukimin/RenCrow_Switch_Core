@@ -30,8 +30,8 @@ pub struct RencrowExecutionGuard {
 impl Default for RencrowExecutionGuard {
     fn default() -> Self {
         Self {
-            max_read_only_calls: NonZeroU16::new(24).expect("nonzero limit"),
-            max_repeated_reads: NonZeroU16::new(3).expect("nonzero limit"),
+            max_read_only_calls: const { NonZeroU16::new(24).unwrap() },
+            max_repeated_reads: const { NonZeroU16::new(3).unwrap() },
             task_kind: None,
             require_edit: false,
             require_check: false,
