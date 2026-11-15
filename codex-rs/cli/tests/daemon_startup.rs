@@ -81,7 +81,12 @@ async fn daemon_startup(command: &str) -> Result<()> {
         home.path().display().to_string(),
     );
     env.insert("TERM".into(), "xterm-256color".into());
-    let mut args = vec!["--no-alt-screen".to_string()];
+    // Every launch below drives the TUI through a PTY, so it must declare automation input.
+    let mut args = vec![
+        "--no-alt-screen".to_string(),
+        "--rencrow-input-author".to_string(),
+        "automation".to_string(),
+    ];
     let mut steps: VecDeque<(&str, &[u8])> = VecDeque::new();
     if matches!(command, "start" | "bedrock-running") {
         // A selected package with a stopped daemon avoids installing a release.

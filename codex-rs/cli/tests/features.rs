@@ -25,6 +25,14 @@ fn codex_command(codex_home: &Path) -> Result<assert_cmd::Command> {
     Ok(cmd)
 }
 
+/// Launches that reach the TUI must declare their input author, so automated tests
+/// that drive the TUI identify themselves as automation instead of a human.
+fn codex_command_automation(codex_home: &Path) -> Result<assert_cmd::Command> {
+    let mut cmd = codex_command(codex_home)?;
+    cmd.args(["--rencrow-input-author", "automation"]);
+    Ok(cmd)
+}
+
 #[test]
 fn strict_config_rejects_unknown_config_override() -> Result<()> {
     let codex_home = TempDir::new()?;
@@ -73,7 +81,7 @@ fn interactive_validates_config_before_requiring_terminal() -> Result<()> {
         let codex_home = TempDir::new()?;
         std::fs::write(codex_home.path().join(config_file), contents)?;
 
-        let mut cmd = codex_command(codex_home.path())?;
+        let mut cmd = codex_command_automation(codex_home.path())?;
         cmd.env("TERM", "xterm-256color")
             .current_dir(codex_home.path())
             .args(args)
@@ -102,7 +110,7 @@ url = "ws://127.0.0.1:4512"
     )?;
     let remote_only_cwd = codex_home.path().join("remote-only-working-directory");
 
-    let mut cmd = codex_command(codex_home.path())?;
+    let mut cmd = codex_command_automation(codex_home.path())?;
     cmd.env("TERM", "xterm-256color")
         .current_dir(codex_home.path())
         .arg("--cd")
@@ -302,7 +310,7 @@ async fn features_list_honors_cloud_managed_feature_requirements() -> Result<()>
 #[test]
 fn remote_start_rejects_add_dir_before_connecting() -> Result<()> {
     let home = TempDir::new()?;
-    let output = codex_command(home.path())?
+    let output = codex_command_automation(home.path())?
         .env("TERM", "xterm-256color")
         .args(["--remote", "ws://127.0.0.1:1", "--add-dir", "remote-extra"])
         .assert()
@@ -321,7 +329,7 @@ fn remote_start_rejects_writable_root_overrides_before_connecting() -> Result<()
         "sandbox_workspace_write={writable_roots=[\"./extra\"],network_access=true}",
     ] {
         let home = TempDir::new()?;
-        let output = codex_command(home.path())?
+        let output = codex_command_automation(home.path())?
             .env("TERM", "xterm-256color")
             .args(["--remote", "ws://127.0.0.1:1", "-c", config_override])
             .assert()
@@ -344,7 +352,7 @@ fn remote_start_allows_network_access_overrides_before_requiring_terminal() -> R
         "sandbox_workspace_write={network_access=true}",
     ] {
         let home = TempDir::new()?;
-        codex_command(home.path())?
+        codex_command_automation(home.path())?
             .env("TERM", "xterm-256color")
             .args(["--remote", "ws://127.0.0.1:1", "-c", config_override])
             .assert()

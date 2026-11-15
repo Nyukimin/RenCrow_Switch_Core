@@ -52,6 +52,9 @@ fn may_supersede(correction: &SourceKind, source: &SourceKind) -> bool {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+// Distinct schema name: the generated definitions must not collide with the ByteRange
+// owned by codex-protocol, which reaches the same RolloutLine schema tree.
+#[schemars(rename = "CompactionByteRange")]
 pub struct ByteRange {
     pub start: usize,
     pub end: usize,

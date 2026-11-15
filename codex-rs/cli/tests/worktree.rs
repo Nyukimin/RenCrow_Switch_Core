@@ -290,6 +290,8 @@ trust_level = "trusted"
         "features.mcp_oauth_refresh_coordination=true".into(),
         "-c".into(),
         "suppress_unstable_features_warning=true".into(),
+        "--rencrow-input-author".into(),
+        "automation".into(),
     ];
     let mut owner = None;
     let mut previous: Vec<String> = Vec::new();
@@ -753,6 +755,8 @@ trust_level = "trusted"
                     "--enable".into(),
                     "worktrees".into(),
                     "--no-alt-screen".into(),
+                    "--rencrow-input-author".into(),
+                    "automation".into(),
                     "fork".into(),
                     next_owner.clone(),
                 ],
@@ -788,6 +792,8 @@ trust_level = "trusted"
                     "--enable".into(),
                     "worktrees".into(),
                     "--no-alt-screen".into(),
+                    "--rencrow-input-author".into(),
+                    "automation".into(),
                     "--cd".into(),
                     source.join(".codex").display().to_string(),
                 ],
@@ -851,6 +857,8 @@ trust_level = "trusted"
             "--enable".into(),
             "worktrees".into(),
             "--no-alt-screen".into(),
+            "--rencrow-input-author".into(),
+            "automation".into(),
             "--cd".into(),
             source.display().to_string(),
         ],

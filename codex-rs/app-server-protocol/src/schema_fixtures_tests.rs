@@ -67,6 +67,62 @@ fn stable_precomputed_exports_match_schema_fixtures() -> Result<()> {
 }
 
 #[test]
+fn internal_rollout_line_schema_keeps_byte_range_types_distinct() -> Result<()> {
+    let internal_dir = tempfile::tempdir().context("create internal schema temp dir")?;
+    generate_internal_json_schema(internal_dir.path())?;
+
+    let raw = std::fs::read_to_string(internal_dir.path().join("RolloutLine.json"))
+        .context("read generated internal RolloutLine schema")?;
+    let schema: serde_json::Value =
+        serde_json::from_str(&raw).context("parse generated internal RolloutLine schema")?;
+    let definitions = schema
+        .get("definitions")
+        .and_then(serde_json::Value::as_object)
+        .context("generated internal RolloutLine schema must expose definitions")?;
+
+    let compaction = definitions
+        .get("CompactionByteRange")
+        .context("history byte ranges must keep a distinct schema name")?;
+    let protocol = definitions
+        .get("ByteRange")
+        .context("codex-protocol byte range definition must stay reachable")?;
+    assert_ne!(
+        compaction, protocol,
+        "byte range definitions must stay distinct"
+    );
+    assert!(
+        !definitions.contains_key("ByteRange2"),
+        "numbered definition names must not collide"
+    );
+
+    assert_eq!(
+        compaction.get("additionalProperties"),
+        Some(&serde_json::Value::Bool(false)),
+        "the history byte range must keep rejecting unknown fields"
+    );
+
+    let coverage = definitions
+        .get("ObservationPartCoverage")
+        .context("compaction coverage must stay reachable from RolloutLine")?;
+    for field in ["presented_ranges", "unpresented_ranges"] {
+        let items = coverage
+            .get("properties")
+            .and_then(|properties| properties.get(field))
+            .and_then(|property| property.get("items"))
+            .with_context(|| format!("missing ObservationPartCoverage.{field} items"))?;
+        assert_eq!(
+            items.get("$ref"),
+            Some(&serde_json::Value::String(
+                "#/definitions/CompactionByteRange".to_string()
+            )),
+            "ObservationPartCoverage.{field} must reference the history byte range"
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
 fn experimental_precomputed_exports_match_generated() -> Result<()> {
     let output_dir = tempfile::tempdir().context("create experimental schema temp dir")?;
     let typescript_dir = output_dir.path().join("typescript");
