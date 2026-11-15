@@ -72,13 +72,22 @@ These refusals count against the existing repeated-read budget.
 
 `require_check` requires a real structured exec result with exit code zero after
 the latest tracked edit. A later edit invalidates the check. A failed check must
-be rerun successfully with the same command; a different passing command cannot
-hide it. Async checks remain pending until `write_stdin` returns their exit code;
-a process started before an edit cannot verify that edit. Supported conservative
+be rerun successfully with the same effective working directory, runner
+arguments, and explicit environment; a different passing command cannot hide
+it. The only environment-repair exception is the exact host-observed `just test`
+startup failure where `cargo` was not found before the test runner started,
+followed by the same `just test` arguments with an explicit `PATH` and optional
+newly pinned `RUSTUP_TOOLCHAIN`. It requires the complete untruncated three-line
+host output proving that specific failure. Other exit-127 results, runner
+arguments, working directories, environment changes, or test failures remain
+unresolved. Async checks remain pending until `write_stdin` returns their exit
+code; a process started before an edit cannot verify that edit. Supported conservative
 forms: `go test/build/vet`, `cargo test/check/build/clippy`, `cargo nextest run`,
 `node --check`, `pytest`, `npm test`, `python[3] [-B] -m pytest/unittest/compileall`,
-`python[3] [-B] -m py_compile`, `just test/fmt-check`, `git diff --check`. Environment assignments and `cd DIR &&`
-prefixes are accepted. A bare trailing `2>&1` is also accepted because it
+`python[3] [-B] -m py_compile`, `just test/fmt-check`, `git diff --check`. Literal
+`NAME=value` or `export NAME=value` assignments and `cd DIR &&` prefixes are
+accepted; explicit environment assignments remain part of check identity. A bare
+trailing `2>&1` is also accepted because it
 preserves the check's exit status. Pipelines, other redirection, `|| true`,
 extra trailing commands, and arbitrary test wrappers do not count. Run a
 supported check directly.

@@ -23,6 +23,8 @@ use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use std::num::NonZeroU16;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn apply_patch_retries_distinguish_syntax_from_markdown_context_failure() -> Result<()> {
@@ -96,6 +98,175 @@ async fn apply_patch_retries_distinguish_syntax_from_markdown_context_failure() 
     assert!(calls[2].body_contains_text("inspect the file"));
     assert!(calls[2].body_contains_text("Markdown line prefixes such as `- `"));
     assert_eq!(std::fs::read_to_string(notes)?, "- current item\n");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repaired_cargo_path_resolves_a_proven_startup_failure_through_the_tool_loop() -> Result<()>
+{
+    let server = start_mock_server().await;
+    let test = test_codex()
+        .with_config(|config| {
+            config.rencrow_execution_guard = Some(RencrowExecutionGuard {
+                task_kind: Some(RencrowTaskKind::Verify),
+                ..Default::default()
+            });
+        })
+        .build_with_auto_env(&server)
+        .await?;
+    let just = test.cwd_path().join("just");
+    std::fs::write(
+        &just,
+        "#!/bin/sh\nif [ \"${RUSTUP_TOOLCHAIN-}\" != completion-fixture-repaired ]; then\n  printf '%s\\n' 'RUST_MIN_STACK=16777216 NEXTEST_PROFILE=local cargo nextest run --no-fail-fast \"$@\"' 'test: cargo: command not found' 'error: recipe `test` failed on line 88 with exit code 127'\n  exit 127\nfi\nif [ \"${7-}\" = 'test(bar)' ]; then IFS= read -r _; fi\nprintf '%s\\n' '3 tests passed'\nexit 0\n",
+    )?;
+    let mut permissions = std::fs::metadata(&just)?.permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&just, permissions)?;
+
+    let runner = |filter: &str| {
+        format!(
+            "{} test --locked -p codex-core --lib -E 'test({filter})'",
+            just.display()
+        )
+    };
+    let repair = |command: String| {
+        format!(
+            "export PATH=/opt/homebrew/opt/rustup/bin:/opt/homebrew/bin:/usr/bin:/bin && export RUSTUP_TOOLCHAIN=completion-fixture-repaired && {command}"
+        )
+    };
+    let initial_foo = runner("foo");
+    let repaired_foo = repair(initial_foo.clone());
+    let initial_bar = runner("bar");
+    let repaired_bar = repair(initial_bar.clone());
+    let requests = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("startup-failure"),
+                ev_function_call(
+                    "startup-failure-call",
+                    "exec_command",
+                    &json!({"cmd":initial_foo}).to_string(),
+                ),
+                ev_completed("startup-failure"),
+            ]),
+            sse(vec![
+                ev_response_created("startup-repair"),
+                ev_function_call(
+                    "startup-repair-call",
+                    "exec_command",
+                    &json!({"cmd":repaired_foo}).to_string(),
+                ),
+                ev_completed("startup-repair"),
+            ]),
+            sse(vec![
+                ev_response_created("startup-second-failure"),
+                ev_function_call(
+                    "startup-second-failure-call",
+                    "exec_command",
+                    &json!({"cmd":initial_bar}).to_string(),
+                ),
+                ev_completed("startup-second-failure"),
+            ]),
+            sse(vec![
+                ev_response_created("startup-async-repair"),
+                ev_function_call(
+                    "startup-async-repair-call",
+                    "exec_command",
+                    &json!({"cmd":repaired_bar, "yield_time_ms":250, "tty":true}).to_string(),
+                ),
+                ev_completed("startup-async-repair"),
+            ]),
+            sse(vec![
+                ev_response_created("startup-async-poll"),
+                ev_function_call(
+                    "startup-async-poll-call",
+                    "write_stdin",
+                    &json!({"session_id":1003, "chars":"\n", "yield_time_ms":1000}).to_string(),
+                ),
+                ev_completed("startup-async-poll"),
+            ]),
+            sse(vec![
+                ev_assistant_message("startup-repair-done", "The corrected checks passed."),
+                ev_completed("startup-repair-done"),
+            ]),
+        ],
+    )
+    .await;
+
+    test.codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "Verify the corrected worker environment".into(),
+            text_elements: vec![],
+        }]))
+        .await?;
+    for expected in [127, 0, 127, 0] {
+        let event = wait_for_event(&test.codex, |event| {
+            matches!(
+                event,
+                EventMsg::ExecCommandEnd(_) | EventMsg::TurnComplete(_)
+            )
+        })
+        .await;
+        let EventMsg::ExecCommandEnd(end) = event else {
+            panic!("turn completed before expected exec exit {expected}")
+        };
+        assert_eq!(end.exit_code, expected);
+    }
+    let event = wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    let EventMsg::TurnComplete(done) = event else {
+        unreachable!()
+    };
+    let calls = requests.requests();
+    let initial_failure = calls[1]
+        .function_call_output("startup-failure-call")
+        .to_string();
+    let direct_success = calls[2]
+        .function_call_output("startup-repair-call")
+        .to_string();
+    let second_failure = calls[3]
+        .function_call_output("startup-second-failure-call")
+        .to_string();
+    let async_start = calls[4]
+        .function_call_output("startup-async-repair-call")
+        .to_string();
+    let async_finish = calls[5]
+        .function_call_output("startup-async-poll-call")
+        .to_string();
+    assert_eq!(
+        done.error, None,
+        "{done:?}; initial receipt: {initial_failure}; direct receipt: {direct_success}; second failure: {second_failure}; async start: {async_start}; async finish: {async_finish}"
+    );
+    assert_eq!(
+        done.last_agent_message.as_deref(),
+        Some("The corrected checks passed.")
+    );
+    assert!(matches!(
+        test.codex.agent_status().await,
+        AgentStatus::Completed(_)
+    ));
+    assert_eq!(calls.len(), 6);
+    assert!(
+        initial_failure.contains("cargo: command not found"),
+        "{initial_failure}"
+    );
+    assert!(initial_failure.contains("127"), "{initial_failure}");
+    assert!(
+        direct_success.contains("3 tests passed"),
+        "{direct_success}"
+    );
+    assert!(
+        async_start.contains("Process running with session ID 1003"),
+        "{async_start}"
+    );
+    assert!(
+        async_finish.contains("Process exited with code 0"),
+        "{async_finish}"
+    );
     Ok(())
 }
 
