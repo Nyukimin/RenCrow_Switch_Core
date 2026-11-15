@@ -687,6 +687,7 @@ fn shell_classification_preserves_checks_and_excludes_masked_failures() {
         "go test -run 'TestFetchRetries429|TestThrottleCooldown' ./...",
         "go test -run 'TestDollar$Literal|TestQuoted&&Name' ./...",
         "cd '/workspace with spaces' && GOCACHE='/cache|literal' go test -run 'TestOne|TestTwo' ./...",
+        "export PATH=/opt/homebrew/bin:/usr/bin:/bin && export RUSTUP_TOOLCHAIN=1.95.0 && just test --locked -p codex-core --lib -E 'test(foo)'",
     ] {
         assert!(check_command(command), "{command}");
     }
@@ -700,6 +701,7 @@ fn shell_classification_preserves_checks_and_excludes_masked_failures() {
         "cat tests.log",
         "go test > saved.log",
         "go test ./... 2>&1 | head",
+        "export PATH=/opt/homebrew/bin && just test --lib | head",
         "go test ./... 2>&1; echo done",
         "go test ./... 2>errors.log",
         "go test -run 'TestOne|TestTwo' ./... | cat",
@@ -739,6 +741,177 @@ fn shell_classification_preserves_checks_and_excludes_masked_failures() {
     ] {
         assert!(!check_command(command), "{command}");
     }
+}
+
+#[test]
+fn corrected_environment_resolves_only_a_proven_cargo_launch_failure() {
+    let cwd = std::env::current_dir().unwrap();
+    let initial = "just test --locked -p codex-core --lib -E 'test(foo)'";
+    let repaired = "export PATH=/opt/homebrew/opt/rustup/bin:/opt/homebrew/bin:/usr/bin:/bin && export RUSTUP_TOOLCHAIN=1.95.0 && just test --locked -p codex-core --lib -E 'test(foo)'";
+    let parse = |command: &str| {
+        crate::rencrow_check_identity::parse(command, &cwd, supported_check_words)
+            .expect("literal check command")
+            .identity
+    };
+    let initial_identity = parse(initial);
+    let repaired_identity = parse(repaired);
+    let startup_output = "RUST_MIN_STACK=16777216 NEXTEST_PROFILE=local cargo nextest run --no-fail-fast \"$@\"\ntest: cargo: command not found\nerror: recipe `test` failed on line 88 with exit code 127";
+    let mut state = GuardState::default();
+    state.observe_diff(Some("current patch"));
+    let stamp = state.check_stamp();
+    let initial_key = format!("{}:null:{initial}", cwd.display());
+    state
+        .check_identities
+        .insert(initial_key.clone(), initial_identity.clone());
+    state.finish_check_observed(&initial_key, stamp, 127, startup_output, false);
+    assert!(state.failed_checks.contains(&initial_key));
+
+    // The structured receipt can have an original token count without its output being
+    // truncated. The caller only marks output truncated when the explicit warning is present.
+    let repaired_key = format!("{}:null:{repaired}", cwd.display());
+    state
+        .check_identities
+        .insert(repaired_key.clone(), repaired_identity.clone());
+    state.finish_check_observed(&repaired_key, stamp, 0, "3 tests passed", false);
+    assert!(!state.failed_checks.contains(&initial_key));
+    assert!(
+        state
+            .missing(
+                &RencrowExecutionGuard {
+                    task_kind: Some(RencrowTaskKind::Orchestrate),
+                    ..Default::default()
+                },
+                true
+            )
+            .is_empty()
+    );
+
+    for (suffix, identity, output) in [
+        (
+            "different-filter",
+            {
+                let mut identity = repaired_identity.clone();
+                identity.runner.push("test(other)".into());
+                identity
+            },
+            "3 tests passed",
+        ),
+        (
+            "skip-env",
+            {
+                let mut identity = repaired_identity.clone();
+                identity.environment.insert("TEST_SKIP".into(), "1".into());
+                identity
+            },
+            "3 tests passed",
+        ),
+    ] {
+        let mut state = GuardState::default();
+        state.observe_diff(Some("current patch"));
+        let stamp = state.check_stamp();
+        state
+            .check_identities
+            .insert(initial_key.clone(), initial_identity.clone());
+        state.finish_check_observed(&initial_key, stamp, 127, startup_output, false);
+        let key = format!("{repaired_key}:{suffix}");
+        state.check_identities.insert(key.clone(), identity);
+        state.finish_check_observed(&key, stamp, 0, output, false);
+        assert!(state.failed_checks.contains(&initial_key), "{suffix}");
+    }
+
+    let mut state = GuardState::default();
+    state.observe_diff(Some("old patch"));
+    let old_stamp = state.check_stamp();
+    state
+        .check_identities
+        .insert(initial_key.clone(), initial_identity.clone());
+    state.finish_check_observed(&initial_key, old_stamp, 127, startup_output, false);
+    state.observe_diff(Some("new patch"));
+    let new_stamp = state.check_stamp();
+    state
+        .check_identities
+        .insert(repaired_key.clone(), repaired_identity);
+    state.finish_check_observed(&repaired_key, old_stamp, 0, "3 tests passed", false);
+    assert!(state.failed_checks.contains(&initial_key));
+    assert_ne!(old_stamp, new_stamp);
+
+    let mut state = GuardState::default();
+    state.observe_diff(Some("current patch"));
+    let stamp = state.check_stamp();
+    state
+        .check_identities
+        .insert(initial_key.clone(), initial_identity.clone());
+    state.finish_check_observed(
+        &initial_key,
+        stamp,
+        127,
+        "RUST_MIN_STACK=16777216 NEXTEST_PROFILE=local cargo nextest run --no-fail-fast \"$@\"\ntest: cargo: command not found\nerror: recipe `test` failed on line 88 with exit code 127\nadditional test output",
+        false,
+    );
+    assert!(
+        !state
+            .startup_failed_check_identities
+            .contains_key(&initial_key)
+    );
+    state
+        .check_identities
+        .insert(repaired_key.clone(), parse(repaired));
+    state.finish_check_observed(&repaired_key, stamp, 0, "3 tests passed", false);
+    assert!(state.failed_checks.contains(&initial_key));
+}
+
+#[test]
+fn equivalent_command_identity_resolves_formatting_variants_but_keeps_environment_distinct() {
+    let cwd = std::env::current_dir().unwrap();
+    let plain = "just test --locked -p codex-core --lib";
+    let with_cd = format!(
+        "cd '{}' && just   test --locked -p codex-core --lib",
+        cwd.display()
+    );
+    let parse = |command: &str| {
+        crate::rencrow_check_identity::parse(command, &cwd, supported_check_words)
+            .expect("literal direct check")
+            .identity
+    };
+    let plain_identity = parse(plain);
+    let with_cd_identity = parse(&with_cd);
+    assert_eq!(plain_identity, with_cd_identity);
+
+    let mut state = GuardState::default();
+    state.observe_diff(Some("current patch"));
+    let stamp = state.check_stamp();
+    let failed_key = format!("raw:{plain}");
+    let passed_key = format!("raw:{with_cd}");
+    state
+        .check_identities
+        .insert(failed_key.clone(), plain_identity.clone());
+    state.finish_check_observed(&failed_key, stamp, 1, "test failed", false);
+    let mut different_environment = with_cd_identity;
+    different_environment
+        .environment
+        .insert("TEST_SKIP".into(), "1".into());
+    state
+        .check_identities
+        .insert(passed_key.clone(), different_environment);
+    state.finish_check_observed(&passed_key, stamp, 0, "tests passed", false);
+    assert!(state.failed_checks.contains(&failed_key));
+}
+
+#[test]
+fn original_token_count_alone_does_not_mark_receipt_output_as_truncated() {
+    let receipt = serde_json::json!({
+        "exit_code": 127,
+        "original_token_count": 44,
+        "output": "RUST_MIN_STACK=16777216 NEXTEST_PROFILE=local cargo nextest run --no-fail-fast \"$@\"\ntest: cargo: command not found\nerror: recipe `test` failed on line 88 with exit code 127"
+    });
+    assert!(!check_output_may_be_truncated(&receipt));
+
+    let truncated = serde_json::json!({
+        "exit_code": 127,
+        "original_token_count": 44,
+        "output": "Warning: truncated output (original token count: 44)\n... 123 bytes omitted ..."
+    });
+    assert!(check_output_may_be_truncated(&truncated));
 }
 
 #[test]

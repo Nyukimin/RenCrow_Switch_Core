@@ -53,6 +53,9 @@ pub(crate) struct GuardState {
     patch_verification_failures: u8,
     checked: bool,
     failed_checks: HashSet<String>,
+    failed_check_identities: HashMap<String, crate::rencrow_check_identity::CheckIdentity>,
+    startup_failed_check_identities: HashMap<String, crate::rencrow_check_identity::CheckIdentity>,
+    check_identities: HashMap<String, crate::rencrow_check_identity::CheckIdentity>,
     uncredited_python_test: Option<(String, u64)>,
     pending_checks: HashMap<i64, (String, u64)>,
     started_checks: HashMap<String, (String, u64)>,
@@ -170,6 +173,8 @@ impl GuardState {
         }
         if exit_code == 0 {
             self.failed_checks.remove(key);
+            self.failed_check_identities.remove(key);
+            self.startup_failed_check_identities.remove(key);
             self.checked = true;
             self.uncredited_python_test = None;
             self.diagnostic_reads_stamp = None;
@@ -180,6 +185,69 @@ impl GuardState {
                 self.reset_reads();
                 self.diagnostic_diff_stamps.clear();
             }
+        }
+    }
+
+    fn finish_check_observed(
+        &mut self,
+        key: &str,
+        stamp: u64,
+        exit_code: i64,
+        output: &str,
+        output_may_be_truncated: bool,
+    ) {
+        if stamp != self.check_stamp() {
+            return;
+        }
+        let identity = self.check_identities.get(key).cloned();
+        self.finish_check(key, stamp, exit_code);
+        if exit_code != 0 {
+            if let Some(identity) = identity.as_ref().filter(|identity| {
+                crate::rencrow_check_identity::is_cargo_not_found_startup_failure(
+                    identity,
+                    exit_code,
+                    output,
+                    output_may_be_truncated,
+                )
+            }) {
+                self.failed_check_identities
+                    .insert(key.to_owned(), identity.clone());
+                self.startup_failed_check_identities
+                    .insert(key.to_owned(), identity.clone());
+            } else {
+                if let Some(identity) = identity.as_ref() {
+                    self.failed_check_identities
+                        .insert(key.to_owned(), identity.clone());
+                } else {
+                    self.failed_check_identities.remove(key);
+                }
+                self.startup_failed_check_identities.remove(key);
+            }
+            return;
+        }
+        let Some(identity) = identity else {
+            return;
+        };
+        let resolved = self
+            .failed_check_identities
+            .iter()
+            .filter(|(failed_key, previous)| {
+                **previous == identity
+                    || self
+                        .startup_failed_check_identities
+                        .get(*failed_key)
+                        .is_some_and(|previous| {
+                            crate::rencrow_check_identity::is_cargo_not_found_retry(
+                                previous, &identity,
+                            )
+                        })
+            })
+            .map(|(failed_key, _)| failed_key.clone())
+            .collect::<Vec<_>>();
+        for failed_key in resolved {
+            self.failed_checks.remove(&failed_key);
+            self.failed_check_identities.remove(&failed_key);
+            self.startup_failed_check_identities.remove(&failed_key);
         }
     }
 
@@ -498,89 +566,23 @@ fn read_only(command: &str) -> bool {
 
 /// Deliberately conservative: a passing shell wrapper must not hide a failed check.
 fn check_command(command: &str) -> bool {
-    if command.contains(['\n', '\r']) {
-        return false;
-    }
+    crate::rencrow_check_identity::parse(command, std::path::Path::new("/"), supported_check_words)
+        .is_some()
+}
 
-    // A lone stderr-to-stdout redirect preserves the command's exit status.
-    // Strip only this exact unquoted suffix; all other redirection syntax
-    // remains rejected by the conservative scanner below.
-    let command = command.strip_suffix(" 2>&1").unwrap_or(command);
+fn check_output_may_be_truncated(value: &Value) -> bool {
+    value["output"].as_str().is_some_and(|output| {
+        output.contains("Warning: truncated output (") || output.contains(" bytes omitted ...")
+    })
+}
 
-    // Split only on real shell `&&` operators. Quoted metacharacters are
-    // arguments, while expansions in double quotes remain active shell syntax.
-    let mut parts = Vec::new();
-    let mut start = 0;
-    let mut quote = None;
-    let mut escaped = false;
-    let mut chars = command.char_indices().peekable();
-    while let Some((index, ch)) = chars.next() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        match quote {
-            Some('\'') => {
-                if ch == '\'' {
-                    quote = None;
-                }
-            }
-            Some('"') => match ch {
-                '"' => quote = None,
-                '\\' => escaped = true,
-                '$' | '`' => return false,
-                _ => {}
-            },
-            _ => match ch {
-                '\'' | '"' => quote = Some(ch),
-                '\\' => escaped = true,
-                '$' | '`' | ';' | '|' | '>' | '<' | '(' | ')' | '{' | '}' | '*' | '?' | '['
-                | '~' | '#' => return false,
-                '&' => {
-                    if chars.peek().is_some_and(|(_, next)| *next == '&') {
-                        chars.next();
-                        parts.push(&command[start..index]);
-                        start = index + 2;
-                    } else {
-                        return false;
-                    }
-                }
-                _ => {}
-            },
-        }
-    }
-    if quote.is_some() || escaped {
-        return false;
-    }
-    parts.push(&command[start..]);
-    if parts
-        .iter()
-        .take(parts.len().saturating_sub(1))
-        .any(|part| !shlex::split(part).is_some_and(|words| words.len() == 2 && words[0] == "cd"))
-    {
-        return false;
-    }
-    let Some(words) = parts.last().and_then(|part| shlex::split(part)) else {
-        return false;
-    };
-    let words = words
-        .iter()
-        .skip_while(|word| {
-            word.split_once('=').is_some_and(|(key, _)| {
-                key.chars().next().is_some_and(|first| {
-                    (first.is_ascii_alphabetic() || first == '_')
-                        && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-                })
-            })
-        })
-        .map(String::as_str)
-        .collect::<Vec<_>>();
-    match words.as_slice() {
+fn supported_check_words(words: &[String]) -> bool {
+    match words {
         [script] if is_execution_guard_script(script) => return true,
-        ["bash", script] if is_execution_guard_script(script) => return true,
+        [bash, script] if bash == "bash" && is_execution_guard_script(script) => return true,
         _ => {}
     }
-    let program = words.first().copied().unwrap_or_default();
+    let program = words.first().map(String::as_str).unwrap_or_default();
     let base_program = std::path::Path::new(program)
         .file_name()
         .and_then(|name| name.to_str())
@@ -591,7 +593,7 @@ fn check_command(command: &str) -> bool {
         base_program
     };
     let words = std::iter::once(normalized_program)
-        .chain(words.into_iter().skip(1))
+        .chain(words.iter().skip(1).map(String::as_str))
         .collect::<Vec<_>>();
     match words.as_slice() {
         ["go", "test" | "build" | "vet", ..] => true,
@@ -847,6 +849,27 @@ pub(crate) async fn before_tool(invocation: &ToolInvocation) -> Result<(), Funct
                 command.trim()
             )
         };
+        if !key.starts_with("task-evidence:") {
+            let configured_cwd = invocation.turn.config.cwd.to_path_buf();
+            let requested_cwd = args["workdir"]
+                .as_str()
+                .map(std::path::PathBuf::from)
+                .unwrap_or_default();
+            let base_cwd = if requested_cwd.is_absolute() {
+                requested_cwd
+            } else {
+                configured_cwd.join(requested_cwd)
+            };
+            if let Some(parsed) = crate::rencrow_check_identity::parse(
+                command.trim(),
+                &base_cwd,
+                supported_check_words,
+            )
+            .filter(|parsed| parsed.identity.cwd_reliable)
+            {
+                state.check_identities.insert(key.clone(), parsed.identity);
+            }
+        }
         state
             .started_checks
             .insert(invocation.call_id.clone(), (key, state.check_stamp()));
@@ -1067,9 +1090,11 @@ pub(crate) async fn after_tool(invocation: &ToolInvocation, receipt: ToolReceipt
         .is_some_and(|command| check_command(command))
         && let Some((command, stamp)) = state.started_checks.remove(&invocation.call_id)
     {
+        let output = value["output"].as_str().unwrap_or_default();
+        let output_may_be_truncated = check_output_may_be_truncated(&value);
         if let Some(exit) = value["exit_code"].as_i64() {
             if receipt.successful {
-                state.finish_check(&command, stamp, exit);
+                state.finish_check_observed(&command, stamp, exit, output, output_may_be_truncated);
             }
         } else if let Some(id) = value["session_id"].as_i64() {
             state.pending_checks.insert(id, (command, stamp));
@@ -1080,7 +1105,9 @@ pub(crate) async fn after_tool(invocation: &ToolInvocation, receipt: ToolReceipt
         && let Some((key, stamp)) = state.pending_checks.remove(&id)
         && receipt.successful
     {
-        state.finish_check(&key, stamp, exit);
+        let output = value["output"].as_str().unwrap_or_default();
+        let output_may_be_truncated = check_output_may_be_truncated(&value);
+        state.finish_check_observed(&key, stamp, exit, output, output_may_be_truncated);
     }
     if receipt.successful
         && value["exit_code"].as_i64() == Some(0)

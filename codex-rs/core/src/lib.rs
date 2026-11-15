@@ -259,5 +259,6 @@ pub mod otel_init;
 pub use environment_selection::TurnEnvironmentSnapshot;
 
 // Modified by RenCrow: native executor contract enforcement.
+mod rencrow_check_identity;
 mod rencrow_execution_guard;
 mod rencrow_shell_edit_guard;
