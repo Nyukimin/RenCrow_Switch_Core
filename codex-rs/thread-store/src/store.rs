@@ -1,5 +1,7 @@
+// Modified by RenCrow Switch Core, 2026-11-16: read exact persisted turn-abort evidence.
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::ThreadHistoryMode;
+use codex_protocol::protocol::TurnAbortedEvent;
 use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
@@ -61,6 +63,41 @@ use crate::UpdatedProject;
 
 /// Future returned by [`ThreadStore`] operations.
 pub type ThreadStoreFuture<'a, T> = Pin<Box<dyn Future<Output = ThreadStoreResult<T>> + Send + 'a>>;
+
+/// A typed abort event found in this thread's canonical persisted history.
+///
+/// This proves only that the exact abort record exists. It does not establish that this was the
+/// latest turn, that no later runtime generation exists, or that a review is eligible to retry.
+#[derive(Clone, Debug)]
+pub struct PersistedTurnAbortEvidence {
+    pub event: TurnAbortedEvent,
+    pub owner: PersistedTurnAbortOwner,
+    pub source: PersistedTurnAbortSource,
+}
+
+/// Thread identity recorded in the SessionMeta that owns the abort record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PersistedTurnAbortOwner {
+    pub thread_id: ThreadId,
+    pub parent_thread_id: Option<ThreadId>,
+    pub agent_role: Option<String>,
+}
+
+/// Canonical persisted location for one abort record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PersistedTurnAbortSource {
+    pub rollout_id: ThreadId,
+    pub locator: PersistedTurnAbortLocator,
+}
+
+/// Record locator that preserves the distinction between ordinal and legacy line indexing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PersistedTurnAbortLocator {
+    /// Canonical persisted ordinal in a rollout segment.
+    Ordinal(u64),
+    /// Zero-based physical line index used only when a legacy record has no ordinal.
+    LegacyLineIndex(u64),
+}
 
 /// Why thread persistence is being requested.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -201,6 +238,24 @@ pub trait ThreadStore: Any + Send + Sync {
         Box::pin(async {
             Err(ThreadStoreError::Unsupported {
                 operation: "read_compaction_sources",
+            })
+        })
+    }
+
+    /// Reads one exact historical turn-abort event from this thread's persisted rollout.
+    ///
+    /// Stores that cannot validate persisted rollout ownership may retain this fail-closed
+    /// default. The caller must flush before requesting this evidence. A returned event proves
+    /// only that this exact abort record exists; it does not establish that it is the latest turn
+    /// or that no later runtime generation exists.
+    fn read_persisted_turn_abort(
+        &self,
+        _thread_id: ThreadId,
+        _turn_id: String,
+    ) -> ThreadStoreFuture<'_, Option<PersistedTurnAbortEvidence>> {
+        Box::pin(async {
+            Err(ThreadStoreError::Unsupported {
+                operation: "read_persisted_turn_abort",
             })
         })
     }

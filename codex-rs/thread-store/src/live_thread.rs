@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-16: flush before reading persisted turn-abort evidence.
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -17,6 +18,7 @@ use crate::CreateThreadParams;
 use crate::LoadThreadHistoryParams;
 use crate::LocalThreadStore;
 use crate::PersistContext;
+use crate::PersistedTurnAbortEvidence;
 use crate::ReadThreadParams;
 use crate::ResumeThreadParams;
 use crate::StoredThread;
@@ -354,6 +356,23 @@ impl LiveThread {
                 include_archived,
                 include_history,
             })
+            .await
+    }
+
+    /// Flushes this thread before reading a typed abort event from its persisted rollout.
+    pub async fn read_persisted_turn_abort(
+        &self,
+        turn_id: String,
+    ) -> ThreadStoreResult<Option<PersistedTurnAbortEvidence>> {
+        self.flush()
+            .await
+            .map_err(|error| ThreadStoreError::Internal {
+                message: format!(
+                    "failed to flush thread before reading persisted turn-abort: {error}"
+                ),
+            })?;
+        self.thread_store
+            .read_persisted_turn_abort(self.thread_id, turn_id)
             .await
     }
 

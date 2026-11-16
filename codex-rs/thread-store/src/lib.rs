@@ -4,6 +4,7 @@
 //! Implementations are responsible for resolving that id to local rollout files, RPC requests, or
 //! any other backing store.
 
+// Modified by RenCrow Switch Core, 2026-11-16.
 mod error;
 mod in_memory;
 mod live_thread;
@@ -53,6 +54,10 @@ pub use projects::UpdatedProject;
 pub use queue_store::LocalQueueStore;
 pub use queue_store::QueueStore;
 pub use store::PersistContext;
+pub use store::PersistedTurnAbortEvidence;
+pub use store::PersistedTurnAbortLocator;
+pub use store::PersistedTurnAbortOwner;
+pub use store::PersistedTurnAbortSource;
 pub use store::ThreadStore;
 pub use store::ThreadStoreFuture;
 pub use thread_attachments::AddThreadAttachmentParams;

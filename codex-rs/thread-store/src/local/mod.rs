@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-16: resolve persisted turn-abort evidence.
 mod archive_thread;
 mod compaction_sources;
 mod create_thread;
@@ -20,6 +21,7 @@ mod thread_history;
 mod thread_history_materialization;
 mod thread_rollout_resolver;
 mod thread_sections;
+mod turn_abort;
 mod unarchive_thread;
 mod update_thread_metadata;
 
@@ -574,6 +576,14 @@ impl ThreadStore for LocalThreadStore {
         params: ReadCompactionSourcesParams,
     ) -> ThreadStoreFuture<'_, StoredThreadHistory> {
         Box::pin(async move { compaction_sources::read(self, params).await })
+    }
+
+    fn read_persisted_turn_abort(
+        &self,
+        thread_id: ThreadId,
+        turn_id: String,
+    ) -> ThreadStoreFuture<'_, Option<crate::PersistedTurnAbortEvidence>> {
+        Box::pin(async move { turn_abort::read(self, thread_id, turn_id.as_str()).await })
     }
 
     fn load_latest_model_context(
