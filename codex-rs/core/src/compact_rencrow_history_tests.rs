@@ -539,7 +539,7 @@ fn typed_blocked_output_is_not_execution_evidence_and_must_match_its_observation
         "binding".into(),
         thread,
         vec![json!({"current":true})],
-        &[projection.clone()],
+        std::slice::from_ref(&projection),
     )
     .unwrap();
     assert!(!input.records[1].execution_evidence);

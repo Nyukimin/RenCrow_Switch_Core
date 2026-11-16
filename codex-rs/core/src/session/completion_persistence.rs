@@ -1,5 +1,5 @@
 //! Durable host snapshots reuse the rollout envelope, outside model-written content.
-// Modified by RenCrow Switch Core, 2026-11-11.
+// Modified by RenCrow Switch Core, 2026-11-16.
 
 use super::session::Session;
 use crate::context::AutonomousCompletionSnapshot;
@@ -186,7 +186,15 @@ fn validate_snapshot_payload(
     expected_thread_id: &str,
     receipts: &BTreeMap<String, codex_history::task_context::AcceptedTaskReceipt>,
 ) -> Result<(), String> {
-    if snapshot.version != 1
+    let has_review_state = snapshot
+        .state
+        .units
+        .iter()
+        .any(|unit| unit.review_state.is_some());
+    if !matches!(snapshot.version, 1 | 2)
+        || (snapshot.version == 1 && has_review_state)
+        || (snapshot.version == 2 && !has_review_state)
+        || !completion_review_event_parents_match_snapshot(snapshot)
         || snapshot.thread_id != expected_thread_id
         || snapshot.root_task_id.trim().is_empty()
         || snapshot.root_task_id.len() > 4096
@@ -213,8 +221,11 @@ fn validate_snapshot_payload(
                     .is_some_and(|scope| scope.same_execution(&attempt.scope))
                 || attempt.paths.len() > 16
         })
-        || codex_history::task_context::validate_completion_state(Some(&snapshot.state), receipts)
-            .is_err()
+        || codex_history::task_context::validate_completion_state_snapshot(
+            Some(&snapshot.state),
+            receipts,
+        )
+        .is_err()
     {
         return Err("completion snapshot payload is invalid".into());
     }
@@ -233,6 +244,599 @@ fn validate_snapshot_payload(
         return Err("completion snapshot references a missing task-check receipt".into());
     }
     Ok(())
+}
+
+fn completion_review_event_parents_match_snapshot(snapshot: &Snapshot) -> bool {
+    let expected_parent = snapshot.thread_id.as_str();
+    snapshot.state.units.iter().all(|unit| {
+        let Some(review) = unit.review_state.as_ref() else {
+            return true;
+        };
+        let active_event = review
+            .active_attempt
+            .as_ref()
+            .and_then(|attempt| attempt.terminal_source.as_ref())
+            .and_then(|source| source.event.as_ref());
+        let historical_event = review
+            .historical_failure
+            .as_ref()
+            .map(|failure| &failure.terminal_source)
+            .and_then(|source| source.event.as_ref());
+        let rollback_event = review
+            .retry_reservation_prior_historical_failure
+            .as_ref()
+            .and_then(|failure| failure.terminal_source.event.as_ref());
+        [active_event, historical_event, rollback_event]
+            .into_iter()
+            .flatten()
+            .all(|event| event.owner_parent_thread_id.as_deref() == Some(expected_parent))
+    })
+}
+
+fn revalidation_authorization_snapshot_resolves(
+    snapshot: &Snapshot,
+    prior_host_snapshots: &BTreeMap<String, Value>,
+    unit: &codex_history::task_context::CompletionUnit,
+    revalidation: &codex_history::task_context::CompletionReviewRevalidationSource,
+) -> bool {
+    prior_host_snapshots.iter().any(|(snapshot_sha256, value)| {
+        if codex_history::compaction_candidate::digest(value)
+            .ok()
+            .as_deref()
+            != Some(snapshot_sha256.as_str())
+        {
+            return false;
+        }
+        let Ok(authorized) = serde_json::from_value::<Snapshot>(value.clone()) else {
+            return false;
+        };
+        if !matches!(authorized.version, 1 | 2)
+            || authorized.thread_id != snapshot.thread_id
+            || authorized.root_task_id != snapshot.root_task_id
+            || !completion_review_event_parents_match_snapshot(&authorized)
+        {
+            return false;
+        }
+        let Some(authorized_unit) = authorized
+            .state
+            .units
+            .iter()
+            .find(|candidate| candidate.id == unit.id)
+        else {
+            return false;
+        };
+        let Some(authorized_review) = authorized_unit.review_state.as_ref() else {
+            return false;
+        };
+        let Some(authorized_revalidation) = authorized_review.revalidation.as_ref() else {
+            return false;
+        };
+        let Some(source_unit) = authorized
+            .state
+            .units
+            .iter()
+            .find(|candidate| candidate.id == revalidation.source_unit_id)
+        else {
+            return false;
+        };
+        authorized_revalidation == revalidation
+            && authorized_unit.review_revalidation_of.as_deref()
+                == Some(revalidation.source_unit_id.as_str())
+            && authorized_unit.review_target == unit.review_target
+            && authorized_unit.depends_on == unit.depends_on
+            && authorized_unit.condition_refs == unit.condition_refs
+            && codex_history::task_context::completion_condition_definitions_sha256(
+                &authorized.state,
+                &authorized_unit.condition_refs,
+            )
+            .is_ok_and(|digest| digest == revalidation.required_condition_definitions_sha256)
+            && source_unit.status == codex_history::task_context::UnitStatus::Done
+            && codex_history::task_context::completion_review_adoption_sha256(source_unit)
+                .is_ok_and(|digest| digest == revalidation.source_adoption_sha256)
+            && codex_history::task_context::completion_review_revalidation_dependencies_match(
+                &authorized.state,
+                &authorized.state,
+                source_unit,
+                authorized_unit,
+                &revalidation.required_artifact_fingerprint,
+            )
+    })
+}
+
+fn revalidation_source_snapshot_resolves(
+    snapshot: &Snapshot,
+    current_sha256: &str,
+    prior_host_snapshots: &BTreeMap<String, Value>,
+    unit: &codex_history::task_context::CompletionUnit,
+    revalidation: &codex_history::task_context::CompletionReviewRevalidationSource,
+) -> bool {
+    if revalidation.source_snapshot.sha256 == current_sha256
+        || revalidation.source_snapshot.sha256.len() != 64
+        || revalidation.source_snapshot.version != 1 && revalidation.source_snapshot.version != 2
+        || revalidation.update_call_id.trim().is_empty()
+        || unit.review_revalidation_of.as_deref() != Some(revalidation.source_unit_id.as_str())
+    {
+        return false;
+    }
+    let Some(value) = prior_host_snapshots.get(&revalidation.source_snapshot.sha256) else {
+        return false;
+    };
+    if maintenance_snapshot_digest(value).ok().as_deref()
+        != Some(revalidation.source_snapshot.sha256.as_str())
+    {
+        return false;
+    }
+    let Ok(previous) = serde_json::from_value::<Snapshot>(value.clone()) else {
+        return false;
+    };
+    if previous.version != revalidation.source_snapshot.version
+        || previous.thread_id != snapshot.thread_id
+        || previous.root_task_id != snapshot.root_task_id
+        || !completion_review_event_parents_match_snapshot(&previous)
+        || !revalidation_authorization_snapshot_resolves(
+            snapshot,
+            prior_host_snapshots,
+            unit,
+            revalidation,
+        )
+    {
+        return false;
+    }
+    previous.state.units.iter().any(|source_unit| {
+        let source_digest =
+            codex_history::task_context::completion_review_adoption_sha256(source_unit);
+        let source_conditions =
+            codex_history::task_context::completion_condition_definitions_sha256(
+                &previous.state,
+                &source_unit.condition_refs,
+            );
+        let source_fingerprint = source_unit.review_evidence.as_ref().and_then(|evidence| {
+            codex_history::task_context::task_check_artifact_fingerprint(
+                &evidence.target_artifact_ref,
+            )
+        });
+        source_unit.id == revalidation.source_unit_id
+            && source_unit.kind == codex_history::task_context::CompletionUnitKind::Review
+            && source_unit.status == codex_history::task_context::UnitStatus::Done
+            && source_digest.ok().as_deref() == Some(revalidation.source_adoption_sha256.as_str())
+            && source_conditions.ok().as_deref()
+                == Some(revalidation.source_condition_definitions_sha256.as_str())
+            && source_fingerprint.is_some_and(|fingerprint| {
+                fingerprint != revalidation.required_artifact_fingerprint
+                    || revalidation.source_condition_definitions_sha256
+                        != revalidation.required_condition_definitions_sha256
+            })
+            && unit.condition_refs == source_unit.condition_refs
+            && codex_history::task_context::completion_review_revalidation_dependencies_match(
+                &previous.state,
+                &previous.state,
+                source_unit,
+                unit,
+                &revalidation.required_artifact_fingerprint,
+            )
+    })
+}
+
+fn host_update_withdrawn_revalidation_alias_is_valid(
+    unit: &codex_history::task_context::CompletionUnit,
+    review: &codex_history::task_context::CompletionReviewState,
+    reference: &codex_history::task_context::CompletionReviewSnapshotRef,
+) -> bool {
+    use codex_history::task_context::CompletionReviewWithdrawalSource;
+
+    let Some(withdrawal) = review.withdrawal.as_ref() else {
+        return false;
+    };
+    let CompletionReviewWithdrawalSource::HostUpdate {
+        update_call_id,
+        prior_status,
+    } = &withdrawal.source
+    else {
+        return false;
+    };
+    let source_alias = review
+        .revalidation
+        .as_ref()
+        .is_some_and(|source| &source.source_snapshot == reference);
+    let target_matches = unit.review_target.as_ref().is_some_and(|target| {
+        target.task_id == withdrawal.target_task_id
+            && target.task_revision == withdrawal.target_task_revision
+    });
+    source_alias
+        && !update_call_id.trim().is_empty()
+        && *prior_status == codex_history::task_context::UnitStatus::Planned
+        && unit.kind == codex_history::task_context::CompletionUnitKind::Review
+        && unit.status == codex_history::task_context::UnitStatus::Cancelled
+        && unit.review_decision_reason.as_deref() == Some(withdrawal.reason.as_str())
+        && !withdrawal.reason.trim().is_empty()
+        && target_matches
+        && withdrawal.condition_refs == unit.condition_refs
+        && withdrawal.depends_on == unit.depends_on
+        && unit.review_evidence.is_none()
+        && unit.review_launch.is_none()
+        && review.active_attempt.is_none()
+        && review.historical_failure.is_none()
+        && review.retry_reservation_prior_historical_failure.is_none()
+        && review.retry_authorization.is_none()
+}
+
+fn review_snapshot_references_resolve(
+    snapshot: &Snapshot,
+    current_sha256: &str,
+    prior_host_snapshots: &BTreeMap<String, Value>,
+) -> bool {
+    snapshot.state.units.iter().all(|unit| {
+        let Some(review) = unit.review_state.as_ref() else {
+            return true;
+        };
+        if review.withdrawal.as_ref().is_some_and(|withdrawal| {
+            matches!(
+                &withdrawal.source,
+                codex_history::task_context::CompletionReviewWithdrawalSource::LegacyV1Snapshot {
+                    snapshot,
+                } if review.previous_attempt_ref.as_ref() != Some(snapshot)
+            )
+        }) {
+            return false;
+        }
+        let previous_ref_is_revalidation_source = review.revalidation.as_ref().is_some_and(
+            |revalidation| review.previous_attempt_ref.as_ref() == Some(&revalidation.source_snapshot),
+        );
+        let has_consumed_retry_grant = review
+            .active_attempt
+            .as_ref()
+            .is_some_and(|attempt| attempt.consumed_retry_authorization.is_some());
+        if has_consumed_retry_grant
+            && (review.previous_attempt_ref.is_none() || previous_ref_is_revalidation_source)
+        {
+            return false;
+        }
+        if review.revalidation.as_ref().is_some_and(|revalidation| {
+            !revalidation_source_snapshot_resolves(
+                snapshot,
+                current_sha256,
+                prior_host_snapshots,
+                unit,
+                revalidation,
+            )
+        }) {
+            return false;
+        }
+        let previous_attempt_ref_resolves = review.previous_attempt_ref.as_ref().is_none_or(
+            |reference| {
+                let Some(previous) = load_review_snapshot_reference(
+                    snapshot,
+                    current_sha256,
+                    prior_host_snapshots,
+                    reference,
+                ) else {
+                    return false;
+                };
+                if previous_ref_is_revalidation_source
+                    && !has_consumed_retry_grant
+                        && (review.withdrawal.is_none()
+                            || host_update_withdrawn_revalidation_alias_is_valid(
+                                unit, review, reference,
+                            ))
+                {
+                    // This ref proves the source adoption, which can be another unit and
+                    // predates creation of the revalidation unit itself. A typed HostUpdate
+                    // cancellation retains this source meaning only for its unstarted unit.
+                    return true;
+                }
+                let Some(previous_unit) = previous
+                    .state
+                    .units
+                    .iter()
+                    .find(|previous_unit| previous_unit.id == unit.id)
+                else {
+                    return false;
+                };
+                if let Some(withdrawal) = review.withdrawal.as_ref()
+                    && let codex_history::task_context::CompletionReviewWithdrawalSource::LegacyV1Snapshot {
+                        snapshot: withdrawal_ref,
+                    } = &withdrawal.source
+                {
+                    return withdrawal_ref == reference
+                        && previous.version == 1
+                        && previous_unit.kind
+                            == codex_history::task_context::CompletionUnitKind::Review
+                        && previous_unit.status
+                            == codex_history::task_context::UnitStatus::Cancelled
+                        && previous_unit.review_state.is_none()
+                        && previous_unit.review_evidence.is_none()
+                        && previous_unit.review_launch.is_none()
+                        && previous_unit.review_decision_reason.is_none()
+                        && previous_unit.review_target.as_ref().is_some_and(|target| {
+                            target.task_id == withdrawal.target_task_id
+                                && target.task_revision == withdrawal.target_task_revision
+                        })
+                        && previous_unit.condition_refs == withdrawal.condition_refs
+                        && previous_unit.depends_on == withdrawal.depends_on;
+                }
+                if previous_unit.kind != codex_history::task_context::CompletionUnitKind::Review
+                    || previous_unit.condition_refs != unit.condition_refs
+                    || previous_unit.depends_on != unit.depends_on
+                    || previous_unit.review_target != unit.review_target
+                {
+                    return false;
+                }
+                let Some(current_attempt) = review.active_attempt.as_ref() else {
+                    return false;
+                };
+                let prior_state = previous_unit.review_state.as_ref();
+                let prior_attempt = prior_state.and_then(|state| state.active_attempt.as_ref());
+                if prior_attempt.is_some_and(|prior| prior == current_attempt) {
+                    return true;
+                }
+                if let Some(grant) = current_attempt.consumed_retry_authorization.as_ref() {
+                    return prior_state.is_some_and(|previous_state| {
+                        let prior_matches = previous_state.active_attempt.as_ref().is_some_and(|prior| {
+                            let same_artifact_fingerprint = codex_history::task_context::task_check_artifact_fingerprint(
+                                &prior.target_artifact_ref,
+                            )
+                            .zip(codex_history::task_context::task_check_artifact_fingerprint(
+                                &current_attempt.target_artifact_ref,
+                            ))
+                            .is_some_and(|(old, current)| old == current);
+                            prior.attempt_id == grant.expected_attempt_id
+                                && prior.status
+                                    == codex_history::task_context::CompletionReviewAttemptStatus::Failed
+                                && prior.target_task_id == current_attempt.target_task_id
+                                && prior.target_task_revision == current_attempt.target_task_revision
+                                && same_artifact_fingerprint
+                                && prior.condition_refs == current_attempt.condition_refs
+                                && prior.conditions_sha256 == current_attempt.conditions_sha256
+                                && prior.terminal_source.as_ref().is_some_and(|source| {
+                                    source.status
+                                        == codex_history::task_context::CompletionReviewTerminalStatus::Failed
+                                })
+                        });
+                        let historical_matches = review
+                            .historical_failure
+                            .as_ref()
+                            .is_some_and(|failure| historical_failure_matches_prior(failure, prior_attempt));
+                        previous_state.retry_authorization.as_ref() == Some(grant)
+                            && prior_matches
+                            && historical_matches
+                            && current_attempt.attempt_id != grant.expected_attempt_id
+                    });
+                }
+                if current_attempt.imported_from.as_ref() == Some(reference)
+                    && previous.version == 1
+                {
+                    return LegacyReviewAttemptBinding::from_attempt(current_attempt)
+                        .is_some_and(|binding| {
+                            legacy_review_attempt_binding_matches(unit, previous_unit, binding)
+                        });
+                }
+                prior_state
+                    .and_then(|previous_state| previous_state.active_attempt.as_ref())
+                    .is_some_and(|prior| {
+                        prior.status
+                                == codex_history::task_context::CompletionReviewAttemptStatus::Completed
+                            && previous_unit.status
+                                == codex_history::task_context::UnitStatus::Running
+                            && prior.adoption_reason.is_none()
+                            && prior.attempt_id != current_attempt.attempt_id
+                            && prior.reviewer_thread_id == current_attempt.reviewer_thread_id
+                            && prior.reviewer_turn_id.is_some()
+                            && (match current_attempt.status {
+                                codex_history::task_context::CompletionReviewAttemptStatus::Reserved
+                                | codex_history::task_context::CompletionReviewAttemptStatus::Unknown => {
+                                    current_attempt.reviewer_turn_id.is_none()
+                                }
+                                codex_history::task_context::CompletionReviewAttemptStatus::Bound
+                                | codex_history::task_context::CompletionReviewAttemptStatus::TerminalUnknown
+                                | codex_history::task_context::CompletionReviewAttemptStatus::Failed
+                                | codex_history::task_context::CompletionReviewAttemptStatus::Completed
+                                | codex_history::task_context::CompletionReviewAttemptStatus::Cancelled => {
+                                    current_attempt.reviewer_turn_id.as_ref().is_some_and(|turn| {
+                                        prior.reviewer_turn_id.as_ref() != Some(turn)
+                                    })
+                                }
+                            })
+                            && prior.target_task_id == current_attempt.target_task_id
+                            && prior.target_task_revision == current_attempt.target_task_revision
+                            && prior.target_artifact_ref == current_attempt.target_artifact_ref
+                            && prior.reviewer_role == current_attempt.reviewer_role
+                            && prior.reviewer_model == current_attempt.reviewer_model
+                            && prior.condition_refs == current_attempt.condition_refs
+                            && prior.conditions_sha256 == current_attempt.conditions_sha256
+                            && prior.terminal_source.as_ref().is_some_and(|source| {
+                                source.status
+                                    == codex_history::task_context::CompletionReviewTerminalStatus::Completed
+                            })
+                            && prior.wait_result_ref.as_deref().is_some_and(|value| !value.is_empty())
+                            && prior.wait_call_id.as_deref().is_some_and(|value| !value.is_empty())
+                    })
+            },
+        );
+        let imported_attempts_resolve = review
+            .active_attempt
+            .as_ref()
+            .and_then(|attempt| attempt.imported_from.as_ref().map(|reference| (attempt, reference)))
+            .is_none_or(|(attempt, reference)| {
+                let Some(previous) = load_review_snapshot_reference(
+                    snapshot,
+                    current_sha256,
+                    prior_host_snapshots,
+                    reference,
+                ) else {
+                    return false;
+                };
+                previous.version == 1
+                    && previous
+                        .state
+                        .units
+                        .iter()
+                        .find(|prior| prior.id == unit.id)
+                        .is_some_and(|prior| {
+                            LegacyReviewAttemptBinding::from_attempt(attempt).is_some_and(
+                                |binding| legacy_review_attempt_binding_matches(unit, prior, binding),
+                            )
+                        })
+            })
+            && [&review.historical_failure, &review.retry_reservation_prior_historical_failure]
+                .into_iter()
+                .flatten()
+                .all(|failure| {
+                    let Some(reference) = failure.imported_from.as_ref() else {
+                        return true;
+                    };
+                    let Some(previous) = load_review_snapshot_reference(
+                        snapshot,
+                        current_sha256,
+                        prior_host_snapshots,
+                        reference,
+                    ) else {
+                        return false;
+                    };
+                    previous.version == 1
+                        && previous
+                            .state
+                            .units
+                            .iter()
+                            .find(|prior| prior.id == unit.id)
+                            .is_some_and(|prior| {
+                                legacy_review_attempt_binding_matches(
+                                    unit,
+                                    prior,
+                                    LegacyReviewAttemptBinding::from_failure(failure),
+                                )
+                            })
+                });
+        previous_attempt_ref_resolves && imported_attempts_resolve
+    })
+}
+
+fn load_review_snapshot_reference(
+    current: &Snapshot,
+    current_sha256: &str,
+    prior_host_snapshots: &BTreeMap<String, Value>,
+    reference: &codex_history::task_context::CompletionReviewSnapshotRef,
+) -> Option<Snapshot> {
+    if reference.sha256 == current_sha256 {
+        return None;
+    }
+    let value = prior_host_snapshots.get(&reference.sha256)?;
+    if maintenance_snapshot_digest(value).ok().as_deref() != Some(reference.sha256.as_str()) {
+        return None;
+    }
+    let previous = serde_json::from_value::<Snapshot>(value.clone()).ok()?;
+    (previous.version == reference.version
+        && previous.thread_id == current.thread_id
+        && previous.root_task_id == current.root_task_id
+        && completion_review_event_parents_match_snapshot(&previous))
+    .then_some(previous)
+}
+
+#[derive(Clone, Copy)]
+struct LegacyReviewAttemptBinding<'a> {
+    attempt_id: &'a str,
+    reviewer_thread_id: &'a str,
+    reviewer_turn_id: &'a str,
+    target_task_id: &'a str,
+    target_task_revision: u64,
+    target_artifact_ref: &'a str,
+    reviewer_role: &'a str,
+    wait_result_ref: Option<&'a str>,
+    wait_call_id: Option<&'a str>,
+}
+
+impl<'a> LegacyReviewAttemptBinding<'a> {
+    fn from_attempt(
+        attempt: &'a codex_history::task_context::CompletionReviewAttempt,
+    ) -> Option<Self> {
+        Some(Self {
+            attempt_id: &attempt.attempt_id,
+            reviewer_thread_id: attempt.reviewer_thread_id.as_deref()?,
+            reviewer_turn_id: attempt.reviewer_turn_id.as_deref()?,
+            target_task_id: &attempt.target_task_id,
+            target_task_revision: attempt.target_task_revision,
+            target_artifact_ref: &attempt.target_artifact_ref,
+            reviewer_role: &attempt.reviewer_role,
+            wait_result_ref: attempt.wait_result_ref.as_deref(),
+            wait_call_id: attempt.wait_call_id.as_deref(),
+        })
+    }
+
+    fn from_failure(
+        failure: &'a codex_history::task_context::CompletionReviewHistoricalFailure,
+    ) -> Self {
+        Self {
+            attempt_id: &failure.attempt_id,
+            reviewer_thread_id: &failure.reviewer_thread_id,
+            reviewer_turn_id: &failure.reviewer_turn_id,
+            target_task_id: &failure.target_task_id,
+            target_task_revision: failure.target_task_revision,
+            target_artifact_ref: &failure.target_artifact_ref,
+            reviewer_role: &failure.reviewer_role,
+            wait_result_ref: failure.wait_result_ref.as_deref(),
+            wait_call_id: failure.wait_call_id.as_deref(),
+        }
+    }
+}
+
+fn legacy_review_attempt_binding_matches(
+    current_unit: &codex_history::task_context::CompletionUnit,
+    prior_unit: &codex_history::task_context::CompletionUnit,
+    binding: LegacyReviewAttemptBinding<'_>,
+) -> bool {
+    let Some(evidence) = prior_unit.review_evidence.as_ref() else {
+        return false;
+    };
+    prior_unit.id == current_unit.id
+        && prior_unit.kind == codex_history::task_context::CompletionUnitKind::Review
+        && prior_unit.condition_refs == current_unit.condition_refs
+        && prior_unit.depends_on == current_unit.depends_on
+        && prior_unit.review_target == current_unit.review_target
+        && prior_unit.status == codex_history::task_context::UnitStatus::Failed
+        && prior_unit.review_state.is_none()
+        && prior_unit.review_launch.is_none()
+        && prior_unit.review_decision_reason.is_none()
+        && prior_unit.review_target.as_ref().is_some_and(|target| {
+            target.task_id == binding.target_task_id
+                && target.task_revision == binding.target_task_revision
+        })
+        && evidence.spawn_call_id == binding.attempt_id
+        && evidence.reviewer_thread_id == binding.reviewer_thread_id
+        && evidence.reviewer_turn_id == binding.reviewer_turn_id
+        && evidence.reviewer_role == binding.reviewer_role
+        && evidence.target_task_id == binding.target_task_id
+        && evidence.target_task_revision == binding.target_task_revision
+        && evidence.target_artifact_ref == binding.target_artifact_ref
+        && evidence.wait_result_ref.as_deref() == binding.wait_result_ref
+        && evidence.wait_call_id.as_deref() == binding.wait_call_id
+        && evidence.terminal_status
+            == Some(codex_history::task_context::CompletionReviewTerminalStatus::Failed)
+}
+
+fn historical_failure_matches_prior(
+    failure: &codex_history::task_context::CompletionReviewHistoricalFailure,
+    prior: Option<&codex_history::task_context::CompletionReviewAttempt>,
+) -> bool {
+    let Some(prior) = prior else {
+        return false;
+    };
+    prior.status == codex_history::task_context::CompletionReviewAttemptStatus::Failed
+        && failure.attempt_id == prior.attempt_id
+        && failure.contract_revision == Some(prior.contract_revision)
+        && failure.imported_from == prior.imported_from
+        && failure.consumed_retry_authorization == prior.consumed_retry_authorization
+        && prior.reviewer_thread_id.as_deref() == Some(failure.reviewer_thread_id.as_str())
+        && prior.reviewer_turn_id.as_deref() == Some(failure.reviewer_turn_id.as_str())
+        && failure.target_task_id == prior.target_task_id
+        && failure.target_task_revision == prior.target_task_revision
+        && failure.target_artifact_ref == prior.target_artifact_ref
+        && failure.reviewer_role == prior.reviewer_role
+        && failure.reviewer_model == prior.reviewer_model
+        && failure.deadline_unix_ms == prior.deadline_unix_ms
+        && failure.wait_result_ref == prior.wait_result_ref
+        && failure.wait_call_id == prior.wait_call_id
+        && failure.deadline_escalation == prior.deadline_escalation
+        && failure.deadline_safety_fingerprint == prior.deadline_safety_fingerprint
+        && prior.terminal_source.as_ref() == Some(&failure.terminal_source)
 }
 
 /// Hash a completion snapshot using the canonical JSON digest used by compaction history.
@@ -472,7 +1076,571 @@ struct Snapshot {
     maintenance_repair_receipt: Option<MaintenanceRepairReceipt>,
 }
 
+pub(super) enum PersistedRetryRollbackRef {
+    NotRetry,
+    Retry(Option<codex_history::task_context::CompletionReviewSnapshotRef>),
+}
+
+fn persisted_legacy_review_binding(
+    contract_revision: u64,
+    unit: &codex_history::task_context::CompletionUnit,
+) -> Option<(String, crate::state::PersistedLegacyReviewBinding)> {
+    if unit.kind != codex_history::task_context::CompletionUnitKind::Review
+        || unit.review_state.is_some()
+        || unit.review_launch.is_some()
+    {
+        return None;
+    }
+    let evidence = match (unit.status, unit.review_evidence.as_ref()) {
+        (codex_history::task_context::UnitStatus::Cancelled, None)
+            if unit.review_decision_reason.is_none() =>
+        {
+            None
+        }
+        (_, Some(evidence)) => Some(evidence.clone()),
+        _ => return None,
+    };
+    Some((
+        unit.id.clone(),
+        crate::state::PersistedLegacyReviewBinding {
+            contract_revision,
+            status: unit.status,
+            review_target: unit.review_target.clone(),
+            condition_refs: unit.condition_refs.clone(),
+            depends_on: unit.depends_on.clone(),
+            evidence,
+        },
+    ))
+}
+
 impl Session {
+    pub(super) async fn persisted_retry_rollback_previous_ref(
+        &self,
+        unit_id: &str,
+    ) -> Result<PersistedRetryRollbackRef, String> {
+        use codex_history::task_context::CompletionReviewAttemptStatus;
+
+        let (root_task_id, unit_value, receipt, history_items) = {
+            let state = self.state.lock().await;
+            let Some((root_task_id, contract)) = state.rencrow_completion_state.as_ref() else {
+                return Err("completion review contract disappeared before rollback".into());
+            };
+            let Some(unit) = contract.units.iter().find(|unit| unit.id == unit_id) else {
+                return Err("completion review unit disappeared before rollback".into());
+            };
+            let Some(attempt) = unit
+                .review_state
+                .as_ref()
+                .and_then(|review| review.active_attempt.as_ref())
+            else {
+                return Ok(PersistedRetryRollbackRef::NotRetry);
+            };
+            if attempt.consumed_retry_authorization.is_none() {
+                return Ok(PersistedRetryRollbackRef::NotRetry);
+            }
+            if !matches!(attempt.status, CompletionReviewAttemptStatus::Reserved)
+                || attempt.reviewer_thread_id.is_some()
+                || attempt.reviewer_turn_id.is_some()
+            {
+                return Err("failed retry reservation is no longer safely rollbackable".into());
+            }
+            let receipt = state
+                .rencrow_completion_last_persisted_snapshot
+                .clone()
+                .ok_or_else(|| {
+                    "failed retry reservation has no persisted snapshot receipt".to_string()
+                })?;
+            let attempt_value = serde_json::to_value(attempt).map_err(|error| error.to_string())?;
+            let attempt_sha256 = maintenance_snapshot_digest(&attempt_value)?;
+            if receipt.version != 2
+                || receipt.root_task_id.as_str() != root_task_id.as_str()
+                || receipt.review_attempts.get(unit_id).is_none_or(|identity| {
+                    identity.attempt_id != attempt.attempt_id
+                        || identity.status != CompletionReviewAttemptStatus::Reserved
+                        || identity.reviewer_thread_id.is_some()
+                        || identity.reviewer_turn_id.is_some()
+                        || identity.target_task_id != attempt.target_task_id
+                        || identity.target_task_revision != attempt.target_task_revision
+                        || identity.target_artifact_ref != attempt.target_artifact_ref
+                        || identity.attempt_sha256 != attempt_sha256
+                })
+            {
+                return Err(
+                    "persisted retry reservation receipt does not match the active attempt".into(),
+                );
+            }
+            (
+                root_task_id.clone(),
+                serde_json::to_value(unit).map_err(|error| error.to_string())?,
+                receipt,
+                state.history.annotated_items().to_vec(),
+            )
+        };
+
+        let mut host_snapshots = BTreeMap::new();
+        for envelope in &history_items {
+            let Some(metadata) = envelope.metadata.as_ref() else {
+                continue;
+            };
+            let Some(value) = metadata.rencrow_completion.as_ref() else {
+                continue;
+            };
+            let is_host = matches!(&envelope.item, ResponseItem::Message {
+                role,
+                internal_chat_message_metadata_passthrough: Some(kind),
+                ..
+            } if role == "developer" && kind.content_item_kinds.as_ref().is_some_and(|kinds| {
+                kinds.len() == 1 && kinds[0].0 == "rencrow.completion_snapshot"
+            })) && !metadata.client_authored;
+            if is_host {
+                let digest = maintenance_snapshot_digest(value)?;
+                host_snapshots.insert(digest, value.clone());
+            }
+        }
+        let value = host_snapshots
+            .get(&receipt.sha256)
+            .ok_or_else(|| "persisted retry reservation snapshot is unavailable".to_string())?;
+        if maintenance_snapshot_digest(value)? != receipt.sha256 {
+            return Err("persisted retry reservation snapshot digest is invalid".into());
+        }
+        let reserved = serde_json::from_value::<Snapshot>(value.clone())
+            .map_err(|error| format!("persisted retry reservation snapshot is invalid: {error}"))?;
+        if reserved.version != receipt.version
+            || reserved.thread_id != self.thread_id.to_string()
+            || reserved.root_task_id != root_task_id
+            || reserved
+                .state
+                .units
+                .iter()
+                .find(|unit| unit.id == unit_id)
+                .and_then(|unit| serde_json::to_value(unit).ok())
+                .as_ref()
+                != Some(&unit_value)
+        {
+            return Err(
+                "persisted retry reservation snapshot does not match the current reservation"
+                    .into(),
+            );
+        }
+        if !review_snapshot_references_resolve(&reserved, &receipt.sha256, &host_snapshots) {
+            return Err(
+                "persisted retry reservation snapshot does not validate its source chain".into(),
+            );
+        }
+        let reserved_unit = reserved
+            .state
+            .units
+            .iter()
+            .find(|unit| unit.id == unit_id)
+            .ok_or_else(|| {
+                "persisted retry reservation snapshot lost its review unit".to_string()
+            })?;
+        let reserved_review = reserved_unit
+            .review_state
+            .as_ref()
+            .ok_or_else(|| "persisted retry reservation lost canonical review state".to_string())?;
+        let grant = reserved_review
+            .active_attempt
+            .as_ref()
+            .and_then(|attempt| attempt.consumed_retry_authorization.as_ref())
+            .ok_or_else(|| "persisted retry reservation lost its consumed grant".to_string())?;
+        let prior_ref = reserved_review
+            .previous_attempt_ref
+            .as_ref()
+            .ok_or_else(|| {
+                "persisted retry reservation lost its predecessor reference".to_string()
+            })?;
+        let prior =
+            load_review_snapshot_reference(&reserved, &receipt.sha256, &host_snapshots, prior_ref)
+                .ok_or_else(|| {
+                    "retry predecessor snapshot is unavailable or invalid".to_string()
+                })?;
+        let prior_unit = prior
+            .state
+            .units
+            .iter()
+            .find(|unit| unit.id == unit_id)
+            .ok_or_else(|| "retry predecessor snapshot lost its review unit".to_string())?;
+        let prior_review = prior_unit
+            .review_state
+            .as_ref()
+            .ok_or_else(|| "retry predecessor snapshot lost canonical review state".to_string())?;
+        let prior_attempt = prior_review
+            .active_attempt
+            .as_ref()
+            .ok_or_else(|| "retry predecessor snapshot lost its failed attempt".to_string())?;
+        let current_review = reserved_review;
+        if prior.version != prior_ref.version
+            || prior_unit.review_target != reserved_unit.review_target
+            || prior_unit.condition_refs != reserved_unit.condition_refs
+            || prior_unit.depends_on != reserved_unit.depends_on
+            || prior_attempt.status != CompletionReviewAttemptStatus::Failed
+            || prior_attempt.attempt_id != grant.expected_attempt_id
+            || prior_review.retry_authorization.as_ref() != Some(grant)
+            || current_review
+                .retry_reservation_prior_historical_failure
+                .as_ref()
+                != prior_review.historical_failure.as_ref()
+            || !current_review
+                .historical_failure
+                .as_ref()
+                .is_some_and(|failure| {
+                    historical_failure_matches_prior(failure, Some(prior_attempt))
+                })
+        {
+            return Err(
+                "retry predecessor does not match the exact persisted failed attempt".into(),
+            );
+        }
+        if !review_snapshot_references_resolve(&prior, &prior_ref.sha256, &host_snapshots) {
+            return Err(
+                "retry predecessor snapshot does not resolve its own persisted source references"
+                    .into(),
+            );
+        }
+        Ok(PersistedRetryRollbackRef::Retry(
+            prior_review.previous_attempt_ref.clone(),
+        ))
+    }
+
+    pub(crate) async fn persisted_legacy_review_snapshot_ref(
+        &self,
+        root_task_id: &str,
+        unit_id: &str,
+        expected: &crate::state::PersistedLegacyReviewBinding,
+    ) -> Option<codex_history::task_context::CompletionReviewSnapshotRef> {
+        let state = self.state.lock().await;
+        let receipt = state.rencrow_completion_last_persisted_snapshot.as_ref()?;
+        if receipt.version != 1
+            || receipt.root_task_id != root_task_id
+            || receipt.legacy_review_bindings.get(unit_id) != Some(expected)
+        {
+            return None;
+        }
+        let (current_root, current) = state.rencrow_completion_state.as_ref()?;
+        let current_unit = current.units.iter().find(|unit| unit.id == unit_id)?;
+        if current_root != root_task_id
+            || current.contract_revision != expected.contract_revision
+            || current_unit.status != expected.status
+            || current_unit.review_target != expected.review_target
+            || current_unit.condition_refs != expected.condition_refs
+            || current_unit.depends_on != expected.depends_on
+            || current_unit.review_state.is_some()
+            || current_unit.review_evidence != expected.evidence
+            || current_unit.review_launch.is_some()
+            || current_unit.review_decision_reason.is_some()
+        {
+            return None;
+        }
+        Some(codex_history::task_context::CompletionReviewSnapshotRef {
+            version: receipt.version,
+            sha256: receipt.sha256.clone(),
+        })
+    }
+
+    pub(crate) async fn persisted_review_attempt_snapshot_ref(
+        &self,
+        root_task_id: &str,
+        unit_id: &str,
+        expected_attempt: &codex_history::task_context::CompletionReviewAttempt,
+    ) -> Result<Option<codex_history::task_context::CompletionReviewSnapshotRef>, String> {
+        let expected_attempt_sha256 = serde_json::to_value(expected_attempt)
+            .map_err(|error| error.to_string())
+            .and_then(|value| maintenance_snapshot_digest(&value))?;
+        let expected_terminal_source_sha256 = expected_attempt
+            .terminal_source
+            .as_ref()
+            .map(|source| serde_json::to_value(source).map_err(|error| error.to_string()))
+            .transpose()?
+            .map(|value| codex_history::compaction_candidate::digest(&value))
+            .transpose()?;
+        let Some(expected_terminal_source_sha256) = expected_terminal_source_sha256.as_deref()
+        else {
+            return Ok(None);
+        };
+        let terminal_status_matches_attempt = expected_attempt
+            .terminal_source
+            .as_ref()
+            .is_some_and(|source| match expected_attempt.status {
+                codex_history::task_context::CompletionReviewAttemptStatus::Failed => {
+                    source.status
+                        == codex_history::task_context::CompletionReviewTerminalStatus::Failed
+                        && expected_attempt.adoption_reason.is_none()
+                        && (source.event.is_some() || expected_attempt.wait_result_ref.is_some())
+                }
+                codex_history::task_context::CompletionReviewAttemptStatus::Completed => {
+                    source.status
+                        == codex_history::task_context::CompletionReviewTerminalStatus::Completed
+                        && expected_attempt.adoption_reason.is_none()
+                        && expected_attempt.wait_result_ref.is_some()
+                        && expected_attempt.wait_call_id.is_some()
+                }
+                _ => false,
+            });
+        if !terminal_status_matches_attempt {
+            return Ok(None);
+        }
+        let state = self.state.lock().await;
+        let Some(receipt) = state.rencrow_completion_last_persisted_snapshot.as_ref() else {
+            return Ok(None);
+        };
+        let expected_parent_thread_id = self.thread_id.to_string();
+        let source_matches_parent = state
+            .rencrow_completion_state
+            .as_ref()
+            .filter(|(root, _)| root == root_task_id)
+            .and_then(|(_, contract)| contract.units.iter().find(|unit| unit.id == unit_id))
+            .and_then(|unit| unit.review_state.as_ref())
+            .and_then(|review| review.active_attempt.as_ref())
+            .filter(|attempt| {
+                attempt.attempt_id == expected_attempt.attempt_id
+                    && attempt.reviewer_thread_id == expected_attempt.reviewer_thread_id
+                    && attempt.reviewer_turn_id == expected_attempt.reviewer_turn_id
+            })
+            .and_then(|attempt| attempt.terminal_source.as_ref())
+            .is_some_and(|source| {
+                source.event.as_ref().is_none_or(|event| {
+                    event.owner_parent_thread_id.as_deref()
+                        == Some(expected_parent_thread_id.as_str())
+                }) && serde_json::to_value(source)
+                    .ok()
+                    .and_then(|value| codex_history::compaction_candidate::digest(&value).ok())
+                    .as_deref()
+                    == Some(expected_terminal_source_sha256)
+            });
+        if receipt.root_task_id != root_task_id
+            || !source_matches_parent
+            || receipt.review_attempts.get(unit_id).is_none_or(|attempt| {
+                attempt.attempt_id != expected_attempt.attempt_id
+                    || attempt.reviewer_thread_id != expected_attempt.reviewer_thread_id
+                    || attempt.reviewer_turn_id != expected_attempt.reviewer_turn_id
+                    || attempt.target_task_id != expected_attempt.target_task_id
+                    || attempt.target_task_revision != expected_attempt.target_task_revision
+                    || attempt.target_artifact_ref != expected_attempt.target_artifact_ref
+                    || attempt.status != expected_attempt.status
+                    || attempt.attempt_sha256 != expected_attempt_sha256
+                    || attempt.terminal_source_sha256.as_deref()
+                        != Some(expected_terminal_source_sha256)
+            })
+        {
+            return Ok(None);
+        }
+        Ok(Some(
+            codex_history::task_context::CompletionReviewSnapshotRef {
+                version: receipt.version,
+                sha256: receipt.sha256.clone(),
+            },
+        ))
+    }
+
+    pub(crate) async fn persisted_completed_review_predecessor_turn(
+        &self,
+        root_task_id: &str,
+        unit_id: &str,
+        attempt_id: &str,
+        child_thread_id: &str,
+    ) -> Result<Option<String>, String> {
+        let (previous_ref, receipt, history_items) = {
+            let state = self.state.lock().await;
+            let Some((root, contract)) = state.rencrow_completion_state.as_ref() else {
+                return Err("review predecessor lookup has no completion contract".into());
+            };
+            if root != root_task_id {
+                return Err("review predecessor lookup root does not match".into());
+            }
+            let Some(attempt) = contract
+                .units
+                .iter()
+                .find(|unit| unit.id == unit_id)
+                .and_then(|unit| unit.review_state.as_ref())
+                .and_then(|review| review.active_attempt.as_ref())
+            else {
+                return Ok(None);
+            };
+            if attempt.attempt_id != attempt_id
+                || attempt.reviewer_thread_id.as_deref() != Some(child_thread_id)
+                || attempt.reviewer_turn_id.is_some()
+                || !matches!(
+                    attempt.status,
+                    codex_history::task_context::CompletionReviewAttemptStatus::Reserved
+                        | codex_history::task_context::CompletionReviewAttemptStatus::Unknown
+                )
+            {
+                return Ok(None);
+            }
+            let Some(previous_ref) = contract
+                .units
+                .iter()
+                .find(|unit| unit.id == unit_id)
+                .and_then(|unit| unit.review_state.as_ref())
+                .and_then(|review| review.previous_attempt_ref.clone())
+            else {
+                return Ok(None);
+            };
+            let Some(receipt) = state.rencrow_completion_last_persisted_snapshot.as_ref() else {
+                return Err(
+                    "review predecessor lookup has no persisted current snapshot receipt".into(),
+                );
+            };
+            (
+                previous_ref,
+                (
+                    receipt.version,
+                    receipt.sha256.clone(),
+                    receipt.root_task_id.clone(),
+                    receipt.review_attempts.get(unit_id).cloned(),
+                ),
+                state.history.annotated_items().to_vec(),
+            )
+        };
+        let (receipt_version, current_sha256, receipt_root, persisted_identity) = receipt;
+        let Some(persisted_identity) = persisted_identity else {
+            return Err(
+                "review predecessor lookup has no persisted active-attempt identity".into(),
+            );
+        };
+        if receipt_root != root_task_id
+            || persisted_identity.attempt_id != attempt_id
+            || persisted_identity.reviewer_thread_id.as_deref() != Some(child_thread_id)
+            || persisted_identity.reviewer_turn_id.is_some()
+            || !matches!(
+                persisted_identity.status,
+                codex_history::task_context::CompletionReviewAttemptStatus::Reserved
+                    | codex_history::task_context::CompletionReviewAttemptStatus::Unknown
+            )
+        {
+            return Err(
+                "review predecessor lookup receipt does not match the unresolved attempt".into(),
+            );
+        }
+        let mut host_snapshots = BTreeMap::new();
+        for envelope in &history_items {
+            let Some(metadata) = envelope.metadata.as_ref() else {
+                continue;
+            };
+            let Some(value) = metadata.rencrow_completion.as_ref() else {
+                continue;
+            };
+            let is_host = matches!(&envelope.item, ResponseItem::Message {
+                role,
+                internal_chat_message_metadata_passthrough: Some(kind),
+                ..
+            } if role == "developer" && kind.content_item_kinds.as_ref().is_some_and(|kinds| {
+                kinds.len() == 1 && kinds[0].0 == "rencrow.completion_snapshot"
+            })) && !metadata.client_authored;
+            if is_host {
+                let digest = maintenance_snapshot_digest(value)?;
+                host_snapshots.insert(digest, value.clone());
+            }
+        }
+        let Some(current_value) = host_snapshots.get(&current_sha256) else {
+            return Err(
+                "review predecessor lookup cannot find the persisted current host snapshot".into(),
+            );
+        };
+        let current = serde_json::from_value::<Snapshot>(current_value.clone())
+            .map_err(|error| format!("persisted current review snapshot is invalid: {error}"))?;
+        let digest_matches = maintenance_snapshot_digest(current_value)? == current_sha256;
+        let child_is_uncollected = current
+            .uncollected_children
+            .iter()
+            .any(|id| id == child_thread_id);
+        if receipt_version != 2
+            || current.version != 2
+            || current.thread_id != self.thread_id.to_string()
+            || current.root_task_id != root_task_id
+            || !digest_matches
+            || !child_is_uncollected
+        {
+            return Err(
+                "review predecessor lookup cannot validate its persisted source chain".into(),
+            );
+        }
+        if !review_snapshot_references_resolve(&current, &current_sha256, &host_snapshots) {
+            return Err(
+                "review predecessor lookup cannot validate its persisted source chain".into(),
+            );
+        }
+        let Some(current_unit) = current.state.units.iter().find(|unit| unit.id == unit_id) else {
+            return Err("persisted review predecessor lookup lost its current unit".into());
+        };
+        let Some(current_attempt) = current_unit
+            .review_state
+            .as_ref()
+            .and_then(|review| review.active_attempt.as_ref())
+        else {
+            return Err("persisted review predecessor lookup lost its active attempt".into());
+        };
+        let current_attempt_value =
+            serde_json::to_value(current_attempt).map_err(|error| error.to_string())?;
+        if current_attempt.attempt_id != attempt_id
+            || current_attempt.reviewer_thread_id.as_deref() != Some(child_thread_id)
+            || current_attempt.reviewer_turn_id.is_some()
+            || maintenance_snapshot_digest(&current_attempt_value)?
+                != persisted_identity.attempt_sha256
+        {
+            return Err(
+                "persisted review predecessor lookup has a different active attempt".into(),
+            );
+        }
+        let Some(previous) = load_review_snapshot_reference(
+            &current,
+            &current_sha256,
+            &host_snapshots,
+            &previous_ref,
+        ) else {
+            return Err("review predecessor snapshot reference is unavailable or invalid".into());
+        };
+        let Some(previous_unit) = previous.state.units.iter().find(|unit| unit.id == unit_id)
+        else {
+            // Revalidation snapshots can validly predate creation of this unit.
+            return Ok(None);
+        };
+        let Some(previous_attempt) = previous_unit
+            .review_state
+            .as_ref()
+            .and_then(|review| review.active_attempt.as_ref())
+        else {
+            return Ok(None);
+        };
+        if previous_attempt.status
+            != codex_history::task_context::CompletionReviewAttemptStatus::Completed
+            || previous_attempt.reviewer_thread_id.as_deref() != Some(child_thread_id)
+        {
+            return Ok(None);
+        }
+        let Some(previous_turn_id) = previous_attempt.reviewer_turn_id.as_ref() else {
+            return Err("completed predecessor has no exact reviewer turn".into());
+        };
+        if previous_unit.status != codex_history::task_context::UnitStatus::Running
+            || previous_attempt.adoption_reason.is_some()
+            || previous_attempt
+                .terminal_source
+                .as_ref()
+                .is_none_or(|source| {
+                    source.status
+                        != codex_history::task_context::CompletionReviewTerminalStatus::Completed
+                })
+            || previous_attempt
+                .wait_result_ref
+                .as_deref()
+                .is_none_or(str::is_empty)
+            || previous_attempt
+                .wait_call_id
+                .as_deref()
+                .is_none_or(str::is_empty)
+            || previous_attempt.target_task_id != current_attempt.target_task_id
+            || previous_attempt.target_task_revision != current_attempt.target_task_revision
+            || previous_attempt.reviewer_role != current_attempt.reviewer_role
+            || previous_attempt.reviewer_model != current_attempt.reviewer_model
+            || previous_attempt.condition_refs != current_attempt.condition_refs
+            || previous_attempt.conditions_sha256 != current_attempt.conditions_sha256
+        {
+            return Err("completed predecessor is not an exact unadopted wait result".into());
+        }
+        Ok(Some(previous_turn_id.clone()))
+    }
+
     pub(crate) async fn autonomous_completion_event_seen(&self, event_key: &str) -> bool {
         self.state
             .lock()
@@ -501,6 +1669,85 @@ impl Session {
         // Serialize capture and the async append together; this dedicated lock never
         // protects SessionState and prevents older snapshots overtaking newer ones.
         let _persist_guard = persist_lock.lock().await;
+        {
+            let mut state = self.state.lock().await;
+            let legacy_receipt = state
+                .rencrow_completion_last_persisted_snapshot
+                .as_ref()
+                .filter(|receipt| receipt.version == 1)
+                .cloned();
+            if let (Some(receipt), Some((root, contract))) =
+                (legacy_receipt, state.rencrow_completion_state.as_mut())
+                && receipt.root_task_id.as_str() == root.as_str()
+                && contract
+                    .units
+                    .iter()
+                    .any(|unit| unit.review_state.is_some())
+            {
+                let current_contract_revision = contract.contract_revision;
+                for unit in &mut contract.units {
+                    if unit.kind != codex_history::task_context::CompletionUnitKind::Review
+                        || unit.status != codex_history::task_context::UnitStatus::Cancelled
+                        || unit.review_state.is_some()
+                        || unit.review_evidence.is_some()
+                        || unit.review_launch.is_some()
+                        || unit.review_decision_reason.is_some()
+                    {
+                        continue;
+                    }
+                    let Some((_, mut expected_binding)) =
+                        persisted_legacy_review_binding(current_contract_revision, unit)
+                    else {
+                        continue;
+                    };
+                    let Some(source_binding) = receipt.legacy_review_bindings.get(&unit.id) else {
+                        continue;
+                    };
+                    // The overall contract revision may advance during the explicit operation
+                    // opting into v2. The old unit identity and all of its own binding fields
+                    // must still match the exact v1 snapshot.
+                    expected_binding.contract_revision = source_binding.contract_revision;
+                    if source_binding != &expected_binding {
+                        continue;
+                    }
+                    let Some(target) = unit.review_target.clone() else {
+                        continue;
+                    };
+                    let reference = codex_history::task_context::CompletionReviewSnapshotRef {
+                        version: 1,
+                        sha256: receipt.sha256.clone(),
+                    };
+                    let review_state = codex_history::task_context::CompletionReviewState {
+                        version: 1,
+                        obligation_unit_id: unit.id.clone(),
+                        active_attempt: None,
+                        historical_failure: None,
+                        retry_reservation_prior_historical_failure: None,
+                        previous_attempt_ref: Some(reference.clone()),
+                        retry_authorization: None,
+                        withdrawal: Some(
+                            codex_history::task_context::CompletionReviewWithdrawal {
+                                source: codex_history::task_context::CompletionReviewWithdrawalSource::LegacyV1Snapshot {
+                                    snapshot: reference,
+                                },
+                                reason: "Preserved the exact unstarted cancellation from the v1 completion plan.".into(),
+                                target_task_id: target.task_id,
+                                target_task_revision: target.task_revision,
+                                condition_refs: unit.condition_refs.clone(),
+                                depends_on: unit.depends_on.clone(),
+                            },
+                        ),
+                            revalidation: None,
+                    };
+                    unit.review_state = Some(review_state);
+                    if let Ok(projected) =
+                        codex_history::task_context::project_completion_review_state(unit)
+                    {
+                        *unit = projected;
+                    }
+                }
+            }
+        }
         let (
             completion_state,
             task_checks,
@@ -561,7 +1808,15 @@ impl Session {
             return Err("completion snapshot exceeds the task-check bound".to_string());
         }
         let snapshot = Snapshot {
-            version: 1,
+            version: if contract
+                .units
+                .iter()
+                .any(|unit| unit.review_state.is_some())
+            {
+                2
+            } else {
+                1
+            },
             thread_id: self.thread_id().to_string(),
             root_task_id,
             state: contract,
@@ -572,7 +1827,7 @@ impl Session {
             uncollected_children,
             maintenance_repair_receipt: None,
         };
-        let value = serde_json::to_value(snapshot).map_err(|error| error.to_string())?;
+        let value = serde_json::to_value(&snapshot).map_err(|error| error.to_string())?;
         if serde_json::to_vec(&value)
             .map_err(|error| error.to_string())?
             .len()
@@ -581,6 +1836,8 @@ impl Session {
             self.mark_completion_paused_in_memory().await;
             return Err("completion snapshot exceeds its size bound".to_string());
         }
+        let typed_review_snapshot = snapshot.version == 2;
+        let snapshot_sha256 = maintenance_snapshot_digest(&value)?;
         let item = ResponseItemEnvelope {
             item: Box::new(AutonomousCompletionSnapshot).into_boxed_response_item(),
             metadata: Some(CodexHarnessMetadata {
@@ -588,24 +1845,88 @@ impl Session {
                 ..Default::default()
             }),
         };
-        if !self
-            .persist_rollout_items(&[RolloutItem::ResponseItem(item.clone())])
-            .await
-        {
-            let mut state = self.state.lock().await;
-            state.rencrow_completion_paused = true;
-            if let Some((_, contract)) = state.rencrow_completion_state.as_mut() {
-                contract.paused = true;
+        let persist_result = match self.live_thread() {
+            Some(live_thread) => live_thread
+                .append_items(&[RolloutItem::ResponseItem(item.clone())])
+                .await
+                .map(|()| true)
+                .map_err(|error| error.to_string()),
+            None if typed_review_snapshot => Err(
+                "typed review snapshot cannot be durably recorded without a live thread store"
+                    .into(),
+            ),
+            None => Ok(false),
+        };
+        let durable_snapshot_written = match persist_result {
+            Ok(written) => written,
+            Err(error) => {
+                let mut state = self.state.lock().await;
+                state.rencrow_completion_paused = true;
+                if let Some((_, contract)) = state.rencrow_completion_state.as_mut() {
+                    contract.paused = true;
+                }
+                return Err(format!(
+                    "completion snapshot persistence failed; autonomous work paused: {error}"
+                ));
             }
-            return Err(
-                "completion snapshot persistence failed; autonomous work paused".to_string(),
-            );
-        }
+        };
         self.state
             .lock()
             .await
             .history
             .record_annotated_items(&[item], TruncationPolicy::Tokens(1024));
+        if !durable_snapshot_written {
+            return Ok(());
+        }
+        let review_attempts = snapshot
+            .state
+            .units
+            .iter()
+            .filter_map(|unit| {
+                let attempt = unit.review_state.as_ref()?.active_attempt.as_ref()?;
+                let attempt_sha256 = serde_json::to_value(attempt)
+                    .ok()
+                    .and_then(|value| maintenance_snapshot_digest(&value).ok())?;
+                let terminal_source_sha256 = attempt
+                    .terminal_source
+                    .as_ref()
+                    .and_then(|source| serde_json::to_value(source).ok())
+                    .and_then(|source| maintenance_snapshot_digest(&source).ok());
+                Some((
+                    unit.id.clone(),
+                    crate::state::PersistedReviewAttemptIdentity {
+                        attempt_id: attempt.attempt_id.clone(),
+                        reviewer_thread_id: attempt.reviewer_thread_id.clone(),
+                        reviewer_turn_id: attempt.reviewer_turn_id.clone(),
+                        target_task_id: attempt.target_task_id.clone(),
+                        target_task_revision: attempt.target_task_revision,
+                        target_artifact_ref: attempt.target_artifact_ref.clone(),
+                        status: attempt.status,
+                        attempt_sha256,
+                        terminal_source_sha256,
+                    },
+                ))
+            })
+            .collect();
+        let legacy_review_bindings = snapshot
+            .state
+            .units
+            .iter()
+            .filter_map(|unit| {
+                persisted_legacy_review_binding(snapshot.state.contract_revision, unit)
+            })
+            .collect();
+        self.state
+            .lock()
+            .await
+            .rencrow_completion_last_persisted_snapshot =
+            Some(crate::state::CompletionSnapshotReceipt {
+                version: snapshot.version,
+                sha256: snapshot_sha256,
+                root_task_id: snapshot.root_task_id,
+                review_attempts,
+                legacy_review_bindings,
+            });
         Ok(())
     }
 
@@ -617,6 +1938,7 @@ impl Session {
         let mut restored_children = Vec::new();
         let mut restored_revision = None;
         let mut restored_generation = None;
+        let mut restored_snapshot_version = None;
         let mut restored_paused = false;
         let mut fail_closed = false;
         let mut response_items = Vec::new();
@@ -726,7 +2048,19 @@ impl Session {
                     if declared_shutdown_paused_hashes.contains(&snapshot_sha256) {
                         shutdown_pair_seen = true;
                     }
-                    if snapshot.version != 1
+                    let has_review_state = snapshot
+                        .state
+                        .units
+                        .iter()
+                        .any(|unit| unit.review_state.is_some());
+                    if !matches!(snapshot.version, 1 | 2)
+                        || (snapshot.version == 1 && has_review_state)
+                        || (snapshot.version == 2 && !has_review_state)
+                        || !review_snapshot_references_resolve(
+                            &snapshot,
+                            &snapshot_sha256,
+                            &host_snapshot_values,
+                        )
                         || snapshot.thread_id != self.thread_id().to_string()
                         || snapshot.root_task_id.trim().is_empty()
                         || snapshot.root_task_id.len() > 4096
@@ -847,6 +2181,7 @@ impl Session {
                     }
                     restored_revision = Some(snapshot.state.contract_revision);
                     restored_generation = Some(snapshot.resume_generation);
+                    restored_snapshot_version = Some(snapshot.version);
                     restored_checks = Some(snapshot.task_checks);
                     restored_scope = snapshot.active_scope;
                     restored_patches = snapshot.patch_attempts;
@@ -924,6 +2259,54 @@ impl Session {
                         (call, attempt)
                     })
                     .collect();
+                state.rencrow_completion_last_persisted_snapshot =
+                    last_valid_snapshot_sha256.clone().map(|sha256| {
+                        let review_attempts = contract
+                            .units
+                            .iter()
+                            .filter_map(|unit| {
+                                let attempt =
+                                    unit.review_state.as_ref()?.active_attempt.as_ref()?;
+                                let attempt_sha256 = serde_json::to_value(attempt)
+                                    .ok()
+                                    .and_then(|value| maintenance_snapshot_digest(&value).ok())?;
+                                let terminal_source_sha256 = attempt
+                                    .terminal_source
+                                    .as_ref()
+                                    .and_then(|source| serde_json::to_value(source).ok())
+                                    .and_then(|source| maintenance_snapshot_digest(&source).ok());
+                                Some((
+                                    unit.id.clone(),
+                                    crate::state::PersistedReviewAttemptIdentity {
+                                        attempt_id: attempt.attempt_id.clone(),
+                                        reviewer_thread_id: attempt.reviewer_thread_id.clone(),
+                                        reviewer_turn_id: attempt.reviewer_turn_id.clone(),
+                                        target_task_id: attempt.target_task_id.clone(),
+                                        target_task_revision: attempt.target_task_revision,
+                                        target_artifact_ref: attempt.target_artifact_ref.clone(),
+                                        status: attempt.status,
+                                        attempt_sha256,
+                                        terminal_source_sha256,
+                                    },
+                                ))
+                            })
+                            .collect();
+                        let version = restored_snapshot_version.unwrap_or_default();
+                        let legacy_review_bindings = contract
+                            .units
+                            .iter()
+                            .filter_map(|unit| {
+                                persisted_legacy_review_binding(contract.contract_revision, unit)
+                            })
+                            .collect();
+                        crate::state::CompletionSnapshotReceipt {
+                            version,
+                            sha256,
+                            root_task_id: root.clone(),
+                            review_attempts,
+                            legacy_review_bindings,
+                        }
+                    });
                 state.rencrow_completion_state = Some((root, contract));
             }
             self.revalidate_collected_completion_reviews().await;
@@ -954,7 +2337,6 @@ mod tests {
     use codex_history::task_context::CompletionUnit;
     use codex_history::task_context::UnitStatus;
     use pretty_assertions::assert_eq;
-    use std::future::Future;
     use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
 
@@ -969,17 +2351,15 @@ mod tests {
             "completion_persistence_boundary_fixture"
         }
 
-        fn run(
+        async fn run(
             self: Arc<Self>,
             _session: Arc<Session>,
             _ctx: Arc<TurnContext>,
             _input: Vec<crate::session::input_queue::TurnInput>,
             cancellation_token: CancellationToken,
-        ) -> impl Future<Output = SessionTaskResult> + Send {
-            async move {
-                cancellation_token.cancelled().await;
-                Err(codex_protocol::error::CodexErr::TurnAborted)
-            }
+        ) -> SessionTaskResult {
+            cancellation_token.cancelled().await;
+            Err(codex_protocol::error::CodexErr::TurnAborted)
         }
     }
 
@@ -1135,6 +2515,8 @@ mod tests {
                 review_evidence: None,
                 review_launch: None,
                 review_decision_reason: None,
+                review_state: None,
+                review_revalidation_of: None,
             }],
             current_unit: Some("unit-1".into()),
             failed_approaches: Vec::new(),

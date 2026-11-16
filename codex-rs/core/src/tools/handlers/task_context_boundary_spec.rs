@@ -161,6 +161,12 @@ pub(crate) fn create_task_context_boundary_tool(autonomous_completion: bool) -> 
                                 ),
                             ),
                             (
+                                "review_revalidation_of".into(),
+                                JsonSchema::string(Some(
+                                    "On an explicit update, name the exact previously adopted Done review unit whose current artifact acceptance must be revalidated. The host validates the one-to-one relation; same-target reviews are independent unless this field names the source unit.".into(),
+                                )),
+                            ),
+                            (
                                 "review_decision_reason".into(),
                                 JsonSchema::string(Some("Parent-authored reason for adopting the collected review.".into())),
                             ),
@@ -327,6 +333,17 @@ pub(crate) fn create_task_context_boundary_tool(autonomous_completion: bool) -> 
                 "Review unit ID returned by the host review operation.".into(),
             )),
         );
+        properties.insert(
+            "review_retry".into(),
+            JsonSchema::object(
+                BTreeMap::from([
+                    ("unit_id".into(), JsonSchema::string(None)),
+                    ("expected_attempt_id".into(), JsonSchema::string(None)),
+                ]),
+                Some(vec!["unit_id".into(), "expected_attempt_id".into()]),
+                Some(false.into()),
+            ),
+        );
     } else {
         properties.insert(
             "goal".into(),
@@ -389,7 +406,13 @@ pub(crate) fn create_task_context_boundary_tool(autonomous_completion: bool) -> 
             action_shape("status", &["root_task_id"], &["action"]),
             action_shape(
                 "plan_review",
-                &["root_task_id", "previous_plan", "revised_plan", "reason"],
+                &[
+                    "root_task_id",
+                    "previous_plan",
+                    "revised_plan",
+                    "reason",
+                    "review_retry",
+                ],
                 &[
                     "action",
                     "root_task_id",
@@ -403,7 +426,11 @@ pub(crate) fn create_task_context_boundary_tool(autonomous_completion: bool) -> 
                 &["result", "satisfied_conditions"],
                 &["action", "result"],
             ),
-            action_shape("review", &["target_task_id"], &["action", "target_task_id"]),
+            action_shape(
+                "review",
+                &["target_task_id", "unit_id"],
+                &["action", "target_task_id"],
+            ),
             action_shape(
                 "adopt_review",
                 &["unit_id", "reason"],
@@ -415,7 +442,7 @@ pub(crate) fn create_task_context_boundary_tool(autonomous_completion: bool) -> 
     ToolSpec::Function(ResponsesApiTool {
         name: TASK_CONTEXT_BOUNDARY_TOOL_NAME.to_string(),
         description: if autonomous_completion {
-            "Workflow: register the root with completion_state initially and when changing the plan. For execution units only: begin the task, perform work, run checks with exec task_evidence, then accept and confirm the host checkpoint committed. For review, after an execution task is accepted, call review(target_task_id); the host resolves its accepted latest revision and review unit, applies the read-only reviewer route, and spawns and binds the reviewer. Wait for that child result, then call adopt_review(unit_id, reason) to record whether to adopt the review. Do not resend completion_state for review. Use status to retrieve host facts. Once all canonical conditions and required units are complete and no unresolved work or uncollected children remain, give the final report with evidence references; no additional root check or root accept is required. Receipt hashes, task board, goal, decisions, constraints, and timestamps are host-generated. Actions: begin(root_task_id, task_id, task_revision[, completion_state]); update(root_task_id, completion_state); status([root_task_id]); plan_review(root_task_id, previous_plan, revised_plan, reason); accept(result[, satisfied_conditions]); review(target_task_id); adopt_review(unit_id, reason)."
+            "Workflow: register the root with completion_state initially and when changing the plan. For execution units only: begin the task, perform work, run checks with exec task_evidence, then accept and confirm the host checkpoint committed. For review, after an execution task is accepted, call review(target_task_id[, unit_id]); the host resolves its accepted latest revision and exact review obligation, applies the read-only reviewer route, and persists a reservation before spawning. Wait for that child result, then call adopt_review(unit_id, reason) to record whether to adopt the review. To retry an exact failed attempt, first call plan_review with review_retry containing the review unit_id and expected_attempt_id; then call review for that same unit. Use update to explicitly withdraw only a never-launched planned review that the host can validate; an attempt with a spawn or unknown outcome cannot be withdrawn. When changed artifact bytes invalidate a previously adopted review, add a new planned review with review_revalidation_of naming that exact adopted unit in the update; the host binds the relationship and the new review must be adopted before the current obligation is complete. Same-target reviews remain independent unless this exact relation is provided. Do not resend host review evidence. Use status to retrieve host facts. Once all canonical conditions and required review obligations are complete and no unresolved work or uncollected children remain, give the final report with evidence references; no additional root check or root accept is required. Receipt hashes, task board, goal, decisions, constraints, and timestamps are host-generated. Actions: begin(root_task_id, task_id, task_revision[, completion_state]); update(root_task_id, completion_state); status([root_task_id]); plan_review(root_task_id, previous_plan, revised_plan, reason[, review_retry]); accept(result[, satisfied_conditions]); review(target_task_id[, unit_id]); adopt_review(unit_id, reason)."
         } else {
             "Begin an execution scope or prepare acceptance after host verification."
         }

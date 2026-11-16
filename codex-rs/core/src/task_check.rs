@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-16: compile test helpers only for tests.
 //! Host-owned receipts for task-scoped verification commands.
 use serde::Deserialize;
 use serde::Serialize;
@@ -336,6 +337,7 @@ impl TaskCheckLedger {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn begin(
         &mut self,
         call_id: String,

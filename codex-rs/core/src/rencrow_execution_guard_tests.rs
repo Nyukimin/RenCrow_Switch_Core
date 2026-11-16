@@ -1,7 +1,10 @@
 // Modified by RenCrow: native progress/receipt regression tests.
 use super::*;
 use pretty_assertions::assert_eq;
+use std::future::Future;
 use std::num::NonZeroU16;
+use std::task::Context;
+use std::task::Poll;
 
 #[test]
 fn repeated_read_is_blocked_until_real_progress() {
@@ -208,6 +211,220 @@ fn repeated_budget_refusals_have_a_finite_host_stop_threshold() {
     assert!(!state.record_budget_rejection());
     assert!(!state.record_budget_rejection());
     assert!(state.record_budget_rejection());
+}
+
+async fn exec_guard_invocation(
+    command: &str,
+    policy: RencrowExecutionGuard,
+    task_evidence: Option<serde_json::Value>,
+) -> ToolInvocation {
+    let (session, mut turn) = crate::session::tests::make_session_and_context().await;
+    std::sync::Arc::make_mut(&mut turn.config).rencrow_execution_guard = Some(policy);
+    std::sync::Arc::make_mut(&mut turn.config).rencrow_autonomous_completion = true;
+    let turn = std::sync::Arc::new(turn);
+    let session = std::sync::Arc::new(session);
+    *session.active_turn.lock().await = Some(crate::state::ActiveTurn::default());
+
+    let mut arguments = serde_json::json!({"cmd": command});
+    if let Some(task_evidence) = task_evidence {
+        arguments["task_evidence"] = task_evidence;
+    }
+    ToolInvocation {
+        session,
+        step_context: crate::session::step_context::StepContext::for_test(std::sync::Arc::clone(
+            &turn,
+        )),
+        turn,
+        cancellation_token: tokio_util::sync::CancellationToken::new(),
+        tracker: std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::turn_diff_tracker::TurnDiffTracker::new(),
+        )),
+        call_id: "guard-check".into(),
+        tool_name: codex_tools::ToolName::plain("exec_command"),
+        source: crate::tools::context::ToolCallSource::Direct,
+        payload: ToolPayload::Function {
+            arguments: arguments.to_string(),
+        },
+    }
+}
+
+fn task_evidence_request() -> serde_json::Value {
+    serde_json::json!({
+        "task_id": "unit-1",
+        "task_revision": 1,
+        "artifact_paths": ["Cargo.toml"],
+        "check_kind": "verification"
+    })
+}
+
+fn scope_for_guard_test() -> crate::state::ActiveTaskScope {
+    crate::state::ActiveTaskScope {
+        root_task_id: "root".into(),
+        task_id: "unit-1".into(),
+        task_revision: 1,
+        begin_call_id: "begin-1".into(),
+        start_history_cursor: 0,
+    }
+}
+
+#[tokio::test]
+async fn rejected_read_check_and_shell_edit_do_not_wait_for_or_register_scope_checks() {
+    let command = "python3 -m unittest -c 'os.walk(\".\")'";
+    let policy = RencrowExecutionGuard {
+        max_repeated_reads: NonZeroU16::new(/*n*/ 1).unwrap(),
+        require_edit: true,
+        ..Default::default()
+    };
+    let invocation = exec_guard_invocation(command, policy, Some(task_evidence_request())).await;
+    assert!(read_only(command), "fixture must enter the read path");
+    assert!(check_command(command), "fixture must enter the check path");
+    let turn_state = {
+        let active = invocation.session.active_turn.lock().await;
+        std::sync::Arc::clone(&active.as_ref().expect("fixture has active turn").turn_state)
+    };
+    let mut context = Context::from_waker(futures::task::noop_waker_ref());
+    let ((result, no_started_check), scope_needs_rebase) =
+        crate::session::tests::with_locked_task_scope_for_execution_guard_test(
+            &invocation.session,
+            scope_for_guard_test(),
+            /*needs_rebase*/ true,
+            || {
+                let repeated_key = format!("{:?}:null:{}", invocation.turn.config.cwd, command);
+                {
+                    let mut turn = turn_state
+                        .try_lock()
+                        .expect("turn state is free before the guarded call");
+                    turn.rencrow_execution_guard
+                        .repeated
+                        .insert(repeated_key, 1);
+                }
+
+                let mut rejected_check = Box::pin(before_tool(&invocation));
+                let result = Future::poll(rejected_check.as_mut(), &mut context);
+                let no_started_check = turn_state
+                    .try_lock()
+                    .expect("synchronous rejection released turn state")
+                    .rencrow_execution_guard
+                    .started_checks
+                    .is_empty();
+                (result, no_started_check)
+            },
+        )
+        .await;
+    let Poll::Ready(Err(FunctionCallError::RespondToModel(message))) = result else {
+        panic!("the exhausted read budget must reject synchronously before scope preparation");
+    };
+    assert!(message.contains("same read command repeated"));
+    assert!(scope_needs_rebase);
+    assert!(no_started_check);
+
+    let edit_command = "python3 -m unittest -c 'open(\"x\",\"w\")'";
+    assert!(
+        check_command(edit_command),
+        "fixture must enter the check path"
+    );
+    assert!(
+        crate::rencrow_shell_edit_guard::is_obvious_shell_edit(edit_command),
+        "fixture must enter the shell-edit rejection path"
+    );
+    let invocation = exec_guard_invocation(
+        edit_command,
+        RencrowExecutionGuard {
+            task_kind: Some(RencrowTaskKind::Implement),
+            ..Default::default()
+        },
+        Some(task_evidence_request()),
+    )
+    .await;
+    let turn_state = {
+        let active = invocation.session.active_turn.lock().await;
+        std::sync::Arc::clone(&active.as_ref().expect("fixture has active turn").turn_state)
+    };
+    let ((result, no_started_check), scope_needs_rebase) =
+        crate::session::tests::with_locked_task_scope_for_execution_guard_test(
+            &invocation.session,
+            scope_for_guard_test(),
+            /*needs_rebase*/ true,
+            || {
+                let mut rejected_edit = Box::pin(before_tool(&invocation));
+                let result = Future::poll(rejected_edit.as_mut(), &mut context);
+                let no_started_check = turn_state
+                    .try_lock()
+                    .expect("synchronous rejection released turn state")
+                    .rencrow_execution_guard
+                    .started_checks
+                    .is_empty();
+                (result, no_started_check)
+            },
+        )
+        .await;
+    let Poll::Ready(Err(FunctionCallError::RespondToModel(message))) = result else {
+        panic!("shell-edit rejection must happen before scope preparation");
+    };
+    assert_eq!(
+        message,
+        crate::rencrow_shell_edit_guard::EDIT_METHOD_REQUIRED
+    );
+    assert!(scope_needs_rebase);
+    assert!(no_started_check);
+}
+
+#[tokio::test]
+async fn check_scope_wait_records_commit_time_stamp_and_charges_read_once() {
+    let command = "python3 -m unittest -c 'os.walk(\".\")'";
+    let invocation = exec_guard_invocation(
+        command,
+        RencrowExecutionGuard {
+            max_repeated_reads: NonZeroU16::new(/*n*/ 2).unwrap(),
+            ..Default::default()
+        },
+        Some(task_evidence_request()),
+    )
+    .await;
+    let turn_state = {
+        let active = invocation.session.active_turn.lock().await;
+        std::sync::Arc::clone(&active.as_ref().expect("fixture has active turn").turn_state)
+    };
+    let mut checking = Box::pin(before_tool(&invocation));
+    let mut context = Context::from_waker(futures::task::noop_waker_ref());
+    let ((commit_stamp, charged_key), scope_needs_rebase) =
+        crate::session::tests::with_locked_task_scope_for_execution_guard_test(
+            &invocation.session,
+            scope_for_guard_test(),
+            /*needs_rebase*/ false,
+            || {
+                assert!(Future::poll(checking.as_mut(), &mut context).is_pending());
+                let mut turn = turn_state
+                    .try_lock()
+                    .expect("scope wait released turn state");
+                turn.rencrow_execution_guard
+                    .observe_diff(Some("diff changed during scope preparation"));
+                (
+                    turn.rencrow_execution_guard.check_stamp(),
+                    format!("{:?}:null:{}", invocation.turn.config.cwd, command),
+                )
+            },
+        )
+        .await;
+    assert!(!scope_needs_rebase);
+
+    checking
+        .await
+        .expect("check passes guard after scope resolves");
+    let turn = turn_state.lock().await;
+    assert_eq!(
+        turn.rencrow_execution_guard
+            .started_checks
+            .get(&invocation.call_id)
+            .map(|(_, stamp)| *stamp),
+        Some(commit_stamp),
+        "check receipt uses the stamp current when registration commits"
+    );
+    assert_eq!(
+        turn.rencrow_execution_guard.repeated.get(&charged_key),
+        Some(&1),
+        "scope preparation does not charge the read budget twice"
+    );
 }
 
 #[test]
@@ -509,8 +726,10 @@ fn child_evidence_requires_a_diff_and_passing_check_for_implementation_turns() {
         task_kind: Some(RencrowTaskKind::Verify),
         ..Default::default()
     };
-    let mut state = GuardState::default();
-    state.checked = true;
+    let mut state = GuardState {
+        checked: true,
+        ..Default::default()
+    };
     assert!(child_execution_evidence_eligible(
         &orchestrate,
         &state,
@@ -626,8 +845,10 @@ fn child_receipt_invalidates_parent_checks_started_before_acceptance() {
 
 #[test]
 fn a_new_child_receipt_applies_budget_progress_once() {
-    let mut state = GuardState::default();
-    state.budget_rejections = 2;
+    let mut state = GuardState {
+        budget_rejections: 2,
+        ..Default::default()
+    };
     state.repeated.insert("same read".into(), 2);
     state.record_child_progress();
     assert!(state.repeated.is_empty());
@@ -840,7 +1061,7 @@ fn corrected_environment_resolves_only_a_proven_cargo_launch_failure() {
     let stamp = state.check_stamp();
     state
         .check_identities
-        .insert(initial_key.clone(), initial_identity.clone());
+        .insert(initial_key.clone(), initial_identity);
     state.finish_check_observed(
         &initial_key,
         stamp,
@@ -884,7 +1105,7 @@ fn equivalent_command_identity_resolves_formatting_variants_but_keeps_environmen
     let passed_key = format!("raw:{with_cd}");
     state
         .check_identities
-        .insert(failed_key.clone(), plain_identity.clone());
+        .insert(failed_key.clone(), plain_identity);
     state.finish_check_observed(&failed_key, stamp, 1, "test failed", false);
     let mut different_environment = with_cd_identity;
     different_environment

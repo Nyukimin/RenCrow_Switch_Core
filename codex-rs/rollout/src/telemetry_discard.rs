@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-16.
 use serde::Deserialize;
 use serde::Deserializer;
 use serde::de::DeserializeSeed;
@@ -53,20 +54,18 @@ pub(crate) fn inspect_line(line: &str) -> LineInspection {
     let parsed = deserializer.deserialize_map(RootVisitor {
         state: Rc::clone(&state),
     });
-    let state = Rc::try_unwrap(state)
-        .expect("rollout discriminator parser should release its state")
-        .into_inner();
+    let state_ref = state.borrow();
 
     match parsed {
         Ok(value) => match deserializer.end() {
             Ok(()) => {
-                if state.ambiguous_discriminator || state.ambiguous_header {
+                if state_ref.ambiguous_discriminator || state_ref.ambiguous_header {
                     return LineInspection::Invalid {
                         reason: "ambiguous duplicate discriminator".to_string(),
                     };
                 }
                 LineInspection::Parsed {
-                    telemetry: telemetry_kind(&state),
+                    telemetry: telemetry_kind(&state_ref),
                     value,
                 }
             }
@@ -75,7 +74,7 @@ pub(crate) fn inspect_line(line: &str) -> LineInspection {
             },
         },
         Err(error) if error.classify() == Category::Eof => {
-            if let Some(kind) = truncated_telemetry_kind(&state) {
+            if let Some(kind) = truncated_telemetry_kind(&state_ref) {
                 LineInspection::Discard {
                     kind,
                     reason: "truncated telemetry body",

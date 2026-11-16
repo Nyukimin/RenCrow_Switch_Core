@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-16.
 use super::*;
 
 #[test]
@@ -359,8 +360,8 @@ fn task_check_obligation_identity_ignores_history_cursor_but_keeps_execution_sco
     };
     assert_ne!(first.key(), another_artifact_set.key());
     let another_target = TaskCheckObligation::new(
-        scope.clone(),
-        cwd.clone(),
+        scope,
+        cwd,
         "python3 -m unittest -v tests.other",
         vec!["result.txt".into(), "other.txt".into()],
     )
@@ -453,7 +454,7 @@ fn changed_artifacts_remain_unresolved_after_later_success() {
             0,
             true,
             vec![TaskArtifactStamp {
-                path: stamp.path.clone(),
+                path: stamp.path,
                 sha256: "changed".into(),
             }],
         )
@@ -658,7 +659,7 @@ fn latest_attempt_follows_start_order_when_checks_finish_out_of_order() {
     ledger.begin_with_obligation(
         "newer".into(),
         request_for(6, &stamp.path),
-        cwd.clone(),
+        cwd,
         vec![stamp.clone()],
         Some(obligation),
     );
@@ -693,7 +694,7 @@ fn initial_yield_does_not_complete_pending_evidence() {
             artifact_paths: vec![stamp.path.clone()],
             check_kind: TaskCheckKind::Verification,
         },
-        workspace_root.clone(),
+        workspace_root,
         vec![stamp],
     );
     assert!(matches!(

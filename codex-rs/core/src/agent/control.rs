@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-16.
 use crate::TurnInputRequest;
 use crate::TurnInputSubmission;
 use crate::TurnStartOptions;
@@ -88,6 +89,17 @@ mod user_authorization;
 
 const MAX_ENVIRONMENT_SUBAGENTS: usize = 8;
 const MAX_ENVIRONMENT_SUBAGENT_BYTES: usize = 1_024;
+
+/// The outcome preserves whether send_input is protocol-confirmed, rejected before submission,
+/// or has an unknown outcome.
+pub(crate) enum SendInputSubmissionOutcome {
+    /// The thread input API returned a submission outcome.
+    Protocol(TurnInputSubmission),
+    /// Core established that it rejected the request before applying it.
+    RejectedBeforeSubmission(CodexErr),
+    /// An error followed the submission attempt, so acceptance cannot be ruled out.
+    OutcomeUnknown(CodexErr),
+}
 
 /// Control-plane handle for multi-agent operations.
 /// `LocalAgentControl` is held by each session (via `SessionServices`). It provides capability to
@@ -191,28 +203,59 @@ impl LocalAgentControl {
         input: Vec<UserInput>,
         start_options: TurnStartOptions,
     ) -> CodexResult<String> {
-        let state = self.upgrade()?;
-        let thread = state.get_thread(agent_id).await?;
-        self.ensure_completion_review_input_allowed(&thread).await?;
-        let result = match thread
-            .start_or_steer_turn(TurnInputRequest::user_input(input).on_start(start_options))
+        match self
+            .send_input_submission(agent_id, input, start_options)
             .await
         {
-            Ok(TurnInputSubmission::Started { turn_id }) => Ok(turn_id),
-            Ok(TurnInputSubmission::Steered { .. }) => {
+            SendInputSubmissionOutcome::Protocol(TurnInputSubmission::Started { turn_id }) => {
+                Ok(turn_id)
+            }
+            SendInputSubmissionOutcome::Protocol(TurnInputSubmission::Steered { .. }) => {
                 // MAv1 exposes an opaque `submission_id` to the model. The legacy
                 // `Op::UserInput` path returned a fresh ID for every steer, while the
                 // turn-input API returns the active turn ID. Keep the tool-visible ID
                 // unique without adding a submission receipt back to Core.
                 Ok(Uuid::now_v7().to_string())
             }
-            Ok(TurnInputSubmission::NotSubmitted { reason }) => Err(CodexErr::InvalidRequest(
-                format!("turn input was not submitted: {reason:?}"),
-            )),
-            Err(err) => Err(err),
+            SendInputSubmissionOutcome::Protocol(TurnInputSubmission::NotSubmitted { reason }) => {
+                Err(CodexErr::InvalidRequest(format!(
+                    "turn input was not submitted: {reason:?}"
+                )))
+            }
+            SendInputSubmissionOutcome::RejectedBeforeSubmission(error)
+            | SendInputSubmissionOutcome::OutcomeUnknown(error) => Err(error),
+        }
+    }
+
+    /// Retain the protocol distinction between an exact started turn and an opaque steer
+    /// submission for host workflows that must bind a new execution generation.
+    pub(crate) async fn send_input_submission(
+        &self,
+        agent_id: ThreadId,
+        input: Vec<UserInput>,
+        start_options: TurnStartOptions,
+    ) -> SendInputSubmissionOutcome {
+        let state = match self.upgrade() {
+            Ok(state) => state,
+            Err(error) => return SendInputSubmissionOutcome::RejectedBeforeSubmission(error),
         };
-        self.handle_thread_request_result(agent_id, &state, result)
+        let thread = match state.get_thread(agent_id).await {
+            Ok(thread) => thread,
+            Err(error) => return SendInputSubmissionOutcome::RejectedBeforeSubmission(error),
+        };
+        if let Err(error) = self.ensure_completion_review_input_allowed(&thread).await {
+            return SendInputSubmissionOutcome::RejectedBeforeSubmission(error);
+        }
+        let raw_result = thread
+            .start_or_steer_turn(TurnInputRequest::user_input(input).on_start(start_options))
+            .await;
+        match self
+            .handle_thread_request_result(agent_id, &state, raw_result)
             .await
+        {
+            Ok(submission) => SendInputSubmissionOutcome::Protocol(submission),
+            Err(error) => SendInputSubmissionOutcome::OutcomeUnknown(error),
+        }
     }
 
     pub(crate) async fn send_inter_agent_communication(
@@ -371,12 +414,12 @@ impl LocalAgentControl {
         .await
     }
 
-    async fn handle_thread_request_result(
+    async fn handle_thread_request_result<T>(
         &self,
         agent_id: ThreadId,
         state: &Arc<ThreadManagerState>,
-        result: CodexResult<String>,
-    ) -> CodexResult<String> {
+        result: CodexResult<T>,
+    ) -> CodexResult<T> {
         if result
             .as_ref()
             .is_err_and(|err| matches!(err.details(), CodexErrorDetails::InternalAgentDied))

@@ -36,6 +36,38 @@ use codex_utils_output_truncation::TruncationPolicy;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CompletionSnapshotReceipt {
+    pub(crate) version: u32,
+    pub(crate) sha256: String,
+    pub(crate) root_task_id: String,
+    pub(crate) review_attempts: HashMap<String, PersistedReviewAttemptIdentity>,
+    pub(crate) legacy_review_bindings: HashMap<String, PersistedLegacyReviewBinding>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PersistedLegacyReviewBinding {
+    pub(crate) contract_revision: u64,
+    pub(crate) status: codex_history::task_context::UnitStatus,
+    pub(crate) review_target: Option<codex_history::task_context::CompletionReviewTarget>,
+    pub(crate) condition_refs: Vec<String>,
+    pub(crate) depends_on: Vec<String>,
+    pub(crate) evidence: Option<codex_history::task_context::CompletionReviewEvidence>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PersistedReviewAttemptIdentity {
+    pub(crate) attempt_id: String,
+    pub(crate) reviewer_thread_id: Option<String>,
+    pub(crate) reviewer_turn_id: Option<String>,
+    pub(crate) target_task_id: String,
+    pub(crate) target_task_revision: u64,
+    pub(crate) target_artifact_ref: String,
+    pub(crate) status: codex_history::task_context::CompletionReviewAttemptStatus,
+    pub(crate) attempt_sha256: String,
+    pub(crate) terminal_source_sha256: Option<String>,
+}
+
 /// Runtime request effort, initially unset and established by prewarm or sampling.
 /// Successful compaction allows a fresh baseline without an override.
 pub(crate) enum ReasoningEffortPin {
@@ -126,6 +158,10 @@ pub(crate) struct SessionState {
     pub(crate) rencrow_completion_paused: bool,
     /// Serializes durable completion snapshots without holding session state across storage I/O.
     pub(crate) rencrow_completion_persist_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    /// Serializes review grant, canonical-state mutation, persistence, and spawn permission.
+    pub(crate) rencrow_completion_review_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    /// Receipt created only after the exact snapshot append succeeds.
+    pub(crate) rencrow_completion_last_persisted_snapshot: Option<CompletionSnapshotReceipt>,
     pub(crate) rencrow_completion_continued_for_turn: Option<String>,
     /// Host-marked internal continuation turns, distinct from user-submitted turns.
     pub(crate) rencrow_autonomous_turn_ids: HashSet<String>,
@@ -236,6 +272,8 @@ impl SessionState {
             rencrow_completion_state: None,
             rencrow_completion_paused: false,
             rencrow_completion_persist_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            rencrow_completion_review_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            rencrow_completion_last_persisted_snapshot: None,
             rencrow_completion_continued_for_turn: None,
             rencrow_autonomous_turn_ids: HashSet::new(),
             rencrow_completion_bootstrap_turn_ids: HashSet::new(),

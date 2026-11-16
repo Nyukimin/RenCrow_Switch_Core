@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-16.
 use super::*;
 use crate::agent::child_config::build_agent_resume_config;
 use crate::agent::child_dispatch::ChildDispatchKind;
@@ -6,6 +7,7 @@ use crate::agent::control::render_input_preview;
 use crate::tools::handlers::multi_agents_spec::create_send_input_tool_v1;
 use codex_features::Feature;
 use codex_tools::ToolSpec;
+use uuid::Uuid;
 
 pub(crate) struct Handler;
 
@@ -83,13 +85,27 @@ impl Handler {
                 .map_err(|err| collab_agent_error(receiver_thread_id, err))?;
         }
         let receiver_agent = receiver_agent.unwrap_or_default();
-        if args.interrupt {
-            session
+        let followup_preparation = session
+            .prepare_completion_review_followup(receiver_thread_id, &call_id)
+            .await
+            .map_err(FunctionCallError::RespondToModel)?;
+        if args.interrupt
+            && let Err(error) = session
                 .services
                 .agent_control
                 .interrupt_agent(receiver_thread_id)
                 .await
-                .map_err(|err| collab_agent_error(receiver_thread_id, err))?;
+        {
+            if let Some(preparation) = followup_preparation {
+                session
+                    .record_completion_review_followup_opaque_or_ambiguous(
+                        preparation,
+                        format!("interrupt request failed before follow-up input: {error}"),
+                    )
+                    .await
+                    .map_err(FunctionCallError::RespondToModel)?;
+            }
+            return Err(collab_agent_error(receiver_thread_id, error));
         }
         session
             .emit_turn_item_started(
@@ -110,7 +126,7 @@ impl Handler {
             .await;
         let agent_control = session.services.agent_control.clone();
         let result = agent_control
-            .send_input(
+            .send_input_submission(
                 receiver_thread_id,
                 input_items,
                 crate::TurnStartOptions {
@@ -121,8 +137,7 @@ impl Handler {
                     ..Default::default()
                 },
             )
-            .await
-            .map_err(|err| collab_agent_error(receiver_thread_id, err));
+            .await;
         let status = session
             .services
             .agent_control
@@ -149,8 +164,78 @@ impl Handler {
                 }),
             )
             .await;
-        let submission_id = result?;
+        let submission = match result {
+            crate::agent::control::SendInputSubmissionOutcome::Protocol(submission) => submission,
+            crate::agent::control::SendInputSubmissionOutcome::RejectedBeforeSubmission(error) => {
+                if let Some(preparation) = followup_preparation {
+                    session
+                        .cancel_completion_review_followup_not_submitted(preparation)
+                        .await
+                        .map_err(FunctionCallError::RespondToModel)?;
+                }
+                return Err(collab_agent_error(receiver_thread_id, error));
+            }
+            crate::agent::control::SendInputSubmissionOutcome::OutcomeUnknown(error) => {
+                if let Some(preparation) = followup_preparation {
+                    session
+                        .record_completion_review_followup_opaque_or_ambiguous(
+                            preparation,
+                            format!("send_input returned an ambiguous error: {error}"),
+                        )
+                        .await
+                        .map_err(FunctionCallError::RespondToModel)?;
+                }
+                return Err(collab_agent_error(receiver_thread_id, error));
+            }
+        };
+        let submission_id = match submission {
+            crate::TurnInputSubmission::Started { turn_id } => {
+                if let Some(preparation) = followup_preparation
+                    && let Err(error) = session
+                        .record_completion_review_followup_started(
+                            preparation.clone(),
+                            turn_id.clone(),
+                        )
+                        .await
+                {
+                    session
+                        .record_completion_review_followup_opaque_or_ambiguous(
+                            preparation,
+                            format!("exact Started turn could not be bound: {error}"),
+                        )
+                        .await
+                        .map_err(FunctionCallError::RespondToModel)?;
+                    return Err(FunctionCallError::RespondToModel(format!(
+                        "reviewer started turn {turn_id}, but its exact generation could not be persisted: {error}; do not submit the input again"
+                    )));
+                }
+                turn_id
+            }
+            crate::TurnInputSubmission::Steered { turn_id } => {
+                if let Some(preparation) = followup_preparation {
+                    session
+                        .record_completion_review_followup_opaque_or_ambiguous(
+                            preparation,
+                            format!("send_input steered active turn {turn_id} without starting a new generation"),
+                        )
+                        .await
+                        .map_err(FunctionCallError::RespondToModel)?;
+                }
 
+                Uuid::now_v7().to_string()
+            }
+            crate::TurnInputSubmission::NotSubmitted { reason } => {
+                if let Some(preparation) = followup_preparation {
+                    session
+                        .cancel_completion_review_followup_not_submitted(preparation)
+                        .await
+                        .map_err(FunctionCallError::RespondToModel)?;
+                }
+                return Err(FunctionCallError::RespondToModel(format!(
+                    "turn input was not submitted: {reason:?}"
+                )));
+            }
+        };
         Ok(boxed_tool_output(SendInputResult { submission_id }))
     }
 }

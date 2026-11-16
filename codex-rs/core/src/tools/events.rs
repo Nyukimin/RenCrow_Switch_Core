@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-16.
 use crate::function_tool::FunctionCallError;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
@@ -374,16 +375,16 @@ impl ToolEmitter {
             ) => {
                 emit_exec_stage(
                     ctx,
-                    ExecCommandInput::new(
+                    ExecCommandInput {
                         command,
                         cwd,
                         parsed_cmd,
-                        *source,
-                        /*interaction_input*/ None,
-                        process_id.as_deref(),
-                        plugin_attribution.as_ref(),
-                        task_evidence.as_deref(),
-                    ),
+                        source: *source,
+                        interaction_input: None,
+                        process_id: process_id.as_deref(),
+                        plugin_attribution: plugin_attribution.as_ref(),
+                        task_evidence: task_evidence.as_deref(),
+                    },
                     stage,
                 )
                 .await;
@@ -496,30 +497,6 @@ struct ExecCommandInput<'a> {
     process_id: Option<&'a str>,
     plugin_attribution: Option<&'a PluginCommandAttribution>,
     task_evidence: Option<&'a crate::task_check::TaskCheckExecution>,
-}
-
-impl<'a> ExecCommandInput<'a> {
-    fn new(
-        command: &'a [String],
-        cwd: &'a PathUri,
-        parsed_cmd: &'a [ParsedCommand],
-        source: ExecCommandSource,
-        interaction_input: Option<&'a str>,
-        process_id: Option<&'a str>,
-        plugin_attribution: Option<&'a PluginCommandAttribution>,
-        task_evidence: Option<&'a crate::task_check::TaskCheckExecution>,
-    ) -> Self {
-        Self {
-            command,
-            cwd,
-            parsed_cmd,
-            source,
-            interaction_input,
-            process_id,
-            plugin_attribution,
-            task_evidence,
-        }
-    }
 }
 
 struct ExecCommandResult {

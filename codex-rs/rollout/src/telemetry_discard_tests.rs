@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-16.
 use super::LineInspection;
 use super::TelemetryKind;
 use super::inspect_line;
@@ -25,7 +26,9 @@ fn telemetry_body_preserves_decimal_and_large_numbers() {
     let Ok(expected_number) = serde_json::from_str::<serde_json::Value>(large_number) else {
         return;
     };
-    if expected_number.to_string() != large_number {
+    let serialized_number =
+        serde_json::to_string(&expected_number).expect("parsed JSON number must serialize");
+    if serialized_number != large_number {
         return;
     }
     let raw = format!(

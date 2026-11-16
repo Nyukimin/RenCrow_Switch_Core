@@ -1,3 +1,4 @@
+//! Modified by RenCrow on 2026-11-16: exercise native reviewer recovery against real tool flows.
 //! Autonomous completion claims bind to real accepted task receipts and reopen when stale.
 use anyhow::Result;
 use codex_config::RencrowExecutionGuard;
@@ -15,7 +16,9 @@ use core_test_support::responses::ev_function_call_with_namespace;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_once_match;
 use core_test_support::responses::mount_sse_sequence;
+use core_test_support::responses::mount_sse_sequence_match;
 use core_test_support::responses::sse;
+use core_test_support::responses::sse_failed;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::test_codex;
@@ -34,8 +37,108 @@ fn function_response(call_id: &str, name: &str, args: &Value) -> String {
     ])
 }
 
-fn request_contains_text(request: &wiremock::Request, text: &str) -> bool {
-    String::from_utf8_lossy(&request.body).contains(text)
+async fn mount_function_turn(
+    server: &wiremock::MockServer,
+    parent_thread_id: &str,
+    call_id: &str,
+    name: &str,
+    args: &Value,
+    message: &str,
+) {
+    mount_parent_sse_sequence(
+        server,
+        parent_thread_id,
+        vec![
+            function_response(call_id, name, args),
+            sse(vec![
+                ev_response_created(&format!("{call_id}-finished")),
+                ev_assistant_message(&format!("{call_id}-message"), message),
+                ev_completed(&format!("{call_id}-finished")),
+            ]),
+        ],
+    )
+    .await;
+}
+
+async fn mount_multi_agent_turn(
+    server: &wiremock::MockServer,
+    parent_thread_id: &str,
+    call_id: &str,
+    tool: &str,
+    args: &Value,
+    message: &str,
+) {
+    mount_parent_sse_sequence(
+        server,
+        parent_thread_id,
+        vec![
+            sse(vec![
+                ev_response_created(&format!("{call_id}-parent")),
+                ev_function_call_with_namespace(call_id, "multi_agent_v1", tool, &args.to_string()),
+                ev_completed(&format!("{call_id}-parent")),
+            ]),
+            sse(vec![
+                ev_response_created(&format!("{call_id}-finished")),
+                ev_assistant_message(&format!("{call_id}-message"), message),
+                ev_completed(&format!("{call_id}-finished")),
+            ]),
+        ],
+    )
+    .await;
+}
+
+struct ParentThreadRequest(String);
+
+impl wiremock::Match for ParentThreadRequest {
+    fn matches(&self, request: &wiremock::Request) -> bool {
+        request
+            .body_json::<Value>()
+            .ok()
+            .and_then(|body| {
+                body["client_metadata"]["thread_id"]
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .as_deref()
+            == Some(self.0.as_str())
+    }
+}
+
+async fn mount_parent_sse_sequence(
+    server: &wiremock::MockServer,
+    parent_thread_id: &str,
+    bodies: Vec<String>,
+) {
+    mount_sse_sequence_match(
+        server,
+        ParentThreadRequest(parent_thread_id.to_string()),
+        bodies,
+    )
+    .await;
+}
+
+fn is_completion_reviewer_request(request: &wiremock::Request, parent_thread_id: &str) -> bool {
+    let Ok(body) = request.body_json::<Value>() else {
+        return false;
+    };
+    let has_reviewer_prompt = body["input"].as_array().is_some_and(|items| {
+        items.iter().any(|item| {
+            item["type"] == "message"
+                && item["role"] == "user"
+                && item["content"].as_array().is_some_and(|content| {
+                    content.iter().any(|part| {
+                        part["type"] == "input_text"
+                            && part["text"]
+                                .as_str()
+                                .is_some_and(|text| text.contains("Host-assigned read-only review"))
+                    })
+                })
+        })
+    });
+    has_reviewer_prompt
+        && body["model"] == REVIEW_MODEL
+        && body["client_metadata"]["thread_id"].as_str() != Some(parent_thread_id)
+        && body["client_metadata"]["x-codex-parent-thread-id"].as_str() == Some(parent_thread_id)
 }
 
 fn open_contract() -> Value {
@@ -102,6 +205,22 @@ fn evidence(task_id: &str) -> Value {
     json!({"task_id":task_id, "task_revision":1})
 }
 
+fn write_artifact_content_test(
+    cwd: &std::path::Path,
+    test_filename: &str,
+    artifact_filename: &str,
+) -> Result<()> {
+    let tests_dir = cwd.join("tests");
+    fs::create_dir_all(&tests_dir)?;
+    fs::write(
+        tests_dir.join(test_filename),
+        format!(
+            "import unittest\nfrom pathlib import Path\n\nclass ArtifactContent(unittest.TestCase):\n    def test_accepted_artifact_content(self):\n        self.assertEqual(Path({artifact_filename:?}).read_text(), \"accepted artifact\\n\")\n"
+        ),
+    )?;
+    Ok(())
+}
+
 fn host_completion_snapshots(path: &std::path::Path) -> Result<Vec<Value>> {
     let rollout = fs::read_to_string(path)?;
     Ok(rollout
@@ -114,6 +233,53 @@ fn host_completion_snapshots(path: &std::path::Path) -> Result<Vec<Value>> {
             _ => None,
         })
         .collect())
+}
+
+fn latest_host_completion_snapshot(path: &std::path::Path) -> Result<Value> {
+    host_completion_snapshots(path)?
+        .into_iter()
+        .rev()
+        .find(|snapshot| snapshot["state"]["units"].is_array())
+        .ok_or_else(|| anyhow::anyhow!("host completion snapshot with units is missing"))
+}
+
+fn completion_unit<'a>(snapshot: &'a Value, id: &str) -> &'a Value {
+    snapshot["state"]["units"]
+        .as_array()
+        .and_then(|units| units.iter().find(|unit| unit["id"] == id))
+        .unwrap_or_else(|| panic!("completion unit {id} is missing"))
+}
+
+async fn assert_persisted_reviewer_identity(
+    codex_home: &std::path::Path,
+    thread_id: &str,
+    turn_id: &str,
+) -> Result<()> {
+    let path =
+        codex_core::find_thread_path_by_id_str(codex_home, thread_id, /*state_db_ctx*/ None)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("reviewer rollout is missing for thread {thread_id}"))?;
+    let rollout = fs::read_to_string(path)?;
+    let mut agent_role = None;
+    let mut context = None;
+    for line in rollout.lines() {
+        let Ok(entry) = codex_rollout::parse_rollout_line(line) else {
+            continue;
+        };
+        match entry.item {
+            RolloutItem::SessionMeta(meta) => agent_role = meta.meta.agent_role,
+            RolloutItem::TurnContext(item) if item.turn_id.as_deref() == Some(turn_id) => {
+                context = Some(item);
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(agent_role.as_deref(), Some(REVIEW_ROLE));
+    assert_eq!(
+        context.expect("reviewer turn context is persisted").model,
+        REVIEW_MODEL
+    );
+    Ok(())
 }
 
 fn tool_output_debug(path: &std::path::Path, target_call_id: &str) -> Result<Option<String>> {
@@ -130,6 +296,23 @@ fn tool_output_debug(path: &std::path::Path, target_call_id: &str) -> Result<Opt
                 ResponseItem::CustomToolCallOutput {
                     call_id, output, ..
                 } if call_id == target_call_id => Some(format!("{output:?}")),
+                _ => None,
+            },
+            _ => None,
+        }))
+}
+
+fn tool_output_text(path: &std::path::Path, target_call_id: &str) -> Result<Option<String>> {
+    Ok(fs::read_to_string(path)?
+        .lines()
+        .filter_map(|line| codex_rollout::parse_rollout_line(line).ok())
+        .find_map(|entry| match entry.item {
+            RolloutItem::ResponseItem(envelope) => match envelope.item {
+                ResponseItem::FunctionCallOutput {
+                    call_id: Some(call_id),
+                    output,
+                    ..
+                } if call_id == target_call_id => output.body.to_text(),
                 _ => None,
             },
             _ => None,
@@ -255,6 +438,17 @@ async fn real_task_receipts_satisfy_then_stale_artifacts_reopen_without_clock_re
     let mut stale_claim = claim("satisfied", vec![evidence_a, evidence_b], "ready");
     stale_claim["next_action"] = "Reverify A after artifact changes".into();
     let mutate_a = json!({"cmd":"printf 'changed after verification\\n' > artifact-a.txt"});
+    let begin_a_reverify =
+        json!({"action":"begin", "root_task_id":"root", "task_id":"task-a", "task_revision":1});
+    let check_a_reverify = json!({"cmd":"python3 -B -m unittest discover -s tests -p test_fixture.py --verbose", "task_evidence":{
+        "task_id":"task-a", "task_revision":1,
+        "artifact_paths":[relative_a, relative_test_fixture, relative_unrelated_test], "check_kind":"verification"
+    }});
+    let accept_a_reverify = json!({
+        "action":"accept", "result":"Task A reverified after its accepted bytes changed",
+        "satisfied_conditions":["AC-1"]
+    });
+    let mutate_a_again = json!({"cmd":"printf 'changed again after reaccept\\n' > artifact-a.txt"});
 
     let responses = mount_sse_sequence(
         &server,
@@ -303,6 +497,18 @@ async fn real_task_receipts_satisfy_then_stale_artifacts_reopen_without_clock_re
             function_response("plan-review", "task_context_boundary", &plan_review),
             function_response("mutate-a", "exec_command", &mutate_a),
             function_response(
+                "begin-a-reverify",
+                "task_context_boundary",
+                &begin_a_reverify,
+            ),
+            function_response("check-a-reverify", "exec_command", &check_a_reverify),
+            function_response(
+                "accept-a-reverify",
+                "task_context_boundary",
+                &accept_a_reverify,
+            ),
+            function_response("mutate-a-again", "exec_command", &mutate_a_again),
+            function_response(
                 "stale-update",
                 "task_context_boundary",
                 &json!({"action":"update", "root_task_id":"root", "completion_state":stale_claim}),
@@ -324,9 +530,25 @@ async fn real_task_receipts_satisfy_then_stale_artifacts_reopen_without_clock_re
         .await?;
     assert_eq!(
         fs::read_to_string(&artifact_a)?,
-        "changed after verification\n"
+        "changed again after reaccept\n"
     );
     let rollout_path = fixture.codex.rollout_path().expect("rollout path");
+    let reverify_begin_output =
+        tool_output_text(&rollout_path, "begin-a-reverify")?.expect("same-task reverify begin");
+    let reverify_check_output =
+        tool_output_text(&rollout_path, "check-a-reverify")?.expect("same-task reverify check");
+    let reverify_accept_output = tool_output_text(&rollout_path, "accept-a-reverify")?
+        .expect("same-task public accept output");
+    assert!(reverify_begin_output.contains("Task scope begun"));
+    assert!(
+        reverify_check_output.contains("Process exited with code 0")
+            && reverify_check_output.contains("OK"),
+        "same-task verification did not return a successful unified-exec result: {reverify_check_output}"
+    );
+    assert!(
+        reverify_accept_output.contains("Task boundary prepared"),
+        "same-task accept did not prepare its host boundary: {reverify_accept_output}"
+    );
     let rejected_accept = tool_output_debug(&rollout_path, "accept-a-rejected")?
         .expect("first acceptance attempt output");
     assert!(
@@ -334,9 +556,39 @@ async fn real_task_receipts_satisfy_then_stale_artifacts_reopen_without_clock_re
         "unrelated success must not resolve the first failure: {rejected_accept}"
     );
     let snapshots = host_completion_snapshots(&rollout_path)?;
+    let evidence_ids = |snapshot: &Value| {
+        let mut ids = snapshot["state"]["conditions"][0]["evidence"]
+            .as_array()
+            .expect("condition evidence array")
+            .iter()
+            .map(|evidence| serde_json::to_string(evidence).unwrap())
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids
+    };
+    let has_initial_receipts = |snapshot: &Value| {
+        snapshot["state"]["conditions"][0]["evidence"]
+            .as_array()
+            .is_some_and(|evidence| {
+                evidence.len() == 2
+                    && evidence.iter().any(|item| {
+                        item["artifact_ref"].as_str().is_some_and(|reference| {
+                            reference.starts_with("task-check:check-a-recovery:")
+                        })
+                    })
+                    && evidence.iter().any(|item| {
+                        item["artifact_ref"]
+                            .as_str()
+                            .is_some_and(|reference| reference.starts_with("task-check:check-b:"))
+                    })
+            })
+    };
     let satisfied_snapshots = snapshots
         .iter()
-        .filter(|snapshot| snapshot["state"]["conditions"][0]["status"] == "satisfied")
+        .filter(|snapshot| {
+            snapshot["state"]["conditions"][0]["status"] == "satisfied"
+                && has_initial_receipts(snapshot)
+        })
         .collect::<Vec<_>>();
     assert!(
         satisfied_snapshots.len() >= 2,
@@ -353,21 +605,84 @@ async fn real_task_receipts_satisfy_then_stale_artifacts_reopen_without_clock_re
         satisfied_snapshots[0]["state"]["units_completed_since_review"], 0,
         "new acceptance progress resets the no-progress review counter"
     );
+    let plan_review_snapshot = snapshots
+        .iter()
+        .find(|snapshot| {
+            snapshot["state"]["plan_reviews"]
+                .as_array()
+                .is_some_and(|reviews| {
+                    reviews
+                        .iter()
+                        .any(|review| review["revised_plan"] == "Reverify A after artifact changes")
+                })
+        })
+        .expect("host snapshot records the exact plan-review event");
+    assert_eq!(
+        plan_review_snapshot["state"]["units_completed_since_review"], 0,
+        "plan review resets the counter in its own persisted event"
+    );
+    let latest_reaccepted = snapshots
+        .iter()
+        .rev()
+        .find(|snapshot| {
+            snapshot["state"]["conditions"][0]["status"] == "satisfied"
+                && snapshot["state"]["conditions"][0]["evidence"]
+                    .as_array()
+                    .is_some_and(|evidence| {
+                        evidence.iter().any(|item| {
+                            item["artifact_ref"].as_str().is_some_and(|reference| {
+                                reference.starts_with("task-check:check-a-reverify:")
+                            })
+                        })
+                    })
+        })
+        .expect("public same-task reaccept persists a fresh satisfied condition");
+    let reaccepted_evidence = &latest_reaccepted["state"]["conditions"][0]["evidence"];
+    let reaccepted_a_evidence = reaccepted_evidence
+        .as_array()
+        .and_then(|evidence| {
+            evidence
+                .iter()
+                .find(|item| item["task_id"] == "task-a" && item["task_revision"] == 1)
+        })
+        .expect("fresh acceptance retains task-a at the same revision");
+    let reaccepted_a_ref = reaccepted_a_evidence["artifact_ref"]
+        .as_str()
+        .expect("reaccepted task-a artifact ref");
+    assert!(reaccepted_a_ref.starts_with("task-check:check-a-reverify:"));
+    let initial_a_ref = satisfied_snapshots
+        .last()
+        .and_then(|snapshot| snapshot["state"]["conditions"][0]["evidence"].as_array())
+        .and_then(|evidence| evidence.iter().find(|item| item["task_id"] == "task-a"))
+        .and_then(|item| item["artifact_ref"].as_str())
+        .expect("prior satisfied state contains the original task-a proof");
+    assert_ne!(
+        reaccepted_a_ref, initial_a_ref,
+        "same-task same-revision accept binds a fresh receipt after the artifact bytes changed"
+    );
+    let initial_a_fingerprint =
+        codex_history::task_context::task_check_artifact_fingerprint(initial_a_ref)
+            .expect("prior accepted task-a receipt has an artifact fingerprint");
+    let reaccepted_a_fingerprint =
+        codex_history::task_context::task_check_artifact_fingerprint(reaccepted_a_ref)
+            .expect("reaccepted task-a receipt has an artifact fingerprint");
+    assert_ne!(
+        initial_a_fingerprint, reaccepted_a_fingerprint,
+        "same task ID and revision have different artifact bytes after reverification"
+    );
+    assert_eq!(
+        latest_reaccepted["state"]["units_completed_since_review"], 1,
+        "the public subtask reaccept increments the post-review counter"
+    );
     let latest = snapshots.last().expect("stale update persisted");
     assert_eq!(latest["state"]["conditions"][0]["status"], "open");
-    let evidence_ids = |snapshot: &Value| {
-        let mut ids = snapshot["state"]["conditions"][0]["evidence"]
-            .as_array()
-            .expect("condition evidence array")
-            .iter()
-            .map(|evidence| serde_json::to_string(evidence).unwrap())
-            .collect::<Vec<_>>();
-        ids.sort();
-        ids
-    };
+    assert_eq!(
+        latest["state"]["units_completed_since_review"], 1,
+        "stale reopening after reaccept preserves the post-review accepted-unit count"
+    );
     assert_eq!(
         evidence_ids(latest),
-        evidence_ids(satisfied_snapshots.last().unwrap()),
+        evidence_ids(latest_reaccepted),
         "stale reopening retains the previous proof set independent of evidence ordering"
     );
     assert!(
@@ -375,13 +690,6 @@ async fn real_task_receipts_satisfy_then_stale_artifacts_reopen_without_clock_re
             .as_str()
             .unwrap()
             .contains("artifact")
-    );
-    let task_unit_completions = latest["state"]["units_completed_since_review"]
-        .as_u64()
-        .unwrap();
-    assert_eq!(
-        task_unit_completions, 0,
-        "plan review resets its own counter"
     );
     let tool_results = fs::read_to_string(&rollout_path)?
         .lines()
@@ -672,7 +980,8 @@ async fn task_evidence_recovery_accept_completes_final_guard() -> Result<()> {
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn planned_review_runs_through_host_spawn_wait_and_adoption() -> Result<()> {
+async fn planned_review_runs_through_host_spawn_wait_same_child_followup_and_adoption() -> Result<()>
+{
     skip_if_no_network!(Ok(()));
     let server = start_mock_server().await;
     let provider_url = format!("{}/v1", server.uri());
@@ -683,6 +992,7 @@ async fn planned_review_runs_through_host_spawn_wait_and_adoption() -> Result<()
             config.rencrow_tool_allowlist = Some(vec![
                 "exec_command".into(),
                 "task_context_boundary".into(),
+                "multi_agent_v1::send_input".into(),
                 "multi_agent_v1::wait_agent".into(),
             ]);
             config.features.enable(Feature::Collab).unwrap();
@@ -706,8 +1016,14 @@ async fn planned_review_runs_through_host_spawn_wait_and_adoption() -> Result<()
         })
         .build(&server)
         .await?;
+    let parent_thread_id = fixture.session_configured.thread_id.to_string();
     let artifact = fixture.cwd_path().join("review-artifact.txt");
     fs::write(&artifact, "accepted artifact\n")?;
+    write_artifact_content_test(
+        fixture.cwd_path(),
+        "test_review_artifact.py",
+        "review-artifact.txt",
+    )?;
     let relative_artifact = artifact
         .strip_prefix(fixture.cwd_path())?
         .to_string_lossy()
@@ -729,8 +1045,9 @@ async fn planned_review_runs_through_host_spawn_wait_and_adoption() -> Result<()
         "current_unit":"task-a", "failed_approaches":[], "blocker":null, "next_action":"Begin task A",
         "product_progress_at":null, "runtime_recovery_at":null, "activity_at":null
     });
-    mount_sse_sequence(
+    mount_parent_sse_sequence(
         &server,
+        &parent_thread_id,
         vec![
             function_response(
                 "review-begin-root",
@@ -745,41 +1062,61 @@ async fn planned_review_runs_through_host_spawn_wait_and_adoption() -> Result<()
         .submit_turn("Register the finite A, review A, B, review B plan.")
         .await?;
 
-    mount_sse_sequence(
+    mount_parent_sse_sequence(
         &server,
+        &parent_thread_id,
         vec![
             function_response("review-begin-a", "task_context_boundary", &json!({"action":"begin","root_task_id":"root","task_id":"task-a","task_revision":1})),
-            function_response("review-check-a", "exec_command", &json!({"cmd":"cat review-artifact.txt","task_evidence":{"task_id":"task-a","task_revision":1,"artifact_paths":[relative_artifact],"check_kind":"verification"}})),
+            function_response("review-check-a", "exec_command", &json!({"cmd":"python3 -B -m unittest discover -s tests -p test_review_artifact.py -v","task_evidence":{"task_id":"task-a","task_revision":1,"artifact_paths":[relative_artifact],"check_kind":"verification"}})),
             function_response("review-accept-a", "task_context_boundary", &json!({"action":"accept","result":"Task A artifact verified","satisfied_conditions":["AC-1"]})),
             sse(vec![ev_response_created("review-a-accepted"), ev_assistant_message("review-a-accepted-message", "Task A is accepted; required review A remains."), ev_completed("review-a-accepted")]),
         ],
     )
     .await;
     fixture.submit_turn("Verify and accept task A.").await?;
+    let rollout_path = fixture.codex.rollout_path().expect("rollout path");
+    let begin_output =
+        tool_output_debug(&rollout_path, "review-begin-a")?.expect("task A begin output");
+    let check_output =
+        tool_output_debug(&rollout_path, "review-check-a")?.expect("task A check output");
+    let accept_output =
+        tool_output_debug(&rollout_path, "review-accept-a")?.expect("task A accept output");
+    assert!(!begin_output.is_empty());
+    assert!(
+        check_output.contains("OK"),
+        "task A verification failed: {check_output}"
+    );
+    assert!(
+        accept_output.contains("Task boundary prepared"),
+        "task A acceptance failed: {accept_output}"
+    );
 
-    let parent_thread_id = fixture.session_configured.thread_id.to_string();
-    let child_response = mount_sse_once_match(
+    let child_parent_thread_id = parent_thread_id.clone();
+    let child_response = mount_sse_sequence_match(
         &server,
         move |request: &wiremock::Request| {
-            let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
-            let is_agent_message = body["input"]
-                .as_array()
-                .is_some_and(|items| items.iter().any(|item| item["type"] == "agent_message"));
-            request_contains_text(request, "Host-assigned read-only review")
-                && request_contains_text(request, "Expected content is present")
-                && request_contains_text(request, "review-artifact.txt")
-                && is_agent_message
-                && body["client_metadata"]["thread_id"].as_str() != Some(parent_thread_id.as_str())
+            is_completion_reviewer_request(request, &child_parent_thread_id)
         },
-        sse(vec![
-            ev_response_created("reviewer-turn-1"),
-            ev_assistant_message("reviewer-result-1", "The accepted artifact matches AC-1."),
-            ev_completed("reviewer-turn-1"),
-        ]),
+        vec![
+            sse(vec![
+                ev_response_created("reviewer-turn-1"),
+                ev_assistant_message("reviewer-result-1", "The accepted artifact matches AC-1."),
+                ev_completed("reviewer-turn-1"),
+            ]),
+            sse(vec![
+                ev_response_created("reviewer-followup-response"),
+                ev_assistant_message(
+                    "reviewer-followup-result",
+                    "The accepted artifact still matches AC-1 after the follow-up review.",
+                ),
+                ev_completed("reviewer-followup-response"),
+            ]),
+        ],
     )
     .await;
-    mount_sse_sequence(
+    mount_parent_sse_sequence(
         &server,
+        &parent_thread_id,
         vec![
             function_response(
                 "review-action-a",
@@ -800,7 +1137,6 @@ async fn planned_review_runs_through_host_spawn_wait_and_adoption() -> Result<()
     fixture
         .submit_turn("Run the planned read-only review for task A.")
         .await?;
-    let rollout_path = fixture.codex.rollout_path().expect("rollout path");
     let review_output =
         tool_output_debug(&rollout_path, "review-action-a")?.expect("review action tool output");
     let launched = host_completion_snapshots(&rollout_path)?
@@ -829,6 +1165,7 @@ async fn planned_review_runs_through_host_spawn_wait_and_adoption() -> Result<()
         1,
         "review launches exactly the host-returned child thread {reviewer_thread_id}; tool output: {review_output}"
     );
+    assert_eq!(reviewer_requests[0]["model"], REVIEW_MODEL);
     let reviewer_turn_id = reviewer_requests
         .first()
         .and_then(|body| {
@@ -845,8 +1182,9 @@ async fn planned_review_runs_through_host_spawn_wait_and_adoption() -> Result<()
         reviewer_thread_id
     );
 
-    mount_sse_sequence(
+    mount_parent_sse_sequence(
         &server,
+        &parent_thread_id,
         vec![
             sse(vec![
                 ev_response_created("review-wait-parent"),
@@ -898,11 +1236,171 @@ async fn planned_review_runs_through_host_spawn_wait_and_adoption() -> Result<()
     let wait_output =
         tool_output_debug(&rollout_path, "review-wait-call")?.expect("native V1 wait_agent output");
     assert!(wait_output.contains(&reviewer_thread_id));
+    assert!(
+        wait_output.contains("The accepted artifact matches AC-1."),
+        "the parent wait must collect the child review reply: {wait_output}"
+    );
+    assert_persisted_reviewer_identity(
+        fixture.codex_home_path(),
+        &reviewer_thread_id,
+        &reviewer_turn_id,
+    )
+    .await?;
 
-    mount_sse_sequence(
+    mount_multi_agent_turn(
         &server,
+        &parent_thread_id,
+        "review-send-input-followup",
+        "send_input",
+        &json!({
+            "target":reviewer_thread_id,
+            "message":"Please recheck the same accepted artifact against AC-1 and return a fresh review result."
+        }),
+        "A fresh reviewer turn was submitted to the same completed child.",
+    )
+    .await;
+    fixture
+        .submit_turn("Send the completed reviewer child one follow-up request.")
+        .await?;
+    let send_input_json = tool_output_text(&rollout_path, "review-send-input-followup")?
+        .expect("native send_input follow-up output");
+    let send_input_result: Value = serde_json::from_str(&send_input_json)?;
+    let submission_id = send_input_result["submission_id"]
+        .as_str()
+        .expect("started send_input exposes its actual submission id");
+    let followup_requests = child_response.requests();
+    let reviewer_requests = followup_requests
+        .iter()
+        .filter(|request| {
+            let body = request.body_json();
+            body["client_metadata"]["thread_id"] == reviewer_thread_id
+                && body["model"] == REVIEW_MODEL
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reviewer_requests.len(),
+        2,
+        "one initial and one follow-up request use the same reviewer child and model"
+    );
+    let followup_request = reviewer_requests
+        .iter()
+        .find(|request| {
+            request.body_json()["client_metadata"]["turn_id"].as_str()
+                != Some(reviewer_turn_id.as_str())
+        })
+        .expect("same reviewer child receives the follow-up model request");
+    let followup_request_body = followup_request.body_json();
+    let followup_turn_id = followup_request_body["client_metadata"]["turn_id"]
+        .as_str()
+        .expect("follow-up model request identifies its new turn");
+    assert_eq!(followup_request_body["model"], REVIEW_MODEL);
+    assert!(followup_request.body_contains_text(
+        "Please recheck the same accepted artifact against AC-1 and return a fresh review result."
+    ));
+    assert_eq!(submission_id, followup_turn_id);
+    assert_ne!(followup_turn_id, reviewer_turn_id);
+
+    let followup_started = latest_host_completion_snapshot(&rollout_path)?;
+    let started_review = completion_unit(&followup_started, "review-a");
+    assert_eq!(started_review["status"], "running");
+    assert_eq!(
+        started_review["review_evidence"]["reviewer_thread_id"],
+        reviewer_thread_id
+    );
+    assert_eq!(
+        started_review["review_evidence"]["reviewer_turn_id"],
+        followup_turn_id
+    );
+    assert_eq!(
+        started_review["review_state"]["active_attempt"]["attempt_id"],
+        "review-send-input-followup"
+    );
+    assert_ne!(
+        started_review["review_state"]["active_attempt"]["attempt_id"],
+        reviewer_turn_id
+    );
+    assert_eq!(
+        started_review["review_state"]["active_attempt"]["status"],
+        "bound"
+    );
+    assert!(started_review["review_evidence"]["wait_result_ref"].is_null());
+    assert!(started_review["review_evidence"]["wait_call_id"].is_null());
+
+    mount_function_turn(
+        &server,
+        &parent_thread_id,
+        "review-reject-old-adoption",
+        "task_context_boundary",
+        &json!({
+            "action":"adopt_review",
+            "unit_id":"review-a",
+            "reason":"The first collected review result was superseded by a follow-up."
+        }),
+        "The prior generation cannot be adopted while follow-up work remains uncollected.",
+    )
+    .await;
+    fixture
+        .submit_turn("Try to adopt the prior review while its follow-up child is still active.")
+        .await?;
+    let old_adoption_output = tool_output_debug(&rollout_path, "review-reject-old-adoption")?
+        .expect("old adoption response");
+    assert!(
+        !old_adoption_output.is_empty(),
+        "the prior-generation adoption action must return a host response: {old_adoption_output}"
+    );
+    let still_pending = latest_host_completion_snapshot(&rollout_path)?;
+    assert_eq!(
+        completion_unit(&still_pending, "review-a")["status"],
+        "running"
+    );
+    assert!(completion_unit(&still_pending, "review-a")["review_state"]["active_attempt"]["adoption_reason"].is_null());
+    assert!(
+        still_pending["uncollected_children"]
+            .as_array()
+            .is_some_and(|children| children
+                .iter()
+                .any(|child| child.as_str() == Some(reviewer_thread_id.as_str()))),
+        "the follow-up child remains on the host uncollected-work ledger until native wait"
+    );
+
+    mount_multi_agent_turn(
+        &server,
+        &parent_thread_id,
+        "review-wait-followup",
+        "wait_agent",
+        &json!({"targets":[reviewer_thread_id],"timeout_ms":30000}),
+        "The new follow-up reviewer result was collected.",
+    )
+    .await;
+    fixture
+        .submit_turn("Collect the follow-up review turn from the same child.")
+        .await?;
+    let followup_wait_output = tool_output_debug(&rollout_path, "review-wait-followup")?
+        .expect("native follow-up wait output");
+    assert!(followup_wait_output.contains("The accepted artifact still matches AC-1"));
+    let followup_collected = latest_host_completion_snapshot(&rollout_path)?;
+    let collected_followup_review = completion_unit(&followup_collected, "review-a");
+    assert_eq!(
+        collected_followup_review["review_evidence"]["reviewer_turn_id"],
+        followup_turn_id
+    );
+    assert!(collected_followup_review["review_evidence"]["wait_result_ref"].is_string());
+    assert_eq!(
+        collected_followup_review["review_evidence"]["wait_call_id"],
+        "review-wait-followup"
+    );
+    assert_persisted_reviewer_identity(
+        fixture.codex_home_path(),
+        &reviewer_thread_id,
+        followup_turn_id,
+    )
+    .await?;
+
+    mount_parent_sse_sequence(
+        &server,
+        &parent_thread_id,
         vec![
-            function_response("review-adopt-a", "task_context_boundary", &json!({"action":"adopt_review","unit_id":"review-a","reason":"The reviewer confirmed the accepted artifact meets AC-1."})),
+            function_response("review-adopt-a", "task_context_boundary", &json!({"action":"adopt_review","unit_id":"review-a","reason":"The follow-up reviewer confirmed the accepted artifact still meets AC-1."})),
             sse(vec![ev_response_created("review-adopted"), ev_assistant_message("review-adopted-message", "Review A adopted; continue with task B."), ev_completed("review-adopted")]),
         ],
     )
@@ -961,5 +1459,504 @@ async fn planned_review_runs_through_host_spawn_wait_and_adoption() -> Result<()
         review_b["status"], "planned",
         "required review B remains on the host board"
     );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_review_close_preserves_history_and_allows_one_new_authorized_review() -> Result<()>
+{
+    skip_if_no_network!(Ok(()));
+    let server = start_mock_server().await;
+    let provider_url = format!("{}/v1", server.uri());
+    let fixture = test_codex()
+        .with_config(move |config| {
+            config.rencrow_compaction = true;
+            config.rencrow_autonomous_completion = true;
+            config.rencrow_tool_allowlist = Some(vec![
+                "exec_command".into(),
+                "task_context_boundary".into(),
+                "multi_agent_v1::wait_agent".into(),
+                "multi_agent_v1::close_agent".into(),
+            ]);
+            config.features.enable(Feature::Collab).unwrap();
+            let role_path = config.codex_home.join("completion-reviewer.toml");
+            fs::write(
+                &role_path,
+                format!(
+                    "model = \"{REVIEW_MODEL}\"\nrencrow_read_only = true\nmodel_provider = \"mock\"\n\n[rencrow_execution_guard]\ntask_kind = \"read_only\"\n\n[model_providers.mock]\nname = \"mock\"\nbase_url = \"{provider_url}\"\nenv_key = \"PATH\"\nwire_api = \"responses\"\n"
+                ),
+            )
+            .unwrap();
+            config.agent_roles.insert(
+                REVIEW_ROLE.into(),
+                AgentRoleConfig {
+                    enabled: None,
+                    description: Some("Read-only completion reviewer".into()),
+                    config_file: Some(role_path.to_path_buf()),
+                    nickname_candidates: None,
+                },
+            );
+        })
+        .build(&server)
+        .await?;
+    let parent_thread_id = fixture.session_configured.thread_id.to_string();
+
+    let artifact = fixture.cwd_path().join("review-recovery-artifact.txt");
+    fs::write(&artifact, "accepted artifact\n")?;
+    let relative_artifact = artifact
+        .strip_prefix(fixture.cwd_path())?
+        .to_string_lossy()
+        .to_string();
+    write_artifact_content_test(
+        fixture.cwd_path(),
+        "test_review_recovery_artifact.py",
+        "review-recovery-artifact.txt",
+    )?;
+    let state = json!({
+        "contract_revision":1,
+        "conditions":[{"id":"AC-1","revision":1,"result":"Artifact is correct","scope":"CLI","verification":"Inspect the accepted artifact","acceptance_criteria":"Expected content is present","status":"open","evidence":[],"unmet_reason":null}],
+        "units":[
+            {"id":"task-a","purpose":"Create the reviewed artifact","status":"ready","condition_refs":["AC-1"],"depends_on":[],"evidence":[],"task_refs":[]},
+            {"id":"review-a","purpose":"Review task A against AC-1","status":"planned","kind":"review","condition_refs":["AC-1"],"depends_on":["task-a"],"evidence":[],"task_refs":[],"review_target":{"task_id":"task-a","task_revision":1}}
+        ],
+        "current_unit":"task-a","failed_approaches":[],"blocker":null,"next_action":"Begin task A",
+        "product_progress_at":null,"runtime_recovery_at":null,"activity_at":null
+    });
+    mount_parent_sse_sequence(
+        &server,
+        &parent_thread_id,
+        vec![
+            function_response("recovery-begin-root", "task_context_boundary", &json!({"action":"begin","root_task_id":"root","task_id":"root","task_revision":1,"completion_state":state})),
+            sse(vec![ev_response_created("recovery-root-ready"), ev_assistant_message("recovery-root-ready-msg", "Plan registered."), ev_completed("recovery-root-ready")]),
+        ],
+    )
+    .await;
+    fixture
+        .submit_turn("Register the artifact task and its required review.")
+        .await?;
+
+    mount_parent_sse_sequence(
+        &server,
+        &parent_thread_id,
+        vec![
+            function_response("recovery-begin-task", "task_context_boundary", &json!({"action":"begin","root_task_id":"root","task_id":"task-a","task_revision":1})),
+            function_response("recovery-check-task", "exec_command", &json!({"cmd":"python3 -B -m unittest discover -s tests -p test_review_recovery_artifact.py -v","task_evidence":{"task_id":"task-a","task_revision":1,"artifact_paths":[relative_artifact],"check_kind":"verification"}})),
+            function_response("recovery-accept-task", "task_context_boundary", &json!({"action":"accept","result":"Task A artifact verified","satisfied_conditions":["AC-1"]})),
+            sse(vec![ev_response_created("recovery-task-accepted"), ev_assistant_message("recovery-task-accepted-msg", "Task A is accepted; its required review remains."), ev_completed("recovery-task-accepted")]),
+        ],
+    )
+    .await;
+    fixture.submit_turn("Verify and accept task A.").await?;
+    let rollout_path = fixture.codex.rollout_path().expect("rollout path");
+    let begin_output = tool_output_debug(&rollout_path, "recovery-begin-task")?
+        .expect("recovery task begin output");
+    let check_output = tool_output_debug(&rollout_path, "recovery-check-task")?
+        .expect("recovery task check output");
+    let accept_output = tool_output_debug(&rollout_path, "recovery-accept-task")?
+        .expect("recovery task accept output");
+    assert!(!begin_output.is_empty());
+    assert!(
+        check_output.contains("OK"),
+        "recovery task verification failed: {check_output}"
+    );
+    assert!(
+        accept_output.contains("Task boundary prepared"),
+        "recovery task acceptance failed: {accept_output}"
+    );
+
+    let child_parent_thread_id = parent_thread_id.clone();
+    let matches_review_request = move |request: &wiremock::Request| {
+        is_completion_reviewer_request(request, &child_parent_thread_id)
+    };
+    let failed_child_response = mount_sse_once_match(
+        &server,
+        matches_review_request,
+        sse_failed(
+            "reviewer-provider-error",
+            "insufficient_quota",
+            "simulated reviewer failure",
+        ),
+    )
+    .await;
+    mount_function_turn(
+        &server,
+        &parent_thread_id,
+        "recovery-review-first",
+        "task_context_boundary",
+        &json!({"action":"review","target_task_id":"task-a"}),
+        "The reviewer ended with a provider error.",
+    )
+    .await;
+    fixture
+        .submit_turn("Run the planned read-only review for task A.")
+        .await?;
+    let first_launch = latest_host_completion_snapshot(&rollout_path)?;
+    let first_launch_output = tool_output_debug(&rollout_path, "recovery-review-first")?
+        .unwrap_or_else(|| "<missing review tool output>".into());
+    let first_unit = completion_unit(&first_launch, "review-a");
+    let first_thread_id = first_unit["review_evidence"]["reviewer_thread_id"]
+        .as_str()
+        .expect("first host-bound reviewer thread")
+        .to_string();
+    let first_turn_id = first_unit["review_evidence"]["reviewer_turn_id"]
+        .as_str()
+        .expect("first reviewer turn")
+        .to_string();
+    assert!(first_launch_output.contains(REVIEW_MODEL));
+    assert!(first_launch_output.contains(REVIEW_ROLE));
+    let first_child_requests = failed_child_response
+        .requests()
+        .into_iter()
+        .filter(|request| {
+            request.body_json()["client_metadata"]["thread_id"].as_str()
+                == Some(first_thread_id.as_str())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        first_child_requests.len(),
+        1,
+        "one dispatch for the host-bound child"
+    );
+    assert_eq!(first_child_requests[0].body_json()["model"], REVIEW_MODEL);
+    assert_eq!(
+        first_child_requests[0].body_json()["client_metadata"]["turn_id"],
+        first_turn_id
+    );
+
+    mount_multi_agent_turn(
+        &server,
+        &parent_thread_id,
+        "recovery-wait-first",
+        "wait_agent",
+        &json!({"targets":[first_thread_id],"timeout_ms":30000}),
+        "The failed reviewer result was collected.",
+    )
+    .await;
+    fixture
+        .submit_turn("Collect the result from the failed reviewer.")
+        .await?;
+    assert_persisted_reviewer_identity(fixture.codex_home_path(), &first_thread_id, &first_turn_id)
+        .await?;
+    let after_wait = latest_host_completion_snapshot(&rollout_path)?;
+    let first_wait_output = tool_output_debug(&rollout_path, "recovery-wait-first")?
+        .unwrap_or_else(|| "<missing wait_agent output>".into());
+    assert!(
+        first_wait_output.contains("Quota exceeded")
+            || first_wait_output.contains("simulated reviewer failure"),
+        "wait must collect the provider failure served to the child: {first_wait_output}"
+    );
+    let first_wait_unit = completion_unit(&after_wait, "review-a");
+    let preceding_outputs = [
+        "recovery-begin-root",
+        "recovery-begin-task",
+        "recovery-check-task",
+        "recovery-accept-task",
+        "recovery-review-first",
+    ]
+    .into_iter()
+    .map(|call_id| {
+        (
+            call_id,
+            tool_output_debug(&rollout_path, call_id)
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "<missing tool output>".into()),
+        )
+    })
+    .collect::<Vec<_>>();
+    assert_eq!(
+        first_wait_unit["status"], "failed",
+        "wait output={first_wait_output}; review evidence={}; blocker={}; preceding tool outputs={preceding_outputs:?}",
+        first_wait_unit["review_evidence"], after_wait["state"]["blocker"],
+    );
+    assert_eq!(
+        after_wait["state"]["units"][1]["review_evidence"]["reviewer_turn_id"],
+        first_turn_id
+    );
+    assert_eq!(
+        after_wait["state"]["failed_approaches"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    mount_multi_agent_turn(
+        &server,
+        &parent_thread_id,
+        "recovery-close-first",
+        "close_agent",
+        &json!({"target":first_thread_id}),
+        "The failed reviewer child was closed.",
+    )
+    .await;
+    fixture
+        .submit_turn("Close the terminal failed reviewer child.")
+        .await?;
+    let after_close = latest_host_completion_snapshot(&rollout_path)?;
+    assert_eq!(after_close["state"]["units"][1]["status"], "failed");
+    assert_eq!(
+        after_close["state"]["units"][1]["review_evidence"]["reviewer_turn_id"],
+        first_turn_id
+    );
+
+    mount_function_turn(
+        &server,
+        &parent_thread_id,
+        "recovery-reject-failed-adoption",
+        "task_context_boundary",
+        &json!({"action":"adopt_review","unit_id":"review-a","reason":"Attempt to adopt the failed reviewer result."}),
+        "The host refused to adopt the failed review.",
+    )
+    .await;
+    fixture
+        .submit_turn("Try adopting the failed review to verify the host rejects it.")
+        .await?;
+    let failed_adoption = tool_output_debug(&rollout_path, "recovery-reject-failed-adoption")?
+        .expect("failed review adoption output");
+    assert!(
+        failed_adoption.contains(
+            "review result has not been collected from the same completed child generation"
+        ),
+        "the failed result must remain unadoptable: {failed_adoption}"
+    );
+
+    let failed_attempt_id =
+        completion_unit(&after_close, "review-a")["review_evidence"]["spawn_call_id"]
+            .as_str()
+            .expect("host spawn call ID identifies the failed attempt")
+            .to_string();
+    let retry_previous_plan = after_close["state"]["next_action"]
+        .as_str()
+        .expect("host completion snapshot retains the current next action")
+        .to_string();
+    let review_state_before_unknown_retry =
+        completion_unit(&after_close, "review-a")["review_state"].clone();
+    mount_function_turn(
+        &server,
+        &parent_thread_id,
+        "recovery-reject-unknown-retry",
+        "task_context_boundary",
+        &json!({
+            "action":"plan_review",
+            "root_task_id":"root",
+            "previous_plan":retry_previous_plan.clone(),
+            "revised_plan":"Try a new review attempt without a known host failed generation.",
+            "reason":"The submitted attempt identifier is not the exact failed generation.",
+            "review_retry":{"unit_id":"review-a","expected_attempt_id":"unseen-attempt"}
+        }),
+        "The host refused a retry grant for an unknown attempt.",
+    )
+    .await;
+    fixture
+        .submit_turn("Try to authorize a retry using an unknown attempt identifier.")
+        .await?;
+    let unknown_retry = tool_output_debug(&rollout_path, "recovery-reject-unknown-retry")?
+        .expect("unknown retry tool output");
+    assert!(
+        unknown_retry
+            .contains("retry request does not match the active or importable legacy attempt"),
+        "unknown attempt must reach the exact-attempt validation branch: {unknown_retry}"
+    );
+    let after_unknown_retry = latest_host_completion_snapshot(&rollout_path)?;
+    assert_eq!(
+        after_unknown_retry["state"]["next_action"], retry_previous_plan,
+        "a rejected retry leaves the host-registered next action unchanged"
+    );
+    assert_eq!(
+        completion_unit(&after_unknown_retry, "review-a")["review_state"],
+        review_state_before_unknown_retry,
+        "an unknown attempt must not mutate review state or consume retry authorization"
+    );
+
+    let authorized_previous_plan = after_unknown_retry["state"]["next_action"]
+        .as_str()
+        .expect("rejected retry leaves a host-owned next action")
+        .to_string();
+    mount_function_turn(
+        &server,
+        &parent_thread_id,
+        "recovery-authorize-retry",
+        "task_context_boundary",
+        &json!({
+            "action":"plan_review",
+            "root_task_id":"root",
+            "previous_plan":authorized_previous_plan,
+            "revised_plan":"Review task A against AC-1 again after replacing the failed reviewer result with a new host-authorized attempt.",
+            "reason":"The first reviewer attempt failed; the exact same review obligation remains required and needs a fresh reviewer attempt.",
+            "review_retry":{"unit_id":"review-a","expected_attempt_id":failed_attempt_id}
+        }),
+        "The parent authorized one new attempt for the same review obligation; the failed attempt remains recorded.",
+    )
+    .await;
+    fixture
+        .submit_turn("Record the changed plan and explicitly authorize one retry for the exact failed review attempt.")
+        .await?;
+    let authorized_tool_output = tool_output_text(&rollout_path, "recovery-authorize-retry")?
+        .expect("plan-review returns the host completion state");
+    let authorized_tool_state: Value = serde_json::from_str(&authorized_tool_output)?;
+    let authorized_tool_unit = authorized_tool_state["units"]
+        .as_array()
+        .and_then(|units| units.iter().find(|unit| unit["id"] == "review-a"))
+        .expect("plan-review tool output contains the review obligation");
+    assert_eq!(
+        authorized_tool_unit["review_state"]["active_attempt"]["attempt_id"], failed_attempt_id,
+        "successful plan-review output retains the exact failed attempt"
+    );
+    assert_eq!(
+        authorized_tool_unit["review_state"]["active_attempt"]["status"],
+        "failed"
+    );
+    assert_eq!(
+        authorized_tool_unit["review_state"]["retry_authorization"]["expected_attempt_id"],
+        failed_attempt_id,
+        "successful plan-review output grants exactly the currently failed attempt"
+    );
+    assert_eq!(
+        authorized_tool_unit["review_state"]["retry_authorization"]["authorization_id"],
+        "recovery-authorize-retry"
+    );
+    let authorized_snapshot = latest_host_completion_snapshot(&rollout_path)?;
+    let authorized_retry_state =
+        completion_unit(&authorized_snapshot, "review-a")["review_state"].clone();
+    assert_eq!(
+        authorized_retry_state["active_attempt"]["attempt_id"], failed_attempt_id,
+        "the recorded retry grant must still be attached to the failed attempt"
+    );
+    assert_eq!(
+        authorized_retry_state["retry_authorization"]["expected_attempt_id"], failed_attempt_id,
+        "the grant must authorize exactly the currently recorded failed attempt"
+    );
+
+    let retry_parent_thread_id = parent_thread_id.clone();
+    let retry_child_response = mount_sse_once_match(
+        &server,
+        move |request: &wiremock::Request| {
+            is_completion_reviewer_request(request, &retry_parent_thread_id)
+        },
+        sse(vec![
+            ev_response_created("recovery-reviewer-success"),
+            ev_assistant_message(
+                "recovery-reviewer-success-msg",
+                "The accepted artifact matches AC-1.",
+            ),
+            ev_completed("recovery-reviewer-success"),
+        ]),
+    )
+    .await;
+    mount_function_turn(
+        &server,
+        &parent_thread_id,
+        "recovery-review-retry",
+        "task_context_boundary",
+        &json!({"action":"review","target_task_id":"task-a","unit_id":"review-a"}),
+        "The authorized new reviewer confirmed the artifact.",
+    )
+    .await;
+    fixture
+        .submit_turn("Run the authorized new attempt for review-a.")
+        .await?;
+    let retry_launch_output =
+        tool_output_debug(&rollout_path, "recovery-review-retry")?.expect("retry launch output");
+    let retry_launch = latest_host_completion_snapshot(&rollout_path)?;
+    let retry_unit = completion_unit(&retry_launch, "review-a");
+    let active_attempt = &retry_unit["review_state"]["active_attempt"];
+    let active_attempt_id = active_attempt["attempt_id"].as_str().unwrap_or("<missing>");
+    let active_attempt_status = active_attempt["status"].as_str().unwrap_or("<missing>");
+    let retry_thread_id = retry_unit["review_evidence"]["reviewer_thread_id"]
+        .as_str()
+        .unwrap_or("<missing>")
+        .to_string();
+    let retry_turn_id_snapshot = retry_unit["review_evidence"]["reviewer_turn_id"]
+        .as_str()
+        .unwrap_or("<missing>");
+    let provider_requests = retry_child_response.requests();
+    let provider_request_metadata = provider_requests
+        .iter()
+        .map(|request| {
+            let body = request.body_json();
+            serde_json::json!({
+                "model": body.get("model"),
+                "client_metadata": body.get("client_metadata"),
+            })
+        })
+        .collect::<Vec<_>>();
+    assert_ne!(
+        retry_thread_id, "<missing>",
+        "retry response={retry_launch_output:?}; active attempt id={active_attempt_id:?} status={active_attempt_status:?}; snapshot turn={retry_turn_id_snapshot:?}; provider requests={provider_request_metadata:?}"
+    );
+    assert_ne!(
+        retry_thread_id, first_thread_id,
+        "retry response={retry_launch_output:?}; active attempt id={active_attempt_id:?} status={active_attempt_status:?}; snapshot child={retry_thread_id:?} turn={retry_turn_id_snapshot:?}; provider requests={provider_request_metadata:?}"
+    );
+    assert_eq!(retry_unit["review_evidence"]["reviewer_role"], REVIEW_ROLE);
+    assert!(retry_launch_output.contains(REVIEW_MODEL));
+    assert!(retry_launch_output.contains(REVIEW_ROLE));
+    let retry_requests = provider_requests
+        .into_iter()
+        .filter(|request| request.body_json()["client_metadata"]["thread_id"] == retry_thread_id)
+        .collect::<Vec<_>>();
+    assert_eq!(retry_requests.len(), 1, "one new reviewer dispatch only");
+    assert_eq!(retry_requests[0].body_json()["model"], REVIEW_MODEL);
+    assert_eq!(
+        retry_requests[0].body_json()["client_metadata"]["turn_id"],
+        retry_unit["review_evidence"]["reviewer_turn_id"]
+    );
+    assert_ne!(
+        retry_requests[0].body_json()["client_metadata"]["turn_id"],
+        first_turn_id
+    );
+
+    mount_multi_agent_turn(
+        &server,
+        &parent_thread_id,
+        "recovery-wait-retry",
+        "wait_agent",
+        &json!({"targets":[retry_thread_id],"timeout_ms":30000}),
+        "The successful retry result was collected.",
+    )
+    .await;
+    fixture
+        .submit_turn("Collect the successful retry review result.")
+        .await?;
+    let retry_wait_output = tool_output_debug(&rollout_path, "recovery-wait-retry")?
+        .expect("successful retry wait output");
+    assert!(
+        retry_wait_output.contains("The accepted artifact matches AC-1."),
+        "wait must collect the reply served to the retry child: {retry_wait_output}"
+    );
+    let retry_turn_id = retry_unit["review_evidence"]["reviewer_turn_id"]
+        .as_str()
+        .expect("retry reviewer turn")
+        .to_string();
+    assert_persisted_reviewer_identity(fixture.codex_home_path(), &retry_thread_id, &retry_turn_id)
+        .await?;
+    mount_function_turn(
+        &server,
+        &parent_thread_id,
+        "recovery-adopt-retry",
+        "task_context_boundary",
+        &json!({"action":"adopt_review","unit_id":"review-a","reason":"The authorized reviewer confirmed the accepted artifact meets AC-1."}),
+        "The new review is adopted.",
+    )
+    .await;
+    fixture
+        .submit_turn("Adopt the collected result from review-a.")
+        .await?;
+
+    let final_state = latest_host_completion_snapshot(&rollout_path)?;
+    let adopted = completion_unit(&final_state, "review-a");
+    assert_eq!(adopted["status"], "done");
+    assert_eq!(adopted["review_evidence"]["reviewer_role"], REVIEW_ROLE);
+    assert_eq!(
+        adopted["review_evidence"]["reviewer_thread_id"],
+        retry_thread_id
+    );
+    assert!(adopted["review_evidence"]["wait_result_ref"].is_string());
+    let failed_wait =
+        tool_output_debug(&rollout_path, "recovery-wait-first")?.expect("failed wait output");
+    assert!(failed_wait.contains("Errored") || failed_wait.contains("error"));
+    assert!(tool_output_debug(&rollout_path, "recovery-adopt-retry")?.is_some());
     Ok(())
 }

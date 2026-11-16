@@ -3,6 +3,8 @@
 mod autonomous_completion_tests;
 #[path = "completion_recovery_tests.rs"]
 mod completion_recovery_tests;
+#[path = "completion_review_async_tests.rs"]
+mod completion_review_async_tests;
 #[path = "notification_tests.rs"]
 mod notification_tests;
 
@@ -248,6 +250,20 @@ pub(crate) fn mcp_config_for_test(config: &crate::config::Config) -> Arc<codex_m
         &codex_core_plugins::PluginLoadOutcome::default(),
         std::iter::empty(),
     ))
+}
+
+/// Holds SessionState only around synchronous guard-test observations while keeping its type private.
+pub(crate) async fn with_locked_task_scope_for_execution_guard_test<R>(
+    session: &Session,
+    scope: crate::state::ActiveTaskScope,
+    needs_rebase: bool,
+    observe: impl FnOnce() -> R,
+) -> (R, bool) {
+    let mut state = session.state.lock().await;
+    state.active_task_scope = Some(scope);
+    state.rencrow_scope_needs_rebase = needs_rebase;
+    let result = observe();
+    (result, state.rencrow_scope_needs_rebase)
 }
 
 /// Updates both initial/current views before sharing a test turn context.
@@ -599,6 +615,207 @@ fn skill_message(text: &str) -> ResponseItem {
         phase: None,
         internal_chat_message_metadata_passthrough: None,
     }
+}
+
+#[tokio::test]
+async fn stale_status_waiting_for_child_monitor_rechecks_turn_generation() {
+    use std::future::Future;
+    use std::task::Context;
+
+    use codex_protocol::protocol::AgentStatus;
+    use codex_protocol::protocol::Event;
+    use codex_protocol::protocol::EventMsg;
+
+    let (session, _turn_context, _rx) = make_session_and_context_with_auth_and_config_and_rx(
+        CodexAuth::from_api_key("Test API Key"),
+        Vec::new(),
+        |config| {
+            config
+                .features
+                .enable(Feature::RencrowChildMonitor)
+                .expect("child monitor opt-in");
+        },
+    )
+    .await;
+    session.record_started_turn("old-turn").await;
+
+    let event = Event {
+        id: "old-turn".to_string(),
+        msg: EventMsg::TurnComplete(TurnCompleteEvent {
+            turn_id: "old-turn".to_string(),
+            last_agent_message: None,
+            error: None,
+            started_at: None,
+            completed_at: None,
+            duration_ms: None,
+            time_to_first_token_ms: None,
+        }),
+    };
+    let mut delivery = Box::pin(session.deliver_event_raw(event));
+    let delivery_is_pending = {
+        let _monitor_guard = session.child_monitor.lock().await;
+        let mut context = Context::from_waker(futures::task::noop_waker_ref());
+        Future::poll(delivery.as_mut(), &mut context).is_pending()
+    };
+    assert!(delivery_is_pending);
+
+    // The delivery must release SessionState before waiting for the monitor, so a newer
+    // generation can be recorded while the old event is blocked on that monitor.
+    session.record_started_turn("new-turn").await;
+    delivery.await;
+
+    assert_eq!(
+        session.agent_status_generation().await,
+        (Some("new-turn".to_string()), AgentStatus::Running)
+    );
+}
+
+#[tokio::test]
+async fn reviewer_dispatch_waiters_recheck_after_the_active_turn_changes() {
+    use std::future::Future;
+    use std::task::Context;
+    use std::task::Poll;
+
+    struct WaitForCancellation {
+        release_after_cancel: Option<std::sync::Arc<tokio::sync::Notify>>,
+    }
+
+    impl crate::tasks::SessionTask for WaitForCancellation {
+        fn kind(&self) -> crate::state::TaskKind {
+            crate::state::TaskKind::Regular
+        }
+
+        fn span_name(&self) -> &'static str {
+            "review_dispatch_wait_test"
+        }
+
+        async fn run(
+            self: std::sync::Arc<Self>,
+            _session: std::sync::Arc<Session>,
+            _ctx: std::sync::Arc<crate::session::turn_context::TurnContext>,
+            _input: Vec<crate::session::TurnInput>,
+            cancellation_token: tokio_util::sync::CancellationToken,
+        ) -> crate::tasks::SessionTaskResult {
+            cancellation_token.cancelled().await;
+            if let Some(release) = &self.release_after_cancel {
+                release.notified().await;
+            }
+            Err(codex_protocol::error::CodexErr::TurnAborted)
+        }
+    }
+
+    use codex_protocol::protocol::TurnAbortReason;
+
+    let (session, old_turn) = make_session_and_context().await;
+    let session = std::sync::Arc::new(session);
+    let old_turn = std::sync::Arc::new(old_turn);
+    let release_old_task = std::sync::Arc::new(tokio::sync::Notify::new());
+    session
+        .start_task(
+            old_turn.clone(),
+            Vec::new(),
+            WaitForCancellation {
+                release_after_cancel: Some(std::sync::Arc::clone(&release_old_task)),
+            },
+        )
+        .await;
+    let old_generation = old_turn.sub_id.clone();
+    let initial_epoch = session
+        .reviewer_tool_dispatch_snapshot(&old_generation)
+        .await
+        .expect("initial reviewer generation is active")
+        .0;
+    let old_turn_state = {
+        let active = session.active_turn.lock().await;
+        std::sync::Arc::clone(
+            &active
+                .as_ref()
+                .expect("started task has an active turn")
+                .turn_state,
+        )
+    };
+
+    let mut snapshot = Box::pin(session.reviewer_tool_dispatch_snapshot(&old_generation));
+    let mut registration = Box::pin(session.register_in_flight_tool_call(&old_generation));
+    let mut guarded_abort = Box::pin(session.abort_model_only_turn_if_active(
+        &old_generation,
+        initial_epoch,
+        TurnAbortReason::ReviewEnded,
+    ));
+    let mut retire_turn =
+        Box::pin(session.abort_turn_if_active(&old_generation, TurnAbortReason::ReviewEnded));
+    let (all_waited_for_turn_state, retire_result) = {
+        let _old_turn_state_guard = old_turn_state.lock().await;
+        let mut context = Context::from_waker(futures::task::noop_waker_ref());
+        let snapshot_waited = Future::poll(snapshot.as_mut(), &mut context).is_pending();
+        let registration_waited = Future::poll(registration.as_mut(), &mut context).is_pending();
+        let abort_waited = Future::poll(guarded_abort.as_mut(), &mut context).is_pending();
+        let retire_result = Future::poll(retire_turn.as_mut(), &mut context);
+        (
+            snapshot_waited && registration_waited && abort_waited,
+            retire_result,
+        )
+    };
+    assert!(all_waited_for_turn_state);
+
+    assert!(
+        session
+            .active_turn
+            .try_lock()
+            .expect("retirement released the active-turn lock")
+            .is_none(),
+        "retirement removes the old generation before waiting for its turn-state lock"
+    );
+    let new_turn = session.new_default_turn().await;
+    let new_generation = new_turn.sub_id.clone();
+    session
+        .start_task(
+            new_turn,
+            Vec::new(),
+            WaitForCancellation {
+                release_after_cancel: None,
+            },
+        )
+        .await;
+
+    // Poll the retirement and all lock waiters together. Retirement removes the old
+    // active turn before it waits for the turn-state lock. The replacement is active
+    // while each waiter wakes and re-checks its generation.
+    let retirement = async {
+        match retire_result {
+            Poll::Ready(retired) => retired,
+            Poll::Pending => retire_turn.await,
+        }
+    };
+    let waiter_recheck = async {
+        let (snapshot_result, registration_result, abort_result) =
+            tokio::join!(snapshot, registration, guarded_abort);
+        assert!(
+            session
+                .reviewer_tool_dispatch_snapshot(&new_generation)
+                .await
+                .is_some(),
+            "the replacement generation is active while old waiters re-check"
+        );
+        assert!(
+            session
+                .abort_turn_if_active(&new_generation, TurnAbortReason::ReviewEnded)
+                .await,
+            "the replacement generation is retired before the old task is released"
+        );
+        release_old_task.notify_one();
+        (snapshot_result, registration_result, abort_result)
+    };
+    let (retired, (snapshot_result, registration_result, abort_result)) =
+        tokio::join!(retirement, waiter_recheck);
+    assert!(retired, "the old turn was retired while waiters slept");
+
+    assert!(
+        !abort_result.expect("reviewer abort observation succeeds"),
+        "the old epoch cannot abort the replacement turn"
+    );
+    assert!(snapshot_result.is_none());
+    assert!(registration_result.is_none());
 }
 
 #[tokio::test]
@@ -8342,16 +8559,17 @@ async fn shutdown_still_pauses_for_uncollected_children_or_disabled_completion_a
             "blocker": null
         }))
         .expect("completed host contract fixture");
-    let mut state = session.state.lock().await;
-    state.rencrow_completion_state = Some(("root".into(), completed));
-    state.active_task_scope = Some(crate::state::ActiveTaskScope {
-        root_task_id: "root".into(),
-        task_id: "unit-1".into(),
-        task_revision: 1,
-        begin_call_id: "begin-1".into(),
-        start_history_cursor: 0,
-    });
-    drop(state);
+    {
+        let mut state = session.state.lock().await;
+        state.rencrow_completion_state = Some(("root".into(), completed));
+        state.active_task_scope = Some(crate::state::ActiveTaskScope {
+            root_task_id: "root".into(),
+            task_id: "unit-1".into(),
+            task_revision: 1,
+            begin_call_id: "begin-1".into(),
+            start_history_cursor: 0,
+        });
+    }
 
     handlers::shutdown_session_runtime(&session).await;
 

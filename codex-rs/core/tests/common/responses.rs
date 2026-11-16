@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-16: preserve validation in matched SSE sequences.
 #![allow(clippy::unwrap_used)]
 
 use std::collections::VecDeque;
@@ -1424,6 +1425,20 @@ pub async fn mount_function_call_agent_response(
 /// POST to `/v1/responses`. Panics if more requests are received than bodies
 /// provided. Also asserts the exact number of expected calls.
 pub async fn mount_sse_sequence(server: &MockServer, bodies: Vec<String>) -> ResponseMock {
+    mount_sse_sequence_match(server, |_: &wiremock::Request| true, bodies).await
+}
+
+/// Mounts an ordered SSE sequence for POST requests accepted by `matcher`.
+/// Panics if more matching requests are received than bodies provided. Also
+/// asserts the exact number of expected calls.
+pub async fn mount_sse_sequence_match<M>(
+    server: &MockServer,
+    matcher: M,
+    bodies: Vec<String>,
+) -> ResponseMock
+where
+    M: Match + Send + Sync + 'static,
+{
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
 
@@ -1453,7 +1468,8 @@ pub async fn mount_sse_sequence(server: &MockServer, bodies: Vec<String>) -> Res
     };
 
     let (mock, response_mock) = base_mock();
-    mock.respond_with(responder)
+    mock.and(matcher)
+        .respond_with(responder)
         .up_to_n_times(num_calls as u64)
         .expect(num_calls as u64)
         .mount(server)

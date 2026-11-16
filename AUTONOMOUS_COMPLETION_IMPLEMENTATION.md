@@ -255,3 +255,45 @@ autonomous child acceptでは、既存のunit選択と `apply_host_acceptance` �
 取消し後も、同じgenerationの `ReviewEnded` statusと永続化済み終了イベントを確認するまで失敗確定にしない。安全性・終了が不明なら、host証拠にescalationと固定長の観測fingerprintを保存し、同条件の再送・連続waitを止める。実際のterminal結果は回収でき、別generation・通常worker・hostの結果通知配送は妨げない。汎用followupの拒否は入力依頼の入口に置き、共通の通知transportには置かない。
 
 Rust 1.95.0の変更Core機能とhistory crateの限定検証は217/217成功。Human再開の永続化・失敗時停止、期限とhost所有権の保持、実checkpointとdisk snapshotからの復元、親に属する実childの取消しと終了証拠、worker保護、世代別waitを含む。全workspace検査とC01-v6総合E2Eの合格を意味しない。実機配置・同一thread再開の証拠は私有の `Tmp/ren2-supervision/periodic/human-resume-20261112/` に分けて保持する。
+
+<a id="review-lifecycle-20261116"></a>
+
+## レビュー共通状態契約の実装（2026-11-17）
+
+正本は [自律完了統合仕様§14](AUTONOMOUS_COMPLETION_SPEC.md#review-lifecycle-contract)。レビュー義務と一回の試行を分離し、正常起動・回収・採用、失敗後の認可済み再試行、close・followup・保存復元、現在の全体完了を同じhost事実から判定する。稼働中ren2への入力・停止・再起動・台帳変更は、この修正には含めていない。
+
+### 原因と責務
+
+単一のunit statusと互換evidenceに、義務・試行・所在・採否が混在していたことが、旧失敗による候補選択の阻害、close後の終端上書き、現在理由への旧escalation残留につながっていた。Paginated reviewerに対応しない全履歴取得APIの使用は、別のAPI契約違反である。これらを一行の原因へ還元せず、状態ownerと保存ownerの責務を分けて直した。
+
+| 契約 | 実装と受入対象 |
+|---|---|
+| 永続終了証拠 | Thread Storeの`read_persisted_turn_abort`でLegacy/Paginatedのexact turn・canonical owner・lineage・locator・decode/I/O異常を照合する。LiveThreadは読取り前にflushする。旧abortの存在だけで最新世代・retry資格を主張しない |
+| 義務と試行 | `CompletionUnit.review_state`にactive attempt、限定された失敗履歴、再試行認可・撤回・出典を保持し、互換status/evidence/理由を投影する。副作用のない現在義務の評価は`session/completion_review.rs`、予約・保存・child処理は既存Session ownerに置く |
+| 再試行 | 実plan_review callと旧Failedを結ぶ一回限りの認可を、効果前の予約で消費する。未送信が確定した場合のみ同じ保存出典から元のunit・認可へ戻す。出典欠落時は状態・ledger・receipt・pauseを変えず拒否し、結果不明を自動再送しない |
+| closeとfollowup | closeは所在だけを変え、既知の失敗・回収済み成功・Doneを保持する。未採用成功へのfollowupは新turn開始・Steered・未送信を型で区別し、旧結果を新試行の採用に流用しない。公開submission出力と実protocolの`NotSubmittedReason`を維持する |
+| 成果変更と再検証 | 同task再受入、新task IDでの修正受入、複数段の明示`review_revalidation_of`を扱う。過去Doneは保持し、有効末端を現在のartifact fingerprint・条件定義で評価する。同じbytesのreceipt更新だけを成果変更としない。独立した同targetのレビューは免除しない |
+| 出典の種類と復元 | 新revalidationは旧採用の`source_snapshot`を持ち、同義務の過去状態がないため`previous_attempt_ref`は空とする。旧形式の重複source aliasは正式な未起動HostUpdate撤回後も読める。消費済みretry認可は別の同義務grant snapshotを必須とし、Noneやsource aliasで代用できない。legacy失敗import・legacy取消しは独立したexact出典を照合する。cold restoreは参照先を含む実永続履歴を読む |
+| 現在理由と完了 | active状態から現在理由・候補・採用資格・残件を導く。再試行成功の親採用で当該義務は解決するが、独立レビュー、未知のchild/外部効果、検査失敗、Authorityやユーザー停止は保持する |
+
+### 保存互換性と変更範囲
+
+旧v1は読取りだけで自動変換せず、旧形式の正当な成功・取消しを維持する。新しい型付き事実の保存は明示的な変更からouter snapshot v2へ移り、task boundary V3とは別に扱う。旧readerへの書戻しや同一状態への複数writerは認めない。全試行の正本は既存append-only記録に残し、snapshot/contextに無制限の履歴を追加しない。
+
+差分は800行を超えるため、最小の独立した段階をThread Storeのtyped終了証拠APIと対照試験とし、型・Session owner・保存互換性・公開consumerは共通契約に依存する次段階として照合する。無関係な層の再編成や状態公開は行わない。
+
+ユーザーが追加許可した11ファイルの既存lint対策と関連同期テストも含む。mutex警告は単純unlockで解消せず、世代・status公開、tool登録・epoch確認・active除去の原子性を保持し、競合時はguardを解放して待機・再照合する。execution guardのscope/identity解決と更新順序、telemetry parserの重複・破損・truncated判定を維持する。警告抑制・検査除外は追加しない。
+
+### 検証結果と限界
+
+検査原記録・失敗時のraw log・構築checkpointは私有の`Tmp/ren2-supervision/new-thread-20261116/recovery-fix-20261116/four-defects-verification-20261116/`に保存する。以下の結果は現在sourceに結び付くものだけを記し、過去の部分成功を流用しない。
+
+| 検査 | 現在の結果 |
+|---|---|
+| 差分・API/保存契約の手動照合 | 親が宣言・呼出側・使用先、所有権、参照種類、正常・異常・復元を照合。参照分離後のretry証明迂回はビルド前のレビューで修正 |
+| 整形・関連lib/testsの静的確認 | `common-contract-round23-fmt`と`common-contract-round23-clippy`が終了0・エラー0・Warning 0。関連4 crate、source identity `4ded5872e65cedc10423d4fd697aeb7212d6318aba1e08b07ee7b59d59a47b4d`。検査前後と親の現在source確認が一致 |
+| ビルド・関連系列 | 関連lib・integrationのbuild-onlyは終了0・Warning 0。対象3系列は3/3、History・Thread Store・Rolloutは637/637成功。Core関連回帰は337件中336成功・1失敗（automatic CompactionのTurnComplete待ちtimeout）。この系列は未受入 |
+| 全workspace試験 | 未許可・未実施 |
+| native CLI/helper pairと実機反映 | 未実施。稼働中ren2は観測・メモのみ |
+
+通常RenCrow Compaction/raw restartのsource保持は、opaque envelope・metadata sidecar・transaction marker・context再構築まで静的照合した。正規化済みcheckpoint-only/bounded入力のnested source対応は別の境界であり、対応済みとしない。自動CompactionのTurnComplete待ちtimeoutをCore回帰で再観測した。今回の入力iteration・処理段階はログから確定できず、原因は未確認である。変更前HEADの型検査は既存Warning3件で静的ゲート未完了となり、build/runtime比較は実施していない。実要求・要約・再開を確認した過去の成功を、その原因修正や全workspace受入の証明にはしない。観測用の一時instrumentationは除去し、入力・閾値・timeout・assertionは緩和していない。

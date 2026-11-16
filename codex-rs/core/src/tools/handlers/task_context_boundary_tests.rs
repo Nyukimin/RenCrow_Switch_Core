@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-16.
 use super::*;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
@@ -157,6 +158,63 @@ fn begin(root: &str, task: &str, revision: u64) -> serde_json::Value {
     json!({"action":"begin", "root_task_id":root, "task_id":task, "task_revision":revision})
 }
 
+#[test]
+fn status_presents_current_review_reason_without_changing_canonical_next_action() {
+    let state: codex_history::task_context::CompletionState = serde_json::from_value(json!({
+        "contract_revision": 2,
+        "conditions": [{
+            "id": "AC-1", "revision": 1, "result": "Output", "scope": "CLI",
+            "verification": "Check output", "acceptance_criteria": "Check passes",
+            "status": "satisfied", "evidence": []
+        }],
+        "units": [],
+        "next_action": "Keep the canonical plan action unchanged"
+    }))
+    .expect("minimal completion state deserializes");
+
+    let rendered = super::render_completion_status(
+        &state,
+        Some(
+            "review-a is stale for the current accepted artifact; add an explicitly linked review",
+        ),
+    )
+    .expect("status output serializes");
+    let status_value: serde_json::Value = serde_json::from_str(&rendered)
+        .expect("status output remains a single parseable JSON object");
+    assert_eq!(
+        status_value["current_review_obligation"],
+        "review-a is stale for the current accepted artifact; add an explicitly linked review"
+    );
+    assert!(
+        serde_json::from_value::<codex_history::task_context::CompletionState>(
+            status_value.clone()
+        )
+        .is_err(),
+        "status-only annotation is not accepted as model-authored completion state"
+    );
+    let mut rendered_state = status_value;
+    assert_eq!(
+        rendered_state
+            .as_object_mut()
+            .unwrap()
+            .remove("current_review_obligation"),
+        Some(json!(
+            "review-a is stale for the current accepted artifact; add an explicitly linked review"
+        ))
+    );
+    assert_eq!(rendered_state, serde_json::to_value(&state).unwrap());
+    assert_eq!(
+        rendered_state["next_action"],
+        "Keep the canonical plan action unchanged"
+    );
+
+    assert_eq!(
+        super::render_completion_status(&state, /*reason*/ None)
+            .expect("no-reason output serializes"),
+        serde_json::to_string(&state).expect("canonical state serializes")
+    );
+}
+
 #[tokio::test]
 async fn schema_parses_and_parent_begin_records_host_scope() {
     let handler = TaskContextBoundaryHandler::new(false);
@@ -190,7 +248,7 @@ async fn schema_parses_and_parent_begin_records_host_scope() {
             .get("previous_plan")
             .is_none()
     );
-    for autonomous_field in ["target_task_id", "unit_id"] {
+    for autonomous_field in ["target_task_id", "unit_id", "review_retry"] {
         assert!(
             schema["parameters"]["properties"]
                 .get(autonomous_field)
@@ -222,6 +280,12 @@ async fn schema_parses_and_parent_begin_records_host_scope() {
             .get("previous_plan")
             .is_some()
     );
+    assert_eq!(
+        enabled_schema["parameters"]["properties"]["completion_state"]["properties"]["units"]["items"]
+            ["properties"]["review_revalidation_of"]["type"],
+        "string",
+        "a planned review may explicitly name the exact adopted review it revalidates"
+    );
     for accepted_field in [
         "root_task_id",
         "task_id",
@@ -229,6 +293,7 @@ async fn schema_parses_and_parent_begin_records_host_scope() {
         "result",
         "target_task_id",
         "unit_id",
+        "review_retry",
     ] {
         assert!(
             enabled_schema["parameters"]["properties"]
@@ -311,6 +376,7 @@ fn enabled_schema_action_shapes_match_argument_parser() {
                 "previous_plan",
                 "revised_plan",
                 "reason",
+                "review_retry",
             ],
             &[
                 "action",
@@ -327,7 +393,7 @@ fn enabled_schema_action_shapes_match_argument_parser() {
         ),
         (
             "review",
-            &["action", "target_task_id"],
+            &["action", "target_task_id", "unit_id"],
             &["action", "target_task_id"],
         ),
         (
@@ -365,14 +431,31 @@ fn enabled_schema_action_shapes_match_argument_parser() {
     let valid = [
         json!({"action":"begin","root_task_id":"root","task_id":"unit","task_revision":1,"completion_state":{}}),
         json!({"action":"update","root_task_id":"root","completion_state":{}}),
+        json!({"action":"update","root_task_id":"root","completion_state":{"contract_revision":3,"conditions":[],"units":[{"id":"review-a-current","purpose":"Revalidate accepted task bytes","status":"planned","kind":"review","condition_refs":["AC-1"],"depends_on":["task-a"],"review_target":{"task_id":"task-a","task_revision":1},"review_revalidation_of":"review-a"}]}}),
         json!({"action":"status"}),
         json!({"action":"plan_review","root_task_id":"root","previous_plan":"a","revised_plan":"b","reason":"new evidence"}),
+        json!({"action":"plan_review","root_task_id":"root","previous_plan":"a","revised_plan":"b","reason":"failed attempt has a new authorized mitigation","review_retry":{"unit_id":"review-a","expected_attempt_id":"spawn-call-a"}}),
         json!({"action":"accept","result":"done","satisfied_conditions":["AC-1"]}),
+        json!({"action":"review","target_task_id":"task-a","unit_id":"review-a"}),
     ];
     for input in valid {
         serde_json::from_value::<TaskContextBoundaryArgs>(input)
             .expect("valid action shape parses");
     }
+    let TaskContextBoundaryArgs::Review {
+        target_task_id,
+        unit_id,
+    } = serde_json::from_value(json!({
+        "action":"review",
+        "target_task_id":"task-a",
+        "unit_id":"review-a"
+    }))
+    .expect("review parses an explicit obligation selector")
+    else {
+        panic!("review arguments parse as review action");
+    };
+    assert_eq!(target_task_id, "task-a");
+    assert_eq!(unit_id.as_deref(), Some("review-a"));
 
     for invalid in [
         json!({"action":"begin","root_task_id":"root","task_id":"unit","task_revision":1,"goal":"extra"}),
@@ -928,7 +1011,12 @@ async fn record_successful_verification(
         )
         .await;
     session
-        .finish_task_check(call_id, 0, true, evidence.hash_artifacts().unwrap())
+        .finish_task_check(
+            call_id,
+            /*exit_code*/ 0,
+            /*completed*/ true,
+            evidence.hash_artifacts().unwrap(),
+        )
         .await
         .expect("verification succeeds");
     record_call(session, turn, call_id, "exec_command").await;
@@ -1748,7 +1836,12 @@ async fn accept_uses_host_receipt_and_stays_pending_until_safe_point() {
         )
         .await;
     session
-        .finish_task_check("verify-call", 0, true, after)
+        .finish_task_check(
+            "verify-call",
+            /*exit_code*/ 0,
+            /*completed*/ true,
+            after,
+        )
         .await
         .expect("successful receipt");
     record_call(&session, &turn, "verify-call", "exec_command").await;
@@ -1935,8 +2028,8 @@ async fn accept_uses_host_receipt_and_stays_pending_until_safe_point() {
     session
         .finish_task_check(
             "verify-b-call",
-            0,
-            true,
+            /*exit_code*/ 0,
+            /*completed*/ true,
             evidence_b.hash_artifacts().unwrap(),
         )
         .await

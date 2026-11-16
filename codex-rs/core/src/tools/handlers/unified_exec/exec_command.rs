@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-16.
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -426,8 +427,7 @@ impl ExecCommandHandler {
         let task_evidence_result = match task_evidence {
             Some(_request) if let Some(message) = task_evidence_command_error => {
                 Err(FunctionCallError::RespondToModel(format!(
-                    "{}; remove shell wrappers such as `;`, pipes, or exit-status masking and run the check directly",
-                    message
+                    "{message}; remove shell wrappers such as `;`, pipes, or exit-status masking and run the check directly"
                 )))
             }
             Some(_request) if environment.is_remote() => Err(FunctionCallError::RespondToModel(

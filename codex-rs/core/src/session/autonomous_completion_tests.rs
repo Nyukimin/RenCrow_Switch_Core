@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-16.
 use super::InitialHistory;
 use super::ResumedHistory;
 use super::RolloutItem;
@@ -47,6 +48,8 @@ fn open_contract() -> CompletionState {
             review_evidence: None,
             review_launch: None,
             review_decision_reason: None,
+            review_state: None,
+            review_revalidation_of: None,
         }],
         current_unit: Some("unit-1".into()),
         failed_approaches: vec![],
@@ -192,6 +195,8 @@ async fn planned_review_can_reference_future_task_but_evidence_and_spawn_need_re
         review_evidence: None,
         review_launch: None,
         review_decision_reason: None,
+        review_state: None,
+        review_revalidation_of: None,
     });
     session
         .set_rencrow_completion_state("root".into(), serde_json::to_value(&contract).unwrap())
@@ -294,6 +299,7 @@ async fn model_completion_update_cannot_clear_or_replace_unknown_review_launch()
             .review_launch,
         Some(launch)
     );
+    let accepted_before_rejections = session.rencrow_completion_state("root").await;
 
     let mut removed = serde_json::to_value(&contract).unwrap();
     removed["units"] = serde_json::json!([]);
@@ -302,6 +308,11 @@ async fn model_completion_update_cannot_clear_or_replace_unknown_review_launch()
         .await
         .expect_err("unresolved host launch cannot be removed from the plan");
     assert!(error.contains("cannot remove unresolved review unit"));
+    assert_eq!(
+        session.rencrow_completion_state("root").await,
+        accepted_before_rejections,
+        "rejected removal preserves the immediately preceding accepted host state"
+    );
 
     let mut retargeted = serde_json::to_value(&contract).unwrap();
     retargeted["units"][0]["review_target"]["task_revision"] = serde_json::json!(2);
@@ -309,7 +320,14 @@ async fn model_completion_update_cannot_clear_or_replace_unknown_review_launch()
         .set_rencrow_completion_state("root".into(), retargeted)
         .await
         .expect_err("unresolved host launch cannot be retargeted");
-    assert!(error.contains("cannot change the identity or target"));
+    assert!(error.contains(
+        "completion update cannot change the identity, target, or dependencies of review unit"
+    ));
+    assert_eq!(
+        session.rencrow_completion_state("root").await,
+        accepted_before_rejections,
+        "a rejected target change preserves the unknown host launch and its canonical binding"
+    );
 }
 
 #[tokio::test]
@@ -368,6 +386,7 @@ async fn pending_review_evidence_cannot_be_removed_or_retargeted() {
             .status,
         UnitStatus::Running
     );
+    let accepted_before_rejections = session.rencrow_completion_state("root").await;
 
     let mut omitted = serde_json::to_value(&contract).unwrap();
     omitted["units"] = serde_json::json!([]);
@@ -376,6 +395,11 @@ async fn pending_review_evidence_cannot_be_removed_or_retargeted() {
         .await
         .expect_err("unresolved host-bound review cannot be removed");
     assert!(error.contains("cannot remove unresolved review unit"));
+    assert_eq!(
+        session.rencrow_completion_state("root").await,
+        accepted_before_rejections,
+        "rejected removal preserves the immediately preceding accepted host state"
+    );
 
     let mut renamed = serde_json::to_value(&contract).unwrap();
     renamed["units"][0]["id"] = serde_json::json!("replacement-review");
@@ -384,6 +408,11 @@ async fn pending_review_evidence_cannot_be_removed_or_retargeted() {
         .await
         .expect_err("unresolved host-bound review cannot be renamed");
     assert!(error.contains("cannot remove unresolved review unit"));
+    assert_eq!(
+        session.rencrow_completion_state("root").await,
+        accepted_before_rejections,
+        "rejected rename preserves the immediately preceding accepted host state"
+    );
 
     let mut retargeted = serde_json::to_value(&contract).unwrap();
     retargeted["units"][0]["review_target"]["task_revision"] = serde_json::json!(2);
@@ -391,11 +420,18 @@ async fn pending_review_evidence_cannot_be_removed_or_retargeted() {
         .set_rencrow_completion_state("root".into(), retargeted)
         .await
         .expect_err("unresolved host-bound review cannot be retargeted");
-    assert!(error.contains("cannot change the identity or target"));
+    assert!(error.contains(
+        "completion update cannot change the identity, target, or dependencies of review unit"
+    ));
+    assert_eq!(
+        session.rencrow_completion_state("root").await,
+        accepted_before_rejections,
+        "a rejected target change preserves the pending host evidence and its canonical binding"
+    );
 }
 
 #[tokio::test]
-async fn legacy_review_without_host_deadline_keeps_model_status_semantics() {
+async fn legacy_host_bound_review_keeps_running_status_and_evidence_on_update() {
     let (session, _) = make_session_and_context().await;
     let workspace = tempfile::tempdir().expect("workspace");
     std::fs::write(workspace.path().join("artifact.txt"), "accepted artifact\n").unwrap();
@@ -440,15 +476,15 @@ async fn legacy_review_without_host_deadline_keeps_model_status_semantics() {
     session
         .set_rencrow_completion_state("root".into(), proposed)
         .await
-        .expect("legacy review status retains its prior model-controlled behavior");
+        .expect("model status cannot overwrite the host-bound legacy review state");
+    let after_update = session
+        .rencrow_completion_state("root")
+        .await
+        .expect("legacy review remains present after Update");
+    assert_eq!(after_update.units[0].status, UnitStatus::Running);
     assert_eq!(
-        session
-            .rencrow_completion_state("root")
-            .await
-            .unwrap()
-            .units[0]
-            .status,
-        UnitStatus::Blocked
+        after_update.units[0].review_evidence, contract.units[0].review_evidence,
+        "model Update must preserve the host-bound reviewer identity and target evidence"
     );
 }
 

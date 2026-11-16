@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-16.
 use super::*;
 use crate::agent::child_config::PreparedSpawnConfig;
 use crate::agent::child_config::SpawnConfigOptions;
@@ -9,8 +10,11 @@ use crate::agent::next_thread_spawn_depth;
 use crate::agent::role::DEFAULT_ROLE_NAME;
 use crate::agent::types::SpawnAgentForkMode;
 use crate::agent::types::SpawnAgentOptions;
+use crate::session::CompletionReviewChildGeneration;
+use crate::session::CompletionReviewChildIdentity;
 use crate::tools::handlers::multi_agents_spec::SpawnAgentToolOptions;
 use crate::tools::handlers::multi_agents_spec::create_spawn_agent_tool_v1;
+use codex_history::task_context::CompletionReviewTarget;
 use codex_protocol::ThreadId;
 use codex_protocol::error::CodexErrorDetails;
 use codex_tools::ToolSpec;
@@ -243,12 +247,16 @@ pub(crate) async fn spawn_configured_completion_review(
                     if let Err(persist_error) = session
                         .record_completion_review_child_pending(
                             unit_id,
-                            target_task_id,
-                            target_task_revision,
-                            target_ref.to_string(),
-                            child_id,
-                            role.clone(),
-                            call_id.clone(),
+                            CompletionReviewChildIdentity {
+                                target: CompletionReviewTarget {
+                                    task_id: target_task_id.to_string(),
+                                    task_revision: target_task_revision,
+                                },
+                                target_artifact_ref: target_ref.to_string(),
+                                reviewer_thread_id: child_id,
+                                reviewer_role: role.clone(),
+                                spawn_call_id: call_id.clone(),
+                            },
                         )
                         .await
                     {
@@ -281,12 +289,16 @@ pub(crate) async fn spawn_configured_completion_review(
     if let Err(error) = session
         .record_completion_review_child_pending(
             unit_id,
-            target_task_id,
-            target_task_revision,
-            target_ref.to_string(),
-            child.thread_id,
-            role.clone(),
-            call_id.clone(),
+            CompletionReviewChildIdentity {
+                target: CompletionReviewTarget {
+                    task_id: target_task_id.to_string(),
+                    task_revision: target_task_revision,
+                },
+                target_artifact_ref: target_ref.to_string(),
+                reviewer_thread_id: child.thread_id,
+                reviewer_role: role.clone(),
+                spawn_call_id: call_id.clone(),
+            },
         )
         .await
     {
@@ -332,13 +344,19 @@ pub(crate) async fn spawn_configured_completion_review(
     session
         .record_completion_review_spawn(
             unit_id,
-            target_task_id,
-            target_task_revision,
-            target_ref.to_string(),
-            child.thread_id,
-            reviewer_turn_id,
-            role.clone(),
-            call_id.clone(),
+            CompletionReviewChildGeneration {
+                identity: CompletionReviewChildIdentity {
+                    target: CompletionReviewTarget {
+                        task_id: target_task_id.to_string(),
+                        task_revision: target_task_revision,
+                    },
+                    target_artifact_ref: target_ref.to_string(),
+                    reviewer_thread_id: child.thread_id,
+                    reviewer_role: role.clone(),
+                    spawn_call_id: call_id.clone(),
+                },
+                reviewer_turn_id,
+            },
         )
         .await
         .map_err(FunctionCallError::RespondToModel)?;
@@ -443,6 +461,7 @@ async fn handle_spawn_agent(
     .await
     .map_err(FunctionCallError::RespondToModel)?;
     let config = prepared.config;
+    let mut completion_review_model = None;
     let completion_review = if let Some(review) = args.completion_review.as_ref() {
         let role = prepared.role_name.as_deref().ok_or_else(|| {
             FunctionCallError::RespondToModel(
@@ -454,6 +473,17 @@ async fn handle_spawn_agent(
                 "completion review requires a configured reviewer/analyst/verifier role with read-only permissions".to_string(),
             ));
         }
+        completion_review_model = Some(
+            config
+                .model
+                .clone()
+                .filter(|model| !model.trim().is_empty())
+                .ok_or_else(|| {
+                    FunctionCallError::RespondToModel(
+                        "completion review requires an explicit configured model route".into(),
+                    )
+                })?,
+        );
         let target_ref = session
             .reserve_completion_review_launch(
                 &review.unit_id,
@@ -534,18 +564,27 @@ async fn handle_spawn_agent(
                     .map_err(FunctionCallError::RespondToModel)?;
             }
             ReviewSpawnFailureDisposition::ChildCreated(child_id) => {
-                session
+                if let Err(persist_error) = session
                     .record_completion_review_child_pending(
                         &review.unit_id,
-                        &review.target_task_id,
-                        review.target_task_revision,
-                        target_ref.clone(),
-                        child_id,
-                        role.clone(),
-                        call_id.clone(),
+                        CompletionReviewChildIdentity {
+                            target: CompletionReviewTarget {
+                                task_id: review.target_task_id.clone(),
+                                task_revision: review.target_task_revision,
+                            },
+                            target_artifact_ref: target_ref.clone(),
+                            reviewer_thread_id: child_id,
+                            reviewer_role: role.clone(),
+                            spawn_call_id: call_id.clone(),
+                        },
                     )
                     .await
-                    .map_err(FunctionCallError::RespondToModel)?;
+                {
+                    session.pause_autonomous_completion().await;
+                    return Err(FunctionCallError::RespondToModel(format!(
+                        "review spawn call {call_id} created child {child_id}, but its unresolved identity could not be persisted: {persist_error}; do not spawn another reviewer"
+                    )));
+                }
             }
             ReviewSpawnFailureDisposition::CreationUnknown => {
                 session
@@ -580,6 +619,29 @@ async fn handle_spawn_agent(
             None => (None, None, AgentStatus::NotFound),
         },
     };
+    if let (Some((review, role, target_ref)), Ok(spawned_agent)) = (&completion_review, &result)
+        && let Err(error) = session
+            .record_completion_review_child_pending(
+                &review.unit_id,
+                CompletionReviewChildIdentity {
+                    target: CompletionReviewTarget {
+                        task_id: review.target_task_id.clone(),
+                        task_revision: review.target_task_revision,
+                    },
+                    target_artifact_ref: target_ref.clone(),
+                    reviewer_thread_id: spawned_agent.thread_id,
+                    reviewer_role: role.clone(),
+                    spawn_call_id: call_id.clone(),
+                },
+            )
+            .await
+    {
+        session.pause_autonomous_completion().await;
+        return Err(FunctionCallError::RespondToModel(format!(
+            "reviewer child {} started, but its unresolved identity could not be persisted: {error}; do not spawn another reviewer",
+            spawned_agent.thread_id
+        )));
+    }
     let agent_snapshot = match new_thread_id {
         Some(thread_id) => {
             session
@@ -599,29 +661,43 @@ async fn handle_spawn_agent(
             .ok()
             .and_then(|(turn_id, _)| turn_id);
         if spawned_agent.metadata.agent_role.as_deref() != Some(role.as_str())
+            || agent_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.model.as_str())
+                != completion_review_model.as_deref()
             || reviewer_turn_id.is_none()
         {
             session.pause_autonomous_completion().await;
-            tracing::error!(
-                reviewer_thread_id = %spawned_agent.thread_id,
-                "completion reviewer role or initial turn generation could not be verified"
-            );
+            return Err(FunctionCallError::RespondToModel(format!(
+                "reviewer child {} started but its role, model, or initial turn generation could not be verified; it remains pending, do not spawn another reviewer",
+                spawned_agent.thread_id
+            )));
         } else if let Some(reviewer_turn_id) = reviewer_turn_id
             && let Err(error) = session
                 .record_completion_review_spawn(
                     &review.unit_id,
-                    &review.target_task_id,
-                    review.target_task_revision,
-                    target_ref,
-                    spawned_agent.thread_id,
-                    reviewer_turn_id,
-                    role,
-                    call_id.clone(),
+                    CompletionReviewChildGeneration {
+                        identity: CompletionReviewChildIdentity {
+                            target: CompletionReviewTarget {
+                                task_id: review.target_task_id.clone(),
+                                task_revision: review.target_task_revision,
+                            },
+                            target_artifact_ref: target_ref,
+                            reviewer_thread_id: spawned_agent.thread_id,
+                            reviewer_role: role,
+                            spawn_call_id: call_id.clone(),
+                        },
+                        reviewer_turn_id,
+                    },
                 )
                 .await
         {
             tracing::error!(%error, "failed to persist completion reviewer spawn evidence");
             session.pause_autonomous_completion().await;
+            return Err(FunctionCallError::RespondToModel(format!(
+                "reviewer child {} started but its turn binding could not be persisted: {error}; it remains pending, do not spawn another reviewer",
+                spawned_agent.thread_id
+            )));
         }
     }
     let (_new_agent_path, new_agent_nickname, new_agent_role) =

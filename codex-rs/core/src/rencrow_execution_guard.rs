@@ -763,6 +763,7 @@ pub(crate) async fn before_tool(invocation: &ToolInvocation) -> Result<(), Funct
     let embedded_direct_check = (!is_check)
         .then(|| direct_check_in_compound_command(&command))
         .flatten();
+    let args = arguments(invocation);
     let diff = invocation.tracker.lock().await.get_unified_diff();
     let turn_state = {
         let active = invocation.session.active_turn.lock().await;
@@ -773,42 +774,49 @@ pub(crate) async fn before_tool(invocation: &ToolInvocation) -> Result<(), Funct
             "RENCROW_EXECUTION_GUARD: no active turn".into(),
         ));
     };
-    let mut turn = turn_state.lock().await;
-    turn.rencrow_execution_guard.observe_diff(diff.as_deref());
-    if is_read || !is_check {
-        // Cwd is part of the identity; identical relative reads in different roots are distinct.
-        let args = arguments(invocation);
-        let key = format!(
-            "{:?}:{}:{}",
-            invocation.turn.config.cwd,
-            args["workdir"],
-            command.trim()
-        );
-        if let Err(message) = turn.rencrow_execution_guard.charge_read(policy, &key) {
-            let state = &mut turn.rencrow_execution_guard;
-            if state.record_budget_rejection() {
-                return Err(FunctionCallError::Fatal(format!(
-                    "RENCROW_READ_BUDGET_EXCEEDED: repeated host refusals stopped the turn; {message}"
-                )));
+    {
+        let mut turn = turn_state.lock().await;
+        turn.rencrow_execution_guard.observe_diff(diff.as_deref());
+        if is_read || !is_check {
+            // Cwd is part of the identity; identical relative reads in different roots are distinct.
+            let key = format!(
+                "{:?}:{}:{}",
+                invocation.turn.config.cwd,
+                args["workdir"],
+                command.trim()
+            );
+            if let Err(message) = turn.rencrow_execution_guard.charge_read(policy, &key) {
+                let state = &mut turn.rencrow_execution_guard;
+                if state.record_budget_rejection() {
+                    return Err(FunctionCallError::Fatal(format!(
+                        "RENCROW_READ_BUDGET_EXCEEDED: repeated host refusals stopped the turn; {message}"
+                    )));
+                }
+                return Err(FunctionCallError::RespondToModel(message));
             }
-            return Err(FunctionCallError::RespondToModel(message));
+        }
+        if is_shell_edit {
+            return Err(FunctionCallError::RespondToModel(
+                crate::rencrow_shell_edit_guard::EDIT_METHOD_REQUIRED.into(),
+            ));
+        }
+        if let Some(check) = embedded_direct_check {
+            let check = check.chars().take(240).collect::<String>();
+            return Err(FunctionCallError::RespondToModel(format!(
+                "RENCROW_DIRECT_CHECK_REQUIRED: command not executed; run the check as a separate direct shell invocation with the same working directory and environment. Detected check (up to 240 characters): {check}"
+            )));
         }
     }
-    if is_shell_edit {
-        return Err(FunctionCallError::RespondToModel(
-            crate::rencrow_shell_edit_guard::EDIT_METHOD_REQUIRED.into(),
-        ));
-    }
-    if let Some(check) = embedded_direct_check {
-        let check = check.chars().take(240).collect::<String>();
-        return Err(FunctionCallError::RespondToModel(format!(
-            "RENCROW_DIRECT_CHECK_REQUIRED: command not executed; run the check as a separate direct shell invocation with the same working directory and environment. Detected check (up to 240 characters): {check}"
-        )));
-    }
-    if is_check {
-        let state = &mut turn.rencrow_execution_guard;
-        let args = arguments(invocation);
-        let key = if invocation.turn.config.rencrow_autonomous_completion
+    let check_key = if is_check {
+        let fallback = || {
+            format!(
+                "{:?}:{}:{}",
+                invocation.turn.config.cwd,
+                args["workdir"],
+                command.trim()
+            )
+        };
+        if invocation.turn.config.rencrow_autonomous_completion
             && let Some(evidence) = args.get("task_evidence")
             && let Ok(request) =
                 serde_json::from_value::<crate::task_check::TaskEvidenceRequest>(evidence.clone())
@@ -833,22 +841,38 @@ pub(crate) async fn before_tool(invocation: &ToolInvocation) -> Result<(), Funct
                 request.artifact_paths,
             )
             .map(|obligation| format!("task-evidence:{}", obligation.key()))
-            .unwrap_or_else(|| {
-                format!(
-                    "{:?}:{}:{}",
-                    invocation.turn.config.cwd,
-                    args["workdir"],
-                    command.trim()
-                )
-            })
+            .unwrap_or_else(&fallback)
         } else {
-            format!(
-                "{:?}:{}:{}",
-                invocation.turn.config.cwd,
-                args["workdir"],
-                command.trim()
-            )
+            fallback()
+        }
+    } else {
+        String::new()
+    };
+    if is_check {
+        let mut turn = loop {
+            let contention = {
+                let active = invocation.session.active_turn.lock().await;
+                if !active
+                    .as_ref()
+                    .is_some_and(|active| std::sync::Arc::ptr_eq(&active.turn_state, &turn_state))
+                {
+                    return Err(FunctionCallError::RespondToModel(
+                        "RENCROW_EXECUTION_GUARD: no active turn".into(),
+                    ));
+                }
+                match turn_state.try_lock() {
+                    Ok(turn) => break turn,
+                    Err(_) => true,
+                }
+            };
+            if contention {
+                {
+                    let _turn = turn_state.lock().await;
+                }
+            }
         };
+        let state = &mut turn.rencrow_execution_guard;
+        let key = check_key;
         if !key.starts_with("task-evidence:") {
             let configured_cwd = invocation.turn.config.cwd.to_path_buf();
             let requested_cwd = args["workdir"]
@@ -1246,7 +1270,7 @@ pub(crate) async fn check_completion(
     let outcome = {
         let mut state = turn_state.lock().await;
         state.rencrow_execution_guard.observe_diff(diff.as_deref());
-        let mut missing = state
+        let missing = state
             .rencrow_execution_guard
             .missing(policy, diff.as_ref().is_some_and(|diff| !diff.is_empty()));
         if missing.is_empty() {

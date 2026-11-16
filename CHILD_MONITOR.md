@@ -8,6 +8,8 @@
 
 ## 状態と進捗
 
+レビュー義務・試行・回収・親採用の共通契約は [自律完了統合仕様§14](AUTONOMOUS_COMPLETION_SPEC.md#review-lifecycle-contract) を正本とする。実装・検証・実機反映の確認範囲は [実装記録](AUTONOMOUS_COMPLETION_IMPLEMENTATION.md#review-lifecycle-20261116) を参照する。
+
 子の状態は `Unknown`、`Pending`、`Generating`、`ToolExecution`、`InputWaiting`、`Compacting`、`Completed`、`Failed` です。既存の状態APIを維持し、監視有効時は継続可能なrollback/steerエラーで子を終端扱いしないよう状態の投影を補正します。
 
 `TurnStarted`、実データを含むtext/reasoning/tool引数の出力、toolの開始と終了、入力要求、compaction、terminal eventなどをSessionが観測してsnapshotへ反映します。空delta、request開始、retry計数、snapshot読取りは子の作業進捗として数えません。`progress_sequence` と `last_activity_at_ms` は実観測イベントで進捗が変わった場合にだけ更新します。

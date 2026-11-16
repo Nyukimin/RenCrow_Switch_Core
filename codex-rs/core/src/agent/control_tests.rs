@@ -125,6 +125,10 @@ async fn test_config_with_cli_overrides(
     (home, config)
 }
 
+#[cfg(test)]
+#[path = "completion_review_legacy_tests.rs"]
+mod completion_review_legacy_tests;
+
 async fn test_config() -> (TempDir, Config) {
     test_config_with_cli_overrides(Vec::new()).await
 }
@@ -4959,9 +4963,19 @@ async fn expired_completion_review_deadline_aborts_only_the_bound_readonly_gener
     const WORKER_ROLE: &str = "worker";
 
     let server = start_mock_server().await;
+    let (request_arrival_tx, mut request_arrival_rx) =
+        tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
     Mock::given(method("POST"))
         .and(path("/v1/responses"))
-        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(60)))
+        .respond_with(move |request: &wiremock::Request| {
+            let body = request
+                .body_json::<serde_json::Value>()
+                .expect("Responses API request body should be JSON");
+            request_arrival_tx
+                .send(body)
+                .expect("test should keep the request-arrival receiver open");
+            ResponseTemplate::new(200).set_delay(Duration::from_secs(60))
+        })
         .expect(2)
         .mount(&server)
         .await;
@@ -5053,46 +5067,6 @@ async fn expired_completion_review_deadline_aborts_only_the_bound_readonly_gener
         .await
         .expect("worker child remains registered");
 
-    let requests_arrived = timeout(Duration::from_secs(5), async {
-        loop {
-            if server.received_requests().await.unwrap_or_default().len() == 2 {
-                break;
-            }
-            sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await;
-    if requests_arrived.is_err() {
-        let reviewer_generation = reviewer_thread.session.agent_status_generation().await;
-        let worker_generation = worker_thread.session.agent_status_generation().await;
-        let reviewer_rollout_error = reviewer_thread
-            .read_thread(
-                /*include_archived*/ true, /*include_history*/ true,
-            )
-            .await
-            .err()
-            .map(|error| error.to_string());
-        let worker_rollout_error = worker_thread
-            .read_thread(
-                /*include_archived*/ true, /*include_history*/ true,
-            )
-            .await
-            .err()
-            .map(|error| error.to_string());
-        let requests = server.received_requests().await.unwrap_or_default();
-        panic!(
-            "both regular child turns should reach the mock model before timeout; requests={}, reviewer_generation={reviewer_generation:?}, reviewer_rollout_error={reviewer_rollout_error:?}, worker_generation={worker_generation:?}, worker_rollout_error={worker_rollout_error:?}",
-            requests.len(),
-        );
-    }
-    let requests = server.received_requests().await.unwrap_or_default();
-    assert_eq!(requests.len(), 2);
-    assert!(
-        requests
-            .iter()
-            .all(|request| request.url.path() == "/v1/responses")
-    );
-
     let (reviewer_turn_id, reviewer_status) =
         reviewer_thread.session.agent_status_generation().await;
     let reviewer_turn_id = reviewer_turn_id.expect("reviewer regular turn generation");
@@ -5100,6 +5074,40 @@ async fn expired_completion_review_deadline_aborts_only_the_bound_readonly_gener
     let (worker_turn_id, worker_status) = worker_thread.session.agent_status_generation().await;
     let worker_turn_id = worker_turn_id.expect("worker regular turn generation");
     assert!(!crate::agent::status::is_final(&worker_status));
+
+    let mut arrived_turns = Vec::with_capacity(2);
+    for _ in 0..2 {
+        let request = request_arrival_rx
+            .recv()
+            .await
+            .expect("each child turn should dispatch a Responses API request");
+        let client_metadata = request
+            .get("client_metadata")
+            .and_then(serde_json::Value::as_object)
+            .expect("Responses API request should carry client metadata");
+        let thread_id = client_metadata
+            .get("thread_id")
+            .and_then(serde_json::Value::as_str)
+            .expect("Responses API request should identify its thread");
+        let turn_id = client_metadata
+            .get("turn_id")
+            .and_then(serde_json::Value::as_str)
+            .expect("Responses API request should identify its turn");
+        arrived_turns.push((thread_id.to_string(), turn_id.to_string()));
+    }
+    assert_eq!(
+        arrived_turns.len(),
+        2,
+        "both child requests should be observed at the mock model"
+    );
+    assert!(
+        arrived_turns.contains(&(reviewer_thread_id.to_string(), reviewer_turn_id.clone())),
+        "reviewer request should belong to the exact active reviewer generation"
+    );
+    assert!(
+        arrived_turns.contains(&(worker_thread_id.to_string(), worker_turn_id.clone())),
+        "worker request should belong to the exact active worker generation"
+    );
 
     let wrong_generation = format!("{reviewer_turn_id}-stale");
     let wrong_generation_result = control

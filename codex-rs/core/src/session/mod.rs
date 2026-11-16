@@ -232,8 +232,13 @@ use codex_protocol::exec_output::StreamOutput;
 
 mod code_mode_warning;
 mod completion_children;
+pub(crate) use completion_children::CompletionReviewChildGeneration;
+pub(crate) use completion_children::CompletionReviewChildIdentity;
 pub(crate) mod completion_persistence;
 mod completion_recovery;
+mod completion_review;
+pub(crate) use completion_review::CompletionReviewRetryRequest;
+pub(crate) use completion_review::CompletionReviewSelectionOutcome;
 mod completion_review_deadline;
 pub(crate) mod context_window;
 mod daemon_recovery;
@@ -2685,7 +2690,6 @@ impl Session {
             agent_status_from_event(&event.msg)
         };
         if let Some(status) = status {
-            let state = self.state.lock().await;
             let turn_scoped = matches!(
                 &event.msg,
                 EventMsg::TurnStarted(_)
@@ -2693,20 +2697,40 @@ impl Session {
                     | EventMsg::TurnAborted(_)
                     | EventMsg::Error(_)
             );
-            let is_current_turn = !turn_scoped
-                || state
-                    .last_started_turn_id
-                    .as_deref()
-                    .is_none_or(|turn_id| turn_id == event.id.as_str());
-            if is_current_turn && child_monitor_enabled {
-                self.child_monitor.lock().await.observe(
-                    &event.id,
-                    &event.msg,
-                    now_unix_timestamp_ms(),
-                );
-            }
-            if is_current_turn {
-                self.agent_status.send_replace(status);
+            loop {
+                let (is_current_turn, wait_for_monitor) = {
+                    let state = self.state.lock().await;
+                    let is_current_turn = !turn_scoped
+                        || state
+                            .last_started_turn_id
+                            .as_deref()
+                            .is_none_or(|turn_id| turn_id == event.id.as_str());
+                    if !is_current_turn {
+                        (false, false)
+                    } else if child_monitor_enabled {
+                        match self.child_monitor.try_lock() {
+                            Ok(mut monitor) => {
+                                monitor.observe(&event.id, &event.msg, now_unix_timestamp_ms());
+                                self.agent_status.send_replace(status.clone());
+                                (true, false)
+                            }
+                            Err(_) => (true, true),
+                        }
+                    } else {
+                        self.agent_status.send_replace(status.clone());
+                        (true, false)
+                    }
+                };
+                if !is_current_turn {
+                    break;
+                }
+                if wait_for_monitor {
+                    {
+                        let _monitor = self.child_monitor.lock().await;
+                    }
+                } else {
+                    break;
+                }
             }
             // A late status event may describe the previous turn after a follow-up has already
             // been admitted. Keep the event and its history; only suppress stale state writes.

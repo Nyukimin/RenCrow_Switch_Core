@@ -1,4 +1,5 @@
 // Modified by RenCrow Switch Core, 2026-09-22: handle durable compaction markers; 2026-09-28: role tool allowlist.
+use super::completion_review::completion_unit_obligation_is_satisfied;
 use super::input_queue::InputQueue;
 use super::mcp_refresh::McpRefresh;
 use super::step_context::StepContext;
@@ -876,14 +877,145 @@ impl Session {
     pub(crate) async fn set_rencrow_completion_state(
         &self,
         root_task_id: String,
-        mut completion_state: serde_json::Value,
+        completion_state: serde_json::Value,
     ) -> Result<(), String> {
+        self.set_rencrow_completion_state_with_call_id(
+            root_task_id,
+            completion_state,
+            /*update_call_id*/ None,
+        )
+        .await
+    }
+
+    pub(crate) async fn set_rencrow_completion_state_with_call_id(
+        &self,
+        root_task_id: String,
+        mut completion_state: serde_json::Value,
+        update_call_id: Option<String>,
+    ) -> Result<(), String> {
+        let _review_guard = self.completion_review_owner_guard().await;
         if root_task_id.trim().is_empty() {
             return Err("completion state requires a root ID".into());
         }
         // Invalidation is a host fact, not a model-controlled progress reset.
         // A stale condition may be reopened after its evidence is removed from the proposal.
         let previous_contract = self.rencrow_completion_state(&root_task_id).await;
+        let previous_canonical = self.state.lock().await.rencrow_completion_state.clone();
+        let mut previous_snapshot_receipt = self
+            .state
+            .lock()
+            .await
+            .rencrow_completion_last_persisted_snapshot
+            .clone();
+        if previous_canonical
+            .as_ref()
+            .is_some_and(|(active_root, _)| active_root != &root_task_id)
+        {
+            return Err("completion update root does not match the active contract".into());
+        }
+        if previous_canonical.is_some() && previous_contract.is_none() {
+            return Err("existing completion state cannot be safely projected for update".into());
+        }
+        let mut withdrawals = std::collections::HashMap::new();
+        if let Some(previous) = previous_contract.as_ref() {
+            let proposed_units = completion_state
+                .get("units")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| "completion update must retain its unit list".to_string())?;
+            for old_unit in previous.units.iter().filter(|unit| {
+                unit.kind == codex_history::task_context::CompletionUnitKind::Review
+                    && unit.status == codex_history::task_context::UnitStatus::Planned
+                    && unit.review_state.as_ref().is_none_or(|review| {
+                        review.active_attempt.is_none()
+                            && review.historical_failure.is_none()
+                            && review.retry_reservation_prior_historical_failure.is_none()
+                            && review.retry_authorization.is_none()
+                            && review.withdrawal.is_none()
+                    })
+                    && unit.review_launch.is_none()
+                    && unit.review_evidence.is_none()
+                    && unit.review_decision_reason.is_none()
+            }) {
+                let Some(proposed) = proposed_units.iter().find(|unit| {
+                    unit.get("id").and_then(serde_json::Value::as_str) == Some(old_unit.id.as_str())
+                }) else {
+                    continue;
+                };
+                if proposed.get("status").and_then(serde_json::Value::as_str) != Some("cancelled") {
+                    continue;
+                }
+                let call_id = update_call_id
+                    .as_deref()
+                    .filter(|call_id| !call_id.trim().is_empty())
+                    .ok_or_else(|| {
+                        "planned review withdrawal requires an explicit host Update call"
+                            .to_string()
+                    })?;
+                let target = proposed.get("review_target");
+                let target_matches = target
+                    .and_then(|target| target.get("task_id"))
+                    .and_then(serde_json::Value::as_str)
+                    == old_unit
+                        .review_target
+                        .as_ref()
+                        .map(|target| target.task_id.as_str())
+                    && target
+                        .and_then(|target| target.get("task_revision"))
+                        .and_then(serde_json::Value::as_u64)
+                        == old_unit
+                            .review_target
+                            .as_ref()
+                            .map(|target| target.task_revision);
+                let condition_refs = serde_json::to_value(&old_unit.condition_refs)
+                    .map_err(|error| error.to_string())?;
+                let depends_on = serde_json::to_value(&old_unit.depends_on)
+                    .map_err(|error| error.to_string())?;
+                if proposed.get("kind").and_then(serde_json::Value::as_str) != Some("review")
+                    || !target_matches
+                    || proposed.get("condition_refs") != Some(&condition_refs)
+                    || proposed.get("depends_on") != Some(&depends_on)
+                {
+                    return Err(format!(
+                        "planned review {} can only be cancelled with unchanged target and dependencies",
+                        old_unit.id
+                    ));
+                }
+                let target = old_unit
+                    .review_target
+                    .as_ref()
+                    .ok_or_else(|| "planned review withdrawal has no target".to_string())?;
+                let review_state = codex_history::task_context::CompletionReviewState {
+                    version: 1,
+                    obligation_unit_id: old_unit.id.clone(),
+                    active_attempt: None,
+                    historical_failure: None,
+                    retry_reservation_prior_historical_failure: None,
+                    previous_attempt_ref: old_unit
+                        .review_state
+                        .as_ref()
+                        .and_then(|review| review.previous_attempt_ref.clone()),
+                    retry_authorization: None,
+                    withdrawal: Some(
+                        codex_history::task_context::CompletionReviewWithdrawal {
+                            source: codex_history::task_context::CompletionReviewWithdrawalSource::HostUpdate {
+                                update_call_id: call_id.to_string(),
+                                prior_status: codex_history::task_context::UnitStatus::Planned,
+                            },
+                            reason: "Explicitly cancelled by the host-authorized completion Update.".into(),
+                            target_task_id: target.task_id.clone(),
+                            target_task_revision: target.task_revision,
+                            condition_refs: old_unit.condition_refs.clone(),
+                            depends_on: old_unit.depends_on.clone(),
+                        },
+                    ),
+                    revalidation: old_unit
+                        .review_state
+                        .as_ref()
+                        .and_then(|review| review.revalidation.clone()),
+                };
+                withdrawals.insert(old_unit.id.clone(), review_state);
+            }
+        }
         // Review evidence is host-collected from the reviewer child lifecycle. Never
         // accept a model-supplied replacement or deletion of that binding.
         if let Some(previous) = previous_contract.as_ref() {
@@ -893,12 +1025,11 @@ impl Session {
                 .ok_or_else(|| {
                     "completion update must retain host-bound review units".to_string()
                 })?;
-            for old_unit in previous.units.iter().filter(|unit| {
-                unit.review_launch.is_some()
-                    || (unit.kind == codex_history::task_context::CompletionUnitKind::Review
-                        && unit.review_evidence.is_some()
-                        && unit.status != codex_history::task_context::UnitStatus::Done)
-            }) {
+            for old_unit in previous
+                .units
+                .iter()
+                .filter(|unit| unit.kind == codex_history::task_context::CompletionUnitKind::Review)
+            {
                 let proposed = proposed_units.iter().find(|unit| {
                     unit.get("id").and_then(serde_json::Value::as_str) == Some(old_unit.id.as_str())
                 });
@@ -909,6 +1040,10 @@ impl Session {
                     ));
                 };
                 let target = proposed.get("review_target");
+                let condition_refs = serde_json::to_value(&old_unit.condition_refs)
+                    .map_err(|error| error.to_string())?;
+                let depends_on = serde_json::to_value(&old_unit.depends_on)
+                    .map_err(|error| error.to_string())?;
                 if proposed.get("kind").and_then(serde_json::Value::as_str) != Some("review")
                     || target
                         .and_then(|target| target.get("task_id"))
@@ -924,9 +1059,19 @@ impl Session {
                             .review_target
                             .as_ref()
                             .map(|target| target.task_revision)
+                    || proposed.get("condition_refs") != Some(&condition_refs)
+                    || proposed.get("depends_on") != Some(&depends_on)
                 {
                     return Err(format!(
-                        "completion update cannot change the identity or target of unresolved review unit {}",
+                        "completion update cannot change the identity, target, or dependencies of review unit {}",
+                        old_unit.id
+                    ));
+                }
+                if old_unit.status == codex_history::task_context::UnitStatus::Done
+                    && proposed.get("status").and_then(serde_json::Value::as_str) != Some("done")
+                {
+                    return Err(format!(
+                        "completion update cannot reopen adopted review unit {}",
                         old_unit.id
                     ));
                 }
@@ -942,6 +1087,7 @@ impl Session {
                 };
                 object.remove("review_evidence");
                 object.remove("review_launch");
+                object.remove("review_state");
                 let Some(old_unit) = previous_contract.as_ref().and_then(|old| {
                     old.units.iter().find(|unit| {
                         object.get("id").and_then(serde_json::Value::as_str)
@@ -950,6 +1096,27 @@ impl Session {
                 }) else {
                     continue;
                 };
+                if old_unit.kind == codex_history::task_context::CompletionUnitKind::Review {
+                    object.insert(
+                        "review_revalidation_of".into(),
+                        serde_json::to_value(&old_unit.review_revalidation_of)
+                            .map_err(|error| error.to_string())?,
+                    );
+                    object.insert(
+                        "review_target".into(),
+                        serde_json::to_value(&old_unit.review_target)
+                            .map_err(|error| error.to_string())?,
+                    );
+                    object.insert(
+                        "review_decision_reason".into(),
+                        serde_json::to_value(&old_unit.review_decision_reason)
+                            .map_err(|error| error.to_string())?,
+                    );
+                    object.insert(
+                        "status".into(),
+                        serde_json::to_value(old_unit.status).map_err(|error| error.to_string())?,
+                    );
+                }
                 let review_result_collected = old_unit
                     .review_evidence
                     .as_ref()
@@ -981,6 +1148,30 @@ impl Session {
                         serde_json::to_value(launch).map_err(|error| error.to_string())?,
                     );
                 }
+                if let Some(review_state) = old_unit.review_state.as_ref() {
+                    object.insert(
+                        "review_state".into(),
+                        serde_json::to_value(review_state).map_err(|error| error.to_string())?,
+                    );
+                }
+                if let Some(review_state) = withdrawals.get(&old_unit.id) {
+                    object.insert(
+                        "review_state".into(),
+                        serde_json::to_value(review_state).map_err(|error| error.to_string())?,
+                    );
+                    object.insert(
+                        "status".into(),
+                        serde_json::to_value(codex_history::task_context::UnitStatus::Cancelled)
+                            .map_err(|error| error.to_string())?,
+                    );
+                    object.insert(
+                        "review_decision_reason".into(),
+                        serde_json::to_value(Some(
+                            "Explicitly cancelled by the host-authorized completion Update.",
+                        ))
+                        .map_err(|error| error.to_string())?,
+                    );
+                }
             }
         }
         let mut invalidated_conditions = std::collections::HashSet::new();
@@ -999,6 +1190,21 @@ impl Session {
                 }
             }
         }
+        let latest = self
+            .latest_rencrow_task_state()
+            .await
+            .map_err(|error| error.to_string())?;
+        if latest
+            .as_ref()
+            .is_some_and(|state| state.boundary.root_task_id != root_task_id)
+        {
+            return Err("completion root does not match the latest accepted task state".into());
+        }
+        let completed = latest
+            .as_ref()
+            .map(|state| state.completed.clone())
+            .unwrap_or_default();
+        canonicalize_completion_state_evidence(&mut completion_state, &completed)?;
         if !invalidated_conditions.is_empty()
             && let Some(conditions) = completion_state
                 .get_mut("conditions")
@@ -1020,7 +1226,12 @@ impl Session {
                             .evidence
                             .iter()
                             .map(|evidence| {
-                                (evidence.task_id.as_str(), evidence.task_revision)
+                                (
+                                    evidence.task_id.as_str(),
+                                    evidence.task_revision,
+                                    evidence.artifact_ref.as_str(),
+                                    evidence.verification_ref.as_str(),
+                                )
                             })
                             .collect::<std::collections::HashSet<_>>();
                         condition
@@ -1028,13 +1239,18 @@ impl Session {
                             .and_then(serde_json::Value::as_array)
                             .is_some_and(|evidence| {
                                 evidence.iter().any(|item| {
-                                    let task_id = item
-                                        .get("task_id")
-                                        .and_then(serde_json::Value::as_str);
-                                    let revision = item
-                                        .get("task_revision")
-                                        .and_then(serde_json::Value::as_u64);
-                                    matches!((task_id, revision), (Some(task_id), Some(revision)) if !prior.contains(&(task_id, revision)))
+                                    let identity = (
+                                        item.get("task_id")
+                                            .and_then(serde_json::Value::as_str),
+                                        item.get("task_revision")
+                                            .and_then(serde_json::Value::as_u64),
+                                        item.get("artifact_ref")
+                                            .and_then(serde_json::Value::as_str),
+                                        item.get("verification_ref")
+                                            .and_then(serde_json::Value::as_str),
+                                    );
+                                    matches!(identity, (Some(task_id), Some(revision), Some(artifact_ref), Some(verification_ref))
+                                        if !prior.contains(&(task_id, revision, artifact_ref, verification_ref)))
                                 })
                             })
                     });
@@ -1058,25 +1274,9 @@ impl Session {
                 }
             }
         }
-        let latest = self
-            .latest_rencrow_task_state()
-            .await
-            .map_err(|error| error.to_string())?;
-        if latest
-            .as_ref()
-            .is_some_and(|state| state.boundary.root_task_id != root_task_id)
-        {
-            return Err("completion root does not match the latest accepted task state".into());
-        }
-        let completed = latest
-            .as_ref()
-            .map(|state| state.completed.clone())
-            .unwrap_or_default();
-        if let Some(accepted) = latest.as_ref()
-            && accepted.boundary.root_task_id != root_task_id
-        {
-            return Err("completion root does not match the latest accepted task state".into());
-        }
+        // The stale-proof fallback above may restore the prior evidence after the incoming
+        // proposal was canonicalized. Keep that fallback aligned with the same accepted host
+        // receipts before the existing exact task-check and physical-artifact validation.
         canonicalize_completion_state_evidence(&mut completion_state, &completed)?;
         let mut evidence_refs = Vec::new();
         collect_fresh_completion_evidence(
@@ -1140,6 +1340,337 @@ impl Session {
         }
         let mut completion_state: codex_history::task_context::CompletionState =
             serde_json::from_value(completion_state).map_err(|error| error.to_string())?;
+        let has_new_revalidation = completion_state.units.iter().any(|unit| {
+            unit.review_revalidation_of.is_some()
+                && previous_contract.as_ref().is_none_or(|previous| {
+                    !previous.units.iter().any(|old_unit| old_unit.id == unit.id)
+                })
+        });
+        if let Some(previous) = previous_contract.as_ref() {
+            for old_unit in previous.units.iter().filter(|unit| {
+                unit.kind == codex_history::task_context::CompletionUnitKind::Review
+                    && unit.status == codex_history::task_context::UnitStatus::Done
+                    && unit.review_state.is_none()
+            }) {
+                let previous_definition_digest =
+                    codex_history::task_context::completion_condition_definitions_sha256(
+                        previous,
+                        &old_unit.condition_refs,
+                    )?;
+                let current_definition_digest =
+                    codex_history::task_context::completion_condition_definitions_sha256(
+                        &completion_state,
+                        &old_unit.condition_refs,
+                    )?;
+                let explicitly_revalidated = completion_state.units.iter().any(|unit| {
+                    unit.review_revalidation_of.as_deref() == Some(old_unit.id.as_str())
+                });
+                if previous_definition_digest != current_definition_digest
+                    && !explicitly_revalidated
+                {
+                    return Err(format!(
+                        "condition definitions for adopted legacy review {} changed without an explicit revalidation review",
+                        old_unit.id
+                    ));
+                }
+            }
+        }
+        let new_revalidation_condition_digests = completion_state
+            .units
+            .iter()
+            .filter(|unit| {
+                unit.review_revalidation_of.is_some()
+                    && previous_contract.as_ref().is_none_or(|previous| {
+                        !previous.units.iter().any(|old_unit| old_unit.id == unit.id)
+                    })
+            })
+            .map(|unit| {
+                codex_history::task_context::completion_condition_definitions_sha256(
+                    &completion_state,
+                    &unit.condition_refs,
+                )
+                .map(|digest| (unit.id.clone(), digest))
+            })
+            .collect::<Result<std::collections::HashMap<_, _>, _>>()?;
+        let revalidation_dependencies = completion_state
+            .units
+            .iter()
+            .filter_map(|unit| {
+                if unit.review_revalidation_of.is_none()
+                    || previous_contract.as_ref().is_some_and(|previous| {
+                        previous.units.iter().any(|old_unit| old_unit.id == unit.id)
+                    })
+                {
+                    return None;
+                }
+                let source_id = unit.review_revalidation_of.as_deref()?;
+                let source_contract = previous_contract.as_ref()?;
+                let source = source_contract
+                    .units
+                    .iter()
+                    .find(|source| source.id == source_id)?;
+                let target = unit.review_target.as_ref()?;
+                let accepted_artifact_ref = completed.get(&target.task_id)?.artifact_ref.as_str();
+                let accepted_fingerprint =
+                    codex_history::task_context::task_check_artifact_fingerprint(
+                        accepted_artifact_ref,
+                    )?;
+                (codex_history::task_context::completion_review_target_has_exact_execution_dependency(
+                    source_contract,
+                    unit,
+                    accepted_fingerprint,
+                ) && codex_history::task_context::completion_review_revalidation_dependencies_match(
+                    source_contract,
+                    &completion_state,
+                    source,
+                    unit,
+                    accepted_fingerprint,
+                ))
+                .then(|| unit.id.clone())
+            })
+            .collect::<std::collections::HashSet<_>>();
+        if has_new_revalidation
+            && completion_state.units.iter().any(|unit| {
+                unit.review_revalidation_of.is_some()
+                    && previous_contract.as_ref().is_none_or(|previous| {
+                        !previous.units.iter().any(|old_unit| old_unit.id == unit.id)
+                    })
+                    && !revalidation_dependencies.contains(&unit.id)
+            })
+        {
+            return Err(
+                "review revalidation requires its accepted target and execution dependency in the persisted current plan".into(),
+            );
+        }
+        if has_new_revalidation {
+            // Anchor the old adoption together with the latest accepted execution dependency
+            // before the revalidation edge is added to the contract.
+            self.persist_autonomous_completion_snapshot().await?;
+            previous_snapshot_receipt = self
+                .state
+                .lock()
+                .await
+                .rencrow_completion_last_persisted_snapshot
+                .clone();
+        }
+        let mut revalidated_sources = std::collections::HashSet::new();
+        for unit in completion_state.units.iter_mut().filter(|unit| {
+            unit.review_revalidation_of.is_some()
+                && previous_contract.as_ref().is_none_or(|previous| {
+                    !previous.units.iter().any(|old_unit| old_unit.id == unit.id)
+                })
+        }) {
+            let source_id = unit.review_revalidation_of.as_deref().ok_or_else(|| {
+                "review revalidation is missing its source obligation id".to_string()
+            })?;
+            if unit.kind != codex_history::task_context::CompletionUnitKind::Review
+                || unit.status != codex_history::task_context::UnitStatus::Planned
+                || unit.review_state.is_some()
+                || !revalidated_sources.insert(source_id.to_string())
+            {
+                return Err(
+                    "review revalidation must name one new planned review per adopted obligation"
+                        .into(),
+                );
+            }
+            let source = previous_contract
+                .as_ref()
+                .and_then(|previous| {
+                    previous
+                        .units
+                        .iter()
+                        .find(|candidate| candidate.id == source_id)
+                })
+                .ok_or_else(|| {
+                    "review revalidation source is not an existing obligation".to_string()
+                })?;
+            let source_adoption_sha256 =
+                codex_history::task_context::completion_review_adoption_sha256(source)?;
+            let condition_definitions_sha256 = new_revalidation_condition_digests
+                .get(&unit.id)
+                .cloned()
+                .ok_or_else(|| "new review revalidation has no condition digest".to_string())?;
+            let source_evidence = source
+                .review_evidence
+                .as_ref()
+                .ok_or_else(|| "review revalidation source has no adopted evidence".to_string())?;
+            let target = unit
+                .review_target
+                .as_ref()
+                .ok_or_else(|| "new review revalidation has no target".to_string())?;
+            let accepted = completed.get(&target.task_id).ok_or_else(|| {
+                "review revalidation target has no current accepted receipt".to_string()
+            })?;
+            let accepted_artifact_fingerprint =
+                codex_history::task_context::task_check_artifact_fingerprint(
+                    &accepted.artifact_ref,
+                )
+                .ok_or_else(|| {
+                    "accepted artifact receipt has an invalid fingerprint".to_string()
+                })?;
+            let source_artifact_fingerprint =
+                codex_history::task_context::task_check_artifact_fingerprint(
+                    &source_evidence.target_artifact_ref,
+                )
+                .ok_or_else(|| {
+                    "adopted review source has an invalid artifact fingerprint".to_string()
+                })?;
+            let persisted_snapshot = previous_snapshot_receipt
+                .as_ref()
+                .filter(|receipt| receipt.root_task_id == root_task_id)
+                .ok_or_else(|| {
+                    "review revalidation source has no persisted snapshot receipt".to_string()
+                })?;
+            let persisted_source_matches = match persisted_snapshot.version {
+                1 => persisted_snapshot
+                    .legacy_review_bindings
+                    .get(source_id)
+                    .is_some_and(|binding| {
+                        binding.contract_revision <= previous_contract
+                            .as_ref()
+                            .map_or(0, |contract| contract.contract_revision)
+                            && binding.status
+                                == codex_history::task_context::UnitStatus::Done
+                            && binding.review_target == source.review_target
+                            && binding.condition_refs == source.condition_refs
+                            && binding.depends_on == source.depends_on
+                            && binding.evidence.as_ref() == Some(source_evidence)
+                    }),
+                2 => persisted_snapshot
+                    .legacy_review_bindings
+                    .get(source_id)
+                    .is_some_and(|binding| {
+                        binding.status == codex_history::task_context::UnitStatus::Done
+                            && binding.review_target == source.review_target
+                            && binding.condition_refs == source.condition_refs
+                            && binding.depends_on == source.depends_on
+                            && binding.evidence.as_ref() == Some(source_evidence)
+                    })
+                    || source
+                        .review_state
+                        .as_ref()
+                        .and_then(|review| review.active_attempt.as_ref())
+                        .zip(persisted_snapshot.review_attempts.get(source_id))
+                        .is_some_and(|(attempt, persisted)| {
+                        let terminal_source_sha256 = attempt
+                            .terminal_source
+                            .as_ref()
+                            .and_then(|source| {
+                                serde_json::to_value(source)
+                                    .ok()
+                                    .and_then(|value| {
+                                        codex_history::compaction_candidate::digest(&value).ok()
+                                    })
+                            });
+                        attempt.attempt_id == persisted.attempt_id
+                            && attempt.status
+                                == codex_history::task_context::CompletionReviewAttemptStatus::Completed
+                            && persisted.status
+                                == codex_history::task_context::CompletionReviewAttemptStatus::Completed
+                            && attempt.reviewer_thread_id == persisted.reviewer_thread_id
+                            && attempt.reviewer_turn_id == persisted.reviewer_turn_id
+                            && attempt.target_task_id == persisted.target_task_id
+                            && attempt.target_task_revision == persisted.target_task_revision
+                            && attempt.target_artifact_ref == persisted.target_artifact_ref
+                            && terminal_source_sha256 == persisted.terminal_source_sha256
+                    }),
+                _ => false,
+            };
+            let existing_active_successor = previous_contract.as_ref().is_some_and(|previous| {
+                previous.units.iter().any(|candidate| {
+                    candidate.review_revalidation_of.as_deref() == Some(source_id)
+                        && candidate.status != codex_history::task_context::UnitStatus::Cancelled
+                })
+            });
+            if source.status != codex_history::task_context::UnitStatus::Done
+                || source.kind != codex_history::task_context::CompletionUnitKind::Review
+                || target.task_revision != accepted.revision
+                || unit.condition_refs != source.condition_refs
+                || !revalidation_dependencies.contains(&unit.id)
+                || (accepted_artifact_fingerprint == source_artifact_fingerprint
+                    && condition_definitions_sha256
+                        == codex_history::task_context::completion_condition_definitions_sha256(
+                            previous_contract.as_ref().ok_or_else(|| {
+                                "review revalidation requires an existing completion contract"
+                                    .to_string()
+                            })?,
+                            &source.condition_refs,
+                        )?)
+                || accepted.revision == 0
+                || source_id == unit.id.as_str()
+                || previous_contract.as_ref().is_some_and(|previous| {
+                    previous
+                        .units
+                        .iter()
+                        .any(|candidate| candidate.id == unit.id)
+                })
+                || source
+                    .review_revalidation_of
+                    .as_ref()
+                    .is_some_and(|ancestor| ancestor == &unit.id)
+                || existing_active_successor
+                || !persisted_source_matches
+            {
+                return Err(
+                    "review revalidation must bind the exact adopted obligation to a current accepted target without replacing an active successor".into(),
+                );
+            }
+            let current_target_ref = self
+                .current_completion_review_target_ref(&target.task_id, target.task_revision)
+                .await?;
+            if codex_history::task_context::task_check_artifact_fingerprint(&current_target_ref)
+                != Some(accepted_artifact_fingerprint)
+            {
+                return Err("current verified target differs from its accepted receipt".into());
+            }
+            let source_snapshot = codex_history::task_context::CompletionReviewSnapshotRef {
+                version: persisted_snapshot.version,
+                sha256: persisted_snapshot.sha256.clone(),
+            };
+            unit.review_state = Some(codex_history::task_context::CompletionReviewState {
+                version: 1,
+                obligation_unit_id: unit.id.clone(),
+                active_attempt: None,
+                historical_failure: None,
+                retry_reservation_prior_historical_failure: None,
+                previous_attempt_ref: None,
+                retry_authorization: None,
+                withdrawal: None,
+                revalidation: Some(
+                    codex_history::task_context::CompletionReviewRevalidationSource {
+                        source_unit_id: source_id.to_string(),
+                        source_adoption_sha256,
+                        source_snapshot,
+                        required_artifact_fingerprint: accepted_artifact_fingerprint.to_string(),
+                        source_condition_definitions_sha256: codex_history::task_context::completion_condition_definitions_sha256(
+                            previous_contract.as_ref().ok_or_else(|| "review revalidation requires an existing completion contract".to_string())?,
+                            &source.condition_refs,
+                        )?,
+                        required_condition_definitions_sha256: condition_definitions_sha256,
+                        update_call_id: update_call_id
+                            .as_deref()
+                            .filter(|call_id| !call_id.trim().is_empty())
+                            .ok_or_else(|| {
+                                "review revalidation requires an explicit host Update call".to_string()
+                            })?
+                            .to_string(),
+                    },
+                ),
+            });
+        }
+        if let Some(previous) = previous_contract.as_ref() {
+            if previous.blocker.is_some() {
+                completion_state.blocker = previous.blocker.clone();
+            } else if completion_state
+                .blocker
+                .as_ref()
+                .is_some_and(|blocker| blocker.review_owner.is_some())
+            {
+                return Err(
+                    "model update cannot create a host-owned reviewer blocker source".into(),
+                );
+            }
+        }
         if completion_state.contract_revision == 0 {
             return Err("completion state requires a positive contract revision".into());
         }
@@ -1312,7 +1843,17 @@ impl Session {
             }
             state.rencrow_completion_state = Some((root_task_id, completion_state));
         }
-        self.persist_autonomous_completion_snapshot().await?;
+        if let Err(error) = self.persist_autonomous_completion_snapshot().await {
+            if !withdrawals.is_empty()
+                && let Some((root, mut previous)) = previous_canonical
+            {
+                previous.paused = true;
+                let mut state = self.state.lock().await;
+                state.rencrow_completion_state = Some((root, previous));
+                state.rencrow_completion_paused = true;
+            }
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -1320,43 +1861,414 @@ impl Session {
         &self,
         root_task_id: &str,
     ) -> Option<codex_history::task_context::CompletionState> {
-        self.state
+        let contract = self
+            .state
             .lock()
             .await
             .rencrow_completion_state
             .as_ref()
             .filter(|(root, _)| root == root_task_id)
-            .map(|(_, completion_state)| completion_state.clone())
+            .map(|(_, completion_state)| completion_state.clone())?;
+        super::completion_review::project_completion_state(&contract).ok()
+    }
+
+    async fn current_completion_review_artifact_fingerprints(
+        &self,
+        contract: &codex_history::task_context::CompletionState,
+        accepted_tasks: &std::collections::BTreeMap<
+            String,
+            codex_history::task_context::AcceptedTaskReceipt,
+        >,
+    ) -> std::collections::HashMap<String, String> {
+        let task_ids = contract
+            .units
+            .iter()
+            .filter(|unit| unit.kind == codex_history::task_context::CompletionUnitKind::Review)
+            .filter_map(|unit| {
+                unit.review_target
+                    .as_ref()
+                    .map(|target| target.task_id.clone())
+            })
+            .collect::<std::collections::HashSet<_>>();
+        let mut fingerprints = std::collections::HashMap::new();
+        for task_id in task_ids {
+            let Some(accepted) = accepted_tasks.get(&task_id) else {
+                continue;
+            };
+            let Ok(artifact_ref) = self
+                .current_completion_review_target_ref(&task_id, accepted.revision)
+                .await
+            else {
+                continue;
+            };
+            if let Some(fingerprint) =
+                codex_history::task_context::task_check_artifact_fingerprint(&artifact_ref)
+            {
+                fingerprints.insert(task_id, fingerprint.to_string());
+            }
+        }
+        fingerprints
+    }
+
+    async fn completion_observation_is_current(
+        &self,
+        expected_root_task_id: &str,
+        expected_contract: &codex_history::task_context::CompletionState,
+        expected_snapshot_receipt: Option<&crate::state::CompletionSnapshotReceipt>,
+        expected_paused: bool,
+        expected_uncollected_children: &std::collections::HashSet<String>,
+        expected_task_state: Option<&codex_history::task_context::StoredTaskState>,
+    ) -> bool {
+        let current_task_state = self.latest_rencrow_task_state().await.ok().flatten();
+        if current_task_state.as_ref() != expected_task_state {
+            return false;
+        }
+        let state = self.state.lock().await;
+        state.rencrow_completion_paused == expected_paused
+            && state.rencrow_completion_uncollected_children == *expected_uncollected_children
+            && state.rencrow_completion_last_persisted_snapshot.as_ref()
+                == expected_snapshot_receipt
+            && state
+                .rencrow_completion_state
+                .as_ref()
+                .is_some_and(|(root, contract)| {
+                    root == expected_root_task_id && contract == expected_contract
+                })
+    }
+
+    pub(crate) async fn autonomous_completion_current_review_scope_reason(&self) -> Option<String> {
+        let latest_task_state = self.latest_rencrow_task_state().await.ok().flatten();
+        let (root_task_id, canonical, receipt, paused, uncollected_children) = {
+            let state = self.state.lock().await;
+            let (root_task_id, canonical) = state.rencrow_completion_state.as_ref()?;
+            (
+                root_task_id.clone(),
+                canonical.clone(),
+                state.rencrow_completion_last_persisted_snapshot.clone(),
+                state.rencrow_completion_paused,
+                state.rencrow_completion_uncollected_children.clone(),
+            )
+        };
+        let Ok(contract) = super::completion_review::project_completion_state(&canonical) else {
+            let current = self
+                .completion_observation_is_current(
+                    &root_task_id,
+                    &canonical,
+                    receipt.as_ref(),
+                    paused,
+                    &uncollected_children,
+                    latest_task_state.as_ref(),
+                )
+                .await;
+            return Some(if current {
+                "Completion state cannot be projected; review scope remains unresolved.".into()
+            } else {
+                "Completion changed during review freshness checks; the current review scope is unverified.".into()
+            });
+        };
+        let has_adopted_review = contract.units.iter().any(|unit| {
+            unit.kind == codex_history::task_context::CompletionUnitKind::Review
+                && unit.status == codex_history::task_context::UnitStatus::Done
+        });
+        if !has_adopted_review {
+            return if self
+                .completion_observation_is_current(
+                    &root_task_id,
+                    &canonical,
+                    receipt.as_ref(),
+                    paused,
+                    &uncollected_children,
+                    latest_task_state.as_ref(),
+                )
+                .await
+            {
+                None
+            } else {
+                Some("Completion changed during review freshness checks; the current review scope is unverified.".into())
+            };
+        }
+        let Some(latest_task_state) = latest_task_state else {
+            let current = self
+                .completion_observation_is_current(
+                    &root_task_id,
+                    &canonical,
+                    receipt.as_ref(),
+                    paused,
+                    &uncollected_children,
+                    /*expected_task_state*/ None,
+                )
+                .await;
+            return Some(if current {
+                "Current accepted task receipts are unavailable; review scope cannot be verified."
+                    .into()
+            } else {
+                "Completion changed during review freshness checks; the current review scope is unverified.".into()
+            });
+        };
+        if latest_task_state.boundary.root_task_id != root_task_id {
+            let current = self
+                .completion_observation_is_current(
+                    &root_task_id,
+                    &canonical,
+                    receipt.as_ref(),
+                    paused,
+                    &uncollected_children,
+                    Some(&latest_task_state),
+                )
+                .await;
+            return Some(if current {
+                "Current accepted task receipts belong to a different completion root; review completion remains unresolved.".into()
+            } else {
+                "Completion changed during review freshness checks; the current review scope is unverified.".into()
+            });
+        }
+        let legacy_receipt = receipt
+            .as_ref()
+            .filter(|receipt| receipt.version == 1 && receipt.root_task_id == root_task_id);
+        let current_fingerprints = self
+            .current_completion_review_artifact_fingerprints(
+                &contract,
+                &latest_task_state.completed,
+            )
+            .await;
+        let stale = contract.units.iter().find(|unit| {
+            unit.kind == codex_history::task_context::CompletionUnitKind::Review
+                && unit.status == codex_history::task_context::UnitStatus::Done
+                && !completion_unit_obligation_is_satisfied(
+                    &contract,
+                    unit,
+                    &root_task_id,
+                    legacy_receipt,
+                    &latest_task_state.completed,
+                    &current_fingerprints,
+                )
+        });
+        let Some(stale) = stale else {
+            return if self
+                .completion_observation_is_current(
+                    &root_task_id,
+                    &canonical,
+                    receipt.as_ref(),
+                    paused,
+                    &uncollected_children,
+                    Some(&latest_task_state),
+                )
+                .await
+            {
+                None
+            } else {
+                Some("Completion changed during review freshness checks; the current review scope is unverified.".into())
+            };
+        };
+        let mut current_leaf = stale;
+        for _ in 0..contract.units.len() {
+            let mut successors = contract.units.iter().filter(|unit| {
+                unit.review_revalidation_of.as_deref() == Some(current_leaf.id.as_str())
+                    && unit.status != codex_history::task_context::UnitStatus::Cancelled
+            });
+            let Some(successor) = successors.next() else {
+                break;
+            };
+            if successors.next().is_some() {
+                break;
+            }
+            current_leaf = successor;
+            if current_leaf.status != codex_history::task_context::UnitStatus::Done
+                || completion_unit_obligation_is_satisfied(
+                    &contract,
+                    current_leaf,
+                    &root_task_id,
+                    legacy_receipt,
+                    &latest_task_state.completed,
+                    &current_fingerprints,
+                )
+            {
+                break;
+            }
+        }
+        let reason = match current_leaf.status {
+            codex_history::task_context::UnitStatus::Failed => format!(
+                "Review {} is the failed current revalidation of historical obligation {}; retry only this exact failed attempt through plan_review.",
+                current_leaf.id, stale.id
+            ),
+            codex_history::task_context::UnitStatus::Running
+            | codex_history::task_context::UnitStatus::Blocked => format!(
+                "Review {} is the unresolved current revalidation of historical obligation {}; resolve this exact attempt before planning a replacement.",
+                current_leaf.id, stale.id
+            ),
+            codex_history::task_context::UnitStatus::Planned
+            | codex_history::task_context::UnitStatus::Ready => format!(
+                "Review {} is the planned current revalidation of historical obligation {}; complete and adopt it.",
+                current_leaf.id, stale.id
+            ),
+            _ if current_leaf.id != stale.id => format!(
+                "Review {} remains historical for the current accepted artifact or condition definitions; add a new Planned review with review_revalidation_of set to {} through Update.",
+                current_leaf.id, current_leaf.id
+            ),
+            _ => format!(
+                "Review {} remains historical for the current accepted artifact or condition definitions; add a new Planned review with review_revalidation_of set to {} through Update.",
+                stale.id, stale.id
+            ),
+        };
+        if !self
+            .completion_observation_is_current(
+                &root_task_id,
+                &canonical,
+                receipt.as_ref(),
+                paused,
+                &uncollected_children,
+                Some(&latest_task_state),
+            )
+            .await
+        {
+            return Some("Completion changed during review freshness checks; the current review scope is unverified.".into());
+        }
+        Some(reason)
     }
 
     pub(crate) async fn autonomous_completion_pending(&self) -> bool {
-        let state = self.state.lock().await;
-        if state.rencrow_completion_paused
-            || state
-                .rencrow_completion_state
-                .as_ref()
-                .is_none_or(|(_, contract)| contract.paused)
-        {
+        let latest_task_state = self.latest_rencrow_task_state().await.ok().flatten();
+        let (root_task_id, canonical, snapshot_receipt, paused, uncollected_child_ids) = {
+            let state = self.state.lock().await;
+            let Some((root_task_id, canonical)) = state.rencrow_completion_state.as_ref() else {
+                return false;
+            };
+            (
+                root_task_id.clone(),
+                canonical.clone(),
+                state.rencrow_completion_last_persisted_snapshot.clone(),
+                state.rencrow_completion_paused,
+                state.rencrow_completion_uncollected_children.clone(),
+            )
+        };
+        if paused || canonical.paused {
             return false;
         }
-        let Some((_, contract)) = state.rencrow_completion_state.as_ref() else {
-            return false;
+        let accepted_tasks = latest_task_state
+            .as_ref()
+            .filter(|latest| latest.boundary.root_task_id == root_task_id)
+            .map(|latest| latest.completed.clone())
+            .unwrap_or_default();
+        let Ok(contract) = super::completion_review::project_completion_state(&canonical) else {
+            return self
+                .completion_observation_is_current(
+                    &root_task_id,
+                    &canonical,
+                    snapshot_receipt.as_ref(),
+                    paused,
+                    &uncollected_child_ids,
+                    latest_task_state.as_ref(),
+                )
+                .await;
         };
+        let legacy_receipt = snapshot_receipt
+            .as_ref()
+            .filter(|receipt| receipt.version == 1 && receipt.root_task_id == root_task_id);
+        let current_fingerprints = self
+            .current_completion_review_artifact_fingerprints(&contract, &accepted_tasks)
+            .await;
         let open_conditions = contract.conditions.iter().any(|condition| {
             condition.status != codex_history::task_context::AcceptanceStatus::Satisfied
                 && condition.status != codex_history::task_context::AcceptanceStatus::Waived
         });
         let unfinished_units = contract.units.iter().any(|unit| {
-            !matches!(
-                unit.status,
-                codex_history::task_context::UnitStatus::Done
-                    | codex_history::task_context::UnitStatus::Cancelled
+            !completion_unit_obligation_is_satisfied(
+                &contract,
+                unit,
+                &root_task_id,
+                legacy_receipt,
+                &accepted_tasks,
+                &current_fingerprints,
             )
         });
-        (open_conditions
-            || unfinished_units
-            || !state.rencrow_completion_uncollected_children.is_empty())
+        let pending = (open_conditions || unfinished_units || !uncollected_child_ids.is_empty())
+            && contract.blocker.is_none();
+        self.completion_observation_is_current(
+            &root_task_id,
+            &canonical,
+            snapshot_receipt.as_ref(),
+            paused,
+            &uncollected_child_ids,
+            latest_task_state.as_ref(),
+        )
+        .await
+            && pending
+    }
+
+    pub(crate) async fn autonomous_completion_is_complete(&self) -> bool {
+        let Some(latest_task_state) = self.latest_rencrow_task_state().await.ok().flatten() else {
+            return false;
+        };
+        let (root_task_id, canonical, snapshot_receipt, paused, uncollected_child_ids) = {
+            let state = self.state.lock().await;
+            if state.rencrow_completion_paused
+                || !state.rencrow_completion_uncollected_children.is_empty()
+            {
+                return false;
+            }
+            let Some((root_task_id, canonical)) = state.rencrow_completion_state.as_ref() else {
+                return false;
+            };
+            (
+                root_task_id.clone(),
+                canonical.clone(),
+                state.rencrow_completion_last_persisted_snapshot.clone(),
+                canonical.paused,
+                state.rencrow_completion_uncollected_children.clone(),
+            )
+        };
+        if paused
+            || !uncollected_child_ids.is_empty()
+            || latest_task_state.boundary.root_task_id != root_task_id
+        {
+            return false;
+        }
+        let Ok(contract) = super::completion_review::project_completion_state(&canonical) else {
+            return false;
+        };
+        let legacy_receipt = snapshot_receipt
+            .as_ref()
+            .filter(|receipt| receipt.version == 1 && receipt.root_task_id == root_task_id);
+        let current_fingerprints = self
+            .current_completion_review_artifact_fingerprints(
+                &contract,
+                &latest_task_state.completed,
+            )
+            .await;
+        let completion_state_is_settled = !contract.paused
             && contract.blocker.is_none()
+            && contract.conditions.iter().all(|condition| {
+                matches!(
+                    condition.status,
+                    codex_history::task_context::AcceptanceStatus::Satisfied
+                        | codex_history::task_context::AcceptanceStatus::Waived
+                )
+            })
+            && contract.units.iter().all(|unit| {
+                completion_unit_obligation_is_satisfied(
+                    &contract,
+                    unit,
+                    &root_task_id,
+                    legacy_receipt,
+                    &latest_task_state.completed,
+                    &current_fingerprints,
+                )
+            });
+        let completion_state_is_settled = completion_state_is_settled
+            && !self
+                .autonomous_completion_has_unresolved_runtime_work()
+                .await;
+        completion_state_is_settled
+            && self
+                .completion_observation_is_current(
+                    &root_task_id,
+                    &canonical,
+                    snapshot_receipt.as_ref(),
+                    paused,
+                    &uncollected_child_ids,
+                    Some(&latest_task_state),
+                )
+                .await
     }
 
     pub(crate) async fn autonomous_completion_plan_review_due(&self) -> bool {
@@ -1390,12 +2302,211 @@ impl Session {
         }
     }
 
+    async fn import_legacy_failed_review_attempt(
+        &self,
+        root_task_id: &str,
+        unit_id: &str,
+        expected_attempt_id: &str,
+        latest: &codex_history::task_context::StoredTaskState,
+    ) -> Result<
+        (
+            codex_history::task_context::CompletionReviewAttempt,
+            codex_history::task_context::CompletionReviewSnapshotRef,
+        ),
+        String,
+    > {
+        if self.live_thread().is_none() {
+            return Err("legacy retry import requires a live durable parent thread".into());
+        }
+        let (legacy_contract_revision, legacy_unit) = self
+            .autonomous_completion_current_state()
+            .await
+            .filter(|(root, _)| root == root_task_id)
+            .and_then(|(_, contract)| {
+                contract
+                    .units
+                    .iter()
+                    .find(|unit| unit.id == unit_id)
+                    .cloned()
+                    .map(|unit| (contract.contract_revision, unit))
+            })
+            .ok_or_else(|| "legacy retry obligation disappeared before import".to_string())?;
+        let evidence = legacy_unit
+            .review_evidence
+            .as_ref()
+            .ok_or_else(|| "legacy retry has no persisted reviewer evidence".to_string())?;
+        if legacy_unit.kind != codex_history::task_context::CompletionUnitKind::Review
+            || legacy_unit.status != codex_history::task_context::UnitStatus::Failed
+            || legacy_unit.review_state.is_some()
+            || legacy_unit.review_launch.is_some()
+            || evidence.terminal_status
+                != Some(codex_history::task_context::CompletionReviewTerminalStatus::Failed)
+            || evidence.reviewer_turn_id.trim().is_empty()
+            || evidence.reviewer_turn_id.starts_with("pending-")
+            || evidence.spawn_call_id.trim().is_empty()
+            || evidence.spawn_call_id != expected_attempt_id
+            || evidence.reviewer_role.trim().is_empty()
+            || evidence.wait_result_ref.is_some() != evidence.wait_call_id.is_some()
+            || evidence
+                .deadline_unix_ms
+                .is_some_and(|deadline| deadline <= 0)
+        {
+            return Err("legacy review is not an exact failed host-bound attempt".into());
+        }
+        let accepted = latest
+            .completed
+            .get(&evidence.target_task_id)
+            .filter(|receipt| {
+                receipt.revision == evidence.target_task_revision
+                    && receipt.artifact_ref == evidence.target_artifact_ref
+            })
+            .ok_or_else(|| {
+                "legacy retry accepted target changed since the failed attempt".to_string()
+            })?;
+        let target = legacy_unit
+            .review_target
+            .as_ref()
+            .ok_or_else(|| "legacy retry obligation has no declared target".to_string())?;
+        if target.task_id != evidence.target_task_id
+            || target.task_revision != evidence.target_task_revision
+            || accepted.artifact_ref != evidence.target_artifact_ref
+        {
+            return Err("legacy retry target does not match its accepted task receipt".into());
+        }
+        if self
+            .current_completion_review_target_ref(
+                &evidence.target_task_id,
+                evidence.target_task_revision,
+            )
+            .await?
+            != evidence.target_artifact_ref
+        {
+            return Err("legacy retry target artifact changed after its accepted revision".into());
+        }
+        let reviewer_thread_id =
+            codex_protocol::ThreadId::try_from(evidence.reviewer_thread_id.as_str())
+                .map_err(|_| "legacy retry reviewer thread id is invalid".to_string())?;
+        {
+            let state = self.state.lock().await;
+            if state
+                .rencrow_completion_uncollected_children
+                .contains(&evidence.reviewer_thread_id)
+            {
+                return Err("legacy retry still has an uncollected reviewer child".into());
+            }
+        }
+        self.services
+            .agent_control
+            .validate_completion_review_identity(
+                self.thread_id,
+                reviewer_thread_id,
+                &evidence.reviewer_role,
+            )
+            .await?;
+        let (observed_turn, observed_status) = self
+            .services
+            .agent_control
+            .get_agent_status_generation(reviewer_thread_id)
+            .await
+            .map_err(|error| format!("legacy reviewer runtime status is unavailable: {error}"))?;
+        if observed_turn.as_deref() != Some(evidence.reviewer_turn_id.as_str())
+            || !matches!(
+                observed_status,
+                codex_protocol::protocol::AgentStatus::Errored(_)
+                    | codex_protocol::protocol::AgentStatus::Shutdown
+                    | codex_protocol::protocol::AgentStatus::Completed(None)
+            )
+        {
+            return Err(
+                "legacy reviewer is not the same currently resolved terminal generation".into(),
+            );
+        }
+
+        // Refresh only the existing v1 snapshot before importing it; restore/read alone
+        // never changes schema version or grants retry authority.
+        self.persist_autonomous_completion_snapshot().await?;
+        let expected_binding = crate::state::PersistedLegacyReviewBinding {
+            contract_revision: legacy_contract_revision,
+            status: legacy_unit.status,
+            review_target: legacy_unit.review_target.clone(),
+            condition_refs: legacy_unit.condition_refs.clone(),
+            depends_on: legacy_unit.depends_on.clone(),
+            evidence: Some(evidence.clone()),
+        };
+        let imported_from = self
+            .persisted_legacy_review_snapshot_ref(root_task_id, unit_id, &expected_binding)
+            .await
+            .ok_or_else(|| {
+                "legacy retry requires the exact persisted v1 failure snapshot".to_string()
+            })?;
+        let terminal_source = if evidence.wait_result_ref.is_none() {
+            let proof = self
+                .services
+                .agent_control
+                .persisted_completion_review_abort_evidence(
+                    self.thread_id,
+                    reviewer_thread_id,
+                    &evidence.reviewer_turn_id,
+                    &evidence.reviewer_role,
+                )
+                .await?;
+            super::completion_review_deadline::terminal_source_from_abort(&proof)
+                .ok_or_else(|| "legacy ReviewEnded proof omitted its exact turn id".to_string())?
+        } else {
+            codex_history::task_context::CompletionReviewTerminalSource {
+                status: codex_history::task_context::CompletionReviewTerminalStatus::Failed,
+                event: None,
+            }
+        };
+        let contract = self
+            .autonomous_completion_current_state()
+            .await
+            .filter(|(root, _)| root == root_task_id)
+            .map(|(_, contract)| contract)
+            .ok_or_else(|| {
+                "completion contract disappeared during legacy retry import".to_string()
+            })?;
+        let conditions_sha256 = super::completion_review::completion_review_conditions_sha256(
+            &contract,
+            &legacy_unit.condition_refs,
+        )?;
+        Ok((
+            codex_history::task_context::CompletionReviewAttempt {
+                attempt_id: evidence.spawn_call_id.clone(),
+                contract_revision: legacy_contract_revision,
+                condition_refs: legacy_unit.condition_refs.clone(),
+                conditions_sha256,
+                status: codex_history::task_context::CompletionReviewAttemptStatus::Failed,
+                launch_unknown_reason: None,
+                consumed_retry_authorization: None,
+                imported_from: Some(imported_from.clone()),
+                reviewer_thread_id: Some(evidence.reviewer_thread_id.clone()),
+                reviewer_turn_id: Some(evidence.reviewer_turn_id.clone()),
+                reviewer_role: evidence.reviewer_role.clone(),
+                reviewer_model: None,
+                target_task_id: evidence.target_task_id.clone(),
+                target_task_revision: evidence.target_task_revision,
+                target_artifact_ref: evidence.target_artifact_ref.clone(),
+                deadline_unix_ms: evidence.deadline_unix_ms,
+                deadline_escalation: evidence.deadline_escalation.clone(),
+                deadline_safety_fingerprint: evidence.deadline_safety_fingerprint.clone(),
+                terminal_source: Some(terminal_source),
+                wait_result_ref: evidence.wait_result_ref.clone(),
+                wait_call_id: evidence.wait_call_id.clone(),
+                adoption_reason: None,
+            },
+            imported_from,
+        ))
+    }
+
     pub(crate) async fn record_autonomous_plan_review(
         &self,
         root_task_id: &str,
+        invocation_call_id: &str,
         previous_plan: String,
         revised_plan: String,
         reason: String,
+        retry: Option<super::completion_review::CompletionReviewRetryRequest>,
     ) -> Result<(), String> {
         if previous_plan.trim().is_empty()
             || revised_plan.trim().is_empty()
@@ -1406,9 +2517,91 @@ impl Session {
                 "plan review requires distinct non-empty old and new plans with a reason".into(),
             );
         }
-        let now = chrono::Utc::now().timestamp();
+        if invocation_call_id.trim().is_empty() {
+            return Err("plan review requires the host invocation call id".into());
+        }
+        if let Some(retry) = retry.as_ref()
+            && (retry.invocation_call_id != invocation_call_id
+                || retry.previous_plan != previous_plan
+                || retry.revised_plan != revised_plan
+                || retry.reason != reason)
         {
+            return Err("retry request does not match this explicit plan-review invocation".into());
+        }
+        let _review_guard = self.completion_review_owner_guard().await;
+        let mut legacy_retry_import = None;
+        let (latest_task_state, retry_previous_ref) = if let Some(retry) = retry.as_ref() {
+            let latest = self
+                .latest_rencrow_task_state()
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "retry target has no accepted task receipts".to_string())?;
+            if latest.boundary.root_task_id != root_task_id {
+                return Err("retry task receipts belong to a different completion root".into());
+            }
+            let contract = self
+                .autonomous_completion_current_state()
+                .await
+                .filter(|(root, _)| root == root_task_id)
+                .map(|(_, contract)| contract)
+                .ok_or_else(|| "retry completion contract disappeared".to_string())?;
+            let retry_unit = contract
+                .units
+                .iter()
+                .find(|unit| unit.id == retry.unit_id)
+                .ok_or_else(|| "retry obligation unit does not exist".to_string())?;
+            if let Some(attempt) = retry_unit
+                .review_state
+                .as_ref()
+                .and_then(|review| review.active_attempt.as_ref())
+                .filter(|attempt| attempt.attempt_id == retry.expected_attempt_id)
+            {
+                let receipt = latest
+                    .completed
+                    .get(&attempt.target_task_id)
+                    .filter(|receipt| receipt.revision == attempt.target_task_revision)
+                    .filter(|receipt| receipt.artifact_ref == attempt.target_artifact_ref)
+                    .ok_or_else(|| {
+                        "retry accepted target has changed since the failed attempt".to_string()
+                    })?;
+                let _ = receipt;
+                if attempt.reviewer_thread_id.is_none() || attempt.reviewer_turn_id.is_none() {
+                    return Err("retry requires the exact bound failed child generation".into());
+                }
+                attempt.terminal_source.as_ref().ok_or_else(|| {
+                    "retry requires a recorded exact terminal failure fact".to_string()
+                })?;
+                let reference = self
+                    .persisted_review_attempt_snapshot_ref(root_task_id, &retry.unit_id, attempt)
+                    .await?
+                    .ok_or_else(|| {
+                        "retry authorization requires the exact persisted failed-attempt snapshot"
+                            .to_string()
+                    })?;
+                (Some(latest), Some(reference))
+            } else if retry_unit.review_state.is_none() {
+                let (attempt, reference) = self
+                    .import_legacy_failed_review_attempt(
+                        root_task_id,
+                        &retry.unit_id,
+                        &retry.expected_attempt_id,
+                        &latest,
+                    )
+                    .await?;
+                legacy_retry_import = Some(attempt);
+                (Some(latest), Some(reference))
+            } else {
+                return Err(
+                    "retry request does not match the active or importable legacy attempt".into(),
+                );
+            }
+        } else {
+            (None, None)
+        };
+        let now = chrono::Utc::now().timestamp();
+        let prior_completion_state = {
             let mut state = self.state.lock().await;
+            let uncollected_children = state.rencrow_completion_uncollected_children.clone();
             let (active_root, contract) = state
                 .rencrow_completion_state
                 .as_mut()
@@ -1416,12 +2609,21 @@ impl Session {
             if active_root != root_task_id {
                 return Err("plan review root does not match the registered contract".into());
             }
-            if contract.paused || contract.blocker.is_some() {
+            let retry_owns_current_blocker = retry.as_ref().is_some_and(|retry| {
+                contract.blocker.as_ref().is_some_and(|blocker| {
+                    blocker.review_owner.as_ref().is_some_and(|owner| {
+                        owner.unit_id == retry.unit_id
+                            && owner.attempt_id == retry.expected_attempt_id
+                    })
+                })
+            });
+            if contract.paused || (contract.blocker.is_some() && !retry_owns_current_blocker) {
                 return Err(
                     "cannot review a paused or externally blocked completion contract".into(),
                 );
             }
-            if contract.units_completed_since_review < 2
+            if retry.is_none()
+                && contract.units_completed_since_review < 2
                 && contract
                     .plan_review_at
                     .is_none_or(|at| now.saturating_sub(at) < 30 * 60)
@@ -1435,6 +2637,109 @@ impl Session {
             if host_previous_plan != previous_plan {
                 return Err("previous plan does not match the host-registered next action".into());
             }
+            let prior_completion_state = (active_root.clone(), contract.clone());
+            if let Some(retry) = retry.as_ref() {
+                let unit_index = contract
+                    .units
+                    .iter()
+                    .position(|unit| unit.id == retry.unit_id)
+                    .ok_or_else(|| "retry obligation unit does not exist".to_string())?;
+                let current_conditions_sha256 =
+                    super::completion_review::completion_review_conditions_sha256(
+                        contract,
+                        &contract.units[unit_index].condition_refs,
+                    )?;
+                let current_contract_revision = contract.contract_revision;
+                let imported_attempt = legacy_retry_import.take();
+                let unit = &contract.units[unit_index];
+                let existing_attempt = contract.units[unit_index]
+                    .review_state
+                    .as_ref()
+                    .and_then(|review_state| review_state.active_attempt.as_ref());
+                let attempt = imported_attempt
+                    .as_ref()
+                    .or(existing_attempt)
+                    .ok_or_else(|| {
+                        "retry obligation has no exact failed attempt to authorize".to_string()
+                    })?;
+                let latest = latest_task_state.as_ref().ok_or_else(|| {
+                    "retry target task state is unavailable; no retry was authorized".to_string()
+                })?;
+                let receipt = latest
+                    .completed
+                    .get(&attempt.target_task_id)
+                    .filter(|receipt| receipt.revision == attempt.target_task_revision);
+                let old_thread_uncollected = attempt
+                    .reviewer_thread_id
+                    .as_ref()
+                    .is_some_and(|thread| uncollected_children.contains(thread));
+                if unit.kind != codex_history::task_context::CompletionUnitKind::Review
+                    || attempt.attempt_id != retry.expected_attempt_id
+                    || attempt.status
+                        != codex_history::task_context::CompletionReviewAttemptStatus::Failed
+                    || unit.status != codex_history::task_context::UnitStatus::Failed
+                    || attempt.contract_revision > current_contract_revision
+                    || attempt.condition_refs != unit.condition_refs
+                    || attempt.conditions_sha256 != current_conditions_sha256
+                    || attempt.terminal_source.as_ref().is_none_or(|source| {
+                        source.status
+                            != codex_history::task_context::CompletionReviewTerminalStatus::Failed
+                            || (source.event.is_none()
+                                && (attempt.wait_result_ref.is_none()
+                                    || attempt.wait_call_id.is_none()))
+                    })
+                    || contract.units[unit_index]
+                        .review_state
+                        .as_ref()
+                        .is_some_and(|review_state| review_state.retry_authorization.is_some())
+                    || receipt
+                        .is_none_or(|receipt| receipt.artifact_ref != attempt.target_artifact_ref)
+                    || old_thread_uncollected
+                    || (imported_attempt.is_some()
+                        && (contract.units[unit_index].review_state.is_some()
+                            || contract.units[unit_index]
+                                .review_evidence
+                                .as_ref()
+                                .is_none_or(|evidence| {
+                                    evidence.spawn_call_id != attempt.attempt_id
+                                        || evidence.reviewer_thread_id
+                                            != attempt
+                                                .reviewer_thread_id
+                                                .as_deref()
+                                                .unwrap_or_default()
+                                        || evidence.reviewer_turn_id
+                                            != attempt
+                                                .reviewer_turn_id
+                                                .as_deref()
+                                                .unwrap_or_default()
+                                })))
+                {
+                    return Err("retry requires the exact failed attempt, unchanged accepted target, no unresolved child effects, and no existing grant".into());
+                }
+                let unit = &mut contract.units[unit_index];
+                if let Some(imported_attempt) = imported_attempt {
+                    unit.review_state = Some(codex_history::task_context::CompletionReviewState {
+                        version: 1,
+                        obligation_unit_id: unit.id.clone(),
+                        active_attempt: Some(imported_attempt),
+                        historical_failure: None,
+                        retry_reservation_prior_historical_failure: None,
+                        previous_attempt_ref: retry_previous_ref.clone(),
+                        retry_authorization: Some(super::completion_review::retry_authorization(
+                            retry,
+                        )),
+                        withdrawal: None,
+                        revalidation: None,
+                    });
+                } else if let Some(review_state) = unit.review_state.as_mut() {
+                    review_state.previous_attempt_ref = retry_previous_ref.clone();
+                    review_state.retry_authorization =
+                        Some(super::completion_review::retry_authorization(retry));
+                }
+                if retry_owns_current_blocker {
+                    contract.blocker = None;
+                }
+            }
             contract
                 .plan_reviews
                 .push(codex_history::task_context::PlanReviewRecord {
@@ -1447,8 +2752,17 @@ impl Session {
             contract.units_completed_since_review = 0;
             contract.plan_review_at = Some(now);
             contract.activity_at = Some(now);
+            prior_completion_state
+        };
+        if let Err(error) = self.persist_autonomous_completion_snapshot().await {
+            let (root, mut previous) = prior_completion_state;
+            previous.paused = true;
+            let mut state = self.state.lock().await;
+            state.rencrow_completion_state = Some((root, previous));
+            state.rencrow_completion_paused = true;
+            return Err(error);
         }
-        self.persist_autonomous_completion_snapshot().await
+        Ok(())
     }
 
     pub(crate) async fn autonomous_completion_has_unresolved_work(
@@ -1508,7 +2822,11 @@ impl Session {
     pub(crate) async fn autonomous_completion_current_state(
         &self,
     ) -> Option<(String, codex_history::task_context::CompletionState)> {
-        self.state.lock().await.rencrow_completion_state.clone()
+        let (root, contract) = self.state.lock().await.rencrow_completion_state.clone()?;
+        Some((
+            root,
+            super::completion_review::project_completion_state(&contract).ok()?,
+        ))
     }
 
     pub(crate) fn autonomous_completion_action_digest(
@@ -2039,6 +3357,7 @@ impl Session {
         self.state.lock().await.pending_task_boundary.clone()
     }
 
+    #[cfg(test)]
     pub(crate) async fn begin_task_check(
         &self,
         call_id: String,

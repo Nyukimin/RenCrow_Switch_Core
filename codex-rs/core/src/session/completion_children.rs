@@ -1,10 +1,14 @@
 //! Collection state follows native tool receipts, not the child's completion prose.
-// Modified by RenCrow Switch Core, 2026-11-11.
+// Modified by RenCrow Switch Core, 2026-11-16.
 use super::session::Session;
 use codex_history::compaction_candidate::digest;
+use codex_history::task_context::CompletionReviewAttempt;
+use codex_history::task_context::CompletionReviewAttemptStatus;
 use codex_history::task_context::CompletionReviewEvidence;
 use codex_history::task_context::CompletionReviewLaunchState;
 use codex_history::task_context::CompletionReviewLaunchStatus;
+use codex_history::task_context::CompletionReviewState;
+use codex_history::task_context::CompletionReviewTarget;
 use codex_history::task_context::CompletionReviewTerminalStatus;
 use codex_history::task_context::CompletionUnit;
 use codex_history::task_context::CompletionUnitKind;
@@ -28,6 +32,7 @@ pub(crate) struct CompletionReviewLaunch {
     pub(crate) reviewer_turn_id: Option<String>,
     pub(crate) spawn_call_id: Option<String>,
     pub(crate) reviewer_role: Option<String>,
+    pub(crate) reviewer_model: Option<String>,
     pub(crate) deadline_escalation: Option<String>,
     pub(crate) unresolved_launch: Option<CompletionReviewLaunchState>,
     pub(crate) should_spawn: bool,
@@ -40,6 +45,32 @@ pub(crate) struct CompletionReviewAdoption {
     pub(crate) target_task_id: String,
     pub(crate) target_task_revision: u64,
     pub(crate) reviewer_thread_id: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CompletionReviewChildIdentity {
+    pub(crate) target: CompletionReviewTarget,
+    pub(crate) target_artifact_ref: String,
+    pub(crate) reviewer_thread_id: ThreadId,
+    pub(crate) reviewer_role: String,
+    pub(crate) spawn_call_id: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CompletionReviewChildGeneration {
+    pub(crate) identity: CompletionReviewChildIdentity,
+    pub(crate) reviewer_turn_id: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CompletionReviewFollowupPreparation {
+    pub(crate) root_task_id: String,
+    pub(crate) unit_id: String,
+    pub(crate) child_thread_id: ThreadId,
+    pub(crate) call_id: String,
+    pub(crate) contract_revision: u64,
+    pub(crate) prior_unit: CompletionUnit,
+    pub(crate) reserved_unit: CompletionUnit,
 }
 
 fn terminal(value: &Value) -> bool {
@@ -68,7 +99,33 @@ fn status_matches_review_generation(
 }
 
 fn completion_review_needs_spawn(unit: &CompletionUnit) -> bool {
-    matches!(unit.status, UnitStatus::Planned | UnitStatus::Ready) && unit.review_evidence.is_none()
+    match unit.review_state.as_ref() {
+        Some(review) => match review.active_attempt.as_ref() {
+            None => matches!(unit.status, UnitStatus::Planned | UnitStatus::Ready),
+            Some(attempt) => {
+                attempt.status == CompletionReviewAttemptStatus::Failed
+                    && review
+                        .retry_authorization
+                        .as_ref()
+                        .is_some_and(|grant| grant.expected_attempt_id == attempt.attempt_id)
+            }
+        },
+        None => {
+            matches!(unit.status, UnitStatus::Planned | UnitStatus::Ready)
+                && unit.review_evidence.is_none()
+        }
+    }
+}
+
+fn close_failure_cause(status: &AgentStatus) -> Option<String> {
+    match status {
+        AgentStatus::Completed(None) => Some("reviewer completed without a result summary".into()),
+        AgentStatus::Errored(reason) => {
+            Some(format!("reviewer turn ended with an error: {reason}"))
+        }
+        AgentStatus::Shutdown => Some("reviewer was shut down before returning a result".into()),
+        _ => None,
+    }
 }
 
 fn pending_completion_review_evidence(
@@ -97,6 +154,76 @@ fn pending_completion_review_evidence(
     }
 }
 
+fn existing_completion_review_launch(
+    root_task_id: String,
+    unit: &CompletionUnit,
+    target_task_id: &str,
+) -> Result<CompletionReviewLaunch, String> {
+    let projected = codex_history::task_context::project_completion_review_state(unit)?;
+    let unit = &projected;
+    let attempt = unit
+        .review_state
+        .as_ref()
+        .and_then(|review| review.active_attempt.as_ref());
+    let evidence = unit.review_evidence.as_ref();
+    let target_task_revision = attempt
+        .map(|attempt| attempt.target_task_revision)
+        .or_else(|| evidence.map(|evidence| evidence.target_task_revision))
+        .or_else(|| {
+            unit.review_target
+                .as_ref()
+                .map(|target| target.task_revision)
+        })
+        .unwrap_or_default();
+    let target_artifact_ref = attempt
+        .map(|attempt| attempt.target_artifact_ref.clone())
+        .or_else(|| evidence.map(|evidence| evidence.target_artifact_ref.clone()))
+        .unwrap_or_default();
+    let review_brief = if target_artifact_ref.is_empty() {
+        format!(
+            "Review purpose: {}\nExisting reviewer launch is unresolved.",
+            unit.purpose
+        )
+    } else {
+        format!(
+            "Review purpose: {}\nAccepted artifact ref: {}",
+            unit.purpose, target_artifact_ref
+        )
+    };
+    Ok(CompletionReviewLaunch {
+        root_task_id,
+        unit_id: unit.id.clone(),
+        target_task_id: target_task_id.to_string(),
+        target_task_revision,
+        target_artifact_ref,
+        review_brief,
+        status: unit.status,
+        reviewer_thread_id: attempt
+            .and_then(|attempt| attempt.reviewer_thread_id.clone())
+            .or_else(|| evidence.map(|evidence| evidence.reviewer_thread_id.clone())),
+        reviewer_turn_id: attempt
+            .and_then(|attempt| attempt.reviewer_turn_id.clone())
+            .or_else(|| evidence.map(|evidence| evidence.reviewer_turn_id.clone())),
+        spawn_call_id: attempt
+            .map(|attempt| attempt.attempt_id.clone())
+            .or_else(|| evidence.map(|evidence| evidence.spawn_call_id.clone()))
+            .or_else(|| {
+                unit.review_launch
+                    .as_ref()
+                    .map(|launch| launch.spawn_call_id.clone())
+            }),
+        reviewer_role: attempt
+            .map(|attempt| attempt.reviewer_role.clone())
+            .or_else(|| evidence.map(|evidence| evidence.reviewer_role.clone())),
+        reviewer_model: attempt.and_then(|attempt| attempt.reviewer_model.clone()),
+        deadline_escalation: attempt
+            .and_then(|attempt| attempt.deadline_escalation.clone())
+            .or_else(|| evidence.and_then(|evidence| evidence.deadline_escalation.clone())),
+        unresolved_launch: unit.review_launch.clone(),
+        should_spawn: false,
+    })
+}
+
 fn bind_completion_review_generation(
     evidence: &mut CompletionReviewEvidence,
     reviewer_thread_id: ThreadId,
@@ -120,12 +247,56 @@ impl Session {
     pub(crate) async fn prepare_completion_review_launch(
         &self,
         target_task_id: &str,
+        unit_id: Option<&str>,
         launch_call_id: &str,
+        reviewer_role: Option<&str>,
+        reviewer_model: Option<&str>,
     ) -> Result<CompletionReviewLaunch, String> {
-        let (root_task_id, _) = self
+        let _review_guard = self.completion_review_owner_guard().await;
+        let (root_task_id, current_contract) = self
             .autonomous_completion_current_state()
             .await
             .ok_or_else(|| "completion review requires a registered completion plan".to_string())?;
+        let projected_current_units =
+            super::completion_review::projected_completion_review_units(&current_contract)?;
+        let existing = projected_current_units
+            .iter()
+            .filter(|unit| {
+                unit.kind == CompletionUnitKind::Review
+                    && unit
+                        .review_target
+                        .as_ref()
+                        .is_some_and(|target| target.task_id == target_task_id)
+                    && unit_id.is_none_or(|requested| unit.id == requested)
+                    && (unit.status == UnitStatus::Done
+                        || unit
+                            .review_state
+                            .as_ref()
+                            .is_some_and(|review| review.active_attempt.is_some())
+                        || unit.review_evidence.is_some()
+                        || unit.review_launch.is_some())
+            })
+            .collect::<Vec<_>>();
+        if existing.len() > 1 {
+            return Err("multiple existing review attempts match; provide an exact unit_id".into());
+        }
+        if let Some(unit) = existing.first() {
+            let retry_is_authorized = unit
+                .review_state
+                .as_ref()
+                .and_then(|review| review.active_attempt.as_ref())
+                .is_some_and(|attempt| {
+                    attempt.status == CompletionReviewAttemptStatus::Failed
+                        && unit
+                            .review_state
+                            .as_ref()
+                            .and_then(|review| review.retry_authorization.as_ref())
+                            .is_some_and(|grant| grant.expected_attempt_id == attempt.attempt_id)
+                });
+            if !retry_is_authorized {
+                return existing_completion_review_launch(root_task_id, unit, target_task_id);
+            }
+        }
         let task_state = self
             .latest_rencrow_task_state()
             .await
@@ -142,6 +313,50 @@ impl Session {
         let target_artifact_ref = self
             .current_completion_review_target_ref(target_task_id, target_task_revision)
             .await?;
+        let current_contract = self
+            .autonomous_completion_current_state()
+            .await
+            .map(|(_, contract)| contract)
+            .ok_or_else(|| "completion plan disappeared before review selection".to_string())?;
+        let initial_selection = super::completion_review::select_completion_review(
+            &current_contract,
+            target_task_id,
+            target_task_revision,
+            unit_id,
+        )?;
+        let previous_snapshot_ref = match &initial_selection.outcome {
+            super::completion_review::CompletionReviewSelectionOutcome::NeedsReservation {
+                expected_attempt_id: Some(expected_attempt_id),
+                ..
+            } => {
+                let attempt = current_contract
+                    .units
+                    .iter()
+                    .find(|unit| unit.id == initial_selection.obligation_unit_id)
+                    .and_then(|unit| unit.review_state.as_ref())
+                    .and_then(|review| review.active_attempt.as_ref())
+                    .ok_or_else(|| "retry selection lost its active attempt".to_string())?;
+                if attempt.attempt_id.as_str() != expected_attempt_id.as_str()
+                    || attempt.reviewer_thread_id.is_none()
+                    || attempt.reviewer_turn_id.is_none()
+                {
+                    return Err("retry requires the exact bound failed child generation".into());
+                }
+                attempt.terminal_source.as_ref().ok_or_else(|| {
+                    "retry requires a recorded exact terminal failure fact".to_string()
+                })?;
+                Some(self.persisted_review_attempt_snapshot_ref(
+                    &root_task_id,
+                    &initial_selection.obligation_unit_id,
+                    attempt,
+                )
+                .await?
+                .ok_or_else(|| {
+                    "retry requires a previously persisted snapshot for this exact failed attempt".to_string()
+                })?)
+            }
+            _ => None,
+        };
 
         let launch = {
             let mut state = self.state.lock().await;
@@ -157,43 +372,28 @@ impl Session {
             if active_root != &root_task_id || contract.paused {
                 return Err("completion review root changed or is paused".into());
             }
-            let exact = contract
+            let selected = super::completion_review::select_completion_review(
+                contract,
+                target_task_id,
+                target_task_revision,
+                unit_id,
+            )?;
+            if selected != initial_selection {
+                return Err("review obligation changed between selection and reservation".into());
+            }
+            let review_index = contract
                 .units
                 .iter()
-                .enumerate()
-                .filter(|(_, unit)| {
-                    unit.kind == CompletionUnitKind::Review
-                        && unit.review_target.as_ref().is_some_and(|target| {
-                            target.task_id == target_task_id
-                                && target.task_revision == target_task_revision
-                        })
-                })
-                .map(|(index, _)| index)
-                .collect::<Vec<_>>();
-            if exact.len() != 1 {
-                let has_done_review_for_task = contract.units.iter().any(|unit| {
-                    unit.kind == CompletionUnitKind::Review
-                        && unit.status == UnitStatus::Done
-                        && unit
-                            .review_target
-                            .as_ref()
-                            .is_some_and(|target| target.task_id == target_task_id)
-                });
-                return Err(if has_done_review_for_task {
-                    format!(
-                        "task {target_task_id} already has an adopted review; a new review requires a new host-authorized plan"
-                    )
-                } else if exact.is_empty() {
-                    format!(
-                        "no planned review unit matches accepted task {target_task_id}@{target_task_revision}; add it to the initial completion plan"
-                    )
-                } else {
-                    format!(
-                        "multiple planned review units match accepted task {target_task_id}@{target_task_revision}; review plan is ambiguous"
-                    )
-                });
-            }
-            let review_index = exact[0];
+                .position(|unit| unit.id == selected.obligation_unit_id)
+                .ok_or_else(|| "selected review obligation disappeared".to_string())?;
+            let projected_unit = codex_history::task_context::project_completion_review_state(
+                &contract.units[review_index],
+            )?;
+            contract.units[review_index] = projected_unit;
+            let conditions_sha256 = super::completion_review::completion_review_conditions_sha256(
+                contract,
+                &contract.units[review_index].condition_refs,
+            )?;
             let review_unit = &contract.units[review_index];
             let mut brief = format!(
                 "Review purpose: {}\nAccepted task result: {}\nAccepted artifact ref: {}",
@@ -247,54 +447,162 @@ impl Session {
                             .is_some_and(|candidate| candidate.status == UnitStatus::Done)
                     });
             let unit = &mut contract.units[review_index];
-            if unit.status == UnitStatus::Planned && dependencies_ready {
-                unit.status = UnitStatus::Ready;
-            }
             if unit.status == UnitStatus::Planned && !dependencies_ready {
                 return Err(format!(
                     "planned review unit {} is waiting for its declared dependencies; accept those units first",
                     unit.id
                 ));
             }
-            let reviewer_thread_id = unit
-                .review_evidence
-                .as_ref()
-                .map(|evidence| evidence.reviewer_thread_id.clone());
-            let reviewer_role = unit
-                .review_evidence
-                .as_ref()
-                .map(|evidence| evidence.reviewer_role.clone());
-            let deadline_escalation = unit
-                .review_evidence
-                .as_ref()
-                .and_then(|evidence| evidence.deadline_escalation.clone());
-            let unresolved_launch = unit.review_launch.clone();
-            let reviewer_turn_id = unit
-                .review_evidence
-                .as_ref()
-                .map(|evidence| evidence.reviewer_turn_id.clone());
-            let spawn_call_id = unit
-                .review_evidence
-                .as_ref()
-                .map(|evidence| evidence.spawn_call_id.clone())
-                .or_else(|| {
-                    unit.review_launch
-                        .as_ref()
-                        .map(|launch| launch.spawn_call_id.clone())
-                });
             let should_spawn = match unit.status {
-                UnitStatus::Planned | UnitStatus::Ready if completion_review_needs_spawn(unit) => {
+                UnitStatus::Planned | UnitStatus::Ready | UnitStatus::Failed
+                    if completion_review_needs_spawn(unit) =>
+                {
+                    let (Some(reviewer_role), Some(reviewer_model)) =
+                        (reviewer_role, reviewer_model)
+                    else {
+                        return Err(
+                            "new review reservation requires the effective reviewer role and model"
+                                .into(),
+                        );
+                    };
+                    if reviewer_role.trim().is_empty() || reviewer_model.trim().is_empty() {
+                        return Err(
+                            "review reservation requires the effective reviewer role and model"
+                                .into(),
+                        );
+                    }
+                    let prior_review_state = unit.review_state.clone();
+                    let retry_authorization = prior_review_state
+                        .as_ref()
+                        .and_then(|review| review.retry_authorization.as_ref());
+                    let retry = unit.status == UnitStatus::Failed;
+                    if retry
+                        && retry_authorization.is_none_or(|grant| {
+                            prior_review_state
+                                .as_ref()
+                                .and_then(|review| review.active_attempt.as_ref())
+                                .is_none_or(|attempt| {
+                                    grant.expected_attempt_id != attempt.attempt_id
+                                })
+                        })
+                    {
+                        return Err("failed review retry has no one-shot host authorization".into());
+                    }
+                    if retry
+                        && prior_review_state
+                            .as_ref()
+                            .and_then(|review| review.active_attempt.as_ref())
+                            .is_none_or(|attempt| {
+                                attempt.status != CompletionReviewAttemptStatus::Failed
+                            })
+                    {
+                        return Err(
+                            "retry authorization no longer matches a definitively failed attempt"
+                                .into(),
+                        );
+                    }
+                    let previous_attempt_ref = if retry {
+                        previous_snapshot_ref.clone()
+                    } else {
+                        prior_review_state
+                            .as_ref()
+                            .and_then(|review| review.previous_attempt_ref.clone())
+                    };
+                    let consumed_retry_authorization = retry_authorization.cloned();
+                    let prior_failure = prior_review_state.as_ref().and_then(|review| {
+                        review.active_attempt.as_ref().and_then(|attempt| {
+                            Some(
+                                codex_history::task_context::CompletionReviewHistoricalFailure {
+                                    attempt_id: attempt.attempt_id.clone(),
+                                    contract_revision: Some(attempt.contract_revision),
+                                    imported_from: attempt.imported_from.clone(),
+                                    consumed_retry_authorization: attempt
+                                        .consumed_retry_authorization
+                                        .clone(),
+                                    reviewer_thread_id: attempt.reviewer_thread_id.clone()?,
+                                    reviewer_turn_id: attempt.reviewer_turn_id.clone()?,
+                                    target_task_id: attempt.target_task_id.clone(),
+                                    target_task_revision: attempt.target_task_revision,
+                                    target_artifact_ref: attempt.target_artifact_ref.clone(),
+                                    reviewer_role: attempt.reviewer_role.clone(),
+                                    reviewer_model: attempt.reviewer_model.clone(),
+                                    deadline_unix_ms: attempt.deadline_unix_ms,
+                                    wait_result_ref: attempt.wait_result_ref.clone(),
+                                    wait_call_id: attempt.wait_call_id.clone(),
+                                    deadline_escalation: attempt.deadline_escalation.clone(),
+                                    deadline_safety_fingerprint: attempt
+                                        .deadline_safety_fingerprint
+                                        .clone(),
+                                    terminal_source: attempt.terminal_source.clone()?,
+                                },
+                            )
+                        })
+                    });
+                    let deadline_unix_ms =
+                        chrono::Utc::now().timestamp_millis() + COMPLETION_REVIEWER_SLA_MS;
+                    let mut next_review_state =
+                        prior_review_state.unwrap_or_else(|| CompletionReviewState {
+                            version: 1,
+                            obligation_unit_id: unit.id.clone(),
+                            active_attempt: None,
+                            historical_failure: None,
+                            retry_reservation_prior_historical_failure: None,
+                            previous_attempt_ref: None,
+                            retry_authorization: None,
+                            withdrawal: None,
+                            revalidation: None,
+                        });
+                    if retry {
+                        if next_review_state
+                            .retry_reservation_prior_historical_failure
+                            .is_some()
+                        {
+                            return Err("retry reservation already has rollback history".into());
+                        }
+                        next_review_state.retry_reservation_prior_historical_failure =
+                            next_review_state.historical_failure.take();
+                        next_review_state.historical_failure = prior_failure;
+                        next_review_state.retry_authorization = None;
+                    }
+                    if let Some(previous_attempt_ref) = previous_attempt_ref {
+                        next_review_state.previous_attempt_ref = Some(previous_attempt_ref);
+                    }
+                    next_review_state.active_attempt = Some(CompletionReviewAttempt {
+                        attempt_id: launch_call_id.to_string(),
+                        contract_revision: contract.contract_revision,
+                        condition_refs: unit.condition_refs.clone(),
+                        conditions_sha256,
+                        status: CompletionReviewAttemptStatus::Reserved,
+                        launch_unknown_reason: None,
+                        consumed_retry_authorization,
+                        reviewer_thread_id: None,
+                        reviewer_turn_id: None,
+                        reviewer_role: reviewer_role.to_string(),
+                        reviewer_model: Some(reviewer_model.to_string()),
+                        imported_from: None,
+                        target_task_id: target_task_id.to_string(),
+                        target_task_revision,
+                        target_artifact_ref: target_artifact_ref.clone(),
+                        deadline_unix_ms: Some(deadline_unix_ms),
+                        deadline_escalation: None,
+                        deadline_safety_fingerprint: None,
+                        terminal_source: None,
+                        wait_result_ref: None,
+                        wait_call_id: None,
+                        adoption_reason: None,
+                    });
+                    unit.review_state = Some(next_review_state);
                     unit.status = UnitStatus::Running;
                     unit.review_launch = Some(CompletionReviewLaunchState {
                         spawn_call_id: launch_call_id.to_string(),
                         status: CompletionReviewLaunchStatus::Reserved,
-                        deadline_unix_ms: Some(
-                            chrono::Utc::now().timestamp_millis() + COMPLETION_REVIEWER_SLA_MS,
-                        ),
+                        deadline_unix_ms: Some(deadline_unix_ms),
                         reason: None,
                     });
-                    contract.current_unit = Some(unit.id.clone());
-                    contract.activity_at = Some(chrono::Utc::now().timestamp());
+                    if !retry {
+                        contract.current_unit = Some(unit.id.clone());
+                        contract.activity_at = Some(chrono::Utc::now().timestamp());
+                    }
                     true
                 }
                 UnitStatus::Running
@@ -309,6 +617,46 @@ impl Session {
                     ));
                 }
             };
+            if unit.review_state.is_some() {
+                *unit = codex_history::task_context::project_completion_review_state(unit)?;
+            }
+            let reviewer_thread_id = unit
+                .review_evidence
+                .as_ref()
+                .map(|evidence| evidence.reviewer_thread_id.clone());
+            let projected_reviewer_role = unit
+                .review_state
+                .as_ref()
+                .and_then(|review| review.active_attempt.as_ref())
+                .map(|attempt| attempt.reviewer_role.clone())
+                .or_else(|| {
+                    unit.review_evidence
+                        .as_ref()
+                        .map(|evidence| evidence.reviewer_role.clone())
+                });
+            let deadline_escalation = unit
+                .review_evidence
+                .as_ref()
+                .and_then(|evidence| evidence.deadline_escalation.clone());
+            let reviewer_turn_id = unit
+                .review_evidence
+                .as_ref()
+                .map(|evidence| evidence.reviewer_turn_id.clone());
+            let spawn_call_id = unit
+                .review_state
+                .as_ref()
+                .and_then(|review| review.active_attempt.as_ref())
+                .map(|attempt| attempt.attempt_id.clone())
+                .or_else(|| {
+                    unit.review_evidence
+                        .as_ref()
+                        .map(|evidence| evidence.spawn_call_id.clone())
+                })
+                .or_else(|| {
+                    unit.review_launch
+                        .as_ref()
+                        .map(|launch| launch.spawn_call_id.clone())
+                });
             CompletionReviewLaunch {
                 root_task_id,
                 unit_id: unit.id.clone(),
@@ -320,9 +668,15 @@ impl Session {
                 reviewer_thread_id,
                 reviewer_turn_id,
                 spawn_call_id,
-                reviewer_role,
+                reviewer_role: projected_reviewer_role
+                    .or_else(|| reviewer_role.map(str::to_string)),
+                reviewer_model: unit
+                    .review_state
+                    .as_ref()
+                    .and_then(|review| review.active_attempt.as_ref())
+                    .and_then(|attempt| attempt.reviewer_model.clone()),
                 deadline_escalation,
-                unresolved_launch: unit.review_launch.clone().or(unresolved_launch),
+                unresolved_launch: unit.review_launch.clone(),
                 should_spawn,
             }
         };
@@ -343,16 +697,19 @@ impl Session {
         &self,
         unit_id: &str,
     ) -> Result<(), String> {
+        let _review_guard = self.completion_review_owner_guard().await;
+        let persisted_rollback_ref = self.persisted_retry_rollback_previous_ref(unit_id).await?;
         let changed = {
             let mut state = self.state.lock().await;
             let Some((_, contract)) = state.rencrow_completion_state.as_mut() else {
                 return Err("completion review contract disappeared before rollback".into());
             };
-            let unit = contract
+            let unit_index = contract
                 .units
-                .iter_mut()
-                .find(|unit| unit.id == unit_id)
+                .iter()
+                .position(|unit| unit.id == unit_id)
                 .ok_or_else(|| "completion review unit disappeared before rollback".to_string())?;
+            let unit = &contract.units[unit_index];
             if unit.kind != CompletionUnitKind::Review
                 || unit.status != UnitStatus::Running
                 || unit.review_evidence.is_some()
@@ -361,9 +718,95 @@ impl Session {
                     "completion review reservation is no longer safely rollbackable".into(),
                 );
             }
-            unit.status = UnitStatus::Ready;
+            let conditions_sha256 = super::completion_review::completion_review_conditions_sha256(
+                contract,
+                &unit.condition_refs,
+            )?;
+            let rollback = unit.review_state.as_ref().and_then(|review_state| {
+                review_state.active_attempt.as_ref().and_then(|attempt| {
+                    attempt
+                        .consumed_retry_authorization
+                        .clone()
+                        .map(|authorization| {
+                            (
+                                authorization,
+                                review_state.historical_failure.clone(),
+                                review_state
+                                    .retry_reservation_prior_historical_failure
+                                    .clone(),
+                            )
+                        })
+                })
+            });
+            let retry_previous_attempt_ref = match (&rollback, persisted_rollback_ref) {
+                (
+                    Some(_),
+                    super::completion_persistence::PersistedRetryRollbackRef::Retry(reference),
+                ) => Some(reference),
+                (None, super::completion_persistence::PersistedRetryRollbackRef::NotRetry) => None,
+                _ => {
+                    return Err(
+                        "persisted retry rollback identity does not match the active reservation"
+                            .into(),
+                    );
+                }
+            };
+            let unit = &mut contract.units[unit_index];
+            if let Some((authorization, failure, prior_historical_failure)) = rollback {
+                let failure = failure.ok_or_else(|| {
+                    "failed retry reservation lost its prior failure proof".to_string()
+                })?;
+                let contract_revision = failure.contract_revision.ok_or_else(|| {
+                    "failed retry reservation cannot restore its prior contract revision"
+                        .to_string()
+                })?;
+                let imported_from = failure.imported_from.clone();
+                let reviewer_model = failure.reviewer_model.clone();
+                let previous_attempt_ref = retry_previous_attempt_ref.ok_or_else(|| {
+                    "retry reservation rollback reference was not resolved".to_string()
+                })?;
+                let review_state = unit.review_state.as_mut().ok_or_else(|| {
+                    "failed retry reservation lost canonical review state".to_string()
+                })?;
+                review_state.retry_authorization = Some(authorization);
+                review_state.historical_failure = prior_historical_failure;
+                review_state.retry_reservation_prior_historical_failure = None;
+                review_state.previous_attempt_ref = previous_attempt_ref;
+                review_state.active_attempt = Some(CompletionReviewAttempt {
+                    attempt_id: failure.attempt_id,
+                    contract_revision,
+                    condition_refs: unit.condition_refs.clone(),
+                    conditions_sha256,
+                    status: CompletionReviewAttemptStatus::Failed,
+                    launch_unknown_reason: None,
+                    consumed_retry_authorization: failure.consumed_retry_authorization,
+                    imported_from,
+                    reviewer_thread_id: Some(failure.reviewer_thread_id),
+                    reviewer_turn_id: Some(failure.reviewer_turn_id),
+                    reviewer_role: failure.reviewer_role,
+                    reviewer_model,
+                    target_task_id: failure.target_task_id,
+                    target_task_revision: failure.target_task_revision,
+                    target_artifact_ref: failure.target_artifact_ref,
+                    deadline_unix_ms: failure.deadline_unix_ms,
+                    deadline_escalation: failure.deadline_escalation,
+                    deadline_safety_fingerprint: failure.deadline_safety_fingerprint,
+                    terminal_source: Some(failure.terminal_source),
+                    wait_result_ref: failure.wait_result_ref,
+                    wait_call_id: failure.wait_call_id,
+                    adoption_reason: None,
+                });
+                unit.status = UnitStatus::Failed;
+            } else {
+                if let Some(review_state) = unit.review_state.as_mut() {
+                    review_state.active_attempt = None;
+                }
+                unit.status = UnitStatus::Ready;
+            }
+            if unit.review_state.is_some() {
+                *unit = codex_history::task_context::project_completion_review_state(unit)?;
+            }
             unit.review_launch = None;
-            contract.activity_at = Some(chrono::Utc::now().timestamp());
             true
         };
         if changed {
@@ -377,54 +820,136 @@ impl Session {
     pub(crate) async fn record_completion_review_child_pending(
         &self,
         unit_id: &str,
-        target_task_id: &str,
-        target_task_revision: u64,
-        target_artifact_ref: String,
-        reviewer_thread_id: ThreadId,
-        reviewer_role: String,
-        spawn_call_id: String,
+        identity: CompletionReviewChildIdentity,
     ) -> Result<(), String> {
-        {
+        let _review_guard = self.completion_review_owner_guard().await;
+        let CompletionReviewChildIdentity {
+            target: review_target,
+            target_artifact_ref,
+            reviewer_thread_id,
+            reviewer_role,
+            spawn_call_id,
+        } = identity;
+        let reviewer_thread_id_string = reviewer_thread_id.to_string();
+        let (should_persist, binding_result) = {
             let mut state = self.state.lock().await;
-            let Some((_, contract)) = state.rencrow_completion_state.as_mut() else {
-                return Err("completion review contract disappeared after child spawn".into());
-            };
-            let unit = contract
-                .units
-                .iter_mut()
-                .find(|unit| unit.id == unit_id)
-                .ok_or_else(|| {
-                    "completion review unit disappeared after child spawn".to_string()
-                })?;
-            if unit.kind != CompletionUnitKind::Review
-                || unit.status != UnitStatus::Running
-                || unit.review_evidence.is_some()
-                || unit
+            let newly_uncollected = state
+                .rencrow_completion_uncollected_children
+                .insert(reviewer_thread_id_string.clone());
+            let binding_result = (|| -> Result<bool, String> {
+                let Some((_, contract)) = state.rencrow_completion_state.as_mut() else {
+                    return Err("completion review contract disappeared after child spawn".into());
+                };
+                let Some(unit) = contract.units.iter_mut().find(|unit| unit.id == unit_id) else {
+                    return Err("completion review unit disappeared after child spawn".into());
+                };
+                let mut candidate =
+                    codex_history::task_context::project_completion_review_state(unit)?;
+                if let Some(evidence) = candidate.review_evidence.as_ref() {
+                    let exact_pending_child = candidate.kind == CompletionUnitKind::Review
+                        && candidate.status == UnitStatus::Running
+                        && candidate.review_launch.is_none()
+                        && evidence.reviewer_thread_id == reviewer_thread_id_string
+                        && evidence.reviewer_turn_id
+                            == format!("pending-generation:{spawn_call_id}")
+                        && evidence.reviewer_role == reviewer_role
+                        && evidence.spawn_call_id == spawn_call_id
+                        && evidence.target_task_id == review_target.task_id
+                        && evidence.target_task_revision == review_target.task_revision
+                        && evidence.target_artifact_ref == target_artifact_ref
+                        && evidence.wait_result_ref.is_none()
+                        && evidence.terminal_status.is_none()
+                        && evidence.wait_call_id.is_none()
+                        && candidate.review_state.as_ref().is_none_or(|review_state| {
+                            review_state.active_attempt.as_ref().is_some_and(|attempt| {
+                                attempt.attempt_id == spawn_call_id
+                                    && attempt.reviewer_thread_id.as_deref()
+                                        == Some(reviewer_thread_id_string.as_str())
+                                    && attempt.reviewer_turn_id.is_none()
+                                    && attempt.reviewer_role == reviewer_role
+                                    && matches!(
+                                        attempt.status,
+                                        CompletionReviewAttemptStatus::Reserved
+                                            | CompletionReviewAttemptStatus::Unknown
+                                    )
+                            })
+                        });
+                    return if exact_pending_child {
+                        Ok(false)
+                    } else {
+                        Err("a different child is already recorded for this review launch".into())
+                    };
+                }
+                if candidate.kind != CompletionUnitKind::Review
+                    || candidate.status != UnitStatus::Running
+                    || candidate
+                        .review_launch
+                        .as_ref()
+                        .is_none_or(|launch| launch.spawn_call_id != spawn_call_id)
+                    || candidate
+                        .review_target
+                        .as_ref()
+                        .is_none_or(|existing_target| {
+                            existing_target.task_id != review_target.task_id
+                                || existing_target.task_revision != review_target.task_revision
+                        })
+                {
+                    return Err("completion review launch changed after child spawn".into());
+                }
+                let deadline_unix_ms = candidate
                     .review_launch
                     .as_ref()
-                    .is_none_or(|launch| launch.spawn_call_id != spawn_call_id)
-                || unit.review_target.as_ref().is_none_or(|target| {
-                    target.task_id != target_task_id || target.task_revision != target_task_revision
-                })
-            {
-                return Err("completion review launch changed after child spawn".into());
-            }
-            let deadline_unix_ms = unit
-                .review_launch
-                .as_ref()
-                .and_then(|launch| launch.deadline_unix_ms);
-            unit.review_evidence = Some(pending_completion_review_evidence(
-                reviewer_thread_id,
-                reviewer_role,
-                spawn_call_id,
-                target_task_id.to_string(),
-                target_task_revision,
-                target_artifact_ref,
-                deadline_unix_ms,
-            ));
-            unit.review_launch = None;
+                    .and_then(|launch| launch.deadline_unix_ms);
+                if let Some(review_state) = candidate.review_state.as_mut() {
+                    let attempt = review_state.active_attempt.as_mut().ok_or_else(|| {
+                        "canonical review reservation disappeared after child spawn".to_string()
+                    })?;
+                    if attempt.attempt_id != spawn_call_id
+                        || attempt.reviewer_thread_id.is_some()
+                        || attempt.reviewer_turn_id.is_some()
+                        || !matches!(
+                            attempt.status,
+                            CompletionReviewAttemptStatus::Reserved
+                                | CompletionReviewAttemptStatus::Unknown
+                        )
+                        || attempt.target_task_id != review_target.task_id
+                        || attempt.target_task_revision != review_target.task_revision
+                        || attempt.target_artifact_ref != target_artifact_ref
+                        || attempt.reviewer_role != reviewer_role
+                    {
+                        return Err(
+                            "spawned child does not match its canonical review reservation".into(),
+                        );
+                    }
+                    // This is the configured route, not verified child metadata. The attempt
+                    // remains Unknown until the handler confirms role/model and turn binding.
+                    attempt.reviewer_thread_id = Some(reviewer_thread_id_string.clone());
+                    attempt.status = CompletionReviewAttemptStatus::Unknown;
+                    attempt.launch_unknown_reason = None;
+                }
+                candidate.review_evidence = Some(pending_completion_review_evidence(
+                    reviewer_thread_id,
+                    reviewer_role,
+                    spawn_call_id,
+                    review_target.task_id,
+                    review_target.task_revision,
+                    target_artifact_ref,
+                    deadline_unix_ms,
+                ));
+                candidate.review_launch = None;
+                candidate =
+                    codex_history::task_context::project_completion_review_state(&candidate)?;
+                *unit = candidate;
+                Ok(true)
+            })();
+            let persist =
+                newly_uncollected || binding_result.as_ref().is_ok_and(|changed| *changed);
+            (persist, binding_result.map(|_| ()))
+        };
+        if should_persist {
+            self.persist_autonomous_completion_snapshot().await?;
         }
-        self.persist_autonomous_completion_snapshot().await
+        binding_result
     }
 
     pub(crate) async fn mark_completion_review_launch_unknown(
@@ -433,6 +958,7 @@ impl Session {
         spawn_call_id: &str,
         reason: String,
     ) -> Result<(), String> {
+        let _review_guard = self.completion_review_owner_guard().await;
         {
             let mut state = self.state.lock().await;
             let Some((_, contract)) = state.rencrow_completion_state.as_mut() else {
@@ -447,6 +973,9 @@ impl Session {
                 .ok_or_else(|| {
                     "completion review unit disappeared while recording unknown launch".to_string()
                 })?;
+            if unit.review_state.is_some() {
+                *unit = codex_history::task_context::project_completion_review_state(unit)?;
+            }
             if unit.kind != CompletionUnitKind::Review
                 || unit.status != UnitStatus::Running
                 || unit.review_evidence.is_some()
@@ -464,7 +993,19 @@ impl Session {
                 );
             }
             launch.status = CompletionReviewLaunchStatus::Unknown;
-            launch.reason = Some(reason);
+            launch.reason = Some(reason.clone());
+            if let Some(attempt) = unit
+                .review_state
+                .as_mut()
+                .and_then(|review_state| review_state.active_attempt.as_mut())
+                .filter(|attempt| attempt.attempt_id == spawn_call_id)
+            {
+                attempt.status = CompletionReviewAttemptStatus::Unknown;
+                attempt.launch_unknown_reason = Some(reason);
+            }
+            if unit.review_state.is_some() {
+                *unit = codex_history::task_context::project_completion_review_state(unit)?;
+            }
             contract.activity_at = Some(chrono::Utc::now().timestamp());
         }
         self.persist_autonomous_completion_snapshot().await
@@ -476,6 +1017,7 @@ impl Session {
         unit_id: &str,
         reason: String,
     ) -> Result<CompletionReviewAdoption, String> {
+        let _review_guard = self.completion_review_owner_guard().await;
         if reason.trim().is_empty() {
             return Err("review adoption requires a non-empty parent decision reason".into());
         }
@@ -499,7 +1041,8 @@ impl Session {
                 .units
                 .iter()
                 .find(|unit| unit.id == unit_id)
-                .cloned()
+                .map(codex_history::task_context::project_completion_review_state)
+                .transpose()?
                 .ok_or_else(|| "review unit does not exist in the completion plan".to_string())?;
             (root.clone(), unit)
         };
@@ -526,6 +1069,17 @@ impl Session {
             .review_evidence
             .clone()
             .ok_or_else(|| "review has not been spawned by the host review action".to_string())?;
+        if self
+            .state
+            .lock()
+            .await
+            .rencrow_completion_uncollected_children
+            .contains(&evidence.reviewer_thread_id)
+        {
+            return Err(
+                "review adoption is blocked while its child has uncollected runtime work".into(),
+            );
+        }
         if evidence
             .wait_result_ref
             .as_deref()
@@ -552,6 +1106,9 @@ impl Session {
             if state.rencrow_completion_paused {
                 return Err("review adoption was paused before commit".into());
             }
+            let child_is_uncollected = state
+                .rencrow_completion_uncollected_children
+                .contains(&evidence.reviewer_thread_id);
             let (root, contract) = state
                 .rencrow_completion_state
                 .as_mut()
@@ -559,17 +1116,51 @@ impl Session {
             if root != &root_task_id || contract.paused {
                 return Err("completion plan changed before review adoption".into());
             }
+            if child_is_uncollected {
+                return Err(
+                    "review adoption is blocked while its child has uncollected runtime work"
+                        .into(),
+                );
+            }
             let adopted_unit_id = {
                 let current = contract
                     .units
                     .iter_mut()
                     .find(|candidate| candidate.id == unit_id)
                     .ok_or_else(|| "review unit disappeared before adoption".to_string())?;
-                if current != &unit || current.review_evidence.as_ref() != Some(&evidence) {
+                let projected_current =
+                    codex_history::task_context::project_completion_review_state(current)?;
+                if projected_current != unit
+                    || projected_current.review_evidence.as_ref() != Some(&evidence)
+                {
                     return Err("review evidence changed before adoption".into());
                 }
+                if let Some(attempt) = current
+                    .review_state
+                    .as_mut()
+                    .and_then(|review_state| review_state.active_attempt.as_mut())
+                {
+                    if attempt.status != CompletionReviewAttemptStatus::Completed
+                        || attempt.attempt_id != evidence.spawn_call_id
+                        || attempt.reviewer_thread_id.as_deref()
+                            != Some(evidence.reviewer_thread_id.as_str())
+                        || attempt.reviewer_turn_id.as_deref()
+                            != Some(evidence.reviewer_turn_id.as_str())
+                        || attempt.wait_result_ref != evidence.wait_result_ref
+                        || attempt.wait_call_id != evidence.wait_call_id
+                    {
+                        return Err(
+                            "canonical review attempt is not the exact collected generation".into(),
+                        );
+                    }
+                    attempt.adoption_reason = Some(reason.clone());
+                }
                 current.status = UnitStatus::Done;
-                current.review_decision_reason = Some(reason);
+                current.review_decision_reason = Some(reason.clone());
+                if current.review_state.is_some() {
+                    *current =
+                        codex_history::task_context::project_completion_review_state(current)?;
+                }
                 current.id.clone()
             };
             let done = contract
@@ -610,28 +1201,30 @@ impl Session {
     pub(crate) async fn revalidate_collected_completion_reviews(&self) {
         let collected = {
             let state = self.state.lock().await;
-            state
-                .rencrow_completion_state
-                .as_ref()
-                .map(|(_, contract)| {
-                    contract
-                        .units
-                        .iter()
-                        .filter_map(|unit| {
-                            // Adopted review is historical evidence for its target revision.
-                            // Later implementation work may legitimately change the workspace;
-                            // current acceptance conditions are rechecked against their own
-                            // task-check evidence instead of forcing the old review to repeat.
-                            if unit.status == UnitStatus::Done {
-                                return None;
-                            }
-                            let evidence = unit.review_evidence.as_ref()?;
-                            evidence.wait_result_ref.as_ref()?;
-                            Some((unit.id.clone(), evidence.clone()))
-                        })
-                        .collect::<Vec<_>>()
+            let Some((_, contract)) = state.rencrow_completion_state.as_ref() else {
+                return;
+            };
+            let Ok(projected_units) =
+                super::completion_review::projected_completion_review_units(contract)
+            else {
+                return;
+            };
+            projected_units
+                .into_iter()
+                .filter_map(|unit| {
+                    // Canonical terminal facts are retained as history; their current
+                    // freshness is checked by the shared completion predicate. This
+                    // compatibility cleanup only handles pre-canonical legacy evidence.
+                    if unit.review_state.is_some() || unit.status == UnitStatus::Done {
+                        return None;
+                    }
+                    let evidence = unit.review_evidence.as_ref()?;
+                    evidence
+                        .wait_result_ref
+                        .as_ref()
+                        .map(|_| (unit.id, evidence.clone()))
                 })
-                .unwrap_or_default()
+                .collect::<Vec<_>>()
         };
         for (unit_id, evidence) in collected {
             if self
@@ -652,7 +1245,7 @@ impl Session {
                 let Some(unit) = contract.units.iter_mut().find(|unit| unit.id == unit_id) else {
                     continue;
                 };
-                if unit.review_evidence.as_ref() == Some(&evidence) {
+                if unit.review_state.is_none() && unit.review_evidence.as_ref() == Some(&evidence) {
                     unit.status = UnitStatus::Ready;
                     unit.review_evidence = None;
                     unit.review_decision_reason = None;
@@ -766,20 +1359,68 @@ impl Session {
     pub(crate) async fn record_completion_review_spawn(
         &self,
         unit_id: &str,
-        target_task_id: &str,
-        target_task_revision: u64,
-        target_artifact_ref: String,
-        reviewer_thread_id: ThreadId,
-        reviewer_turn_id: String,
-        reviewer_role: String,
-        spawn_call_id: String,
+        generation: CompletionReviewChildGeneration,
     ) -> Result<(), String> {
+        let CompletionReviewChildGeneration {
+            identity:
+                CompletionReviewChildIdentity {
+                    target: review_target,
+                    target_artifact_ref,
+                    reviewer_thread_id,
+                    reviewer_role,
+                    spawn_call_id,
+                },
+            reviewer_turn_id,
+        } = generation;
+        let reviewer_thread_id_string = reviewer_thread_id.to_string();
+
+        // Persist the known child identity before any later generation or freshness
+        // check can fail. A spawned child is never rolled back as if no child existed.
+        self.record_completion_review_child_pending(
+            unit_id,
+            CompletionReviewChildIdentity {
+                target: review_target.clone(),
+                target_artifact_ref: target_artifact_ref.clone(),
+                reviewer_thread_id,
+                reviewer_role: reviewer_role.clone(),
+                spawn_call_id: spawn_call_id.clone(),
+            },
+        )
+        .await?;
         if self
-            .current_completion_review_target_ref(target_task_id, target_task_revision)
+            .current_completion_review_target_ref(
+                &review_target.task_id,
+                review_target.task_revision,
+            )
             .await?
             != target_artifact_ref
         {
             return Err("review target artifact changed while the reviewer was spawning".into());
+        }
+
+        let _review_guard = self.completion_review_owner_guard().await;
+        let root_task_id = self
+            .state
+            .lock()
+            .await
+            .rencrow_completion_state
+            .as_ref()
+            .map(|(root, _)| root.clone())
+            .ok_or_else(|| "completion review contract disappeared during spawn".to_string())?;
+        if self
+            .persisted_completed_review_predecessor_turn(
+                &root_task_id,
+                unit_id,
+                &spawn_call_id,
+                &reviewer_thread_id_string,
+            )
+            .await?
+            .as_deref()
+            == Some(reviewer_turn_id.as_str())
+        {
+            return Err(
+                "review follow-up cannot bind the predecessor's already-collected turn".into(),
+            );
         }
         {
             let mut state = self.state.lock().await;
@@ -794,56 +1435,72 @@ impl Session {
                 .iter_mut()
                 .find(|unit| unit.id == unit_id)
                 .ok_or_else(|| "completion review unit disappeared during spawn".to_string())?;
+            if unit.review_state.is_some() {
+                *unit = codex_history::task_context::project_completion_review_state(unit)?;
+            }
             if unit.kind != CompletionUnitKind::Review
-                || !matches!(unit.status, UnitStatus::Ready | UnitStatus::Running)
-                || unit.review_target.as_ref().is_none_or(|target| {
-                    target.task_id != target_task_id || target.task_revision != target_task_revision
+                || unit.review_target.as_ref().is_none_or(|existing_target| {
+                    existing_target.task_id != review_target.task_id
+                        || existing_target.task_revision != review_target.task_revision
                 })
-                || unit.review_evidence.as_ref().is_some_and(|evidence| {
-                    evidence.reviewer_thread_id != reviewer_thread_id.to_string()
+                || unit.review_evidence.as_ref().is_none_or(|evidence| {
+                    evidence.reviewer_thread_id != reviewer_thread_id_string
                         || evidence.spawn_call_id != spawn_call_id
-                        || !evidence.reviewer_turn_id.starts_with("pending-generation:")
+                        || evidence.reviewer_turn_id
+                            != format!("pending-generation:{spawn_call_id}")
                 })
-                || !(unit
-                    .review_launch
-                    .as_ref()
-                    .is_some_and(|launch| launch.spawn_call_id == spawn_call_id)
-                    || unit.review_evidence.as_ref().is_some_and(|evidence| {
-                        evidence.reviewer_thread_id == reviewer_thread_id.to_string()
-                            && evidence.spawn_call_id == spawn_call_id
-                            && evidence.reviewer_turn_id.starts_with("pending-generation:")
-                    }))
             {
                 return Err(
-                    "completion review unit changed while the reviewer was spawning".into(),
+                    "completion review child binding changed during generation lookup".into(),
                 );
             }
-            let launch_deadline = unit
-                .review_launch
-                .as_ref()
-                .and_then(|launch| launch.deadline_unix_ms);
-            let evidence = unit.review_evidence.get_or_insert_with(|| {
-                pending_completion_review_evidence(
-                    reviewer_thread_id,
-                    reviewer_role.clone(),
-                    spawn_call_id.clone(),
-                    target_task_id.to_string(),
-                    target_task_revision,
-                    target_artifact_ref.clone(),
-                    launch_deadline,
-                )
-            });
+            let Some(mut evidence) = unit.review_evidence.clone() else {
+                return Err(
+                    "completion review child evidence disappeared during generation lookup".into(),
+                );
+            };
             if !bind_completion_review_generation(
-                evidence,
+                &mut evidence,
                 reviewer_thread_id,
                 &spawn_call_id,
                 reviewer_turn_id,
             ) {
                 return Err("review generation does not match the unresolved child launch".into());
             }
-            evidence.reviewer_role = reviewer_role;
+            evidence.reviewer_role = reviewer_role.clone();
             evidence.target_artifact_ref = target_artifact_ref;
-            unit.review_launch = None;
+            let bound_turn_id = evidence.reviewer_turn_id.clone();
+            let mut candidate = unit.clone();
+            if candidate.review_state.is_some() {
+                let attempt = candidate
+                    .review_state
+                    .as_mut()
+                    .and_then(|review_state| review_state.active_attempt.as_mut())
+                    .ok_or_else(|| {
+                        "canonical review attempt disappeared during generation lookup".to_string()
+                    })?;
+                if attempt.attempt_id != spawn_call_id
+                    || attempt.reviewer_thread_id.as_deref()
+                        != Some(reviewer_thread_id_string.as_str())
+                    || !matches!(
+                        attempt.status,
+                        CompletionReviewAttemptStatus::Reserved
+                            | CompletionReviewAttemptStatus::Unknown
+                    )
+                    || attempt.reviewer_role != reviewer_role
+                {
+                    return Err("review generation does not match its canonical attempt".into());
+                }
+                attempt.reviewer_turn_id = Some(bound_turn_id);
+                attempt.status = CompletionReviewAttemptStatus::Bound;
+                attempt.launch_unknown_reason = None;
+            }
+            candidate.review_evidence = Some(evidence);
+            if candidate.review_state.is_some() {
+                candidate =
+                    codex_history::task_context::project_completion_review_state(&candidate)?;
+            }
+            *unit = candidate;
         }
         self.persist_autonomous_completion_snapshot().await
     }
@@ -854,20 +1511,25 @@ impl Session {
         wait_call_id: &str,
         statuses: &[(ThreadId, Option<String>, AgentStatus)],
     ) {
+        let _review_guard = self.completion_review_owner_guard().await;
         let pending = {
             let state = self.state.lock().await;
             let Some((_, contract)) = state.rencrow_completion_state.as_ref() else {
                 return;
             };
-            contract
-                .units
-                .iter()
+            let projected_units =
+                match super::completion_review::projected_completion_review_units(contract) {
+                    Ok(units) => units,
+                    Err(_) => return,
+                };
+            projected_units
+                .into_iter()
                 .filter_map(|unit| {
                     let review = unit.review_evidence.as_ref()?;
                     review
                         .wait_result_ref
                         .is_none()
-                        .then(|| (unit.id.clone(), review.clone()))
+                        .then(|| (unit.id, review.clone()))
                 })
                 .collect::<Vec<_>>()
         };
@@ -923,6 +1585,20 @@ impl Session {
                         ),
                         _ => unreachable!(),
                     };
+                    let Ok(failure_ref) = digest(&serde_json::json!({
+                        "wait_call_id": wait_call_id,
+                        "reviewer_thread_id": review.reviewer_thread_id,
+                        "reviewer_turn_id": review.reviewer_turn_id,
+                        "terminal_status": format!("{:?}", &status.2),
+                        "cause": cause,
+                    })) else {
+                        continue;
+                    };
+                    let failure_source =
+                        codex_history::task_context::CompletionReviewTerminalSource {
+                            status: CompletionReviewTerminalStatus::Failed,
+                            event: None,
+                        };
                     let changed = {
                         let mut state = self.state.lock().await;
                         let Some((_, contract)) = state.rencrow_completion_state.as_mut() else {
@@ -931,16 +1607,130 @@ impl Session {
                         let Some(unit) = contract.units.iter_mut().find(|u| u.id == unit_id) else {
                             continue;
                         };
-                        if unit.status != UnitStatus::Running
+                        if unit.review_state.is_some() {
+                            let Ok(projected) =
+                                codex_history::task_context::project_completion_review_state(unit)
+                            else {
+                                continue;
+                            };
+                            *unit = projected;
+                        }
+                        let active_attempt_matches = unit
+                            .review_state
+                            .as_ref()
+                            .and_then(|review_state| review_state.active_attempt.as_ref())
+                            .is_some_and(|attempt| {
+                                attempt.attempt_id == review.spawn_call_id
+                                    && attempt.reviewer_thread_id.as_deref()
+                                        == Some(review.reviewer_thread_id.as_str())
+                                    && attempt.reviewer_turn_id.as_deref()
+                                        == Some(review.reviewer_turn_id.as_str())
+                            });
+                        let exact_failure_already_recorded = active_attempt_matches
+                            && unit.status == UnitStatus::Failed
+                            && unit
+                                .review_state
+                                .as_ref()
+                                .and_then(|review_state| review_state.active_attempt.as_ref())
+                                .is_some_and(|attempt| {
+                                    attempt.status == CompletionReviewAttemptStatus::Failed
+                                        && attempt.terminal_source.as_ref().is_some_and(|source| {
+                                            source.status == CompletionReviewTerminalStatus::Failed
+                                        })
+                                });
+                        if (unit.status != UnitStatus::Running && !exact_failure_already_recorded)
                             || unit.review_evidence.as_ref().is_none_or(|current| {
                                 current.reviewer_thread_id != review.reviewer_thread_id
                                     || current.reviewer_turn_id != expected_binding
                                     || current.spawn_call_id != review.spawn_call_id
                             })
+                            || unit
+                                .review_state
+                                .as_ref()
+                                .and_then(|review_state| review_state.active_attempt.as_ref())
+                                .filter(|attempt| {
+                                    attempt.attempt_id == review.spawn_call_id
+                                        && attempt.reviewer_thread_id.as_deref()
+                                            == Some(review.reviewer_thread_id.as_str())
+                                        && attempt.reviewer_turn_id.as_deref()
+                                            == Some(review.reviewer_turn_id.as_str())
+                                })
+                                .and_then(|attempt| attempt.terminal_source.as_ref())
+                                .is_some_and(|source| {
+                                    source.status != CompletionReviewTerminalStatus::Failed
+                                })
                         {
                             false
                         } else {
-                            unit.status = UnitStatus::Failed;
+                            let previous_reviewer_model = unit
+                                .review_state
+                                .as_ref()
+                                .and_then(|review_state| review_state.active_attempt.as_ref())
+                                .filter(|_| active_attempt_matches)
+                                .and_then(|attempt| attempt.reviewer_model.clone());
+                            if let Some(review_state) = unit.review_state.as_mut() {
+                                if active_attempt_matches {
+                                    if let Some(attempt) = review_state.active_attempt.as_mut() {
+                                        attempt.status = CompletionReviewAttemptStatus::Failed;
+                                        // A later wait receipt adds collection evidence, but it
+                                        // must not erase the earlier durable ReviewEnded source.
+                                        if attempt.terminal_source.as_ref().is_none_or(|source| {
+                                            source.status == CompletionReviewTerminalStatus::Failed
+                                                && source.event.is_none()
+                                        }) {
+                                            attempt.terminal_source = Some(failure_source.clone());
+                                        }
+                                        attempt.wait_result_ref = Some(failure_ref.clone());
+                                        attempt.wait_call_id = Some(wait_call_id.to_string());
+                                    }
+                                    review_state.retry_reservation_prior_historical_failure = None;
+                                } else {
+                                    let failure =
+                                        codex_history::task_context::CompletionReviewHistoricalFailure {
+                                            attempt_id: review.spawn_call_id.clone(),
+                                            contract_revision: None,
+                                            imported_from: None,
+                                            consumed_retry_authorization: None,
+                                            reviewer_thread_id: review.reviewer_thread_id.clone(),
+                                            reviewer_turn_id: review.reviewer_turn_id.clone(),
+                                            target_task_id: review.target_task_id.clone(),
+                                            target_task_revision: review.target_task_revision,
+                                            target_artifact_ref: review.target_artifact_ref.clone(),
+                                            reviewer_role: review.reviewer_role.clone(),
+                                            reviewer_model: previous_reviewer_model,
+                                            deadline_unix_ms: review.deadline_unix_ms,
+                                            wait_result_ref: Some(failure_ref.clone()),
+                                            wait_call_id: Some(wait_call_id.to_string()),
+                                            deadline_escalation: review.deadline_escalation.clone(),
+                                            deadline_safety_fingerprint: review.deadline_safety_fingerprint.clone(),
+                                            terminal_source: failure_source.clone(),
+                                        };
+                                    match review_state.historical_failure.as_mut() {
+                                        Some(existing)
+                                            if existing.attempt_id == failure.attempt_id
+                                                && existing.reviewer_thread_id
+                                                    == failure.reviewer_thread_id
+                                                && existing.reviewer_turn_id
+                                                    == failure.reviewer_turn_id =>
+                                        {
+                                            existing.wait_result_ref = Some(failure_ref.clone());
+                                            existing.wait_call_id = Some(wait_call_id.to_string());
+                                            if existing.terminal_source.event.is_none() {
+                                                existing.terminal_source = failure.terminal_source;
+                                            }
+                                        }
+                                        None => review_state.historical_failure = Some(failure),
+                                        // A stale receipt must not replace a more recent
+                                        // bounded historical fact for another attempt.
+                                        Some(_) => {}
+                                    }
+                                }
+                            }
+                            // A late receipt for an older child records its historical
+                            // failure without changing the status of a newer active attempt.
+                            if unit.review_state.is_none() || active_attempt_matches {
+                                unit.status = UnitStatus::Failed;
+                            }
                             contract.failed_approaches.push(
                                 codex_history::task_context::FailedApproach {
                                     summary: format!("review unit {} failed", unit.id),
@@ -949,6 +1739,14 @@ impl Session {
                                     recorded_at: chrono::Utc::now().timestamp(),
                                 },
                             );
+                            if unit.review_state.is_some()
+                                && let Ok(projected) =
+                                    codex_history::task_context::project_completion_review_state(
+                                        unit,
+                                    )
+                            {
+                                *unit = projected;
+                            }
                             true
                         }
                     };
@@ -996,14 +1794,87 @@ impl Session {
                 let Some(unit) = contract.units.iter_mut().find(|unit| unit.id == unit_id) else {
                     continue;
                 };
-                if unit.review_evidence.as_ref().is_some_and(|current| {
-                    current.reviewer_thread_id == review.reviewer_thread_id
-                        && current.reviewer_turn_id == expected_binding
-                        && current.spawn_call_id == review.spawn_call_id
-                        && current.wait_result_ref.is_none()
-                        && !paused
-                }) {
-                    unit.review_evidence = Some(review);
+                if unit.review_state.is_some() {
+                    let Ok(projected) =
+                        codex_history::task_context::project_completion_review_state(unit)
+                    else {
+                        continue;
+                    };
+                    *unit = projected;
+                }
+                let canonical_attempt_accepts_success =
+                    unit.review_state.as_ref().is_none_or(|review_state| {
+                        review_state.active_attempt.as_ref().is_some_and(|attempt| {
+                            attempt.attempt_id == review.spawn_call_id
+                                && attempt.reviewer_thread_id.as_deref()
+                                    == Some(review.reviewer_thread_id.as_str())
+                                && attempt.reviewer_turn_id.as_deref()
+                                    == Some(expected_binding.as_str())
+                                && attempt.status != CompletionReviewAttemptStatus::Failed
+                                && attempt.status != CompletionReviewAttemptStatus::Cancelled
+                                && attempt.terminal_source.as_ref().is_none_or(|source| {
+                                    source.status != CompletionReviewTerminalStatus::Failed
+                                        && source.status
+                                            != CompletionReviewTerminalStatus::Cancelled
+                                })
+                        })
+                    });
+                if canonical_attempt_accepts_success
+                    && unit.review_evidence.as_ref().is_some_and(|current| {
+                        current.reviewer_thread_id == review.reviewer_thread_id
+                            && current.reviewer_turn_id == expected_binding
+                            && current.spawn_call_id == review.spawn_call_id
+                            && current.wait_result_ref.is_none()
+                            && !paused
+                    })
+                {
+                    unit.review_evidence = Some(review.clone());
+                    if let Some(attempt) = unit
+                        .review_state
+                        .as_mut()
+                        .and_then(|review_state| review_state.active_attempt.as_mut())
+                        .filter(|attempt| {
+                            attempt.attempt_id == review.spawn_call_id
+                                && attempt.reviewer_thread_id.as_deref()
+                                    == Some(review.reviewer_thread_id.as_str())
+                                && attempt.reviewer_turn_id.as_deref()
+                                    == Some(expected_binding.as_str())
+                        })
+                    {
+                        attempt.status = CompletionReviewAttemptStatus::Completed;
+                        attempt.terminal_source = Some(
+                            codex_history::task_context::CompletionReviewTerminalSource {
+                                status: CompletionReviewTerminalStatus::Completed,
+                                event: None,
+                            },
+                        );
+                        attempt.wait_result_ref = review.wait_result_ref.clone();
+                        attempt.wait_call_id = review.wait_call_id.clone();
+                    }
+                    if let Some(review_state) = unit.review_state.as_mut()
+                        && review_state.active_attempt.as_ref().is_some_and(|attempt| {
+                            attempt.attempt_id == review.spawn_call_id
+                                && attempt.reviewer_thread_id.as_deref()
+                                    == Some(review.reviewer_thread_id.as_str())
+                                && attempt.reviewer_turn_id.as_deref()
+                                    == Some(expected_binding.as_str())
+                        })
+                    {
+                        review_state.retry_reservation_prior_historical_failure = None;
+                    }
+                    if contract.blocker.as_ref().is_some_and(|blocker| {
+                        blocker.review_owner.as_ref().is_some_and(|owner| {
+                            owner.unit_id == unit_id && owner.attempt_id == review.spawn_call_id
+                        })
+                    }) {
+                        contract.blocker = None;
+                    }
+                    if unit.review_state.is_some()
+                        && let Ok(projected) =
+                            codex_history::task_context::project_completion_review_state(unit)
+                    {
+                        *unit = projected;
+                    }
                     true
                 } else {
                     false
@@ -1016,7 +1887,7 @@ impl Session {
         }
     }
 
-    async fn current_completion_review_target_ref(
+    pub(super) async fn current_completion_review_target_ref(
         &self,
         task_id: &str,
         task_revision: u64,
@@ -1090,6 +1961,419 @@ impl Session {
             .is_empty()
     }
 
+    pub(crate) async fn prepare_completion_review_followup(
+        &self,
+        child_thread_id: ThreadId,
+        call_id: &str,
+    ) -> Result<Option<CompletionReviewFollowupPreparation>, String> {
+        if call_id.trim().is_empty() {
+            return Err("review follow-up requires the host send_input call ID".into());
+        }
+        let _review_guard = self.completion_review_owner_guard().await;
+        let child_id = child_thread_id.to_string();
+        let (root_task_id, contract_revision, prior_unit, prior_attempt) = {
+            let state = self.state.lock().await;
+            let Some((root_task_id, contract)) = state.rencrow_completion_state.as_ref() else {
+                return Ok(None);
+            };
+            let matches = super::completion_review::projected_completion_review_units(contract)?
+                .into_iter()
+                .filter_map(|unit| {
+                    let attempt = unit
+                        .review_state
+                        .as_ref()
+                        .and_then(|review| review.active_attempt.as_ref())?;
+                    (unit.status == UnitStatus::Running
+                        && unit.kind == CompletionUnitKind::Review
+                        && attempt.status == CompletionReviewAttemptStatus::Completed
+                        && attempt.adoption_reason.is_none()
+                        && attempt.reviewer_thread_id.as_deref() == Some(child_id.as_str())
+                        && attempt.terminal_source.as_ref().is_some_and(|source| {
+                            source.status == CompletionReviewTerminalStatus::Completed
+                        })
+                        && attempt
+                            .wait_result_ref
+                            .as_deref()
+                            .is_some_and(|value| !value.is_empty())
+                        && attempt
+                            .wait_call_id
+                            .as_deref()
+                            .is_some_and(|value| !value.is_empty()))
+                    .then(|| (unit.id, attempt.clone()))
+                })
+                .collect::<Vec<_>>();
+            match matches.as_slice() {
+                [] => return Ok(None),
+                [(unit_id, attempt)] => {
+                    if state.rencrow_completion_paused {
+                        return Err(
+                            "review follow-up is blocked while autonomous completion is paused"
+                                .into(),
+                        );
+                    }
+                    if contract.paused {
+                        return Err(
+                            "review follow-up is blocked while its completion plan is paused"
+                                .into(),
+                        );
+                    }
+                    if state
+                        .rencrow_completion_uncollected_children
+                        .contains(&child_id)
+                    {
+                        return Err(
+                            "review follow-up child already has uncollected runtime work".into(),
+                        );
+                    }
+                    let prior_unit = contract
+                        .units
+                        .iter()
+                        .find(|candidate| candidate.id == *unit_id)
+                        .ok_or_else(|| {
+                            "review obligation disappeared during selection".to_string()
+                        })?
+                        .clone();
+                    (
+                        root_task_id.clone(),
+                        contract.contract_revision,
+                        prior_unit,
+                        attempt.clone(),
+                    )
+                }
+                _ => return Err("multiple unadopted review attempts match this child".into()),
+            }
+        };
+        let unit_id = prior_unit.id.clone();
+        let Some(prior_snapshot_ref) = self
+            .persisted_review_attempt_snapshot_ref(&root_task_id, &unit_id, &prior_attempt)
+            .await?
+        else {
+            return Err(
+                "review follow-up requires an exact persisted snapshot of the collected attempt"
+                    .into(),
+            );
+        };
+        if prior_attempt.attempt_id == call_id {
+            return Err("review follow-up call ID reused the predecessor attempt ID".into());
+        }
+        let (reserved_unit, ledger_inserted) = {
+            let mut state = self.state.lock().await;
+            if state.rencrow_completion_paused {
+                return Err("review follow-up was paused before reservation".into());
+            }
+            let Some((current_root, contract)) = state.rencrow_completion_state.as_ref() else {
+                return Err("completion plan disappeared before review follow-up".into());
+            };
+            if current_root != &root_task_id
+                || contract.paused
+                || contract.contract_revision != contract_revision
+                || contract.units.iter().find(|unit| unit.id == unit_id) != Some(&prior_unit)
+                || state
+                    .rencrow_completion_uncollected_children
+                    .contains(&child_id)
+            {
+                return Err("review attempt changed before follow-up submission".into());
+            }
+            let mut reserved_unit = prior_unit.clone();
+            let canonical_attempt = reserved_unit
+                .review_state
+                .as_mut()
+                .and_then(|review| review.active_attempt.as_mut())
+                .ok_or_else(|| {
+                    "canonical completed review disappeared before follow-up".to_string()
+                })?;
+            if canonical_attempt != &prior_attempt
+                || canonical_attempt.status != CompletionReviewAttemptStatus::Completed
+                || canonical_attempt.adoption_reason.is_some()
+            {
+                return Err("review attempt changed before follow-up reservation".into());
+            }
+            canonical_attempt.attempt_id = call_id.to_string();
+            canonical_attempt.status = CompletionReviewAttemptStatus::Reserved;
+            canonical_attempt.launch_unknown_reason = None;
+            canonical_attempt.consumed_retry_authorization = None;
+            canonical_attempt.imported_from = None;
+            canonical_attempt.reviewer_thread_id = Some(child_id.clone());
+            canonical_attempt.reviewer_turn_id = None;
+            canonical_attempt.deadline_unix_ms =
+                Some(chrono::Utc::now().timestamp_millis() + COMPLETION_REVIEWER_SLA_MS);
+            canonical_attempt.deadline_escalation = None;
+            canonical_attempt.deadline_safety_fingerprint = None;
+            canonical_attempt.terminal_source = None;
+            canonical_attempt.wait_result_ref = None;
+            canonical_attempt.wait_call_id = None;
+            canonical_attempt.adoption_reason = None;
+            reserved_unit
+                .review_state
+                .as_mut()
+                .ok_or_else(|| "canonical review state disappeared before follow-up".to_string())?
+                .previous_attempt_ref = Some(prior_snapshot_ref.clone());
+            reserved_unit =
+                codex_history::task_context::project_completion_review_state(&reserved_unit)?;
+            let contract = state
+                .rencrow_completion_state
+                .as_mut()
+                .map(|(_, contract)| contract)
+                .ok_or_else(|| "completion plan disappeared before reservation".to_string())?;
+            let unit = contract
+                .units
+                .iter_mut()
+                .find(|unit| unit.id == unit_id)
+                .ok_or_else(|| "review obligation disappeared before reservation".to_string())?;
+            *unit = reserved_unit.clone();
+            let ledger_inserted = state
+                .rencrow_completion_uncollected_children
+                .insert(child_id.clone());
+            (reserved_unit, ledger_inserted)
+        };
+        if !ledger_inserted {
+            self.pause_autonomous_completion().await;
+            return Err("review follow-up could not reserve its child exactly once".into());
+        }
+        if let Err(error) = self.persist_autonomous_completion_snapshot().await {
+            self.pause_autonomous_completion().await;
+            return Err(format!(
+                "could not persist the reviewer follow-up reservation: {error}"
+            ));
+        }
+        Ok(Some(CompletionReviewFollowupPreparation {
+            root_task_id,
+            unit_id,
+            child_thread_id,
+            call_id: call_id.to_string(),
+            contract_revision,
+            prior_unit,
+            reserved_unit,
+        }))
+    }
+
+    pub(crate) async fn record_completion_review_followup_started(
+        &self,
+        preparation: CompletionReviewFollowupPreparation,
+        started_turn_id: String,
+    ) -> Result<(), String> {
+        let prior_turn_id = preparation
+            .prior_unit
+            .review_state
+            .as_ref()
+            .and_then(|review| review.active_attempt.as_ref())
+            .and_then(|attempt| attempt.reviewer_turn_id.as_deref());
+        if started_turn_id.trim().is_empty() || prior_turn_id == Some(started_turn_id.as_str()) {
+            return Err("review follow-up did not start a distinct child generation".into());
+        }
+        let _review_guard = self.completion_review_owner_guard().await;
+        let child_thread_id = preparation.child_thread_id.to_string();
+        {
+            let mut state = self.state.lock().await;
+            if state.rencrow_completion_paused {
+                return Err(
+                    "review follow-up binding is blocked while autonomous completion is paused"
+                        .into(),
+                );
+            }
+            let child_is_uncollected = state
+                .rencrow_completion_uncollected_children
+                .contains(&child_thread_id);
+            let Some((root_task_id, contract)) = state.rencrow_completion_state.as_mut() else {
+                return Err("completion plan disappeared after reviewer follow-up".into());
+            };
+            if root_task_id != &preparation.root_task_id
+                || contract.paused
+                || contract.contract_revision != preparation.contract_revision
+            {
+                return Err("completion root or contract changed after reviewer follow-up".into());
+            }
+            let current_conditions_sha256 =
+                super::completion_review::completion_review_conditions_sha256(
+                    contract,
+                    &preparation.reserved_unit.condition_refs,
+                )?;
+            let Some(unit) = contract
+                .units
+                .iter_mut()
+                .find(|unit| unit.id == preparation.unit_id)
+            else {
+                return Err("review obligation disappeared after reviewer follow-up".into());
+            };
+            if unit != &preparation.reserved_unit || !child_is_uncollected {
+                return Err(
+                    "review follow-up reservation changed before its generation was bound".into(),
+                );
+            }
+            let mut candidate = unit.clone();
+            let attempt = candidate
+                .review_state
+                .as_mut()
+                .and_then(|review| review.active_attempt.as_mut())
+                .ok_or_else(|| "review follow-up lost its reserved attempt".to_string())?;
+            if attempt.attempt_id != preparation.call_id
+                || attempt.status != CompletionReviewAttemptStatus::Reserved
+                || attempt.reviewer_thread_id.as_deref() != Some(child_thread_id.as_str())
+                || attempt.reviewer_turn_id.is_some()
+                || attempt.terminal_source.is_some()
+                || attempt.wait_result_ref.is_some()
+                || attempt.wait_call_id.is_some()
+                || attempt.adoption_reason.is_some()
+                || attempt.conditions_sha256 != current_conditions_sha256
+            {
+                return Err(
+                    "review follow-up reservation no longer matches its start conditions".into(),
+                );
+            }
+            attempt.reviewer_turn_id = Some(started_turn_id);
+            attempt.status = CompletionReviewAttemptStatus::Bound;
+            attempt.launch_unknown_reason = None;
+            candidate = codex_history::task_context::project_completion_review_state(&candidate)?;
+            *unit = candidate;
+        }
+        if let Err(error) = self.persist_autonomous_completion_snapshot().await {
+            self.pause_autonomous_completion().await;
+            return Err(format!(
+                "review follow-up started but its new generation could not be persisted: {error}"
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn cancel_completion_review_followup_not_submitted(
+        &self,
+        preparation: CompletionReviewFollowupPreparation,
+    ) -> Result<(), String> {
+        let _review_guard = self.completion_review_owner_guard().await;
+        let child_thread_id = preparation.child_thread_id.to_string();
+        let rollback = {
+            let mut state = self.state.lock().await;
+            let Some((root_task_id, contract)) = state.rencrow_completion_state.as_ref() else {
+                return Err("completion plan disappeared before send rejection cleanup".to_string());
+            };
+            if root_task_id != &preparation.root_task_id
+                || contract.contract_revision != preparation.contract_revision
+                || contract
+                    .units
+                    .iter()
+                    .find(|unit| unit.id == preparation.unit_id)
+                    != Some(&preparation.reserved_unit)
+                || !state
+                    .rencrow_completion_uncollected_children
+                    .contains(&child_thread_id)
+            {
+                Err("review attempt changed before rejected follow-up cleanup".to_string())
+            } else {
+                let contract = state
+                    .rencrow_completion_state
+                    .as_mut()
+                    .map(|(_, contract)| contract)
+                    .ok_or_else(|| "completion plan disappeared during cleanup".to_string())?;
+                let unit = contract
+                    .units
+                    .iter_mut()
+                    .find(|unit| unit.id == preparation.unit_id)
+                    .ok_or_else(|| "review obligation disappeared during cleanup".to_string())?;
+                *unit = preparation.prior_unit.clone();
+                state
+                    .rencrow_completion_uncollected_children
+                    .remove(&child_thread_id);
+                Ok(())
+            }
+        };
+        if let Err(error) = rollback {
+            self.pause_autonomous_completion().await;
+            return Err(error);
+        }
+        if let Err(error) = self.persist_autonomous_completion_snapshot().await {
+            {
+                let mut state = self.state.lock().await;
+                if let Some((root, contract)) = state.rencrow_completion_state.as_mut()
+                    && root == &preparation.root_task_id
+                    && contract.contract_revision == preparation.contract_revision
+                    && let Some(unit) = contract
+                        .units
+                        .iter_mut()
+                        .find(|unit| unit.id == preparation.unit_id)
+                    && unit == &preparation.prior_unit
+                {
+                    *unit = preparation.reserved_unit.clone();
+                }
+                state
+                    .rencrow_completion_uncollected_children
+                    .insert(child_thread_id);
+            }
+            self.pause_autonomous_completion().await;
+            return Err(format!(
+                "could not persist rejected follow-up cleanup; child remains unresolved: {error}"
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn record_completion_review_followup_opaque_or_ambiguous(
+        &self,
+        preparation: CompletionReviewFollowupPreparation,
+        reason: String,
+    ) -> Result<(), String> {
+        let _review_guard = self.completion_review_owner_guard().await;
+        let child_thread_id = preparation.child_thread_id.to_string();
+        let reason = reason.chars().take(/*n*/ 1024).collect::<String>();
+        let updated = {
+            let mut state = self.state.lock().await;
+            let child_is_uncollected = state
+                .rencrow_completion_uncollected_children
+                .contains(&child_thread_id);
+            let Some((root, contract)) = state.rencrow_completion_state.as_mut() else {
+                return Err("completion plan disappeared during ambiguous follow-up".into());
+            };
+            if root != &preparation.root_task_id
+                || contract.contract_revision != preparation.contract_revision
+                || !child_is_uncollected
+            {
+                false
+            } else {
+                let Some(unit) = contract
+                    .units
+                    .iter_mut()
+                    .find(|unit| unit.id == preparation.unit_id)
+                else {
+                    return Err("review obligation disappeared during ambiguous follow-up".into());
+                };
+                if unit == &preparation.reserved_unit {
+                    let mut candidate = unit.clone();
+                    let attempt = candidate
+                        .review_state
+                        .as_mut()
+                        .and_then(|review| review.active_attempt.as_mut())
+                        .ok_or_else(|| "reserved follow-up lost its attempt".to_string())?;
+                    attempt.status = CompletionReviewAttemptStatus::Unknown;
+                    attempt.launch_unknown_reason = Some(if reason.trim().is_empty() {
+                        "follow-up submission outcome is unknown".into()
+                    } else {
+                        reason.clone()
+                    });
+                    candidate =
+                        codex_history::task_context::project_completion_review_state(&candidate)?;
+                    *unit = candidate;
+                    true
+                } else {
+                    // A failed persistence after exact Started keeps the observed binding.
+                    false
+                }
+            }
+        };
+        tracing::warn!(
+            child_thread_id = %preparation.child_thread_id,
+            attempt_id = %preparation.call_id,
+            %reason,
+            "reviewer follow-up has no exact new generation"
+        );
+        if updated && let Err(error) = self.persist_autonomous_completion_snapshot().await {
+            self.pause_autonomous_completion().await;
+            return Err(format!(
+                "could not persist the unresolved follow-up attempt: {error}"
+            ));
+        }
+        self.pause_autonomous_completion().await;
+        Ok(())
+    }
+
     pub(crate) async fn observe_completion_child_tool(
         &self,
         tool: &str,
@@ -1099,12 +2383,20 @@ impl Session {
         let mut add = Vec::new();
         let mut remove = Vec::new();
         let mut invalidate_review_children = Vec::new();
+        let close_status = (tool == "close_agent")
+            .then(|| serde_json::from_value::<AgentStatus>(value["previous_status"].clone()).ok())
+            .flatten();
         match tool {
             "spawn_agent" => add.extend(value["agent_id"].as_str()),
-            "send_input" => {
+            "send_input"
+                if value["submission_id"]
+                    .as_str()
+                    .is_some_and(|submission_id| !submission_id.trim().is_empty()) =>
+            {
                 add.extend(args["target"].as_str());
                 invalidate_review_children.extend(args["target"].as_str());
             }
+            "send_input" => return,
             "resume_agent" if terminal(&value["status"]) => {
                 remove.extend(args["id"].as_str());
                 invalidate_review_children.extend(args["id"].as_str());
@@ -1157,7 +2449,53 @@ impl Session {
             }
             let mut collected = false;
             for id in remove {
-                collected |= state.rencrow_completion_uncollected_children.remove(id);
+                let canonical_review_still_uncollected = state
+                    .rencrow_completion_state
+                    .as_ref()
+                    .is_some_and(|(_, contract)| {
+                        contract.units.iter().any(|unit| {
+                            unit.review_evidence.as_ref().is_some_and(|evidence| {
+                                evidence.reviewer_thread_id == id
+                                    && unit.review_state.as_ref().is_some_and(|review| {
+                                        review.active_attempt.as_ref().is_none_or(|attempt| {
+                                            if attempt.wait_result_ref.is_some() {
+                                                false
+                                            } else {
+                                                let exact_failed_event =
+                                                    attempt.status
+                                                        == CompletionReviewAttemptStatus::Failed
+                                                        && attempt.attempt_id.as_str()
+                                                            == evidence.spawn_call_id.as_str()
+                                                        && attempt.reviewer_thread_id.as_deref()
+                                                            == Some(id)
+                                                        && attempt.reviewer_turn_id.as_deref()
+                                                            == Some(evidence.reviewer_turn_id.as_str())
+                                                        && attempt.terminal_source.as_ref().is_some_and(
+                                                            |source| {
+                                                                source.status
+                                                                    == CompletionReviewTerminalStatus::Failed
+                                                                    && source.event.as_ref().is_some_and(
+                                                                        |event| {
+                                                                            event.owner_thread_id.as_str() == id
+                                                                                && event.turn_id.as_str()
+                                                                                    == evidence.reviewer_turn_id.as_str()
+                                                                                && event.owner_agent_role.as_deref()
+                                                                                    == Some(attempt.reviewer_role.as_str())
+                                                                                && event.reason == "ReviewEnded"
+                                                                        },
+                                                                    )
+                                                            },
+                                                        );
+                                                !exact_failed_event
+                                            }
+                                        })
+                                    })
+                            })
+                        })
+                    });
+                if !canonical_review_still_uncollected {
+                    collected |= state.rencrow_completion_uncollected_children.remove(id);
+                }
             }
             let rebind_ids = invalidate_review_children
                 .into_iter()
@@ -1168,6 +2506,12 @@ impl Session {
                 && let Some((_, contract)) = state.rencrow_completion_state.as_mut()
             {
                 for unit in &mut contract.units {
+                    if unit.review_state.is_some() {
+                        // Canonical generations change only through the typed owner path.
+                        // A generic follow-up/resume event has no authority to rewrite its
+                        // terminal or adoption facts.
+                        continue;
+                    }
                     let Some(review_thread_id) = unit
                         .review_evidence
                         .as_ref()
@@ -1192,6 +2536,107 @@ impl Session {
                         if tool == "close_agent" && already_collected_success {
                             continue;
                         }
+                        if tool == "send_input"
+                            && (unit.status == UnitStatus::Failed || !already_collected_success)
+                        {
+                            continue;
+                        }
+                        if tool == "close_agent" {
+                            if unit.status == UnitStatus::Failed {
+                                continue;
+                            }
+                            let cause = close_status.as_ref().and_then(close_failure_cause);
+                            if let Some(cause) = cause {
+                                let Some(evidence) = unit.review_evidence.as_mut() else {
+                                    continue;
+                                };
+                                let previous_turn = evidence.reviewer_turn_id.clone();
+                                let observed_turn = rebind_generations
+                                    .get(&review_thread_id)
+                                    .and_then(Clone::clone);
+                                let (exact_turn, cause) = if previous_turn
+                                    .starts_with("pending-after:")
+                                {
+                                    match observed_turn.filter(|turn_id| {
+                                        turn_id != previous_turn.trim_start_matches("pending-after:")
+                                    }) {
+                                        Some(turn_id) => (Some(turn_id), cause),
+                                        None => (
+                                            None,
+                                            "reviewer closed before the bound review result was collected".into(),
+                                        ),
+                                    }
+                                } else if previous_turn.starts_with("pending-") {
+                                    (
+                                        None,
+                                        "reviewer closed before the bound review result was collected".into(),
+                                    )
+                                } else if observed_turn.as_deref() == Some(previous_turn.as_str()) {
+                                    (Some(previous_turn.clone()), cause)
+                                } else {
+                                    (
+                                        None,
+                                        "reviewer closed before the bound review result was collected".into(),
+                                    )
+                                };
+                                if let Some(exact_turn) = exact_turn {
+                                    evidence.reviewer_turn_id = exact_turn;
+                                }
+                                if let Some(attempt) = unit
+                                    .review_state
+                                    .as_mut()
+                                    .and_then(|review| review.active_attempt.as_mut())
+                                    .filter(|attempt| {
+                                        attempt.attempt_id == evidence.spawn_call_id
+                                            && attempt.reviewer_thread_id.as_deref()
+                                                == Some(evidence.reviewer_thread_id.as_str())
+                                    })
+                                    && matches!(
+                                        attempt.status,
+                                        CompletionReviewAttemptStatus::Reserved
+                                            | CompletionReviewAttemptStatus::Unknown
+                                            | CompletionReviewAttemptStatus::Bound
+                                            | CompletionReviewAttemptStatus::TerminalUnknown
+                                    )
+                                {
+                                    attempt.reviewer_turn_id =
+                                        Some(evidence.reviewer_turn_id.clone());
+                                    attempt.status = CompletionReviewAttemptStatus::TerminalUnknown;
+                                    attempt.launch_unknown_reason = Some(
+                                        "close observed a terminal child status without a collected wait result or exact durable ReviewEnded proof".into(),
+                                    );
+                                    attempt.wait_result_ref = None;
+                                    attempt.wait_call_id = None;
+                                    attempt.terminal_source = None;
+                                    attempt.adoption_reason = None;
+                                }
+                                if unit.review_state.is_none() {
+                                    unit.status = UnitStatus::Failed;
+                                } else if let Ok(projected) =
+                                    codex_history::task_context::project_completion_review_state(
+                                        unit,
+                                    )
+                                {
+                                    *unit = projected;
+                                }
+                                let summary = format!("review unit {} failed", unit.id);
+                                if !contract.failed_approaches.iter().any(|failure| {
+                                    failure.summary == summary && failure.cause == cause
+                                }) {
+                                    contract.failed_approaches.push(
+                                        codex_history::task_context::FailedApproach {
+                                            summary,
+                                            cause,
+                                            next_action: "Diagnose the reviewer failure before creating another authorized review plan".into(),
+                                            recorded_at: chrono::Utc::now().timestamp(),
+                                        },
+                                    );
+                                }
+                                contract.current_unit = Some(unit.id.clone());
+                                changed = true;
+                                continue;
+                            }
+                        }
                         let already_invalidated =
                             unit.review_evidence.as_ref().is_some_and(|evidence| {
                                 evidence.reviewer_turn_id.starts_with("pending-after:")
@@ -1209,9 +2654,35 @@ impl Session {
                             evidence.wait_result_ref = None;
                             evidence.terminal_status = None;
                             evidence.wait_call_id = None;
+                            if let Some(attempt) = unit
+                                .review_state
+                                .as_mut()
+                                .and_then(|review| review.active_attempt.as_mut())
+                                .filter(|attempt| {
+                                    attempt.attempt_id == evidence.spawn_call_id
+                                        && attempt.reviewer_thread_id.as_deref()
+                                            == Some(evidence.reviewer_thread_id.as_str())
+                                })
+                            {
+                                attempt.reviewer_turn_id = Some(evidence.reviewer_turn_id.clone());
+                                attempt.status = CompletionReviewAttemptStatus::Bound;
+                                attempt.launch_unknown_reason = None;
+                                attempt.wait_result_ref = None;
+                                attempt.wait_call_id = None;
+                                attempt.terminal_source = None;
+                                attempt.adoption_reason = None;
+                            }
                         }
                         unit.status = UnitStatus::Running;
                         unit.review_decision_reason = None;
+                        if unit.review_state.is_some() {
+                            let Ok(projected) =
+                                codex_history::task_context::project_completion_review_state(unit)
+                            else {
+                                continue;
+                            };
+                            *unit = projected;
+                        }
                         contract.current_unit = Some(unit.id.clone());
                         changed = true;
                     }
@@ -1253,9 +2724,14 @@ fn task_check_artifact_fingerprint(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::tests::attach_thread_persistence;
     use crate::session::tests::make_session_and_context;
     use codex_history::task_context::AcceptanceCondition;
     use codex_history::task_context::AcceptanceStatus;
+    use codex_history::task_context::CompletionReviewAttempt;
+    use codex_history::task_context::CompletionReviewAttemptStatus;
+    use codex_history::task_context::CompletionReviewState;
+    use codex_history::task_context::CompletionReviewTarget;
     use codex_history::task_context::CompletionState;
     use codex_history::task_context::CompletionUnit;
     use serde_json::json;
@@ -1309,6 +2785,8 @@ mod tests {
                 }),
                 review_launch: None,
                 review_decision_reason: None,
+                review_state: None,
+                review_revalidation_of: None,
             }],
             current_unit: Some("review-1".into()),
             failed_approaches: vec![],
@@ -1318,6 +2796,155 @@ mod tests {
             runtime_recovery_at: None,
             activity_at: None,
         }
+    }
+
+    #[tokio::test]
+    async fn known_child_pending_record_is_idempotent_only_for_same_attempt_and_child() {
+        let (mut session, _) = make_session_and_context().await;
+        attach_thread_persistence(&mut session).await;
+        let task_workspace = tempfile::tempdir().expect("task workspace");
+        let artifact_path = std::path::PathBuf::from("review-target.txt");
+        std::fs::write(
+            task_workspace.path().join(&artifact_path),
+            "accepted artifact\n",
+        )
+        .expect("write accepted artifact");
+        let artifact_paths = vec![artifact_path];
+        let artifact_before =
+            crate::task_check::hash_workspace_artifacts(task_workspace.path(), &artifact_paths)
+                .expect("hash accepted artifact");
+        session
+            .begin_task_check(
+                "check-call".into(),
+                crate::task_check::TaskEvidenceRequest {
+                    task_id: "task-a".into(),
+                    task_revision: 1,
+                    artifact_paths,
+                    check_kind: crate::task_check::TaskCheckKind::Verification,
+                },
+                task_workspace.path().to_path_buf(),
+                artifact_before.clone(),
+            )
+            .await;
+        let task_receipt = session
+            .finish_task_check("check-call", 0, true, artifact_before)
+            .await
+            .expect("accepted task check receipt");
+        let target_artifact_ref = format!(
+            "task-check:check-call:{}",
+            task_check_artifact_fingerprint(&task_receipt).expect("artifact fingerprint")
+        );
+        session
+            .record_initial_history(codex_history::InitialHistory::Forked(vec![
+                crate::session::tests::accepted_task_boundary_item(
+                    &session.thread_id().to_string(),
+                    &target_artifact_ref,
+                ),
+            ]))
+            .await;
+        let child =
+            ThreadId::try_from("01a1c606-48b8-7cf3-bb78-77b47f6b8c2f").expect("valid child id");
+        let other_child = ThreadId::try_from("01a1c606-48b8-7cf3-bb78-77b47f6b8c30")
+            .expect("valid different child id");
+        let target = CompletionReviewTarget {
+            task_id: "task-a".into(),
+            task_revision: 1,
+        };
+        let spawn_call_id = "spawn-review-attempt".to_string();
+        let mut contract = pending_review_state(&child.to_string(), "ignored-turn");
+        let contract_revision = contract.contract_revision;
+        let conditions_sha256 =
+            codex_history::task_context::completion_condition_definitions_sha256(
+                &contract,
+                &contract.units[0].condition_refs,
+            )
+            .expect("fixture review condition exists");
+        let unit = &mut contract.units[0];
+        unit.status = UnitStatus::Running;
+        unit.review_evidence = None;
+        unit.review_launch = None;
+        unit.review_state = Some(CompletionReviewState {
+            version: 1,
+            obligation_unit_id: unit.id.clone(),
+            active_attempt: Some(CompletionReviewAttempt {
+                attempt_id: spawn_call_id.clone(),
+                contract_revision,
+                condition_refs: unit.condition_refs.clone(),
+                conditions_sha256,
+                status: CompletionReviewAttemptStatus::Reserved,
+                launch_unknown_reason: None,
+                consumed_retry_authorization: None,
+                imported_from: None,
+                reviewer_thread_id: None,
+                reviewer_turn_id: None,
+                reviewer_role: "analyst".into(),
+                reviewer_model: Some("review-model".into()),
+                target_task_id: target.task_id.clone(),
+                target_task_revision: target.task_revision,
+                target_artifact_ref: target_artifact_ref.clone(),
+                deadline_unix_ms: Some(chrono::Utc::now().timestamp_millis() + 60_000),
+                deadline_escalation: None,
+                deadline_safety_fingerprint: None,
+                terminal_source: None,
+                wait_result_ref: None,
+                wait_call_id: None,
+                adoption_reason: None,
+            }),
+            historical_failure: None,
+            retry_reservation_prior_historical_failure: None,
+            previous_attempt_ref: None,
+            retry_authorization: None,
+            withdrawal: None,
+            revalidation: None,
+        });
+        session.state.lock().await.rencrow_completion_state = Some(("root".into(), contract));
+        let identity = CompletionReviewChildIdentity {
+            target: target.clone(),
+            target_artifact_ref: target_artifact_ref.clone(),
+            reviewer_thread_id: child,
+            reviewer_role: "analyst".into(),
+            spawn_call_id: spawn_call_id.clone(),
+        };
+
+        session
+            .record_completion_review_child_pending("review-1", identity.clone())
+            .await
+            .expect("first known child binding is persisted");
+        let after_first = session.rencrow_completion_state("root").await.unwrap();
+        assert_eq!(
+            after_first.units[0]
+                .review_evidence
+                .as_ref()
+                .unwrap()
+                .reviewer_turn_id,
+            format!("pending-generation:{spawn_call_id}")
+        );
+        session
+            .record_completion_review_child_pending("review-1", identity)
+            .await
+            .expect("handler-to-owner duplicate for the exact pending child is idempotent");
+        assert_eq!(
+            session.rencrow_completion_state("root").await.unwrap(),
+            after_first
+        );
+
+        let conflicting = CompletionReviewChildIdentity {
+            target,
+            target_artifact_ref,
+            reviewer_thread_id: other_child,
+            reviewer_role: "analyst".into(),
+            spawn_call_id: "different-spawn-attempt".into(),
+        };
+        assert!(
+            session
+                .record_completion_review_child_pending("review-1", conflicting)
+                .await
+                .is_err(),
+            "a second actual child cannot replace the existing attempt binding"
+        );
+        let after_conflict = session.rencrow_completion_state("root").await.unwrap();
+        assert_eq!(after_conflict.units[0], after_first.units[0]);
+        assert!(session.has_uncollected_completion_children().await);
     }
 
     #[test]
@@ -1435,7 +3062,9 @@ mod tests {
             .observe_completion_child_tool(
                 "close_agent",
                 &json!({"target": child_id}),
-                &json!({"previous_status": {"completed": {"message": "review result"}}}),
+                &json!({
+                    "previous_status": AgentStatus::Completed(Some("review result".into()))
+                }),
             )
             .await;
 
@@ -1448,6 +3077,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn close_preserves_host_failed_review_generation() {
+        let (session, _) = make_session_and_context().await;
+        let child_id = "01a1c77f-15cf-7491-9372-cea9ad0c408a";
+        let mut before = pending_review_state(child_id, "review-turn-1");
+        before.units[0].status = UnitStatus::Failed;
+        let evidence = before.units[0].review_evidence.as_mut().unwrap();
+        evidence.deadline_unix_ms = Some(1);
+        evidence.deadline_escalation = Some("reviewer turn ended with an error".into());
+        evidence.deadline_safety_fingerprint = Some("host-terminal-error".into());
+        evidence.wait_result_ref = None;
+        evidence.terminal_status = None;
+        evidence.wait_call_id = None;
+        before
+            .failed_approaches
+            .push(codex_history::task_context::FailedApproach {
+                summary: "review unit review-1 failed".into(),
+                cause: "reviewer turn ended with an error".into(),
+                next_action: "Add a new authorized review unit".into(),
+                recorded_at: 1,
+            });
+        session.state.lock().await.rencrow_completion_state = Some(("root".into(), before.clone()));
+
+        session
+            .observe_completion_child_tool(
+                "close_agent",
+                &json!({"target": child_id}),
+                &json!({"previous_status": {"errored": "ReviewEnded"}}),
+            )
+            .await;
+
+        let after = session.rencrow_completion_state("root").await.unwrap();
+        assert_eq!(after.units[0].status, UnitStatus::Failed);
+        assert_eq!(
+            after.units[0].review_evidence, before.units[0].review_evidence,
+            "close must preserve the exact failed generation and must not fabricate a success receipt"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_records_terminal_error_for_bound_review_without_wait_receipt() {
+        let (session, _) = make_session_and_context().await;
+        let child_id = "01a1c77f-15cf-7491-9372-cea9ad0c408a";
+        let mut before = pending_review_state(child_id, "review-turn-1");
+        let evidence = before.units[0].review_evidence.as_mut().unwrap();
+        evidence.wait_result_ref = None;
+        evidence.terminal_status = None;
+        evidence.wait_call_id = None;
+        session.state.lock().await.rencrow_completion_state = Some(("root".into(), before));
+
+        session
+            .observe_completion_child_tool(
+                "close_agent",
+                &json!({"target": child_id}),
+                &json!({"previous_status": {"errored": "ReviewEnded"}}),
+            )
+            .await;
+
+        let after = session.rencrow_completion_state("root").await.unwrap();
+        let unit = &after.units[0];
+        assert_eq!(unit.status, UnitStatus::Failed);
+        let evidence = unit.review_evidence.as_ref().unwrap();
+        assert_eq!(evidence.reviewer_turn_id, "review-turn-1");
+        assert!(evidence.wait_result_ref.is_none());
+        assert!(evidence.terminal_status.is_none());
+        assert!(evidence.wait_call_id.is_none());
+        assert!(after.failed_approaches.iter().any(|failure| {
+            failure.summary == "review unit review-1 failed" && !failure.cause.trim().is_empty()
+        }));
+    }
+
+    #[tokio::test]
+    async fn close_uncollected_completion_keeps_shutdown_collection_path() {
+        let (session, _) = make_session_and_context().await;
+        let child =
+            ThreadId::try_from("01a1c77f-15cf-7491-9372-cea9ad0c408a").expect("valid child id");
+        let mut contract = pending_review_state(&child.to_string(), "review-turn-1");
+        contract.units[0].status = UnitStatus::Running;
+        let evidence = contract.units[0].review_evidence.as_mut().unwrap();
+        evidence.wait_result_ref = None;
+        evidence.terminal_status = None;
+        evidence.wait_call_id = None;
+        session.state.lock().await.rencrow_completion_state = Some(("root".into(), contract));
+
+        session
+            .observe_completion_child_tool(
+                "close_agent",
+                &json!({"target": child}),
+                &json!({
+                    "previous_status": AgentStatus::Completed(Some("review finished".into()))
+                }),
+            )
+            .await;
+        let closed = session.rencrow_completion_state("root").await.unwrap();
+        assert_eq!(closed.units[0].status, UnitStatus::Running);
+        assert_eq!(
+            closed.units[0]
+                .review_evidence
+                .as_ref()
+                .unwrap()
+                .reviewer_turn_id,
+            "pending-after:review-turn-1"
+        );
+
+        session
+            .collect_completion_review_results(
+                "wait-after-close",
+                &[(child, None, AgentStatus::Shutdown)],
+            )
+            .await;
+        let failed = session.rencrow_completion_state("root").await.unwrap();
+        assert_eq!(failed.units[0].status, UnitStatus::Failed);
+        let evidence = failed.units[0].review_evidence.as_ref().unwrap();
+        assert!(evidence.wait_result_ref.is_none());
+        assert!(evidence.terminal_status.is_none());
+        assert!(evidence.wait_call_id.is_none());
+    }
+
+    #[tokio::test]
     async fn close_after_followup_keeps_old_review_result_invalidated() {
         let (session, _) = make_session_and_context().await;
         let child_id = "01a1c77f-15cf-7491-9372-cea9ad0c408a";
@@ -1456,13 +3203,19 @@ mod tests {
             pending_review_state(child_id, "review-turn-1"),
         ));
         session
-            .observe_completion_child_tool("send_input", &json!({"target": child_id}), &json!({}))
+            .observe_completion_child_tool(
+                "send_input",
+                &json!({"target": child_id}),
+                &json!({"submission_id":"followup-2"}),
+            )
             .await;
         session
             .observe_completion_child_tool(
                 "close_agent",
                 &json!({"target": child_id}),
-                &json!({"previous_status": {"completed": {"message": "review result"}}}),
+                &json!({
+                    "previous_status": AgentStatus::Completed(Some("review result".into()))
+                }),
             )
             .await;
 
@@ -1686,6 +3439,8 @@ mod tests {
                 review_evidence: None,
                 review_launch: None,
                 review_decision_reason: None,
+                review_state: None,
+                review_revalidation_of: None,
             },
         );
         session.state.lock().await.rencrow_completion_state = Some(("root".into(), contract));
@@ -1735,6 +3490,8 @@ mod tests {
                     review_evidence: None,
                     review_launch: None,
                     review_decision_reason: None,
+                    review_state: None,
+                    review_revalidation_of: None,
                 }],
                 current_unit: Some("review-1".into()),
                 failed_approaches: vec![],

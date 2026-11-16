@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-16.
 use super::*;
 use codex_history::ArchiveReference;
 use codex_history::ArchiveTerminalStatus;
@@ -316,7 +317,7 @@ fn prepare_compaction_sources_accepts_only_exact_typed_pre_execution_blocks_with
             BlockedToolCallReference::new(ObservationReference::new(
                 thread.to_string(),
                 "other-call",
-                reference.sha256.clone(),
+                reference.sha256,
             )),
         ),
         (

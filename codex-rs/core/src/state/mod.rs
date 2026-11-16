@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-16.
 mod additional_context;
 mod auto_compact_window;
 mod service;
@@ -11,7 +12,10 @@ pub(crate) use auto_compact_window::AutoCompactWindowIds;
 pub(crate) use auto_compact_window::AutoCompactWindowSnapshot;
 pub(crate) use service::SessionServices;
 pub(crate) use session::ActiveTaskScope;
+pub(crate) use session::CompletionSnapshotReceipt;
 pub(crate) use session::PendingTaskBoundary;
+pub(crate) use session::PersistedLegacyReviewBinding;
+pub(crate) use session::PersistedReviewAttemptIdentity;
 pub(crate) use session::ReasoningEffortPin;
 pub(crate) use session::SessionState;
 pub(crate) use session::TaskPatchAttempt;

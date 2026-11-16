@@ -35,6 +35,8 @@
 
 ## 4. 常駐する課題状態
 
+レビューの義務・試行・採用・現在理由の保存復元は [自律完了統合仕様§14](AUTONOMOUS_COMPLETION_SPEC.md#review-lifecycle-contract) を参照する。本書の保存・権限・byte上限は維持し、確認できた検証範囲は [実装記録](AUTONOMOUS_COMPLETION_IMPLEMENTATION.md#review-lifecycle-20261116) に分けて記す。
+
 単一の型付きスナップショットを使う。フィールド名は各runtimeの既存命名規則に合わせてよいが、次の意味を満たす。
 
 | 情報 | 内容 |

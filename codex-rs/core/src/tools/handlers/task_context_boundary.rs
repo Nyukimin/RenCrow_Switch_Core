@@ -1,7 +1,12 @@
+// Modified by RenCrow Switch Core, 2026-11-16.
 use crate::agent::child_config::SpawnConfigOptions;
 use crate::agent::child_config::SpawnConfigVersion;
 use crate::agent::child_config::prepare_agent_spawn_config;
 use crate::function_tool::FunctionCallError;
+use crate::session::CompletionReviewChildGeneration;
+use crate::session::CompletionReviewChildIdentity;
+use crate::session::CompletionReviewRetryRequest;
+use crate::session::CompletionReviewSelectionOutcome;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
@@ -18,6 +23,7 @@ use codex_history::task_context::AcceptedTaskReceipt;
 use codex_history::task_context::BoundaryCandidate;
 use codex_history::task_context::BoundaryMode;
 use codex_history::task_context::CompletionEvidenceRef;
+use codex_history::task_context::CompletionReviewTarget;
 use codex_history::task_context::CompletionUnitKind;
 use codex_history::task_context::HostBoundaryFacts;
 use codex_history::task_context::StoredTaskState;
@@ -69,9 +75,13 @@ enum TaskContextBoundaryArgs {
         previous_plan: String,
         revised_plan: String,
         reason: String,
+        #[serde(default)]
+        review_retry: Option<ReviewRetryArgs>,
     },
     Review {
         target_task_id: String,
+        #[serde(default)]
+        unit_id: Option<String>,
     },
     AdoptReview {
         unit_id: String,
@@ -92,6 +102,31 @@ enum TaskContextBoundaryArgs {
         #[serde(default)]
         satisfied_conditions: Option<Vec<String>>,
     },
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReviewRetryArgs {
+    unit_id: String,
+    expected_attempt_id: String,
+}
+
+fn render_completion_status(
+    state: &codex_history::task_context::CompletionState,
+    current_review_reason: Option<&str>,
+) -> Result<String, String> {
+    let Some(reason) = current_review_reason.filter(|reason| !reason.trim().is_empty()) else {
+        return serde_json::to_string(state).map_err(|error| error.to_string());
+    };
+    let mut rendered = serde_json::to_value(state).map_err(|error| error.to_string())?;
+    let object = rendered
+        .as_object_mut()
+        .ok_or_else(|| "completion state did not serialize as a JSON object".to_string())?;
+    object.insert(
+        "current_review_obligation".into(),
+        serde_json::Value::String(reason.to_string()),
+    );
+    serde_json::to_string(&rendered).map_err(|error| error.to_string())
 }
 
 impl ToolExecutor<ToolInvocation> for TaskContextBoundaryHandler {
@@ -337,7 +372,11 @@ impl ToolExecutor<ToolInvocation> for TaskContextBoundaryHandler {
                     }
                     invocation
                         .session
-                        .set_rencrow_completion_state(root_task_id.clone(), completion_state)
+                        .set_rencrow_completion_state_with_call_id(
+                            root_task_id.clone(),
+                            completion_state,
+                            Some(invocation.call_id.clone()),
+                        )
                         .await
                         .map_err(FunctionCallError::RespondToModel)?;
                     let state = invocation
@@ -391,67 +430,150 @@ impl ToolExecutor<ToolInvocation> for TaskContextBoundaryHandler {
                                 "no host-registered completion contract is available".into(),
                             )
                         })?;
-                    let rendered = serde_json::to_string(&state)
-                        .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
+                    let current_review_reason = invocation
+                        .session
+                        .autonomous_completion_current_review_scope_reason()
+                        .await;
+                    let rendered =
+                        render_completion_status(&state, current_review_reason.as_deref())
+                            .map_err(FunctionCallError::RespondToModel)?;
                     Ok(boxed_tool_output(FunctionToolOutput::from_text(
                         rendered,
                         Some(true),
                     )))
                 }
-                TaskContextBoundaryArgs::Review { target_task_id } => {
+                TaskContextBoundaryArgs::Review {
+                    target_task_id,
+                    unit_id,
+                } => {
                     if !invocation.turn.config.rencrow_autonomous_completion {
                         return Err(FunctionCallError::RespondToModel(
                             "autonomous completion is not enabled for this session".into(),
                         ));
                     }
-                    let role_name = super::multi_agents::spawn::configured_completion_reviewer_role(
-                        &invocation.turn.config,
-                    )
-                    .ok_or_else(|| {
-                        FunctionCallError::RespondToModel(
-                            "no configured read-only reviewer/analyst/verifier role is available; no reviewer was spawned".into(),
-                        )
-                    })?;
-                    let prepared = prepare_agent_spawn_config(
-                        &invocation.session,
-                        &invocation.step_context,
-                        SpawnConfigOptions {
-                            version: SpawnConfigVersion::V1,
-                            full_history_fork: false,
-                            role_name: Some(&role_name),
-                            model: None,
-                            reasoning_effort: None,
-                        },
-                    )
-                    .await
-                    .map_err(FunctionCallError::RespondToModel)?;
-                    if prepared.config.model.as_deref().is_none_or(str::is_empty) {
-                        return Err(FunctionCallError::RespondToModel(
-                            "configured reviewer role did not resolve an explicit model route; no reviewer was spawned".into(),
-                        ));
-                    }
-                    let prepared_role = prepared.role_name.as_deref().ok_or_else(|| {
-                        FunctionCallError::RespondToModel(
-                            "configured reviewer role was not resolved; no reviewer was spawned"
-                                .into(),
-                        )
-                    })?;
-                    if !super::multi_agents::spawn::completion_reviewer_config_is_read_only(
-                        &prepared.config,
-                        prepared_role,
+                    let selection = invocation
+                        .session
+                        .select_completion_review(&target_task_id, unit_id.as_deref())
+                        .await
+                        .map_err(FunctionCallError::RespondToModel)?;
+                    if matches!(
+                        &selection.outcome,
+                        CompletionReviewSelectionOutcome::AlreadyAdopted
                     ) {
-                        return Err(FunctionCallError::RespondToModel(
-                            "configured reviewer role must declare read-only identity and guard; no reviewer was spawned".into(),
-                        ));
+                        let (_, state) = invocation
+                            .session
+                            .autonomous_completion_current_state()
+                            .await
+                            .ok_or_else(|| {
+                                FunctionCallError::RespondToModel(
+                                    "completion review state is unavailable".into(),
+                                )
+                            })?;
+                        let adopted = state
+                            .units
+                            .iter()
+                            .find(|unit| unit.id == selection.obligation_unit_id);
+                        let evidence = adopted.and_then(|unit| unit.review_evidence.as_ref());
+                        let target_task_revision = adopted
+                            .and_then(|unit| unit.review_target.as_ref())
+                            .map(|target| target.task_revision);
+                        let model_route = adopted
+                            .and_then(|unit| unit.review_state.as_ref())
+                            .and_then(|review| review.active_attempt.as_ref())
+                            .and_then(|attempt| attempt.reviewer_model.as_deref());
+                        let rendered = serde_json::to_string(&serde_json::json!({
+                            "unit_id": selection.obligation_unit_id,
+                            "target_task_id": target_task_id,
+                            "target_task_revision": target_task_revision,
+                            "reviewer_thread_id": evidence.map(|item| item.reviewer_thread_id.as_str()),
+                            "reviewer_role": evidence.map(|item| item.reviewer_role.as_str()),
+                            "model_route": model_route,
+                            "status": "done",
+                            "outcome": "already_adopted",
+                        }))
+                        .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
+                        return Ok(boxed_tool_output(FunctionToolOutput::from_text(
+                            rendered,
+                            Some(true),
+                        )));
                     }
-                    super::multi_agents::spawn::validate_completion_reviewer_depth(
-                        &invocation.turn.session_source,
-                        invocation.turn.config.agent_max_depth,
-                    )
-                    .map_err(FunctionCallError::RespondToModel)?;
+                    let mut prepared = None;
+                    let mut reviewer_role = None;
+                    let mut reviewer_model = None;
+                    if matches!(
+                        &selection.outcome,
+                        CompletionReviewSelectionOutcome::NeedsReservation { .. }
+                    ) {
+                        let role_name = super::multi_agents::spawn::configured_completion_reviewer_role(
+                            &invocation.turn.config,
+                        )
+                        .ok_or_else(|| {
+                            FunctionCallError::RespondToModel(
+                                "no configured read-only reviewer/analyst/verifier role is available; no reviewer was spawned".into(),
+                            )
+                        })?;
+                        let prepared_config = prepare_agent_spawn_config(
+                            &invocation.session,
+                            &invocation.step_context,
+                            SpawnConfigOptions {
+                                version: SpawnConfigVersion::V1,
+                                full_history_fork: false,
+                                role_name: Some(&role_name),
+                                model: None,
+                                reasoning_effort: None,
+                            },
+                        )
+                        .await
+                        .map_err(FunctionCallError::RespondToModel)?;
+                        if prepared_config
+                            .config
+                            .model
+                            .as_deref()
+                            .is_none_or(str::is_empty)
+                        {
+                            return Err(FunctionCallError::RespondToModel(
+                                "configured reviewer role did not resolve an explicit model route; no reviewer was spawned".into(),
+                            ));
+                        }
+                        let prepared_role =
+                            prepared_config.role_name.as_deref().ok_or_else(|| {
+                                FunctionCallError::RespondToModel(
+                                "configured reviewer role was not resolved; no reviewer was spawned"
+                                    .into(),
+                            )
+                            })?;
+                        if !super::multi_agents::spawn::completion_reviewer_config_is_read_only(
+                            &prepared_config.config,
+                            prepared_role,
+                        ) {
+                            return Err(FunctionCallError::RespondToModel(
+                                "configured reviewer role must declare read-only identity and guard; no reviewer was spawned".into(),
+                            ));
+                        }
+                        super::multi_agents::spawn::validate_completion_reviewer_depth(
+                            &invocation.turn.session_source,
+                            invocation.turn.config.agent_max_depth,
+                        )
+                        .map_err(FunctionCallError::RespondToModel)?;
+                        reviewer_role = Some(prepared_role.to_string());
+                        reviewer_model = Some(
+                            prepared_config.config.model.as_deref().ok_or_else(|| {
+                                FunctionCallError::RespondToModel(
+                                    "configured reviewer role did not resolve an explicit model route; no reviewer was spawned".into(),
+                                )
+                            })?.to_string(),
+                        );
+                        prepared = Some(prepared_config);
+                    }
                     let launch = invocation
                         .session
-                        .prepare_completion_review_launch(&target_task_id, &invocation.call_id)
+                        .prepare_completion_review_launch(
+                            &target_task_id,
+                            unit_id.as_deref(),
+                            &invocation.call_id,
+                            reviewer_role.as_deref(),
+                            reviewer_model.as_deref(),
+                        )
                         .await
                         .map_err(FunctionCallError::RespondToModel)?;
                     if !launch.should_spawn
@@ -488,19 +610,25 @@ impl ToolExecutor<ToolInvocation> for TaskContextBoundaryHandler {
                         if let (Some(generation), Some(metadata), Some(child_config)) =
                             (child_generation, child_metadata, child_config)
                             && metadata.agent_role.as_deref() == Some(role)
-                            && prepared.config.model.as_deref() == Some(child_config.model.as_str())
+                            && launch.reviewer_model.as_deref() == Some(child_config.model.as_str())
                         {
                             invocation
                                 .session
                                 .record_completion_review_spawn(
                                     &launch.unit_id,
-                                    &launch.target_task_id,
-                                    launch.target_task_revision,
-                                    launch.target_artifact_ref.clone(),
-                                    child_id,
-                                    generation,
-                                    role.to_string(),
-                                    spawn_call_id.to_string(),
+                                    CompletionReviewChildGeneration {
+                                        identity: CompletionReviewChildIdentity {
+                                            target: CompletionReviewTarget {
+                                                task_id: launch.target_task_id.clone(),
+                                                task_revision: launch.target_task_revision,
+                                            },
+                                            target_artifact_ref: launch.target_artifact_ref.clone(),
+                                            reviewer_thread_id: child_id,
+                                            reviewer_role: role.to_string(),
+                                            spawn_call_id: spawn_call_id.to_string(),
+                                        },
+                                        reviewer_turn_id: generation,
+                                    },
                                 )
                                 .await
                                 .map_err(FunctionCallError::RespondToModel)?;
@@ -512,7 +640,11 @@ impl ToolExecutor<ToolInvocation> for TaskContextBoundaryHandler {
                         let spawned =
                             super::multi_agents::spawn::spawn_configured_completion_review(
                                 &invocation,
-                                prepared,
+                                prepared.ok_or_else(|| {
+                                    FunctionCallError::RespondToModel(
+                                        "completion review reservation requires a prepared reviewer route".into(),
+                                    )
+                                })?,
                                 &launch.unit_id,
                                 &launch.target_task_id,
                                 launch.target_task_revision,
@@ -527,7 +659,9 @@ impl ToolExecutor<ToolInvocation> for TaskContextBoundaryHandler {
                             "spawned".to_string(),
                         )
                     } else {
-                        let model_route = if let Some(id) = launch
+                        let model_route = if let Some(model) = launch.reviewer_model.clone() {
+                            Some(model)
+                        } else if let Some(id) = launch
                             .reviewer_thread_id
                             .as_deref()
                             .and_then(|id| codex_protocol::ThreadId::try_from(id).ok())
@@ -670,6 +804,7 @@ impl ToolExecutor<ToolInvocation> for TaskContextBoundaryHandler {
                     previous_plan,
                     revised_plan,
                     reason,
+                    review_retry,
                 } => {
                     if !invocation.turn.config.rencrow_autonomous_completion {
                         return Err(FunctionCallError::RespondToModel(
@@ -680,9 +815,18 @@ impl ToolExecutor<ToolInvocation> for TaskContextBoundaryHandler {
                         .session
                         .record_autonomous_plan_review(
                             &root_task_id,
-                            previous_plan,
-                            revised_plan,
-                            reason,
+                            &invocation.call_id,
+                            previous_plan.clone(),
+                            revised_plan.clone(),
+                            reason.clone(),
+                            review_retry.map(|retry| CompletionReviewRetryRequest {
+                                unit_id: retry.unit_id,
+                                expected_attempt_id: retry.expected_attempt_id,
+                                invocation_call_id: invocation.call_id.clone(),
+                                previous_plan,
+                                revised_plan,
+                                reason,
+                            }),
                         )
                         .await
                         .map_err(FunctionCallError::RespondToModel)?;
@@ -1122,26 +1266,14 @@ impl ToolExecutor<ToolInvocation> for TaskContextBoundaryHandler {
                         })?;
                     }
                     if autonomous && active.task_id == active.root_task_id {
-                        let contract = completion_state.as_ref().ok_or_else(|| {
+                        let _contract = completion_state.as_ref().ok_or_else(|| {
                             FunctionCallError::RespondToModel(
                                 "root task cannot be accepted without a registered completion contract".into(),
                             )
                         })?;
-                        if contract.conditions.iter().any(|condition| {
-                            condition.status
-                                != codex_history::task_context::AcceptanceStatus::Satisfied
-                        }) {
+                        if !invocation.session.autonomous_completion_is_complete().await {
                             return Err(FunctionCallError::RespondToModel(
-                                "root task cannot be accepted while required completion conditions remain open".into(),
-                            ));
-                        }
-                        if contract
-                            .units
-                            .iter()
-                            .any(|unit| unit.status != UnitStatus::Done)
-                        {
-                            return Err(FunctionCallError::RespondToModel(
-                                "root task cannot be accepted while planned, blocked, failed, or running units remain".into(),
+                                "root task cannot be accepted while projected completion obligations, blockers, or unresolved runtime work remain".into(),
                             ));
                         }
                     }

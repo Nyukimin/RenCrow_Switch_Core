@@ -113,7 +113,7 @@ fn task_boundary_source_fence_binds_exact_snapshot_hash_and_removed_items() {
     assert!(
         validate_task_boundary_source_fence(
             &originals,
-            &[summary.clone()],
+            std::slice::from_ref(&summary),
             &history_hash,
             thread_id,
             summary_text,

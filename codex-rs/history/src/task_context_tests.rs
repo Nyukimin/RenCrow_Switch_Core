@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-16.
 use super::*;
 
 fn candidate() -> BoundaryCandidate {
@@ -77,6 +78,8 @@ fn completion_contract_round_trips_and_requires_current_host_evidence_for_satisf
             review_evidence: None,
             review_launch: None,
             review_decision_reason: None,
+            review_state: None,
+            review_revalidation_of: None,
         }],
         current_unit: None,
         failed_approaches: vec![],
@@ -158,6 +161,8 @@ fn unknown_review_launch_is_typed_bounded_and_host_state_only() {
                 reason: Some("child creation could not be confirmed".into()),
             }),
             review_decision_reason: None,
+            review_state: None,
+            review_revalidation_of: None,
         }],
         current_unit: Some("review-a".into()),
         failed_approaches: vec![],
@@ -273,6 +278,8 @@ fn review_unit_state(status: UnitStatus) -> CompletionState {
             }),
             review_launch: None,
             review_decision_reason: Some("Review found no blocking issues".into()),
+            review_state: None,
+            review_revalidation_of: None,
         }],
         current_unit: None,
         failed_approaches: vec![],
@@ -282,6 +289,366 @@ fn review_unit_state(status: UnitStatus) -> CompletionState {
         runtime_recovery_at: None,
         activity_at: None,
     }
+}
+
+fn review_snapshot(version: u32, digest: char) -> CompletionReviewSnapshotRef {
+    CompletionReviewSnapshotRef {
+        version,
+        sha256: digest.to_string().repeat(/*n*/ 64),
+    }
+}
+
+fn imported_failure(
+    attempt_id: &str,
+    imported_from: CompletionReviewSnapshotRef,
+) -> CompletionReviewHistoricalFailure {
+    CompletionReviewHistoricalFailure {
+        attempt_id: attempt_id.into(),
+        contract_revision: Some(1),
+        imported_from: Some(imported_from),
+        consumed_retry_authorization: None,
+        reviewer_thread_id: format!("thread-{attempt_id}"),
+        reviewer_turn_id: format!("turn-{attempt_id}"),
+        target_task_id: "a".into(),
+        target_task_revision: 2,
+        target_artifact_ref: "artifact:sha".into(),
+        reviewer_role: "analyst".into(),
+        reviewer_model: Some("review-model".into()),
+        deadline_unix_ms: None,
+        wait_result_ref: Some("wait-result".into()),
+        wait_call_id: Some("wait-call".into()),
+        deadline_escalation: None,
+        deadline_safety_fingerprint: None,
+        terminal_source: CompletionReviewTerminalSource {
+            status: CompletionReviewTerminalStatus::Failed,
+            event: None,
+        },
+    }
+}
+
+fn independent_review_references() -> (CompletionUnit, CompletionReviewState) {
+    let unit = CompletionUnit {
+        id: "review-1".into(),
+        purpose: "Review task a again".into(),
+        status: UnitStatus::Running,
+        kind: CompletionUnitKind::Review,
+        condition_refs: vec!["AC-1".into()],
+        depends_on: vec![],
+        evidence: vec![],
+        task_refs: vec![],
+        review_target: Some(CompletionReviewTarget {
+            task_id: "a".into(),
+            task_revision: 2,
+        }),
+        review_evidence: None,
+        review_launch: None,
+        review_decision_reason: None,
+        review_state: None,
+        review_revalidation_of: Some("review-source".into()),
+    };
+    let review = CompletionReviewState {
+        version: 1,
+        obligation_unit_id: unit.id.clone(),
+        active_attempt: Some(CompletionReviewAttempt {
+            attempt_id: "started-turn".into(),
+            contract_revision: 2,
+            condition_refs: unit.condition_refs.clone(),
+            conditions_sha256: "a".repeat(/*n*/ 64),
+            status: CompletionReviewAttemptStatus::Bound,
+            launch_unknown_reason: None,
+            consumed_retry_authorization: Some(CompletionReviewRetryAuthorization {
+                authorization_id: "retry-1".into(),
+                expected_attempt_id: "prior-failure".into(),
+                plan_review_call_id: "retry-1".into(),
+                reason: "Retry after the prior failure".into(),
+                previous_plan: "Review once".into(),
+                revised_plan: "Review the updated artifact".into(),
+            }),
+            imported_from: None,
+            reviewer_thread_id: Some("new-reviewer-thread".into()),
+            reviewer_turn_id: Some("started-turn".into()),
+            reviewer_role: "analyst".into(),
+            reviewer_model: Some("review-model".into()),
+            target_task_id: "a".into(),
+            target_task_revision: 2,
+            target_artifact_ref: "artifact:sha".into(),
+            deadline_unix_ms: None,
+            deadline_escalation: None,
+            deadline_safety_fingerprint: None,
+            terminal_source: None,
+            wait_result_ref: None,
+            wait_call_id: None,
+            adoption_reason: None,
+        }),
+        historical_failure: Some(imported_failure(
+            "past-failure",
+            review_snapshot(/*version*/ 1, 'c'),
+        )),
+        retry_reservation_prior_historical_failure: Some(imported_failure(
+            "rollback-failure",
+            review_snapshot(/*version*/ 1, 'd'),
+        )),
+        previous_attempt_ref: Some(review_snapshot(/*version*/ 2, 'b')),
+        retry_authorization: None,
+        withdrawal: None,
+        revalidation: Some(CompletionReviewRevalidationSource {
+            source_unit_id: "review-source".into(),
+            source_adoption_sha256: "e".repeat(/*n*/ 64),
+            source_snapshot: review_snapshot(/*version*/ 1, 'f'),
+            required_artifact_fingerprint: "1".repeat(/*n*/ 64),
+            source_condition_definitions_sha256: "2".repeat(/*n*/ 64),
+            required_condition_definitions_sha256: "3".repeat(/*n*/ 64),
+            update_call_id: "update-1".into(),
+        }),
+    };
+    (unit, review)
+}
+
+#[test]
+fn review_validator_accepts_distinct_previous_attempt_and_import_source_refs() {
+    let (unit, review) = independent_review_references();
+    assert_ne!(
+        review.previous_attempt_ref,
+        review
+            .revalidation
+            .as_ref()
+            .map(|source| source.source_snapshot.clone())
+    );
+    assert_ne!(
+        review.previous_attempt_ref,
+        review
+            .historical_failure
+            .as_ref()
+            .and_then(|failure| failure.imported_from.clone())
+    );
+    validate_completion_review_state(&unit, &review, /*contract_revision*/ 2)
+        .expect("independent immutable snapshots retain their distinct meanings");
+}
+
+#[test]
+fn review_validator_allows_new_revalidation_without_previous_attempt_ref() {
+    let (mut unit, mut review) = independent_review_references();
+    unit.status = UnitStatus::Planned;
+    review.active_attempt = None;
+    review.historical_failure = None;
+    review.retry_reservation_prior_historical_failure = None;
+    review.previous_attempt_ref = None;
+    review.retry_authorization = None;
+    review.withdrawal = None;
+
+    validate_completion_review_state(&unit, &review, /*contract_revision*/ 2)
+        .expect("a new planned revalidation obligation needs only its source provenance");
+}
+
+#[test]
+fn review_validator_requires_previous_ref_for_consumed_retry_grant() {
+    let (unit, mut review) = independent_review_references();
+    review.previous_attempt_ref = None;
+    review.historical_failure.as_mut().unwrap().imported_from = None;
+    review
+        .retry_reservation_prior_historical_failure
+        .as_mut()
+        .unwrap()
+        .imported_from = None;
+
+    let expected_error = Err(
+        "consumed retry authorization requires its same-obligation grant snapshot reference"
+            .to_string(),
+    );
+    assert_eq!(
+        validate_completion_review_state(&unit, &review, /*contract_revision*/ 2),
+        expected_error
+    );
+    review.previous_attempt_ref = Some(
+        review
+            .revalidation
+            .as_ref()
+            .unwrap()
+            .source_snapshot
+            .clone(),
+    );
+    assert_eq!(
+        validate_completion_review_state(&unit, &review, /*contract_revision*/ 2),
+        expected_error
+    );
+}
+
+#[test]
+fn review_validator_keeps_legacy_withdrawal_snapshot_reference_required() {
+    let target = CompletionReviewTarget {
+        task_id: "task-a".into(),
+        task_revision: 1,
+    };
+    let reason = "Cancelled before reviewer launch";
+    let reference = review_snapshot(/*version*/ 1, 'a');
+    let unit = CompletionUnit {
+        id: "review-cancelled".into(),
+        purpose: "Review task-a".into(),
+        status: UnitStatus::Cancelled,
+        kind: CompletionUnitKind::Review,
+        condition_refs: vec!["AC-1".into()],
+        depends_on: vec![],
+        evidence: vec![],
+        task_refs: vec![],
+        review_target: Some(target.clone()),
+        review_evidence: None,
+        review_launch: None,
+        review_decision_reason: Some(reason.into()),
+        review_state: None,
+        review_revalidation_of: None,
+    };
+    let mut review = CompletionReviewState {
+        version: 1,
+        obligation_unit_id: unit.id.clone(),
+        active_attempt: None,
+        historical_failure: None,
+        retry_reservation_prior_historical_failure: None,
+        previous_attempt_ref: None,
+        retry_authorization: None,
+        withdrawal: Some(CompletionReviewWithdrawal {
+            source: CompletionReviewWithdrawalSource::LegacyV1Snapshot {
+                snapshot: reference.clone(),
+            },
+            reason: reason.into(),
+            target_task_id: target.task_id,
+            target_task_revision: target.task_revision,
+            condition_refs: unit.condition_refs.clone(),
+            depends_on: unit.depends_on.clone(),
+        }),
+        revalidation: None,
+    };
+
+    assert!(validate_completion_review_state(&unit, &review, /*contract_revision*/ 1).is_err());
+    review.previous_attempt_ref = Some(reference);
+    validate_completion_review_state(&unit, &review, /*contract_revision*/ 1)
+        .expect("legacy cancellation keeps its exact v1 source reference");
+}
+
+#[test]
+fn review_validator_rejects_missing_or_malformed_independent_snapshot_refs() {
+    let (unit, mut review) = independent_review_references();
+    review.previous_attempt_ref = None;
+    assert!(validate_completion_review_state(&unit, &review, /*contract_revision*/ 2).is_err());
+
+    let (unit, mut review) = independent_review_references();
+    review.revalidation = None;
+    review.previous_attempt_ref = None;
+    assert!(validate_completion_review_state(&unit, &review, /*contract_revision*/ 2).is_err());
+
+    let (unit, mut review) = independent_review_references();
+    review.revalidation.as_mut().unwrap().source_snapshot.sha256 = "F".repeat(/*n*/ 64);
+    assert!(validate_completion_review_state(&unit, &review, /*contract_revision*/ 2).is_err());
+
+    let (unit, mut review) = independent_review_references();
+    review.active_attempt.as_mut().unwrap().imported_from =
+        Some(review_snapshot(/*version*/ 2, 'c'));
+    assert!(validate_completion_review_state(&unit, &review, /*contract_revision*/ 2).is_err());
+
+    let (unit, mut review) = independent_review_references();
+    review
+        .historical_failure
+        .as_mut()
+        .unwrap()
+        .imported_from
+        .as_mut()
+        .unwrap()
+        .version = 2;
+    assert!(validate_completion_review_state(&unit, &review, /*contract_revision*/ 2).is_err());
+
+    let (unit, mut review) = independent_review_references();
+    review
+        .retry_reservation_prior_historical_failure
+        .as_mut()
+        .unwrap()
+        .imported_from
+        .as_mut()
+        .unwrap()
+        .sha256
+        .truncate(/*new_len*/ 63);
+    assert!(validate_completion_review_state(&unit, &review, /*contract_revision*/ 2).is_err());
+}
+
+#[test]
+fn review_validator_preserves_retry_rollback_and_terminal_proof_checks() {
+    let (unit, mut review) = independent_review_references();
+    review
+        .active_attempt
+        .as_mut()
+        .unwrap()
+        .consumed_retry_authorization = None;
+    assert!(validate_completion_review_state(&unit, &review, /*contract_revision*/ 2).is_err());
+
+    let (unit, mut review) = independent_review_references();
+    let failure = review.historical_failure.as_mut().unwrap();
+    failure.terminal_source.status = CompletionReviewTerminalStatus::Completed;
+    assert!(validate_completion_review_state(&unit, &review, /*contract_revision*/ 2).is_err());
+}
+
+#[test]
+fn completion_state_still_requires_plan_review_proof_for_retry_grant() {
+    let mut state = review_unit_state(UnitStatus::Failed);
+    let retry_authorization = CompletionReviewRetryAuthorization {
+        authorization_id: "plan-review-call".into(),
+        expected_attempt_id: "failed-attempt".into(),
+        plan_review_call_id: "plan-review-call".into(),
+        reason: "A new review attempt is authorized".into(),
+        previous_plan: "Review the result once".into(),
+        revised_plan: "Retry the review after failure".into(),
+    };
+    let mut unit = state.units[0].clone();
+    unit.review_state = Some(CompletionReviewState {
+        version: 1,
+        obligation_unit_id: unit.id.clone(),
+        active_attempt: Some(CompletionReviewAttempt {
+            attempt_id: "failed-attempt".into(),
+            contract_revision: 1,
+            condition_refs: unit.condition_refs.clone(),
+            conditions_sha256: "a".repeat(/*n*/ 64),
+            status: CompletionReviewAttemptStatus::Failed,
+            launch_unknown_reason: None,
+            consumed_retry_authorization: None,
+            imported_from: None,
+            reviewer_thread_id: Some("reviewer-thread".into()),
+            reviewer_turn_id: Some("reviewer-turn-1".into()),
+            reviewer_role: "analyst".into(),
+            reviewer_model: Some("review-model".into()),
+            target_task_id: "a".into(),
+            target_task_revision: 2,
+            target_artifact_ref: "artifact:sha".into(),
+            deadline_unix_ms: None,
+            deadline_escalation: None,
+            deadline_safety_fingerprint: None,
+            terminal_source: Some(CompletionReviewTerminalSource {
+                status: CompletionReviewTerminalStatus::Failed,
+                event: None,
+            }),
+            wait_result_ref: Some("failed-wait-result".into()),
+            wait_call_id: Some("failed-wait-call".into()),
+            adoption_reason: None,
+        }),
+        historical_failure: None,
+        retry_reservation_prior_historical_failure: None,
+        previous_attempt_ref: None,
+        retry_authorization: Some(retry_authorization),
+        withdrawal: None,
+        revalidation: None,
+    });
+    state.units[0] = project_completion_review_state(&unit).unwrap();
+    let receipts = BTreeMap::from([(
+        "a".into(),
+        AcceptedTaskReceipt {
+            revision: 2,
+            result: "Built".into(),
+            artifact_ref: "artifact:sha".into(),
+            verification_ref: "test:42".into(),
+        },
+    )]);
+
+    assert!(
+        validate_completion_state(Some(&state), &receipts)
+            .unwrap_err()
+            .contains("matching recorded plan review decision")
+    );
 }
 
 #[test]
@@ -409,6 +776,8 @@ fn completion_units_reject_missing_refs_cycles_and_unfinished_active_dependencie
                 review_evidence: None,
                 review_launch: None,
                 review_decision_reason: None,
+                review_state: None,
+                review_revalidation_of: None,
             },
             CompletionUnit {
                 id: "u2".into(),
@@ -423,6 +792,8 @@ fn completion_units_reject_missing_refs_cycles_and_unfinished_active_dependencie
                 review_evidence: None,
                 review_launch: None,
                 review_decision_reason: None,
+                review_state: None,
+                review_revalidation_of: None,
             },
         ],
         current_unit: None,

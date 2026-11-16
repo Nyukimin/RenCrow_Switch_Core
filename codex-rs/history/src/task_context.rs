@@ -1,5 +1,6 @@
 //! Typed, host-verified task-boundary state and deterministic derived context.
 
+// Modified by RenCrow Switch Core, 2026-11-16.
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -7,6 +8,10 @@ use std::collections::BTreeSet;
 
 const MAX_BOUNDARY_BYTES: usize = 32 * 1024;
 const MAX_TEXT_BYTES: usize = 4096;
+
+fn is_default<T: Default + PartialEq>(value: &T) -> bool {
+    value == &T::default()
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -112,7 +117,7 @@ pub struct CompletionUnit {
     pub purpose: String,
     pub status: UnitStatus,
     /// Missing legacy values are ordinary executable work units.
-    #[serde(default, skip_serializing_if = "is_execution_unit")]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub kind: CompletionUnitKind,
     #[serde(default)]
     pub condition_refs: Vec<String>,
@@ -134,10 +139,282 @@ pub struct CompletionUnit {
     /// Parent's reason for adopting this review, distinct from task acceptance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_decision_reason: Option<String>,
+    /// Canonical host-owned logical review obligation and attempt lifecycle. Missing only in
+    /// legacy v1 snapshots; legacy fields above remain a derived compatibility projection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_state: Option<CompletionReviewState>,
+    /// Explicit link to an adopted review obligation being revalidated against a newer
+    /// accepted artifact. This intent is checked and bound to host provenance on Update.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_revalidation_of: Option<String>,
 }
 
-fn is_execution_unit(kind: &CompletionUnitKind) -> bool {
-    *kind == CompletionUnitKind::Execution
+/// Versioned state for one logical review obligation. Attempts are bounded to the active
+/// attempt; prior state is retained by an immutable persisted-snapshot reference.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompletionReviewState {
+    pub version: u32,
+    pub obligation_unit_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_attempt: Option<CompletionReviewAttempt>,
+    /// Most recent exact historical failure that is independent of the current active
+    /// generation. Older facts remain reachable through the persisted snapshot chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub historical_failure: Option<CompletionReviewHistoricalFailure>,
+    /// Preserves the pre-retry bounded failure slot until the new attempt has a
+    /// terminal result, allowing a known no-spawn rollback to restore the exact state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_reservation_prior_historical_failure: Option<CompletionReviewHistoricalFailure>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_attempt_ref: Option<CompletionReviewSnapshotRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_authorization: Option<CompletionReviewRetryAuthorization>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub withdrawal: Option<CompletionReviewWithdrawal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revalidation: Option<CompletionReviewRevalidationSource>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompletionReviewRevalidationSource {
+    pub source_unit_id: String,
+    pub source_adoption_sha256: String,
+    pub source_snapshot: CompletionReviewSnapshotRef,
+    pub required_artifact_fingerprint: String,
+    pub source_condition_definitions_sha256: String,
+    pub required_condition_definitions_sha256: String,
+    pub update_call_id: String,
+}
+
+pub fn task_check_artifact_fingerprint(artifact_ref: &str) -> Option<&str> {
+    let (prefix, fingerprint) = artifact_ref.rsplit_once(':')?;
+    if prefix
+        .strip_prefix("task-check:")
+        .is_none_or(|call_id| call_id.trim().is_empty())
+        || fingerprint.len() != 64
+        || fingerprint
+            .bytes()
+            .any(|byte| !byte.is_ascii_hexdigit() || byte.is_ascii_uppercase())
+    {
+        return None;
+    }
+    Some(fingerprint)
+}
+
+pub fn completion_condition_definitions_sha256(
+    contract: &CompletionState,
+    condition_refs: &[String],
+) -> Result<String, String> {
+    use crate::compaction_candidate::digest;
+
+    let definitions = condition_refs
+        .iter()
+        .map(|id| {
+            contract
+                .conditions
+                .iter()
+                .find(|condition| condition.id == *id)
+                .map(|condition| {
+                    serde_json::json!({
+                        "id": condition.id,
+                        "revision": condition.revision,
+                        "result": condition.result,
+                        "scope": condition.scope,
+                        "verification": condition.verification,
+                        "acceptance_criteria": condition.acceptance_criteria,
+                    })
+                })
+                .ok_or_else(|| format!("review condition {id} is missing"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    digest(&serde_json::Value::Array(definitions))
+}
+
+pub fn completion_review_adoption_sha256(unit: &CompletionUnit) -> Result<String, String> {
+    use crate::compaction_candidate::digest;
+
+    let evidence = unit
+        .review_evidence
+        .as_ref()
+        .ok_or_else(|| "revalidation source has no collected review evidence".to_string())?;
+    let adopted = unit.review_state.as_ref().is_none_or(|review| {
+        review.active_attempt.as_ref().is_some_and(|attempt| {
+            attempt.status == CompletionReviewAttemptStatus::Completed
+                && attempt.adoption_reason.as_deref() == unit.review_decision_reason.as_deref()
+        })
+    });
+    if unit.kind != CompletionUnitKind::Review
+        || unit.status != UnitStatus::Done
+        || !adopted
+        || evidence.terminal_status != Some(CompletionReviewTerminalStatus::Completed)
+        || evidence
+            .wait_result_ref
+            .as_deref()
+            .is_none_or(str::is_empty)
+        || evidence.wait_call_id.as_deref().is_none_or(str::is_empty)
+        || unit
+            .review_decision_reason
+            .as_deref()
+            .is_none_or(str::is_empty)
+    {
+        return Err("revalidation source is not an exact collected and adopted review".into());
+    }
+    let bytes = serde_json::to_value(unit).map_err(|error| error.to_string())?;
+    digest(&bytes)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompletionReviewWithdrawal {
+    pub source: CompletionReviewWithdrawalSource,
+    pub reason: String,
+    pub target_task_id: String,
+    pub target_task_revision: u64,
+    pub condition_refs: Vec<String>,
+    pub depends_on: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CompletionReviewWithdrawalSource {
+    HostUpdate {
+        update_call_id: String,
+        prior_status: UnitStatus,
+    },
+    LegacyV1Snapshot {
+        snapshot: CompletionReviewSnapshotRef,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompletionReviewHistoricalFailure {
+    pub attempt_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imported_from: Option<CompletionReviewSnapshotRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consumed_retry_authorization: Option<CompletionReviewRetryAuthorization>,
+    pub reviewer_thread_id: String,
+    pub reviewer_turn_id: String,
+    pub target_task_id: String,
+    pub target_task_revision: u64,
+    pub target_artifact_ref: String,
+    pub reviewer_role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_unix_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_result_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_escalation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_safety_fingerprint: Option<String>,
+    pub terminal_source: CompletionReviewTerminalSource,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompletionReviewAttempt {
+    /// Host spawn call id, also the unique attempt id.
+    pub attempt_id: String,
+    pub contract_revision: u64,
+    pub condition_refs: Vec<String>,
+    pub conditions_sha256: String,
+    pub status: CompletionReviewAttemptStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_unknown_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consumed_retry_authorization: Option<CompletionReviewRetryAuthorization>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imported_from: Option<CompletionReviewSnapshotRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer_thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer_turn_id: Option<String>,
+    pub reviewer_role: String,
+    pub reviewer_model: Option<String>,
+    pub target_task_id: String,
+    pub target_task_revision: u64,
+    pub target_artifact_ref: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_unix_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_escalation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_safety_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_source: Option<CompletionReviewTerminalSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_result_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adoption_reason: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompletionReviewAttemptStatus {
+    Reserved,
+    Unknown,
+    Bound,
+    TerminalUnknown,
+    Failed,
+    Completed,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompletionReviewTerminalSource {
+    pub status: CompletionReviewTerminalStatus,
+    pub event: Option<CompletionReviewTerminalEvent>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompletionReviewTerminalEvent {
+    pub rollout_id: String,
+    pub locator: CompletionReviewRecordLocator,
+    pub owner_thread_id: String,
+    pub turn_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_parent_thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_agent_role: Option<String>,
+    pub reason: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompletionReviewRecordLocator {
+    Ordinal(u64),
+    LegacyLineIndex(u64),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompletionReviewSnapshotRef {
+    pub version: u32,
+    pub sha256: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompletionReviewRetryAuthorization {
+    pub authorization_id: String,
+    pub expected_attempt_id: String,
+    pub plan_review_call_id: String,
+    pub reason: String,
+    pub previous_plan: String,
+    pub revised_plan: String,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -214,6 +491,8 @@ pub enum CompletionReviewLaunchStatus {
 #[serde(rename_all = "snake_case")]
 pub enum CompletionReviewTerminalStatus {
     Completed,
+    Failed,
+    Cancelled,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -270,6 +549,16 @@ pub struct CompletionBlocker {
     pub evidence: Vec<CompletionEvidenceRef>,
     #[serde(default)]
     pub recheck_condition: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_owner: Option<CompletionReviewBlockerOwner>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompletionReviewBlockerOwner {
+    pub unit_id: String,
+    pub attempt_id: String,
+    pub safety_fingerprint: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -634,9 +923,546 @@ pub fn validate_boundary(
     })
 }
 
+fn validate_completion_review_state(
+    unit: &CompletionUnit,
+    review: &CompletionReviewState,
+    contract_revision: u64,
+) -> Result<(), String> {
+    let snapshot_ref_invalid = |reference: &CompletionReviewSnapshotRef, versions: &[u32]| {
+        !versions.contains(&reference.version)
+            || reference.sha256.len() != 64
+            || reference
+                .sha256
+                .bytes()
+                .any(|byte| !byte.is_ascii_hexdigit() || byte.is_ascii_uppercase())
+    };
+    if review.version != 1 || review.obligation_unit_id != unit.id {
+        return Err("completion review state version or obligation identity is invalid".into());
+    }
+    if review
+        .previous_attempt_ref
+        .as_ref()
+        .is_some_and(|reference| snapshot_ref_invalid(reference, &[1, 2]))
+    {
+        return Err("completion review snapshot reference is invalid".into());
+    }
+    if review
+        .revalidation
+        .as_ref()
+        .is_some_and(|source| snapshot_ref_invalid(&source.source_snapshot, &[1, 2]))
+    {
+        return Err("review revalidation source snapshot reference is invalid".into());
+    }
+    let previous_ref_is_revalidation_source = review.revalidation.as_ref().is_some_and(|source| {
+        review.previous_attempt_ref.as_ref() == Some(&source.source_snapshot)
+    });
+    if review
+        .active_attempt
+        .as_ref()
+        .is_some_and(|attempt| attempt.consumed_retry_authorization.is_some())
+        && (review.previous_attempt_ref.is_none() || previous_ref_is_revalidation_source)
+    {
+        return Err(
+            "consumed retry authorization requires its same-obligation grant snapshot reference"
+                .into(),
+        );
+    }
+    let historical_failure_invalid = |failure: &CompletionReviewHistoricalFailure| {
+        failure.attempt_id.trim().is_empty()
+            || failure
+                .contract_revision
+                .is_some_and(|revision| revision == 0 || revision > contract_revision)
+            || failure
+                .imported_from
+                .as_ref()
+                .is_some_and(|source| snapshot_ref_invalid(source, &[1]))
+            || failure.reviewer_thread_id.trim().is_empty()
+            || failure.reviewer_turn_id.trim().is_empty()
+            || failure.target_task_id
+                != unit
+                    .review_target
+                    .as_ref()
+                    .map_or("", |target| target.task_id.as_str())
+            || failure.target_task_revision
+                != unit
+                    .review_target
+                    .as_ref()
+                    .map_or(0, |target| target.task_revision)
+            || failure.target_artifact_ref.trim().is_empty()
+            || failure.reviewer_role.trim().is_empty()
+            || failure
+                .reviewer_model
+                .as_ref()
+                .is_some_and(|model| model.trim().is_empty())
+            || failure
+                .deadline_unix_ms
+                .is_some_and(|deadline| deadline <= 0)
+            || failure.wait_result_ref.is_some() != failure.wait_call_id.is_some()
+            || (failure.terminal_source.event.is_none() && failure.wait_result_ref.is_none())
+            || failure.terminal_source.status != CompletionReviewTerminalStatus::Failed
+            || failure.terminal_source.event.as_ref().is_some_and(|event| {
+                event.rollout_id.trim().is_empty()
+                    || event.owner_thread_id != failure.reviewer_thread_id
+                    || event.turn_id != failure.reviewer_turn_id
+                    || event.reason != "ReviewEnded"
+                    || event.owner_agent_role.as_deref() != Some(failure.reviewer_role.as_str())
+                    || event
+                        .owner_parent_thread_id
+                        .as_ref()
+                        .is_some_and(|parent| parent.trim().is_empty())
+            })
+    };
+    if review
+        .historical_failure
+        .as_ref()
+        .is_some_and(historical_failure_invalid)
+        || review
+            .retry_reservation_prior_historical_failure
+            .as_ref()
+            .is_some_and(historical_failure_invalid)
+    {
+        return Err("historical completion review failure identity or proof is invalid".into());
+    }
+    let has_imported_source = review
+        .active_attempt
+        .as_ref()
+        .and_then(|attempt| attempt.imported_from.as_ref())
+        .is_some()
+        || review
+            .historical_failure
+            .as_ref()
+            .and_then(|failure| failure.imported_from.as_ref())
+            .is_some()
+        || review
+            .retry_reservation_prior_historical_failure
+            .as_ref()
+            .and_then(|failure| failure.imported_from.as_ref())
+            .is_some();
+    if has_imported_source && review.previous_attempt_ref.is_none() {
+        return Err("imported legacy failure has no prior attempt snapshot reference".into());
+    }
+    if review.retry_reservation_prior_historical_failure.is_some()
+        && review.active_attempt.as_ref().is_none_or(|attempt| {
+            attempt.consumed_retry_authorization.is_none()
+                || !matches!(
+                    attempt.status,
+                    CompletionReviewAttemptStatus::Reserved
+                        | CompletionReviewAttemptStatus::Unknown
+                        | CompletionReviewAttemptStatus::Bound
+                )
+        })
+    {
+        return Err("retry rollback history is not attached to a reserved retry".into());
+    }
+    if let Some(attempt) = review.active_attempt.as_ref() {
+        let Some(target) = unit.review_target.as_ref() else {
+            return Err("completion review attempt has no declared target".into());
+        };
+        if attempt.attempt_id.trim().is_empty()
+            || attempt.attempt_id.len() > MAX_TEXT_BYTES
+            || attempt.reviewer_role.trim().is_empty()
+            || attempt.reviewer_role.len() > MAX_TEXT_BYTES
+            || attempt
+                .reviewer_model
+                .as_ref()
+                .is_some_and(|model| model.trim().is_empty() || model.len() > MAX_TEXT_BYTES)
+            || attempt.reviewer_model.is_none()
+                != (attempt.status == CompletionReviewAttemptStatus::Failed
+                    && attempt
+                        .imported_from
+                        .as_ref()
+                        .is_some_and(|source| source.version == 1))
+            || attempt
+                .imported_from
+                .as_ref()
+                .is_some_and(|source| snapshot_ref_invalid(source, &[1]))
+            || attempt
+                .launch_unknown_reason
+                .as_ref()
+                .is_some_and(|reason| reason.trim().is_empty() || reason.len() > MAX_TEXT_BYTES)
+            || attempt.contract_revision == 0
+            || attempt.contract_revision > contract_revision
+            || attempt.condition_refs != unit.condition_refs
+            || attempt.conditions_sha256.len() != 64
+            || attempt
+                .conditions_sha256
+                .bytes()
+                .any(|byte| !byte.is_ascii_hexdigit() || byte.is_ascii_uppercase())
+            || attempt.target_task_id != target.task_id
+            || attempt.target_task_revision != target.task_revision
+            || attempt.target_artifact_ref.trim().is_empty()
+            || attempt.target_artifact_ref.len() > MAX_TEXT_BYTES
+            || attempt
+                .deadline_unix_ms
+                .is_some_and(|deadline| deadline <= 0)
+            || attempt
+                .deadline_escalation
+                .as_ref()
+                .is_some_and(|reason| reason.trim().is_empty() || reason.len() > MAX_TEXT_BYTES)
+            || attempt
+                .deadline_safety_fingerprint
+                .as_ref()
+                .is_some_and(|value| {
+                    value.len() != 64
+                        || value
+                            .bytes()
+                            .any(|byte| !byte.is_ascii_hexdigit() || byte.is_ascii_uppercase())
+                })
+            || attempt
+                .reviewer_thread_id
+                .as_ref()
+                .is_some_and(|id| id.trim().is_empty() || id.len() > MAX_TEXT_BYTES)
+            || attempt
+                .reviewer_turn_id
+                .as_ref()
+                .is_some_and(|id| id.trim().is_empty() || id.len() > MAX_TEXT_BYTES)
+            || attempt.reviewer_turn_id.is_some() && attempt.reviewer_thread_id.is_none()
+            || attempt.wait_result_ref.is_some() != attempt.wait_call_id.is_some()
+            || attempt.terminal_source.as_ref().is_some_and(|source| {
+                source.event.is_some() && source.status != CompletionReviewTerminalStatus::Failed
+            })
+            || attempt
+                .terminal_source
+                .as_ref()
+                .and_then(|source| source.event.as_ref())
+                .is_some_and(|event| {
+                    event.rollout_id.trim().is_empty()
+                        || attempt.reviewer_thread_id.as_deref()
+                            != Some(event.owner_thread_id.as_str())
+                        || attempt.reviewer_turn_id.as_deref() != Some(event.turn_id.as_str())
+                        || event.owner_agent_role.as_deref() != Some(attempt.reviewer_role.as_str())
+                        || event
+                            .owner_parent_thread_id
+                            .as_ref()
+                            .is_some_and(|parent| parent.trim().is_empty())
+                        || event.reason != "ReviewEnded"
+                })
+            || attempt
+                .adoption_reason
+                .as_ref()
+                .is_some_and(|reason| reason.trim().is_empty() || reason.len() > MAX_TEXT_BYTES)
+        {
+            return Err("completion review attempt identity or target is invalid".into());
+        }
+        let terminal = attempt.terminal_source.as_ref().map(|source| source.status);
+        match attempt.status {
+            CompletionReviewAttemptStatus::Reserved
+            | CompletionReviewAttemptStatus::Unknown
+            | CompletionReviewAttemptStatus::Bound => {
+                if attempt.terminal_source.is_some()
+                    || attempt.wait_result_ref.is_some()
+                    || attempt.adoption_reason.is_some()
+                {
+                    return Err("nonterminal review attempt contains terminal facts".into());
+                }
+            }
+            CompletionReviewAttemptStatus::TerminalUnknown => {
+                if attempt.terminal_source.is_some() || attempt.adoption_reason.is_some() {
+                    return Err("unknown review state contains an unproven terminal fact".into());
+                }
+            }
+            CompletionReviewAttemptStatus::Failed => {
+                if terminal != Some(CompletionReviewTerminalStatus::Failed)
+                    || attempt.adoption_reason.is_some()
+                    || (attempt
+                        .terminal_source
+                        .as_ref()
+                        .is_some_and(|source| source.event.is_none())
+                        && attempt.wait_result_ref.is_none())
+                {
+                    return Err("failed review attempt has no exact failure fact".into());
+                }
+            }
+            CompletionReviewAttemptStatus::Cancelled => {
+                if terminal != Some(CompletionReviewTerminalStatus::Cancelled)
+                    || attempt.adoption_reason.is_some()
+                {
+                    return Err("cancelled review attempt has no exact cancellation fact".into());
+                }
+            }
+            CompletionReviewAttemptStatus::Completed => {
+                if terminal != Some(CompletionReviewTerminalStatus::Completed)
+                    || attempt.wait_result_ref.is_none()
+                    || attempt.adoption_reason.is_some() != (unit.status == UnitStatus::Done)
+                {
+                    return Err(
+                        "completed review attempt collection/adoption is inconsistent".into(),
+                    );
+                }
+            }
+        }
+    }
+    if let Some(grant) = review.retry_authorization.as_ref()
+        && (grant.authorization_id.trim().is_empty()
+            || grant.expected_attempt_id.trim().is_empty()
+            || grant.plan_review_call_id.trim().is_empty()
+            || grant.authorization_id != grant.plan_review_call_id
+            || grant.reason.trim().is_empty()
+            || grant.previous_plan.trim().is_empty()
+            || grant.revised_plan.trim().is_empty()
+            || grant.previous_plan == grant.revised_plan
+            || review.active_attempt.as_ref().is_none_or(|attempt| {
+                attempt.attempt_id != grant.expected_attempt_id
+                    || attempt.status != CompletionReviewAttemptStatus::Failed
+            }))
+    {
+        return Err("completion review retry authorization is invalid or stale".into());
+    }
+    if let Some(withdrawal) = review.withdrawal.as_ref() {
+        let target = unit.review_target.as_ref();
+        let source_invalid = match &withdrawal.source {
+            CompletionReviewWithdrawalSource::HostUpdate {
+                update_call_id,
+                prior_status,
+            } => update_call_id.trim().is_empty() || *prior_status != UnitStatus::Planned,
+            CompletionReviewWithdrawalSource::LegacyV1Snapshot { snapshot } => {
+                snapshot.version != 1
+                    || snapshot.sha256.len() != 64
+                    || snapshot
+                        .sha256
+                        .bytes()
+                        .any(|byte| !byte.is_ascii_hexdigit() || byte.is_ascii_uppercase())
+                    || review.previous_attempt_ref.as_ref() != Some(snapshot)
+            }
+        };
+        if review.active_attempt.is_some()
+            || review.historical_failure.is_some()
+            || review.retry_authorization.is_some()
+            || unit.status != UnitStatus::Cancelled
+            || unit.kind != CompletionUnitKind::Review
+            || unit.review_evidence.is_some()
+            || unit.review_launch.is_some()
+            || unit.review_decision_reason.as_deref() != Some(withdrawal.reason.as_str())
+            || source_invalid
+            || withdrawal.reason.trim().is_empty()
+            || target.is_none_or(|target| {
+                target.task_id != withdrawal.target_task_id
+                    || target.task_revision != withdrawal.target_task_revision
+            })
+            || withdrawal.condition_refs != unit.condition_refs
+            || withdrawal.depends_on != unit.depends_on
+        {
+            return Err(
+                "completion review withdrawal fact does not match the retired obligation".into(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Derive legacy completion fields from canonical review state. The canonical state is never
+/// inferred from the compatibility projection here.
+pub fn project_completion_review_state(unit: &CompletionUnit) -> Result<CompletionUnit, String> {
+    let Some(review) = unit.review_state.as_ref() else {
+        return Ok(unit.clone());
+    };
+    let mut projected = unit.clone();
+    let Some(attempt) = review.active_attempt.as_ref() else {
+        if let Some(withdrawal) = review.withdrawal.as_ref() {
+            projected.review_evidence = None;
+            projected.review_launch = None;
+            projected.review_decision_reason = Some(withdrawal.reason.clone());
+            projected.status = UnitStatus::Cancelled;
+            return Ok(projected);
+        }
+        if !matches!(unit.status, UnitStatus::Planned | UnitStatus::Ready) {
+            return Err(
+                "canonical review without an active attempt must be unstarted or withdrawn".into(),
+            );
+        }
+        projected.review_evidence = None;
+        projected.review_launch = None;
+        projected.review_decision_reason = None;
+        projected.status = unit.status;
+        return Ok(projected);
+    };
+    let evidence = match (
+        attempt.reviewer_thread_id.as_ref(),
+        attempt.reviewer_turn_id.as_ref(),
+    ) {
+        (Some(thread_id), Some(turn_id)) => Some(CompletionReviewEvidence {
+            reviewer_thread_id: thread_id.clone(),
+            reviewer_turn_id: turn_id.clone(),
+            reviewer_role: attempt.reviewer_role.clone(),
+            spawn_call_id: attempt.attempt_id.clone(),
+            deadline_unix_ms: attempt.deadline_unix_ms,
+            deadline_escalation: attempt.deadline_escalation.clone(),
+            deadline_safety_fingerprint: attempt.deadline_safety_fingerprint.clone(),
+            wait_result_ref: attempt.wait_result_ref.clone(),
+            terminal_status: attempt.terminal_source.as_ref().map(|source| source.status),
+            wait_call_id: attempt.wait_call_id.clone(),
+            target_task_id: attempt.target_task_id.clone(),
+            target_task_revision: attempt.target_task_revision,
+            target_artifact_ref: attempt.target_artifact_ref.clone(),
+        }),
+        (Some(thread_id), None) => Some(CompletionReviewEvidence {
+            reviewer_thread_id: thread_id.clone(),
+            reviewer_turn_id: format!("pending-generation:{}", attempt.attempt_id),
+            reviewer_role: attempt.reviewer_role.clone(),
+            spawn_call_id: attempt.attempt_id.clone(),
+            deadline_unix_ms: attempt.deadline_unix_ms,
+            deadline_escalation: attempt.deadline_escalation.clone(),
+            deadline_safety_fingerprint: attempt.deadline_safety_fingerprint.clone(),
+            wait_result_ref: None,
+            terminal_status: None,
+            wait_call_id: None,
+            target_task_id: attempt.target_task_id.clone(),
+            target_task_revision: attempt.target_task_revision,
+            target_artifact_ref: attempt.target_artifact_ref.clone(),
+        }),
+        _ => None,
+    };
+    projected.review_evidence = evidence;
+    projected.review_launch = if projected.review_evidence.is_none()
+        && matches!(
+            attempt.status,
+            CompletionReviewAttemptStatus::Reserved | CompletionReviewAttemptStatus::Unknown
+        ) {
+        Some(CompletionReviewLaunchState {
+            spawn_call_id: attempt.attempt_id.clone(),
+            status: if attempt.status == CompletionReviewAttemptStatus::Unknown {
+                CompletionReviewLaunchStatus::Unknown
+            } else {
+                CompletionReviewLaunchStatus::Reserved
+            },
+            deadline_unix_ms: attempt.deadline_unix_ms,
+            reason: attempt.launch_unknown_reason.clone(),
+        })
+    } else {
+        None
+    };
+    projected.status = match attempt.status {
+        CompletionReviewAttemptStatus::Reserved
+        | CompletionReviewAttemptStatus::Unknown
+        | CompletionReviewAttemptStatus::Bound
+        | CompletionReviewAttemptStatus::TerminalUnknown => UnitStatus::Running,
+        CompletionReviewAttemptStatus::Failed => UnitStatus::Failed,
+        CompletionReviewAttemptStatus::Completed if attempt.adoption_reason.is_some() => {
+            UnitStatus::Done
+        }
+        CompletionReviewAttemptStatus::Completed => UnitStatus::Running,
+        // Attempt cancellation does not revoke the logical obligation.
+        CompletionReviewAttemptStatus::Cancelled => UnitStatus::Blocked,
+    };
+    projected.review_decision_reason = attempt.adoption_reason.clone();
+    Ok(projected)
+}
+
+/// Proves a newly authorized revalidation against the execution facts available at the time
+/// of authorization. Historical readers should validate its stored provenance instead.
+pub fn completion_review_target_has_exact_execution_dependency(
+    state: &CompletionState,
+    review: &CompletionUnit,
+    required_artifact_fingerprint: &str,
+) -> bool {
+    let Some(target) = review.review_target.as_ref() else {
+        return false;
+    };
+    !matching_review_execution_dependency_ids(
+        state,
+        review,
+        target,
+        Some(required_artifact_fingerprint),
+    )
+    .is_empty()
+}
+
+pub fn completion_review_revalidation_dependencies_match(
+    source_state: &CompletionState,
+    current_state: &CompletionState,
+    source: &CompletionUnit,
+    current: &CompletionUnit,
+    required_artifact_fingerprint: &str,
+) -> bool {
+    completion_review_dependency_structure_matches(source_state, source, current)
+        && current.review_target.as_ref().is_some_and(|target| {
+            !matching_review_execution_dependency_ids(
+                current_state,
+                current,
+                target,
+                Some(required_artifact_fingerprint),
+            )
+            .is_empty()
+        })
+}
+
+/// Confirms that a revalidation carries forward unrelated dependencies from its source.
+pub fn completion_review_dependency_structure_matches(
+    source_state: &CompletionState,
+    source: &CompletionUnit,
+    current: &CompletionUnit,
+) -> bool {
+    let Some(source_target) = source.review_target.as_ref() else {
+        return false;
+    };
+    if current.review_target.is_none() {
+        return false;
+    }
+    let source_dependencies =
+        matching_review_execution_dependency_ids(source_state, source, source_target, None);
+    let mut unrelated_source_dependencies = source
+        .depends_on
+        .iter()
+        .filter(|dependency| !source_dependencies.contains(dependency));
+    unrelated_source_dependencies.all(|dependency| current.depends_on.contains(dependency))
+}
+
+fn matching_review_execution_dependency_ids(
+    state: &CompletionState,
+    review: &CompletionUnit,
+    target: &CompletionReviewTarget,
+    required_artifact_fingerprint: Option<&str>,
+) -> Vec<String> {
+    review
+        .depends_on
+        .iter()
+        .filter_map(|dependency_id| {
+            let dependency = state
+                .units
+                .iter()
+                .find(|unit| unit.id.as_str() == dependency_id.as_str())?;
+            let has_target_evidence = dependency
+                .task_refs
+                .iter()
+                .chain(dependency.evidence.iter())
+                .any(|reference| {
+                    reference.task_id == target.task_id
+                        && reference.task_revision == target.task_revision
+                        && required_artifact_fingerprint.is_none_or(|fingerprint| {
+                            reference.artifact_ref == reference.verification_ref
+                                && task_check_artifact_fingerprint(&reference.artifact_ref)
+                                    == Some(fingerprint)
+                        })
+                });
+            (dependency.kind == CompletionUnitKind::Execution
+                && (required_artifact_fingerprint.is_none()
+                    || dependency.status == UnitStatus::Done)
+                && has_target_evidence)
+                .then(|| dependency_id.clone())
+        })
+        .collect()
+}
+
 pub fn validate_completion_state(
     state: Option<&CompletionState>,
     receipts: &BTreeMap<String, AcceptedTaskReceipt>,
+) -> Result<(), String> {
+    validate_completion_state_inner(state, receipts, true)
+}
+
+/// Validate an immutable host-authored snapshot without comparing its historical evidence
+/// references to the latest accepted receipt for each task.
+pub fn validate_completion_state_snapshot(
+    state: Option<&CompletionState>,
+    receipts: &BTreeMap<String, AcceptedTaskReceipt>,
+) -> Result<(), String> {
+    validate_completion_state_inner(state, receipts, false)
+}
+
+fn validate_completion_state_inner(
+    state: Option<&CompletionState>,
+    receipts: &BTreeMap<String, AcceptedTaskReceipt>,
+    enforce_current_evidence_receipts: bool,
 ) -> Result<(), String> {
     let Some(state) = state else {
         return Ok(());
@@ -683,7 +1509,7 @@ pub fn validate_completion_state(
             return Err("satisfied condition has no canonical evidence".into());
         }
         for evidence in &condition.evidence {
-            validate_completion_evidence(evidence, receipts)?;
+            validate_completion_evidence(evidence, receipts, enforce_current_evidence_receipts)?;
         }
         if condition
             .unmet_reason
@@ -719,6 +1545,8 @@ pub fn validate_completion_state(
                     || unit.review_evidence.is_some()
                     || unit.review_launch.is_some()
                     || unit.review_decision_reason.is_some()
+                    || unit.review_state.is_some()
+                    || unit.review_revalidation_of.is_some()
                 {
                     return Err("execution unit contains review-only fields".into());
                 }
@@ -733,11 +1561,31 @@ pub fn validate_completion_state(
                 {
                     return Err("review unit target task revision is invalid".into());
                 }
-                if let Some(evidence) = unit.review_evidence.as_ref() {
-                    let receipt = receipts
-                        .get(&evidence.target_task_id)
-                        .filter(|receipt| receipt.revision == evidence.target_task_revision);
-                    if [
+                if let Some(review_state) = unit.review_state.as_ref() {
+                    validate_completion_review_state(unit, review_state, state.contract_revision)?;
+                    let projected = project_completion_review_state(unit)?;
+                    if projected.status != unit.status
+                        || projected.review_evidence != unit.review_evidence
+                        || projected.review_launch != unit.review_launch
+                        || projected.review_decision_reason != unit.review_decision_reason
+                    {
+                        return Err(
+                            "review compatibility fields differ from canonical review state".into(),
+                        );
+                    }
+                }
+                if unit.review_revalidation_of.is_some()
+                    != unit
+                        .review_state
+                        .as_ref()
+                        .is_some_and(|review| review.revalidation.is_some())
+                {
+                    return Err(
+                        "review revalidation intent is detached from its host provenance".into(),
+                    );
+                }
+                if let Some(evidence) = unit.review_evidence.as_ref()
+                    && ([
                         &evidence.reviewer_thread_id,
                         &evidence.reviewer_turn_id,
                         &evidence.reviewer_role,
@@ -773,15 +1621,9 @@ pub fn validate_completion_state(
                         || evidence.wait_result_ref.is_some() != evidence.wait_call_id.is_some()
                         || evidence.target_task_id != target.task_id
                         || evidence.target_task_revision != target.task_revision
-                        || evidence.target_artifact_ref.trim().is_empty()
-                        || receipt.is_none_or(|receipt| {
-                            receipt.artifact_ref != evidence.target_artifact_ref
-                        })
-                    {
-                        return Err(
-                            "review evidence does not match its host-accepted target".into()
-                        );
-                    }
+                        || evidence.target_artifact_ref.trim().is_empty())
+                {
+                    return Err("review evidence does not match its host-accepted target".into());
                 }
                 if unit.status == UnitStatus::Done
                     && (unit
@@ -837,7 +1679,7 @@ pub fn validate_completion_state(
             }
         }
         for evidence in unit.evidence.iter().chain(&unit.task_refs) {
-            validate_completion_evidence(evidence, receipts)?;
+            validate_completion_evidence(evidence, receipts, enforce_current_evidence_receipts)?;
         }
         if unit.kind == CompletionUnitKind::Execution
             && unit.status == UnitStatus::Done
@@ -847,12 +1689,130 @@ pub fn validate_completion_state(
             return Err("completed unit has no canonical evidence".into());
         }
     }
+    let mut active_revalidation_sources = BTreeSet::new();
+    for unit in &state.units {
+        let Some(source_id) = unit.review_revalidation_of.as_deref() else {
+            continue;
+        };
+        let Some(source) = by_unit.get(source_id) else {
+            return Err("review revalidation source unit is missing".into());
+        };
+        let source_proof = unit
+            .review_state
+            .as_ref()
+            .and_then(|review| review.revalidation.as_ref())
+            .ok_or_else(|| "review revalidation provenance is missing".to_string())?;
+        let source_digest = completion_review_adoption_sha256(source)?;
+        let source_artifact_fingerprint = source
+            .review_evidence
+            .as_ref()
+            .and_then(|evidence| task_check_artifact_fingerprint(&evidence.target_artifact_ref));
+        if unit.kind != CompletionUnitKind::Review
+            || unit.id == source_id
+            || source.kind != CompletionUnitKind::Review
+            || unit.review_target.is_none()
+            || source.review_target.is_none()
+            || source_proof.source_unit_id != source_id
+            || source_proof.source_adoption_sha256 != source_digest
+            || source_proof.update_call_id.trim().is_empty()
+            || source_proof.source_condition_definitions_sha256.len() != 64
+            || source_proof
+                .source_condition_definitions_sha256
+                .bytes()
+                .any(|byte| !byte.is_ascii_hexdigit() || byte.is_ascii_uppercase())
+            || source_proof.required_artifact_fingerprint.len() != 64
+            || source_proof
+                .required_artifact_fingerprint
+                .bytes()
+                .any(|byte| !byte.is_ascii_hexdigit() || byte.is_ascii_uppercase())
+            || source_proof.required_condition_definitions_sha256.len() != 64
+            || source_proof
+                .required_condition_definitions_sha256
+                .bytes()
+                .any(|byte| !byte.is_ascii_hexdigit() || byte.is_ascii_uppercase())
+            || (Some(source_proof.required_artifact_fingerprint.as_str())
+                == source_artifact_fingerprint
+                && source_proof.source_condition_definitions_sha256
+                    == source_proof.required_condition_definitions_sha256)
+            || source
+                .review_state
+                .as_ref()
+                .and_then(|review| review.active_attempt.as_ref())
+                .is_some_and(|attempt| {
+                    attempt.conditions_sha256 != source_proof.source_condition_definitions_sha256
+                })
+            || source_proof.source_snapshot.version != 1
+                && source_proof.source_snapshot.version != 2
+            || source_proof.source_snapshot.sha256.len() != 64
+            || source_proof
+                .source_snapshot
+                .sha256
+                .bytes()
+                .any(|byte| !byte.is_ascii_hexdigit() || byte.is_ascii_uppercase())
+            || unit.condition_refs != source.condition_refs
+            || unit.status == UnitStatus::Cancelled
+                && unit
+                    .review_state
+                    .as_ref()
+                    .is_none_or(|review| review.withdrawal.is_none())
+        {
+            return Err("review revalidation source, scope, or host proof is invalid".into());
+        }
+        if unit.status != UnitStatus::Cancelled && !active_revalidation_sources.insert(source_id) {
+            return Err("adopted review obligation has multiple active revalidation leaves".into());
+        }
+        if unit
+            .review_state
+            .as_ref()
+            .and_then(|review| review.active_attempt.as_ref())
+            .is_some_and(|attempt| {
+                task_check_artifact_fingerprint(&attempt.target_artifact_ref)
+                    != Some(source_proof.required_artifact_fingerprint.as_str())
+                    || attempt.conditions_sha256
+                        != source_proof.required_condition_definitions_sha256
+            })
+        {
+            return Err("revalidation attempt is detached from its host-bound artifact".into());
+        }
+        let mut visited = BTreeSet::new();
+        let mut cursor = Some(source_id);
+        while let Some(current) = cursor {
+            if current == unit.id || !visited.insert(current) {
+                return Err("review revalidation relation contains a cycle".into());
+            }
+            cursor = by_unit
+                .get(current)
+                .and_then(|ancestor| ancestor.review_revalidation_of.as_deref());
+        }
+    }
     if state.units.iter().any(|unit| {
         unit.depends_on
             .iter()
             .any(|id| !units.contains(id.as_str()))
     }) {
         return Err("completion unit dependency is missing".into());
+    }
+    for owner in &state.units {
+        let grant = owner
+            .review_state
+            .as_ref()
+            .and_then(|review| review.retry_authorization.as_ref())
+            .or_else(|| {
+                owner
+                    .review_state
+                    .as_ref()
+                    .and_then(|review| review.active_attempt.as_ref())
+                    .and_then(|attempt| attempt.consumed_retry_authorization.as_ref())
+            });
+        if let Some(grant) = grant
+            && !state.plan_reviews.iter().any(|record| {
+                record.previous_plan == grant.previous_plan
+                    && record.revised_plan == grant.revised_plan
+                    && record.reason == grant.reason
+            })
+        {
+            return Err("retry grant has no matching recorded plan review decision".into());
+        }
     }
     fn visit_unit<'a>(
         id: &'a str,
@@ -940,11 +1900,31 @@ pub fn validate_completion_state(
         }
     }
     if let Some(blocker) = &state.blocker {
-        if blocker
-            .evidence
-            .iter()
-            .any(|evidence| validate_completion_evidence(evidence, receipts).is_err())
+        if let Some(owner) = blocker.review_owner.as_ref()
+            && (owner.unit_id.trim().is_empty()
+                || owner.attempt_id.trim().is_empty()
+                || owner.safety_fingerprint.len() != 64
+                || owner
+                    .safety_fingerprint
+                    .bytes()
+                    .any(|byte| !byte.is_ascii_hexdigit() || byte.is_ascii_uppercase())
+                || by_unit.get(owner.unit_id.as_str()).is_none_or(|unit| {
+                    unit.review_state
+                        .as_ref()
+                        .and_then(|review| review.active_attempt.as_ref())
+                        .is_none_or(|attempt| {
+                            attempt.attempt_id != owner.attempt_id
+                                || attempt.deadline_safety_fingerprint.as_deref()
+                                    != Some(owner.safety_fingerprint.as_str())
+                        })
+                }))
         {
+            return Err("review-owned blocker does not match its active host attempt".into());
+        }
+        if blocker.evidence.iter().any(|evidence| {
+            validate_completion_evidence(evidence, receipts, enforce_current_evidence_receipts)
+                .is_err()
+        }) {
             return Err("completion blocker evidence is invalid".into());
         }
         if blocker.category == BlockerCategory::UserInput && blocker.required_input.is_none() {
@@ -991,7 +1971,18 @@ pub fn validate_completion_state(
 fn validate_completion_evidence(
     evidence: &CompletionEvidenceRef,
     receipts: &BTreeMap<String, AcceptedTaskReceipt>,
+    enforce_current_receipt: bool,
 ) -> Result<(), String> {
+    if evidence.task_id.trim().is_empty()
+        || evidence.task_revision == 0
+        || evidence.artifact_ref.trim().is_empty()
+        || evidence.verification_ref.trim().is_empty()
+    {
+        return Err("completion evidence identity is invalid".into());
+    }
+    if !enforce_current_receipt {
+        return Ok(());
+    }
     let Some(receipt) = receipts.get(&evidence.task_id) else {
         return Err("completion evidence has no host receipt".into());
     };

@@ -675,23 +675,43 @@ async fn repeated_apply_patch_verification_failures_stop_the_turn() -> Result<()
     assert!(error.message.contains("RENCROW_PATCH_RETRY_EXCEEDED"));
     assert_eq!(requests.requests().len(), 3);
     let second_output = requests.requests()[2]
-        .custom_tool_call_output("patch-2")
-        .to_string();
+        .custom_tool_call_output_content_and_success("patch-2")
+        .and_then(|(content, _success)| content)
+        .expect("second refusal output preserves its raw text content");
     assert!(second_output.contains("RENCROW_PATCH_FORMAT_HINT"));
     assert!(second_output.contains("never unified-diff line ranges such as @@ -1 +1 @@"));
-    for example_line in [
-        "Example:",
-        "*** Begin Patch",
-        "*** Update File: path",
-        "@@",
-        "-old",
-        "+new",
-        "*** End Patch",
-    ] {
-        assert!(
-            second_output.contains(example_line),
-            "missing {example_line:?}"
-        );
+    let format_hint_start = second_output
+        .find("RENCROW_PATCH_FORMAT_HINT")
+        .expect("second refusal includes the format hint");
+    let format_hint = &second_output[format_hint_start..];
+    let patch_start = format_hint
+        .find("*** Begin Patch")
+        .expect("format hint includes an example patch");
+    let patch_end = format_hint
+        .find("*** End Patch")
+        .map(|end| end + "*** End Patch".len())
+        .expect("format hint example is closed");
+    let example = &format_hint[patch_start..patch_end];
+    let parsed = codex_apply_patch::parse_patch(example)
+        .expect("the example returned by the host parses as an apply-patch envelope");
+    assert_eq!(parsed.hunks.len(), 2);
+    match &parsed.hunks[0] {
+        codex_apply_patch::Hunk::AddFile { path, contents } => {
+            assert_eq!(path.to_string_lossy(), "new.txt");
+            assert_eq!(contents.trim_end(), "new file content");
+        }
+        hunk => panic!("first example hunk should add the new file, got {hunk:?}"),
+    }
+    match &parsed.hunks[1] {
+        codex_apply_patch::Hunk::UpdateFile { path, chunks, .. } => {
+            assert_eq!(path.to_string_lossy(), "existing.txt");
+            assert_eq!(chunks.len(), 1);
+            assert_eq!(chunks[0].old_lines.len(), 1);
+            assert_eq!(chunks[0].old_lines[0], "old");
+            assert_eq!(chunks[0].new_lines.len(), 1);
+            assert_eq!(chunks[0].new_lines[0], "new");
+        }
+        hunk => panic!("second example hunk should update the existing file, got {hunk:?}"),
     }
     Ok(())
 }

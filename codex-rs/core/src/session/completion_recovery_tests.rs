@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-16.
 use super::make_session_and_context;
 use crate::agent::completion_recovery::SUPPORTED_RECHECK_CONDITION;
 use crate::agent::completion_recovery::due_plan_review_event;
@@ -120,6 +121,8 @@ async fn changed_artifact_invalidates_satisfied_condition_during_reconcile() {
                 review_evidence: None,
                 review_launch: None,
                 review_decision_reason: None,
+                review_state: None,
+                review_revalidation_of: None,
             }],
             current_unit: None,
             failed_approaches: Vec::new(),
@@ -268,6 +271,7 @@ async fn changed_artifact_invalidates_satisfied_condition_during_reconcile() {
         authority: Some("project owner".into()),
         evidence: Vec::new(),
         recheck_condition: None,
+        review_owner: None,
     };
     let mut blocked_contract = original.clone();
     blocked_contract.blocker = Some(blocker.clone());
