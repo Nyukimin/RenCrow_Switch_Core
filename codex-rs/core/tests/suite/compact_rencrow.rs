@@ -2,6 +2,7 @@
 use super::compact::non_openai_model_provider;
 use anyhow::Result;
 use codex_core::TurnInputRequest;
+use codex_core::TurnInputSubmission;
 use codex_core::config::ThreadStoreConfig;
 use codex_features::Feature;
 use codex_history::InitialHistory;
@@ -37,10 +38,12 @@ use serde_json::json;
 use std::fs;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use wiremock::Mock;
+use wiremock::MockServer;
 use wiremock::Request;
 use wiremock::ResponseTemplate;
 use wiremock::matchers::method;
@@ -87,6 +90,24 @@ fn stage(body: &Value) -> Stage {
     Stage::Ordinary
 }
 
+fn request_stage_label(body: &Value) -> &'static str {
+    let Some(input) = body["input"].as_array() else {
+        return "unclassified";
+    };
+    let developer = input
+        .iter()
+        .filter(|item| item["role"] == "developer")
+        .flat_map(item_texts)
+        .collect::<String>();
+    if developer.contains(SUMMARY_REQUEST) {
+        "summary"
+    } else if developer.contains(SELECTION_STAGE) {
+        "selection"
+    } else {
+        "ordinary"
+    }
+}
+
 /// Select a host-owned ID without copying original text into a model response.
 fn passage_id(data: &Value, text: &str) -> Value {
     data["passages"]
@@ -122,7 +143,14 @@ fn checkpoint_rows(path: &std::path::Path) -> Result<Vec<Value>> {
 
 /// Submit a turn whose text has an accepted Human intake receipt.
 async fn submit_human_turn(test: &TestCodex, client: &str, text: &str) -> Result<()> {
-    submit_declared_turn(test, client, text, InputAuthor::Human).await
+    submit_declared_turn(
+        test,
+        client,
+        text,
+        InputAuthor::Human,
+        /*request_log*/ None,
+    )
+    .await
 }
 
 /// Submit a turn whose text has an accepted intake receipt from the given author.
@@ -131,6 +159,7 @@ async fn submit_declared_turn(
     client: &str,
     text: &str,
     author: InputAuthor,
+    request_log: Option<&Mutex<Vec<Value>>>,
 ) -> Result<()> {
     let thread = test.session_configured.session_id.to_string();
     let directory = test
@@ -153,33 +182,335 @@ async fn submit_declared_turn(
         directory.join(format!("{client}.json")),
         serde_json::to_vec(&receipt)?,
     )?;
-    test.codex
-        .start_or_steer_turn(TurnInputRequest::new(TurnInput::UserInput {
+    submit_and_wait_for_turn(
+        &test.codex,
+        Some(client),
+        "declared user input",
+        TurnInputRequest::new(TurnInput::UserInput {
             content: vec![UserInput::Text {
                 text: text.into(),
                 text_elements: vec![],
             }],
             client_id: Some(client.into()),
-        }))
-        .await?;
-    wait_for_event(&test.codex, |event| {
-        matches!(event, EventMsg::TurnComplete(_))
-    })
-    .await;
-    Ok(())
+        }),
+        request_log,
+    )
+    .await
 }
 
-/// Run a manual compaction and fail the test on any error event.
-async fn compact_without_error(codex: &codex_core::CodexThread) -> Result<()> {
-    codex.submit(Op::Compact).await?;
-    wait_for_event(codex, |event| {
-        if let EventMsg::Error(error) = event {
-            panic!("compaction error: {error:?}");
+async fn submit_observed_text_turn(
+    codex: &codex_core::CodexThread,
+    submission_label: &str,
+    text: &str,
+    request_log: Option<&Mutex<Vec<Value>>>,
+) -> Result<()> {
+    submit_and_wait_for_turn(
+        codex,
+        /*submission_client*/ None,
+        submission_label,
+        TurnInputRequest::user_input(vec![UserInput::Text {
+            text: text.into(),
+            text_elements: vec![],
+        }]),
+        request_log,
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+enum TurnStartRequirement {
+    Required,
+    NotRequired,
+}
+
+fn request_observation(
+    request_log: Option<&Mutex<Vec<Value>>>,
+    request_start_count: Option<usize>,
+) -> String {
+    let (Some(requests), Some(start_count)) = (request_log, request_start_count) else {
+        let reason = if request_log.is_some() {
+            "initial_count_unavailable"
+        } else {
+            "not_recorded"
+        };
+        return format!("mock_request_observation=unavailable reason={reason}");
+    };
+    let Ok(requests) = requests.lock() else {
+        return "mock_request_observation=unavailable reason=lock_poisoned".to_string();
+    };
+    let Some(matched) = requests.get(start_count..) else {
+        let current_count = requests.len();
+        return format!(
+            "mock_request_observation=unavailable reason=invalid_start_count start_count={start_count} current_count={current_count}"
+        );
+    };
+    let stages = matched.iter().map(request_stage_label).collect::<Vec<_>>();
+    let request_count = matched.len();
+    let total_count = requests.len();
+    format!(
+        "mock_request_count_since_submission={request_count} mock_request_stages={stages:?} mock_request_count_total={total_count}"
+    )
+}
+
+fn turn_diagnostic(
+    submission_label: &str,
+    submission_client: Option<&str>,
+    turn_id: Option<&str>,
+    last_event: Option<&str>,
+    request_log: Option<&Mutex<Vec<Value>>>,
+    request_start_count: Option<usize>,
+) -> String {
+    let request_observation = request_observation(request_log, request_start_count);
+    format!(
+        "submission_label={submission_label:?} submission_client={submission_client:?} expected_turn_id={turn_id:?} last_event={last_event:?} {request_observation}"
+    )
+}
+
+async fn await_correlated_turn_completion(
+    codex: &codex_core::CodexThread,
+    turn_id: &str,
+    turn_start_requirement: TurnStartRequirement,
+    submission_label: &str,
+    submission_client: Option<&str>,
+    request_log: Option<&Mutex<Vec<Value>>>,
+    request_start_count: Option<usize>,
+) -> Result<()> {
+    let mut matching_turn_started = false;
+    let mut last_event = None;
+    let diagnostic = |last_event: Option<&str>| {
+        turn_diagnostic(
+            submission_label,
+            submission_client,
+            /*turn_id*/ Some(turn_id),
+            last_event,
+            request_log,
+            request_start_count,
+        )
+    };
+    loop {
+        let event = match tokio::time::timeout(
+            std::time::Duration::from_secs(/*secs*/ 10),
+            codex.next_event(),
+        )
+        .await
+        {
+            Ok(Ok(event)) => event,
+            Ok(Err(error)) => {
+                let diagnostic = diagnostic(last_event.as_deref());
+                anyhow::bail!(
+                    "event stream failed while waiting for TurnComplete: {error}; {diagnostic}"
+                );
+            }
+            Err(_) => {
+                let last_event = last_event.as_deref().unwrap_or("no event received");
+                let diagnostic = diagnostic(Some(last_event));
+                anyhow::bail!("timeout waiting for TurnComplete: {last_event}; {diagnostic}");
+            }
+        };
+        let event_id = event.id;
+        let message = event.msg;
+        last_event = Some(format!("event_id={event_id:?} message={message:?}"));
+        let last_event_text = last_event.as_deref();
+        match message {
+            EventMsg::TurnStarted(started) => {
+                let envelope_matches = event_id == turn_id;
+                let payload_matches = started.turn_id == turn_id;
+                if envelope_matches != payload_matches {
+                    let diagnostic = diagnostic(last_event_text);
+                    anyhow::bail!(
+                        "TurnStarted identity mismatch: {last_event_text:?}; {diagnostic}"
+                    );
+                }
+                if envelope_matches {
+                    matching_turn_started |=
+                        matches!(turn_start_requirement, TurnStartRequirement::Required);
+                }
+            }
+            EventMsg::TurnComplete(completed) => {
+                let envelope_matches = event_id == turn_id;
+                let payload_matches = completed.turn_id == turn_id;
+                if envelope_matches || payload_matches {
+                    if envelope_matches != payload_matches {
+                        let diagnostic = diagnostic(last_event_text);
+                        anyhow::bail!(
+                            "TurnComplete identity mismatch: {last_event_text:?}; {diagnostic}"
+                        );
+                    }
+                    if matches!(turn_start_requirement, TurnStartRequirement::Required)
+                        && !matching_turn_started
+                    {
+                        let diagnostic = diagnostic(last_event_text);
+                        anyhow::bail!(
+                            "TurnComplete arrived without matching TurnStarted: {last_event_text:?}; {diagnostic}"
+                        );
+                    }
+                    if let Some(error) = completed.error {
+                        let diagnostic = diagnostic(last_event_text);
+                        anyhow::bail!("turn completed with an error: {error:?}; {diagnostic}");
+                    }
+                    return Ok(());
+                }
+            }
+            EventMsg::TurnAborted(aborted) => {
+                let envelope_matches = event_id == turn_id;
+                let payload_matches = aborted.turn_id.as_deref() == Some(turn_id);
+                if envelope_matches || payload_matches {
+                    if !envelope_matches || aborted.turn_id.is_some() && !payload_matches {
+                        let diagnostic = diagnostic(last_event_text);
+                        anyhow::bail!(
+                            "TurnAborted identity mismatch: {last_event_text:?}; {diagnostic}"
+                        );
+                    }
+                    let diagnostic = diagnostic(last_event_text);
+                    anyhow::bail!("turn was aborted: {aborted:?}; {diagnostic}");
+                }
+            }
+            EventMsg::Error(error) if event_id == turn_id => {
+                let diagnostic = diagnostic(last_event_text);
+                anyhow::bail!("turn emitted an error event: {error:?}; {diagnostic}");
+            }
+            _ => {}
         }
-        matches!(event, EventMsg::TurnComplete(_))
-    })
+    }
+}
+
+async fn submit_and_wait_for_turn(
+    codex: &codex_core::CodexThread,
+    submission_client: Option<&str>,
+    submission_label: &str,
+    request: TurnInputRequest,
+    request_log: Option<&Mutex<Vec<Value>>>,
+) -> Result<()> {
+    let request_start_count =
+        request_log.and_then(|requests| requests.lock().ok().map(|requests| requests.len()));
+    let submission = codex.start_or_steer_turn(request).await.map_err(|error| {
+        let diagnostic = turn_diagnostic(
+            submission_label,
+            submission_client,
+            /*turn_id*/ None,
+            /*last_event*/ None,
+            request_log,
+            request_start_count,
+        );
+        anyhow::anyhow!("turn input submission failed: {error}; {diagnostic}")
+    })?;
+    let turn_id = match submission {
+        TurnInputSubmission::Started { turn_id } => turn_id,
+        TurnInputSubmission::Steered { turn_id } => {
+            let diagnostic = turn_diagnostic(
+                submission_label,
+                submission_client,
+                /*turn_id*/ Some(&turn_id),
+                /*last_event*/ None,
+                request_log,
+                request_start_count,
+            );
+            anyhow::bail!(
+                "expected a newly started turn but input was steered to {turn_id:?}; {diagnostic}"
+            );
+        }
+        TurnInputSubmission::NotSubmitted { reason } => {
+            let diagnostic = turn_diagnostic(
+                submission_label,
+                submission_client,
+                /*turn_id*/ None,
+                /*last_event*/ None,
+                request_log,
+                request_start_count,
+            );
+            anyhow::bail!(
+                "expected a newly started turn but input was not submitted ({reason:?}); {diagnostic}"
+            );
+        }
+    };
+    await_correlated_turn_completion(
+        codex,
+        &turn_id,
+        TurnStartRequirement::Required,
+        submission_label,
+        submission_client,
+        request_log,
+        request_start_count,
+    )
+    .await
+}
+
+/// Run a manual compaction and fail on its correlated error, abort, or failed completion.
+async fn compact_without_error(codex: &codex_core::CodexThread) -> Result<()> {
+    compact_without_error_observed(codex, /*request_log*/ None).await
+}
+
+async fn compact_without_error_observed(
+    codex: &codex_core::CodexThread,
+    request_log: Option<&Mutex<Vec<Value>>>,
+) -> Result<()> {
+    let request_start_count =
+        request_log.and_then(|requests| requests.lock().ok().map(|requests| requests.len()));
+    let submission_id = codex.submit(Op::Compact).await?;
+    await_correlated_turn_completion(
+        codex,
+        &submission_id,
+        TurnStartRequirement::NotRequired,
+        "manual compaction",
+        /*submission_client*/ None,
+        request_log,
+        request_start_count,
+    )
+    .await
+}
+
+fn install_compaction_trace_if_requested() -> Result<()> {
+    if std::env::var_os("RENCROW_COMPACTION_TRACE").as_deref() != Some(std::ffi::OsStr::new("1")) {
+        return Ok(());
+    }
+
+    static SUBSCRIBER_RESULT: OnceLock<std::result::Result<(), String>> = OnceLock::new();
+    let result = SUBSCRIBER_RESULT.get_or_init(|| {
+        let filter = tracing_subscriber::EnvFilter::try_new(
+            "codex_core::client=info,codex_core::session=trace,codex_api::endpoint::responses=info",
+        )
+        .map_err(|error| error.to_string())?;
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_ansi(false)
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::FULL)
+            .with_timer(tracing_subscriber::fmt::time::SystemTime)
+            .with_writer(std::io::stderr)
+            .try_init()
+            .map_err(|error| error.to_string())
+    });
+    result
+        .as_ref()
+        .map(|_| ())
+        .map_err(|error| anyhow::anyhow!("failed to install compaction trace subscriber: {error}"))
+}
+
+async fn report_mock_routes_on_failure(server: &MockServer, result: Result<()>) -> Result<()> {
+    let Err(error) = result else {
+        return Ok(());
+    };
+    let requests = tokio::time::timeout(
+        std::time::Duration::from_secs(/*secs*/ 1),
+        server.received_requests(),
+    )
     .await;
-    Ok(())
+    let observation = match requests {
+        Ok(Some(requests)) => {
+            let count = requests.len();
+            let method_paths = requests
+                .iter()
+                .map(|request| {
+                    let method = request.method.to_string();
+                    let path = request.url.path().to_string();
+                    format!("{method} {path}")
+                })
+                .collect::<Vec<_>>();
+            format!("count={count} method_paths={method_paths:?}")
+        }
+        Ok(None) => "unavailable=request_recording_disabled".to_string(),
+        Err(_) => "unavailable=read_timeout".to_string(),
+    };
+    Err(error.context(format!("all mock server requests: {observation}")))
 }
 
 /// The RenCrow metadata stored on the checkpoint summary of one compacted rollout row.
@@ -200,6 +531,12 @@ async fn rencrow_compaction_keeps_one_selected_history_through_resume_and_recomp
 ) -> Result<()> {
     skip_if_no_network!(Ok(()));
     let server = start_mock_server().await;
+    let result = run_rencrow_compaction_fixture(automatic, &server).await;
+    report_mock_routes_on_failure(&server, result).await
+}
+
+async fn run_rencrow_compaction_fixture(automatic: bool, server: &MockServer) -> Result<()> {
+    install_compaction_trace_if_requested()?;
     let seen = Arc::new(Mutex::new(Vec::<Value>::new()));
     let captured = Arc::clone(&seen);
     let responses = Arc::new(AtomicUsize::new(0));
@@ -260,9 +597,9 @@ async fn rencrow_compaction_keeps_one_selected_history_through_resume_and_recomp
                 }
             }
         })
-        .mount(&server)
+        .mount(server)
         .await;
-    let provider = non_openai_model_provider(&server);
+    let provider = non_openai_model_provider(server);
     let mut builder = test_codex().with_config(move |config| {
         config.model_provider = provider;
         config.rencrow_compaction = true;
@@ -270,17 +607,23 @@ async fn rencrow_compaction_keeps_one_selected_history_through_resume_and_recomp
             config.model_auto_compact_token_limit = Some(100_000);
         }
     });
-    let test = builder.build(&server).await?;
+    let test = builder.build(server).await?;
     for (client, text) in [
         ("first", "Keep Japanese. Use obsolete-label."),
         ("second", "Use current-label instead."),
     ] {
-        submit_human_turn(&test, client, text).await?;
+        submit_declared_turn(&test, client, text, InputAuthor::Human, Some(&seen)).await?;
     }
     if !automatic {
-        compact_without_error(&test.codex).await?;
+        compact_without_error_observed(&test.codex, Some(&seen)).await?;
     }
-    test.submit_text_turn("continue before restart").await?;
+    submit_observed_text_turn(
+        &test.codex,
+        "continue before restart",
+        "continue before restart",
+        Some(&seen),
+    )
+    .await?;
     let path = test.codex.rollout_path().expect("rollout path");
     let checkpoints = checkpoint_rows(&path)?;
     assert_eq!(checkpoints.len(), 1);
@@ -303,24 +646,27 @@ async fn rencrow_compaction_keeps_one_selected_history_through_resume_and_recomp
     assert!(!actual.contains("Use obsolete-label."));
     assert!(actual.contains("Keep Japanese."));
     assert!(replacement_metadata.contains("rencrow_compaction"));
-    let provider = non_openai_model_provider(&server);
+    let provider = non_openai_model_provider(server);
     let mut restarted = test_codex().with_config(move |config| {
         config.model_provider = provider;
         config.rencrow_compaction = true;
     });
-    let resumed = restarted.restart(&server, &test).await?;
-    resumed.submit_text_turn("continue after restart").await?;
-    resumed.codex.submit(Op::Compact).await?;
-    wait_for_event(&resumed.codex, |event| {
-        if let EventMsg::Error(error) = event {
-            panic!("second compaction error: {error:?}");
-        }
-        matches!(event, EventMsg::TurnComplete(_))
-    })
-    .await;
-    resumed
-        .submit_text_turn("continue after second compact")
-        .await?;
+    let resumed = restarted.restart(server, &test).await?;
+    submit_observed_text_turn(
+        &resumed.codex,
+        "continue after restart",
+        "continue after restart",
+        Some(&seen),
+    )
+    .await?;
+    compact_without_error_observed(&resumed.codex, Some(&seen)).await?;
+    submit_observed_text_turn(
+        &resumed.codex,
+        "continue after second compact",
+        "continue after second compact",
+        Some(&seen),
+    )
+    .await?;
     let checkpoints = checkpoint_rows(&path)?;
     assert_eq!(checkpoints.len(), 2);
     // The second checkpoint has no new Human, so it sends no selection request.
@@ -1613,7 +1959,14 @@ async fn rencrow_automation_note_is_removed_only_by_a_later_correction() -> Resu
         ("standing", STANDING),
         ("correction", CORRECTION),
     ] {
-        submit_declared_turn(&test, client, text, InputAuthor::Automation).await?;
+        submit_declared_turn(
+            &test,
+            client,
+            text,
+            InputAuthor::Automation,
+            /*request_log*/ None,
+        )
+        .await?;
     }
     compact_without_error(&test.codex).await?;
 

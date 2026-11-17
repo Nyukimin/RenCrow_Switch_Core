@@ -1,7 +1,17 @@
 //! Detects the TUI host's clock preference once. Unknown preferences preserve 12-hour output;
-//! detection never changes the process locale or runs while rendering a history cell.
+//! detection never changes the process locale or runs while rendering a history cell. It also
+//! provides the fixed JST offset used by optional activity and completion timestamps.
 
 use std::sync::OnceLock;
+
+use chrono::FixedOffset;
+
+// Modified by RenCrow Switch Core, 2026-11-16.
+
+pub(crate) const JST_OFFSET: FixedOffset = match FixedOffset::east_opt(9 * 60 * 60) {
+    Some(offset) => offset,
+    None => panic!("UTC+09:00 is a valid fixed offset"),
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ClockFormat {

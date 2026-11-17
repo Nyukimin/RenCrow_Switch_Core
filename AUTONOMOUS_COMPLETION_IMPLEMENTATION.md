@@ -286,14 +286,18 @@ Rust 1.95.0の変更Core機能とhistory crateの限定検証は217/217成功。
 
 ### 検証結果と限界
 
-検査原記録・失敗時のraw log・構築checkpointは私有の`Tmp/ren2-supervision/new-thread-20261116/recovery-fix-20261116/four-defects-verification-20261116/`に保存する。以下の結果は現在sourceに結び付くものだけを記し、過去の部分成功を流用しない。
+検査原記録・失敗時のraw log・構築checkpointは私有の`Tmp/ren2-supervision/new-thread-20261116/recovery-fix-20261116/four-defects-verification-20261116/`に保存する。検査結果は対象sourceごとに記し、追加修正後の確認を追加修正前の成功で代用しない。
 
 | 検査 | 現在の結果 |
 |---|---|
 | 差分・API/保存契約の手動照合 | 親が宣言・呼出側・使用先、所有権、参照種類、正常・異常・復元を照合。参照分離後のretry証明迂回はビルド前のレビューで修正 |
-| 整形・関連lib/testsの静的確認 | `common-contract-round23-fmt`と`common-contract-round23-clippy`が終了0・エラー0・Warning 0。関連4 crate、source identity `4ded5872e65cedc10423d4fd697aeb7212d6318aba1e08b07ee7b59d59a47b4d`。検査前後と親の現在source確認が一致 |
-| ビルド・関連系列 | 関連lib・integrationのbuild-onlyは終了0・Warning 0。対象3系列は3/3、History・Thread Store・Rolloutは637/637成功。Core関連回帰は337件中336成功・1失敗（automatic CompactionのTurnComplete待ちtimeout）。この系列は未受入 |
+| 追加修正前のレビュー本体の整形・関連lib/tests確認 | `common-contract-round23-fmt`と`common-contract-round23-clippy`が終了0・エラー0・Warning 0。関連4 crate、source identity `4ded5872e65cedc10423d4fd697aeb7212d6318aba1e08b07ee7b59d59a47b4d`。検査前後と親の現在source確認が一致 |
+| 追加修正前のビルド・関連系列 | 関連lib・integrationのbuild-onlyは終了0・Warning 0。対象3系列は3/3、History・Thread Store・Rolloutは637/637成功。Core関連回帰は337件中336成功・1失敗（automatic CompactionのTurnComplete待ちtimeout）。この系列は未受入 |
+| 既知の静的診断とfixture不備の追加修正 | ユーザーの全件対策指示に基づき13 Rustファイルを構築。共有JST定数をコンパイル時検証し、本文と出典を型で束ね、test/debug専用コードを実際の使用構成へ配置。fixtureは受付結果と実turn/submission ID、開始・終了・取消し・エラーを対応付け、診断不能を0件と扱わない。入力・閾値・timeout・期待値は維持。整形、Core・TUI・app-server・cloud-tasks・CLIの関連全ターゲットClippy、配備プロファイルのCLI/helperとapp-server/cloud-tasks関連testsの型検査は、同じsource `6337cf5ae3620302d070460843ff94846f636286fda590ce6af99dd3663e6eaa` で終了0・エラー0・Warning 0。親が原記録とsource不変を照合済み。同一sourceの隔離checkoutで関連ビルド終了0・エラー0・Warning 0。TUI・app-server・cloud-tasks関連173/173成功。Compactionのautomatic/manualは両方とも最初の通常入力後にtimeoutとなり、原因調査を継続 |
+| Compactionの限定観測 | source `ff6adc4df60514e1b9a7b76261fc8f68292b8ef3655d3b5646f5fdede7f5dc18` の全ターゲットClippy・配備CLI型確認・Coreビルドは終了0・エラー0・Warning 0。手動ケース1件はtimeout。履歴保存は約0.2msで終了し、最初のmodel client pollからResponses endpoint呼出しまで同期区間が12.495秒。mock受信0件。auth・client構築・request準備の内訳は未確定 |
+| 非同期client構築の契約修正 | async処理が同期HTTP client構築を直接実行している逸脱を静的に確認。既存の非同期ownerへ製品3呼出経路とテスト1呼出を統一。source `e25f8bddee8f68f960e6bc723b4a298ceb7e5a1e03bdce65c4a47b27bc33d27e` の整形、Core・CLI全ターゲットClippy、配備CLI/helper型確認は終了0・エラー0・Warning 0。親が原記録と同一sourceを照合済み。worker占有解消と構築所要時間短縮を分けて確認。最終source `074343db4eff6de25e74b940e10d847d6a482a3369a6666d3b920a2ac1ff7941` のCore・CLI全ターゲットClippyとfmt-checkは終了0・エラー0・Warning 0。Core unit buildも同条件で通過し、client関連28件とレビュー2系列の計30/30成功 |
+| timeoutの原因区間と最終関連検査 | sampleはreqwest system proxy matcherからmacOS CFBundleのディレクトリ走査で714 samples。元のtest binary同居depsは811,692 entries、一覧走査4.131秒。同一binary SHAを保ち、nextest metadata/remapで少数artifactへ隔離した対照はmanual 0.303秒で成功。補助3 binaryも同じ内容へそろえ、観測traceなしの標準状態では圧縮系列15件・completion loop 1件・WebRTC 2件の18/18成功（automatic 0.224秒、manual 0.227秒）。入力・閾値・期限・proxy方針は維持。既存targetの削除や製品のproxy無効化はしていない |
 | 全workspace試験 | 未許可・未実施 |
-| native CLI/helper pairと実機反映 | 未実施。稼働中ren2は観測・メモのみ |
+| native CLI/helper pairと実機反映 | 追加修正後のCLI/helper型検査は配備プロファイルでもエラー0・Warning 0。native pair buildは次工程、実機反映は未実施。稼働中ren2は観測・メモのみ |
 
-通常RenCrow Compaction/raw restartのsource保持は、opaque envelope・metadata sidecar・transaction marker・context再構築まで静的照合した。正規化済みcheckpoint-only/bounded入力のnested source対応は別の境界であり、対応済みとしない。自動CompactionのTurnComplete待ちtimeoutをCore回帰で再観測した。今回の入力iteration・処理段階はログから確定できず、原因は未確認である。変更前HEADの型検査は既存Warning3件で静的ゲート未完了となり、build/runtime比較は実施していない。実要求・要約・再開を確認した過去の成功を、その原因修正や全workspace受入の証明にはしない。観測用の一時instrumentationは除去し、入力・閾値・timeout・assertionは緩和していない。
+通常RenCrow Compaction/raw restartのsource保持は、opaque envelope・metadata sidecar・transaction marker・context再構築まで静的照合した。正規化済みcheckpoint-only/bounded入力のnested source対応は別の境界であり、対応済みとしない。自動CompactionのTurnComplete待ちtimeoutをCore回帰で再観測し、受付・turn識別を正したfixtureではautomatic/manualとも最初の通常入力で再現した。限定観測とsampleで、保存・認証後のsystem proxy matcher初期化内にあるCFBundleディレクトリ走査へ絞った。配置を変えた同一binaryと補助artifactで圧縮系列が通過し、配置依存の探索遅延を支持する。OS内部で実際に走査したpathはsampleに含まれず、一般的なOS挙動までは断定しない。変更前HEADの型検査は既存Warning3件で静的ゲート未完了となり、build/runtime比較は実施していない。実要求・要約・再開を確認した過去の成功を、その原因修正や全workspace受入の証明にはしない。観測は明示フラグで有効にするspanと失敗時のmethod/path件数だけに限定し、入力・閾値・timeout・assertionは緩和していない。

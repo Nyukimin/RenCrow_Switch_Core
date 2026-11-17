@@ -133,6 +133,7 @@ use crate::multi_agents::AgentPickerThreadEntry;
 use crate::multi_agents::SubAgentActivityDisplay;
 use assert_matches::assert_matches;
 
+use crate::app::agent_message_consolidation::AgentMessageSource;
 use crate::app_command::AppCommand as Op;
 use crate::app_event::ConsolidationScrollbackReflow;
 use crate::diff_model::FileChange;
@@ -6879,8 +6880,10 @@ async fn directive_only_completion_removes_streamed_directive() -> Result<()> {
     let mut tui = crate::tui::test_support::make_test_tui()?;
     app.handle_consolidate_agent_message(
         &mut tui,
-        String::new(),
-        /*source_item*/ None,
+        AgentMessageSource {
+            markdown: String::new(),
+            item: None,
+        },
         PathBuf::from("/tmp"),
         /*inline_visualization_context*/ None,
         ConsolidationScrollbackReflow::Required,
@@ -6915,8 +6918,10 @@ async fn completed_item_reconciles_an_answer_consolidated_by_an_earlier_flush() 
 
     app.handle_consolidate_agent_message(
         &mut tui,
-        "The task is complete.".to_string(),
-        Some((turn_id.clone(), item_id.clone())),
+        AgentMessageSource {
+            markdown: "The task is complete.".to_string(),
+            item: Some((turn_id.clone(), item_id.clone())),
+        },
         app.config.cwd.to_path_buf(),
         /*inline_visualization_context*/ None,
         ConsolidationScrollbackReflow::IfResizeReflowRan,
@@ -6924,8 +6929,10 @@ async fn completed_item_reconciles_an_answer_consolidated_by_an_earlier_flush() 
     )?;
     app.handle_consolidate_agent_message(
         &mut tui,
-        "The task is complete. Here is the result.".to_string(),
-        Some((turn_id.clone(), item_id.clone())),
+        AgentMessageSource {
+            markdown: "The task is complete. Here is the result.".to_string(),
+            item: Some((turn_id.clone(), item_id.clone())),
+        },
         app.config.cwd.to_path_buf(),
         /*inline_visualization_context*/ None,
         ConsolidationScrollbackReflow::Required,
@@ -6963,8 +6970,10 @@ async fn canonical_answer_reconciles_multiple_flush_fragments_without_removing_o
     app.transcript_cells = vec![Arc::new(first)];
     app.handle_consolidate_agent_message(
         &mut tui,
-        "Answer fragment A".to_string(),
-        Some(identity.clone()),
+        AgentMessageSource {
+            markdown: "Answer fragment A".to_string(),
+            item: Some(identity.clone()),
+        },
         cwd.clone(),
         /*inline_visualization_context*/ None,
         ConsolidationScrollbackReflow::IfResizeReflowRan,
@@ -6979,8 +6988,10 @@ async fn canonical_answer_reconciles_multiple_flush_fragments_without_removing_o
     app.transcript_cells.push(Arc::new(second));
     app.handle_consolidate_agent_message(
         &mut tui,
-        "Answer fragment B".to_string(),
-        Some(identity.clone()),
+        AgentMessageSource {
+            markdown: "Answer fragment B".to_string(),
+            item: Some(identity.clone()),
+        },
         cwd.clone(),
         /*inline_visualization_context*/ None,
         ConsolidationScrollbackReflow::IfResizeReflowRan,
@@ -6988,8 +6999,10 @@ async fn canonical_answer_reconciles_multiple_flush_fragments_without_removing_o
     )?;
     app.handle_consolidate_agent_message(
         &mut tui,
-        "Canonical answer AB".to_string(),
-        Some(identity.clone()),
+        AgentMessageSource {
+            markdown: "Canonical answer AB".to_string(),
+            item: Some(identity.clone()),
+        },
         cwd,
         /*inline_visualization_context*/ None,
         ConsolidationScrollbackReflow::Required,
@@ -7049,8 +7062,10 @@ async fn canonical_answer_reconciles_stream_fragments_split_by_reasoning_cell() 
 
     app.handle_consolidate_agent_message(
         &mut tui,
-        "ALPHA\nBRAVO\nCHARLIE".to_string(),
-        Some(identity.clone()),
+        AgentMessageSource {
+            markdown: "ALPHA\nBRAVO\nCHARLIE".to_string(),
+            item: Some(identity.clone()),
+        },
         cwd,
         /*inline_visualization_context*/ None,
         ConsolidationScrollbackReflow::Required,
@@ -7096,8 +7111,10 @@ async fn item_identity_does_not_reconcile_another_items_untagged_stream_cell() -
 
     app.handle_consolidate_agent_message(
         &mut tui,
-        "canonical answer for this item".to_string(),
-        Some(("turn-1".to_string(), "msg-1".to_string())),
+        AgentMessageSource {
+            markdown: "canonical answer for this item".to_string(),
+            item: Some(("turn-1".to_string(), "msg-1".to_string())),
+        },
         cwd,
         /*inline_visualization_context*/ None,
         ConsolidationScrollbackReflow::Required,
@@ -7145,9 +7162,12 @@ async fn required_stream_reflow_during_capped_initial_replay_survives_transcript
     let mut tui = crate::tui::test_support::make_test_tui()?;
     app.handle_consolidate_agent_message(
         &mut tui,
-        "Final answer:\n\n| Pattern | Outcome |\n| --- | --- |\n| Table tail | Preserved |"
-            .to_string(),
-        /*source_item*/ None,
+        AgentMessageSource {
+            markdown:
+                "Final answer:\n\n| Pattern | Outcome |\n| --- | --- |\n| Table tail | Preserved |"
+                    .to_string(),
+            item: None,
+        },
         PathBuf::from("/tmp"),
         /*inline_visualization_context*/ None,
         ConsolidationScrollbackReflow::Required,

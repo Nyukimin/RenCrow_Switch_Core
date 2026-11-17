@@ -1,5 +1,7 @@
 //! Subtle completion timestamps, elapsed durations, and runtime metrics for transcript history.
 
+// Modified by RenCrow Switch Core, 2026-11-16.
+
 use super::*;
 use crate::clock_format::ClockFormat;
 use chrono::DateTime;
@@ -80,9 +82,7 @@ impl FinalMessageSeparator {
         }
         if let Some(completed_at) = self.completed_at {
             if self.jst_timestamps {
-                let jst = completed_at.with_timezone(
-                    &chrono::FixedOffset::east_opt(9 * 60 * 60).expect("valid JST offset"),
-                );
+                let jst = completed_at.with_timezone(&crate::clock_format::JST_OFFSET);
                 label_parts.push(jst.format("[%m-%d %H:%M:%S JST]").to_string());
             } else {
                 let date_format = if completed_at.date_naive() == today {

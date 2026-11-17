@@ -10,6 +10,8 @@
 //! retained view preserves its displayed revision before replacement, then
 //! repaints without replaying terminal scrollback.
 
+// Modified by RenCrow Switch Core, 2026-11-16.
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -24,17 +26,25 @@ use crate::inline_visualization::InlineVisualizationContext;
 use crate::pager_overlay::Overlay;
 use crate::tui;
 
+pub(super) struct AgentMessageSource {
+    pub(super) markdown: String,
+    pub(super) item: Option<(String, String)>,
+}
+
 impl App {
     pub(super) fn handle_consolidate_agent_message(
         &mut self,
         tui: &mut tui::Tui,
-        source: String,
-        source_item: Option<(String, String)>,
+        message: AgentMessageSource,
         cwd: PathBuf,
         inline_visualization_context: Option<InlineVisualizationContext>,
         scrollback_reflow: ConsolidationScrollbackReflow,
         deferred_history_cell: Option<Box<dyn HistoryCell>>,
     ) -> Result<()> {
+        let AgentMessageSource {
+            markdown: source,
+            item: source_item,
+        } = message;
         // Some finalize paths must preserve a last provisional stream cell long
         // enough for queue ordering, then fold it into the canonical
         // source-backed cell during consolidation.

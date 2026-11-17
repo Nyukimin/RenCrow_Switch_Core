@@ -3,6 +3,8 @@
 //! This module contains the exhaustive `AppEvent` dispatcher and exit-mode handling. Large domain
 //! actions are delegated to focused app submodules so the central match remains the routing layer.
 
+// Modified by RenCrow Switch Core, 2026-11-16.
+
 use super::rate_limit_refresh::RateLimitReadStatus;
 use super::rate_limit_refresh::RateLimitRefreshOutcome;
 use super::resize_reflow::trailing_run_start;
@@ -805,8 +807,10 @@ impl App {
             } => {
                 self.handle_consolidate_agent_message(
                     tui,
-                    source,
-                    source_item,
+                    super::agent_message_consolidation::AgentMessageSource {
+                        markdown: source,
+                        item: source_item,
+                    },
                     cwd,
                     inline_visualization_context,
                     scrollback_reflow,

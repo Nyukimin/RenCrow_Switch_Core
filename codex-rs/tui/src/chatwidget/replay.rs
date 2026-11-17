@@ -4,6 +4,8 @@
 //! live-only side effects. An in-progress snapshot does not carry reasoning completion
 //! state: keep its trailing reasoning provisional until live events identify the next item.
 
+// Modified by RenCrow Switch Core, 2026-11-16.
+
 use super::*;
 
 impl ChatWidget {
@@ -244,6 +246,7 @@ impl ChatWidget {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn replay_thread_item(
         &mut self,
         item: ThreadItem,

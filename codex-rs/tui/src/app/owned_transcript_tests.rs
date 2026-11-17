@@ -1,5 +1,8 @@
 //! Owned transcript integration preserves composer spacing/input, prompt editing, and gestures.
 
+// Modified by RenCrow Switch Core, 2026-11-16.
+
+use super::agent_message_consolidation::AgentMessageSource;
 use super::*;
 use crate::app::tests::make_test_app_with_channels;
 use crate::app_command::AppCommand;
@@ -102,8 +105,10 @@ async fn list_spacing_completion_preserves_the_scrolled_reader() -> Result<()> {
     assert!(buffer_text(&before).contains("- c"));
     app.handle_consolidate_agent_message(
         &mut tui,
-        "- First item wraps onto a second row\n- b\n- c".into(),
-        /*source_item*/ None,
+        AgentMessageSource {
+            markdown: "- First item wraps onto a second row\n- b\n- c".into(),
+            item: None,
+        },
         app.config.cwd.to_path_buf(),
         /*inline_visualization_context*/ None,
         ConsolidationScrollbackReflow::Required,

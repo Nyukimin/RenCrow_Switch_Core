@@ -1,3 +1,5 @@
+// Modified by RenCrow Switch Core, 2026-11-17.
+
 use super::AuthRequestTelemetryContext;
 use super::ModelClient;
 use super::PendingUnauthorizedRetry;
@@ -203,6 +205,7 @@ async fn workspace_routed_http_rejects_redirects_without_a_routing_header() {
         setup.api_provider.base_url = origin.uri();
         let transport = client
             .build_api_transport(&setup.api_provider, "/responses", setup.redirect_policy)
+            .await
             .unwrap();
         let request = setup
             .api_provider

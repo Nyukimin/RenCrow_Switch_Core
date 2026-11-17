@@ -1,13 +1,14 @@
 //! Formatting for the optional RenCrow activity footer.
 
+// Modified by RenCrow Switch Core, 2026-11-16.
+
+use crate::clock_format::JST_OFFSET;
 use chrono::DateTime;
-use chrono::FixedOffset;
 use chrono::Utc;
 
 pub(super) fn activity_label(activity_epoch_seconds: i64, now_epoch_seconds: i64) -> String {
-    let jst = FixedOffset::east_opt(9 * 60 * 60).expect("JST offset is valid");
     let activity = DateTime::from_timestamp(activity_epoch_seconds, 0)
-        .map(|timestamp| timestamp.with_timezone(&jst));
+        .map(|timestamp| timestamp.with_timezone(&JST_OFFSET));
     let Some(activity) = activity else {
         return "Last activity: time unknown".to_string();
     };
@@ -43,10 +44,9 @@ pub(super) fn activity_label(activity_epoch_seconds: i64, now_epoch_seconds: i64
 }
 
 pub(super) fn history_timestamp_label(epoch_seconds: i64) -> Option<String> {
-    let jst = FixedOffset::east_opt(9 * 60 * 60).expect("JST offset is valid");
     DateTime::from_timestamp(epoch_seconds, 0).map(|timestamp| {
         timestamp
-            .with_timezone(&jst)
+            .with_timezone(&JST_OFFSET)
             .format("[%H:%M:%S JST]")
             .to_string()
     })

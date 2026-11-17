@@ -1,4 +1,7 @@
+// Modified by RenCrow Switch Core, 2026-11-16.
+
 use super::*;
+use crate::app::agent_message_consolidation::AgentMessageSource;
 use pretty_assertions::assert_eq;
 
 fn user_verification_server_request(thread_id: ThreadId, request_id: i64) -> ServerRequest {
@@ -277,8 +280,10 @@ async fn inactive_thread_user_verification_preserves_foreground_stream() -> Resu
                 completed_messages.push(source.clone());
                 app.handle_consolidate_agent_message(
                     &mut tui,
-                    source,
-                    source_item,
+                    AgentMessageSource {
+                        markdown: source,
+                        item: source_item,
+                    },
                     cwd,
                     inline_visualization_context,
                     scrollback_reflow,

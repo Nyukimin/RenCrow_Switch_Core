@@ -1498,6 +1498,11 @@ impl Session {
         }
     }
 
+    #[instrument(
+        name = "session.try_ensure_rollout_materialized",
+        level = "trace",
+        skip_all
+    )]
     pub(crate) async fn try_ensure_rollout_materialized(
         &self,
         context: PersistContext,
