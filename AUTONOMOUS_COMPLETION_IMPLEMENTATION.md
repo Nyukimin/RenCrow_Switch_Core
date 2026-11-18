@@ -286,6 +286,21 @@ Rust 1.95.0の変更Core機能とhistory crateの限定検証は217/217成功。
 
 ### 検証結果と限界
 
+#### 2026-11-18の追加修正と現在の検証状態
+
+nested zshの明示Cancelは、起動call・起動turn・承認UUIDを結ぶ型付きreceiptで扱う。古い承認、閉じた応答チャネル、一般的な中断から明示Cancelを推定しない。実プロセス生成後から管理表への登録までのキャンセルでは、起動guardから既存のイベント・保存処理を使う完了ownerへ資源を引き継ぎ、親コマンドの終了通知を一度だけ確定する。通常の非zero終了は検査完了として記録し、後の成功による回復を維持する。
+
+- Core/app-serverの関連テストを含むClippy、および配布用CLI/helperのfork-deploy型検査はエラー0・Warning 0。
+- 現行ソースの最小14件、承認・検査回復などの関連12件、出力・プロセス整理10件、実zshの4件が成功。zshは同じbinary・同じ期限で既存の起動逐次化設定を使い、親のDeclined通知と保存結果を確認した。並行起動時の3 timeoutは別記録として保持し、内部原因までは断定しない。
+- 軽微なfixture修正16ファイルはcommit `75bd9b1a081bb6619c742d4697c38b035b699ae6` でorigin/mainへpush済み。TUIの対象7件と関連340件の成功は、このfixture候補の証拠である。
+- 2026-11-19時点で全workspaceの直列ビルドとnative CLI/helper対のビルドはエラー0・Warning 0。native対は隔離checkoutで構築し、作業元との対象ソース・設定の一致、退避成果物のSHA、version/helpの成功を確認した。実環境への配置は行っていない。
+- 最終全体回帰は20,894件実行し、20,892成功・1失敗・1 timeout、59 skip。Guardianの応答数assertと外部エディタ検査のtimeoutが残った。同じバイナリ・同じ期限・retryなしで1件ずつ実行すると両方成功したが、全体実行時の原因は未確定であり、全体受入完了とはしない。assert・期限・製品コードをこの2件のために緩和していない。
+- ユーザーの「一度Pushして」に基づき、上記の未解決事項を保持したまま現行修正をコミット・pushする。以後のビルドも同時起動せずjobs=1とする。
+
+証跡の正本: `/Users/yukimi/RenCrow/Tmp/ren2-supervision/new-thread-20261116/recovery-fix-20261116/four-defects-verification-20261116`。現行Wソースは`d4fb620299a24ba29d922c81552d507741b979e7e3427b508ff42ee22e7ffdc8`（57ファイル）、作業元の変更26ファイルと内容一致。稼働中ren2は観測・メモのみで、配置・停止・再起動は行っていない。
+
+以下は11月17日までの検証経緯であり、現行候補の全体受入完了を示さない。
+
 検査原記録・失敗時のraw log・構築checkpointは私有の`Tmp/ren2-supervision/new-thread-20261116/recovery-fix-20261116/four-defects-verification-20261116/`に保存する。検査結果は対象sourceごとに記し、追加修正後の確認を追加修正前の成功で代用しない。
 
 | 検査 | 現在の結果 |
@@ -297,7 +312,10 @@ Rust 1.95.0の変更Core機能とhistory crateの限定検証は217/217成功。
 | Compactionの限定観測 | source `ff6adc4df60514e1b9a7b76261fc8f68292b8ef3655d3b5646f5fdede7f5dc18` の全ターゲットClippy・配備CLI型確認・Coreビルドは終了0・エラー0・Warning 0。手動ケース1件はtimeout。履歴保存は約0.2msで終了し、最初のmodel client pollからResponses endpoint呼出しまで同期区間が12.495秒。mock受信0件。auth・client構築・request準備の内訳は未確定 |
 | 非同期client構築の契約修正 | async処理が同期HTTP client構築を直接実行している逸脱を静的に確認。既存の非同期ownerへ製品3呼出経路とテスト1呼出を統一。source `e25f8bddee8f68f960e6bc723b4a298ceb7e5a1e03bdce65c4a47b27bc33d27e` の整形、Core・CLI全ターゲットClippy、配備CLI/helper型確認は終了0・エラー0・Warning 0。親が原記録と同一sourceを照合済み。worker占有解消と構築所要時間短縮を分けて確認。最終source `074343db4eff6de25e74b940e10d847d6a482a3369a6666d3b920a2ac1ff7941` のCore・CLI全ターゲットClippyとfmt-checkは終了0・エラー0・Warning 0。Core unit buildも同条件で通過し、client関連28件とレビュー2系列の計30/30成功 |
 | timeoutの原因区間と最終関連検査 | sampleはreqwest system proxy matcherからmacOS CFBundleのディレクトリ走査で714 samples。元のtest binary同居depsは811,692 entries、一覧走査4.131秒。同一binary SHAを保ち、nextest metadata/remapで少数artifactへ隔離した対照はmanual 0.303秒で成功。補助3 binaryも同じ内容へそろえ、観測traceなしの標準状態では圧縮系列15件・completion loop 1件・WebRTC 2件の18/18成功（automatic 0.224秒、manual 0.227秒）。入力・閾値・期限・proxy方針は維持。既存targetの削除や製品のproxy無効化はしていない |
-| 全workspace試験 | 未許可・未実施 |
-| native CLI/helper pairと実機反映 | 追加修正後のCLI/helper型検査は配備プロファイルでもエラー0・Warning 0。native pair buildは次工程、実機反映は未実施。稼働中ren2は観測・メモのみ |
+| 全workspace前提のV8取得 | 初回buildは150.4.0のsandbox用archiveがupstream既定取得先に無く404。Rustのコンパイラ診断は無く、Cargoの取得失敗・後続待機で終了101。既存 `.github/actions/setup-rusty-v8/action.yml` に従いCodex配布のarchiveとbindingを取得。repo内信頼anchorから配布manifest、さらに2artifactのSHAを親も照合済み。version・target・sandboxを維持し、`RUSTY_V8_ARCHIVE` と `RUSTY_V8_SRC_BINDING_PATH` の両方を設定 |
+| Cargo feature加算のfixture契約 | `v8-poc` のlocal feature非要求を、共有V8での無効化と同一視するassertを静的に特定。native flagは常に照会し、明示要求なら有効必須とする正方向契約へ修正。既存JS・version・CRDTP試験は維持。非要求PoC＋runtime経由の加算、およびPoC明示要求の2構成でClippy全targetsが終了0・エラー0・Warning 0（primary source `9bd30cc4139e15b2c3ca9a38490f3aee1455e9aae51c8b4f386b674cda5539fc`）。親が差分と原記録を照合済み |
+| 全workspace試験 | 2026-11-17にユーザーが明示許可。全workspaceのbuild-onlyは終了0・エラー0・Warning 0。最初の全件実行は20,874件実行（20,822成功・30失敗・22timeout）、既定のskip59件で終了100。検証用の`RUST_BACKTRACE=1`と継承された`NO_COLOR=1`の混入を原記録で確認し、同じ検証済みバイナリでCLI4件・cursor4件は環境を正して成功。全体成功は未判定 |
+| 全件失敗から判明したfixture契約 | 役割の既定値と明示指定の優先順位、型付きprotocolエラーのログ、起動時処理を含む呼出回数、実ユーザーのskill混入、長いcwdの画面折返しを個別に照合。TUIのtimeoutはsampleで実端末cursor照会への滞留を確認し、既存の合成座標fixtureがcursorにも一貫するよう修正。marketplaceの推論とローカルconsumer検査を分け、doctorは同じ8入力・同じ期限の独立ケースへ分割。snapshot更新・期待する機能の緩和・製品のmodel/color/skill探索変更は行っていない。関連6 crateの全ターゲットClippyと最終整形確認は終了0・エラー0・Warning 0（同じbytesの未変更対象は検査を再利用）。最終source `77044a6b85ee46e8044fa2605204bb073569679590f5ee276984e3a8a8675928` を親も照合済み。最終候補の全workspaceビルドも終了0・エラー0・Warning 0。新しいmetadataとhash照合済みartifactで限定62件を実行し57成功・5失敗、timeout 0。元の22 timeout系列は通過。残りはzsh用app-serverのinitialize待ち3件、daemonの互換probe後の起動flag1件、折返し警告の先頭行だけを取得するTUI fixture1件。TUIは必要な末尾まで継続行を取得し、全文snapshotと全3シナリオのstatus確認を維持するfixtureへ修正。起動の代表2件は同一binary・同一期限の単独実行で成功（zsh 7.983秒、daemon 0.947秒）し、起動時間と並行負荷への感度を支持するが内部原因は断定しない。追加修正後のsource `52e4305d45509055ceb58d4c85986f563e04f8b755e7ebb349940c42230a527b` は整形とTUI全ターゲットClippyが終了0・エラー0・Warning 0、親が原記録と全28ファイルのprimary/隔離先一致を照合。最終ビルド・残り7件・全件の最終受入は未完了 |
+| native CLI/helper pairと実機反映 | 追加修正後のCLI/helper型検査とnative pair buildは配備プロファイルで終了0・エラー0・Warning 0。code commit `4cc76e7ff55162cebf222e99575efca480cf209b` と検査済みRust内容を照合済み。`codex --no-daemon --version` とhelper `--help` も終了0。対のartifactを `offline-native-pair-e/` に退避し、SHA-256を親が再照合（codex `eb482fe6…`、helper `1fd2ea4e…`）。実機反映・pushは未実施。稼働中ren2は観測・メモのみ |
 
 通常RenCrow Compaction/raw restartのsource保持は、opaque envelope・metadata sidecar・transaction marker・context再構築まで静的照合した。正規化済みcheckpoint-only/bounded入力のnested source対応は別の境界であり、対応済みとしない。自動CompactionのTurnComplete待ちtimeoutをCore回帰で再観測し、受付・turn識別を正したfixtureではautomatic/manualとも最初の通常入力で再現した。限定観測とsampleで、保存・認証後のsystem proxy matcher初期化内にあるCFBundleディレクトリ走査へ絞った。配置を変えた同一binaryと補助artifactで圧縮系列が通過し、配置依存の探索遅延を支持する。OS内部で実際に走査したpathはsampleに含まれず、一般的なOS挙動までは断定しない。変更前HEADの型検査は既存Warning3件で静的ゲート未完了となり、build/runtime比較は実施していない。実要求・要約・再開を確認した過去の成功を、その原因修正や全workspace受入の証明にはしない。観測は明示フラグで有効にするspanと失敗時のmethod/path件数だけに限定し、入力・閾値・timeout・assertionは緩和していない。

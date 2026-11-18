@@ -109,24 +109,25 @@ async fn exec_command_with_tty(
     let command = vec!["bash".to_string(), "-lc".to_string(), cmd.to_string()];
     let request = test_exec_request(turn, command.clone(), cwd.clone(), shell_env());
 
-    let process = Arc::new(
-        manager
-            .open_session_with_prepared_exec_env(
-                process_id,
-                &request,
-                /*tool_ctx*/ None,
-                codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
-                /*network_policy_decider*/ None,
-                tty,
-                Box::new(NoopSpawnLifecycle),
-                turn.initial_environments
-                    .primary()
-                    .expect("turn environment")
-                    .environment
-                    .as_ref(),
-            )
-            .await?,
-    );
+    let process = manager
+        .open_session_with_prepared_exec_env(
+            process_id,
+            &request,
+            /*tool_ctx*/ None,
+            codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
+            /*network_policy_decider*/ None,
+            tty,
+            Box::new(NoopSpawnLifecycle),
+            None,
+            None,
+            turn.initial_environments
+                .primary()
+                .expect("turn environment")
+                .environment
+                .as_ref(),
+        )
+        .await?
+        .handoff();
     let context = UnifiedExecContext::new(
         Arc::clone(session),
         crate::session::step_context::StepContext::for_test(Arc::clone(turn)),
@@ -790,6 +791,8 @@ async fn completed_pipe_commands_preserve_exit_code() -> anyhow::Result<()> {
             /*network_policy_decider*/ None,
             /*tty*/ false,
             Box::new(NoopSpawnLifecycle),
+            None,
+            None,
             &environment,
         )
         .await?;
@@ -833,6 +836,8 @@ async fn unified_exec_uses_remote_exec_server_when_configured() -> anyhow::Resul
             /*network_policy_decider*/ None,
             /*tty*/ true,
             Box::new(NoopSpawnLifecycle),
+            None,
+            None,
             remote_test_env.environment(),
         )
         .await?;
@@ -875,7 +880,7 @@ async fn remote_exec_server_rejects_inherited_fd_launches() -> anyhow::Result<()
     );
 
     let manager = UnifiedExecProcessManager::default();
-    let err = manager
+    let result = manager
         .open_session_with_prepared_exec_env(
             /*process_id*/ 1234,
             &request,
@@ -886,14 +891,19 @@ async fn remote_exec_server_rejects_inherited_fd_launches() -> anyhow::Result<()
             Box::new(TestSpawnLifecycle {
                 inherited_fds: vec![42],
             }),
+            None,
+            None,
             turn.initial_environments
                 .primary()
                 .expect("turn environment")
                 .environment
                 .as_ref(),
         )
-        .await
-        .expect_err("expected inherited fd rejection");
+        .await;
+    let err = match result {
+        Ok(_) => panic!("expected inherited fd rejection"),
+        Err(error) => error,
+    };
 
     assert_eq!(
         err.to_string(),

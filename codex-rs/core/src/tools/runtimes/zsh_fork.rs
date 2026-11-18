@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-18: retain nested approval cancellation with the spawned process.
 use crate::sandboxing::ExecRequest;
 use crate::tools::runtimes::unified_exec::UnifiedExecRequest;
 use crate::tools::sandboxing::SandboxAttempt;
@@ -35,13 +36,16 @@ mod unix_escalation;
 mod imp {
     use super::*;
     use crate::tools::runtimes::zsh_fork::unix_escalation;
+    use crate::unified_exec::ExecCancellationDisposition;
     use crate::unified_exec::SpawnLifecycle;
     use codex_shell_escalation::ESCALATE_SOCKET_ENV_VAR;
     use codex_shell_escalation::EscalationSession;
+    use std::sync::Arc;
 
     #[derive(Debug)]
     struct ZshForkSpawnLifecycle {
         escalation_session: EscalationSession,
+        explicit_exec_cancel_receipt: Arc<crate::state::ExplicitExecCancelReceipt>,
     }
 
     impl SpawnLifecycle for ZshForkSpawnLifecycle {
@@ -56,6 +60,17 @@ mod imp {
 
         fn after_spawn(&mut self) {
             self.escalation_session.close_client_socket();
+        }
+
+        fn cancellation_disposition(
+            &self,
+            call_id: &str,
+            turn_id: &str,
+        ) -> Option<ExecCancellationDisposition> {
+            let receipt = &self.explicit_exec_cancel_receipt;
+            receipt
+                .was_cancelled_for_command(call_id, turn_id)
+                .then_some(ExecCancellationDisposition::ExplicitUserCancellation)
         }
     }
 
@@ -83,6 +98,7 @@ mod imp {
             exec_request: prepared.exec_request,
             spawn_lifecycle: Box::new(ZshForkSpawnLifecycle {
                 escalation_session: prepared.escalation_session,
+                explicit_exec_cancel_receipt: prepared.explicit_exec_cancel_receipt,
             }),
         }))
     }

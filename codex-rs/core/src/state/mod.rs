@@ -4,6 +4,9 @@ mod auto_compact_window;
 mod service;
 mod session;
 mod turn;
+#[cfg(test)]
+#[path = "turn_tests.rs"]
+mod turn_tests;
 mod turn_token_usage;
 
 pub(crate) use crate::tools::ExecutedToolCalls;
@@ -22,8 +25,10 @@ pub(crate) use session::TaskPatchAttempt;
 pub(crate) use session::TokenUsageSource;
 pub(crate) use turn::AcceptedUserInputResponse;
 pub(crate) use turn::ActiveTurn;
+pub(crate) use turn::ExplicitExecCancelReceipt;
 pub(crate) use turn::InFlightToolCallGuard;
 pub(crate) use turn::MailboxDeliveryPhase;
+pub(crate) use turn::PendingApproval;
 pub(crate) use turn::PendingRequestPermissions;
 pub(crate) use turn::RunningTask;
 pub(crate) use turn::TaskKind;

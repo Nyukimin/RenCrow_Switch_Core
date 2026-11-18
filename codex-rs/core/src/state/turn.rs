@@ -1,7 +1,9 @@
+// Modified by RenCrow Switch Core, 2026-11-18: retain explicit approval cancellation with its command owner.
 //! Turn-scoped state, input waiters, and active turn metadata.
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use tokio::sync::Mutex;
@@ -89,7 +91,7 @@ pub(crate) struct RunningTask {
 /// Mutable state for a single turn.
 #[derive(Default)]
 pub(crate) struct TurnState {
-    pending_approvals: HashMap<String, oneshot::Sender<ReviewDecision>>,
+    pending_approvals: HashMap<String, PendingApproval>,
     pending_request_permissions: HashMap<String, PendingRequestPermissions>,
     pending_user_input: HashMap<String, oneshot::Sender<AcceptedUserInputResponse>>,
     pending_elicitations: HashMap<(String, RequestId), oneshot::Sender<ElicitationResponse>>,
@@ -136,6 +138,50 @@ pub(crate) struct PendingRequestPermissions {
     pub(crate) environment: TurnEnvironment,
 }
 
+/// Command-owned evidence that a matching exec approval was explicitly canceled.
+/// The process can outlive the turn that launched it, so approval turn identity
+/// is recorded separately in `PendingApproval`.
+#[derive(Debug)]
+pub(crate) struct ExplicitExecCancelReceipt {
+    launch_call_id: String,
+    #[cfg(any(unix, test))]
+    launch_turn_id: String,
+    approval_id: OnceLock<String>,
+}
+
+impl ExplicitExecCancelReceipt {
+    #[cfg(any(unix, test))]
+    pub(crate) fn new(launch_call_id: String, launch_turn_id: String) -> Self {
+        Self {
+            launch_call_id,
+            launch_turn_id,
+            approval_id: OnceLock::new(),
+        }
+    }
+
+    fn record(&self, approval_id: &str) {
+        let _ = self.approval_id.set(approval_id.to_owned());
+    }
+
+    #[cfg(any(unix, test))]
+    pub(crate) fn was_cancelled_for_command(&self, call_id: &str, turn_id: &str) -> bool {
+        self.launch_call_id == call_id
+            && self.launch_turn_id == turn_id
+            && self.approval_id.get().is_some()
+    }
+
+    fn matches_call_id(&self, call_id: &str) -> bool {
+        self.launch_call_id == call_id
+    }
+}
+
+pub(crate) struct PendingApproval {
+    pub(crate) tx: oneshot::Sender<ReviewDecision>,
+    pub(crate) call_id: String,
+    pub(crate) turn_id: String,
+    pub(crate) explicit_exec_cancel_receipt: Option<Arc<ExplicitExecCancelReceipt>>,
+}
+
 impl TurnState {
     pub(crate) fn begin_in_flight_tool_call(&mut self) -> Option<(InFlightToolCallGuard, u64)> {
         self.tool_dispatch_epoch = self.tool_dispatch_epoch.checked_add(1)?;
@@ -147,16 +193,35 @@ impl TurnState {
     pub(crate) fn insert_pending_approval(
         &mut self,
         key: String,
-        tx: oneshot::Sender<ReviewDecision>,
-    ) -> Option<oneshot::Sender<ReviewDecision>> {
-        self.pending_approvals.insert(key, tx)
+        approval: PendingApproval,
+    ) -> Option<PendingApproval> {
+        self.pending_approvals.insert(key, approval)
     }
 
-    pub(crate) fn remove_pending_approval(
-        &mut self,
-        key: &str,
-    ) -> Option<oneshot::Sender<ReviewDecision>> {
+    pub(crate) fn remove_pending_approval(&mut self, key: &str) -> Option<PendingApproval> {
         self.pending_approvals.remove(key)
+    }
+
+    pub(crate) fn record_explicit_exec_cancel(
+        &self,
+        approval_id: &str,
+        response_turn_id: Option<&str>,
+        active_turn_id: &str,
+    ) -> Option<String> {
+        let pending = self.pending_approvals.get(approval_id)?;
+        if active_turn_id != pending.turn_id
+            || response_turn_id.is_some_and(|turn_id| turn_id != pending.turn_id)
+            || pending.tx.is_closed()
+        {
+            return None;
+        }
+        if let Some(receipt) = pending.explicit_exec_cancel_receipt.as_ref() {
+            if !receipt.matches_call_id(&pending.call_id) {
+                return None;
+            }
+            receipt.record(approval_id);
+        }
+        Some(pending.turn_id.clone())
     }
 
     pub(crate) fn clear_pending_waiters(&mut self) {

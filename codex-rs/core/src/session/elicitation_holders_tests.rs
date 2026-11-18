@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-18: keep direct approval registration test aligned with pending metadata.
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -65,6 +66,7 @@ async fn command_approval_holds_an_elicitation_until_response() {
                     /*additional_permissions*/ None,
                     /*available_decisions*/ None,
                     /*plugin_attribution_override*/ Some(plugin_attribution),
+                    /*explicit_exec_cancel_receipt*/ None,
                 )
                 .await
         }

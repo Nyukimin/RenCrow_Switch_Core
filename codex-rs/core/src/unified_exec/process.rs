@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-18: expose command-owned approval cancellation to canonical completion.
 #![allow(clippy::module_inception)]
 
 use std::sync::Arc;
@@ -6,6 +7,7 @@ use std::sync::atomic::Ordering;
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
 use tokio::sync::broadcast;
+use tokio::sync::oneshot;
 use tokio::sync::oneshot::error::TryRecvError;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -29,6 +31,7 @@ use codex_utils_pty::ExecCommandSession;
 use codex_utils_pty::ProcessSignal as PtyProcessSignal;
 use codex_utils_pty::SpawnedPty;
 
+use super::SharedPluginMetricsSidecar;
 use super::UNIFIED_EXEC_OUTPUT_MAX_BYTES;
 use super::UNIFIED_EXEC_OUTPUT_MAX_TOKENS;
 use super::UnifiedExecError;
@@ -48,9 +51,198 @@ pub(crate) trait SpawnLifecycle: std::fmt::Debug + Send + Sync {
     }
 
     fn after_spawn(&mut self) {}
+
+    fn cancellation_disposition(
+        &self,
+        _call_id: &str,
+        _turn_id: &str,
+    ) -> Option<ExecCancellationDisposition> {
+        None
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExecCancellationDisposition {
+    ExplicitUserCancellation,
+    Interrupted,
 }
 
 pub(crate) type SpawnLifecycleHandle = Box<dyn SpawnLifecycle>;
+
+pub(crate) enum StartupProcessResolution {
+    Abandoned,
+    Discarded,
+}
+
+pub(crate) struct StartupProcessResources {
+    pub(crate) process: Arc<UnifiedExecProcess>,
+    pub(crate) early_exit_rx: Option<oneshot::Receiver<i32>>,
+    pub(crate) started_at: tokio::time::Instant,
+    pub(crate) metrics_sidecar: Option<SharedPluginMetricsSidecar>,
+}
+
+pub(crate) trait StartupProcessOwner: std::fmt::Debug + Send + Sync {
+    fn resolve(
+        &self,
+        resources: StartupProcessResources,
+        resolution: StartupProcessResolution,
+    ) -> Result<(), StartupProcessResources>;
+}
+
+pub(crate) struct StartupProcessGuard {
+    process: Arc<UnifiedExecProcess>,
+    early_exit_rx: Option<oneshot::Receiver<i32>>,
+    owner: Option<Arc<dyn StartupProcessOwner>>,
+    resolved: bool,
+    started_at: tokio::time::Instant,
+    metrics_sidecar: Option<SharedPluginMetricsSidecar>,
+}
+
+impl StartupProcessGuard {
+    pub(crate) fn unowned(process: UnifiedExecProcess) -> Self {
+        Self {
+            process: Arc::new(process),
+            early_exit_rx: None,
+            owner: None,
+            resolved: false,
+            started_at: tokio::time::Instant::now(),
+            metrics_sidecar: None,
+        }
+    }
+
+    fn new(
+        process: UnifiedExecProcess,
+        early_exit_rx: oneshot::Receiver<i32>,
+        owner: Option<Arc<dyn StartupProcessOwner>>,
+        metrics_sidecar: Option<SharedPluginMetricsSidecar>,
+    ) -> Self {
+        Self {
+            process: Arc::new(process),
+            early_exit_rx: Some(early_exit_rx),
+            owner,
+            resolved: false,
+            started_at: tokio::time::Instant::now(),
+            metrics_sidecar,
+        }
+    }
+
+    pub(crate) fn process(&self) -> &UnifiedExecProcess {
+        self.process.as_ref()
+    }
+
+    pub(crate) fn process_arc(&self) -> Arc<UnifiedExecProcess> {
+        Arc::clone(&self.process)
+    }
+
+    pub(crate) fn started_at(&self) -> tokio::time::Instant {
+        self.started_at
+    }
+
+    pub(crate) fn set_shell_snapshot(
+        &mut self,
+        shell_snapshot: Option<Arc<ShellSnapshotFile>>,
+    ) -> Result<(), Arc<UnifiedExecProcess>> {
+        let Some(process) = Arc::get_mut(&mut self.process) else {
+            return Err(Arc::clone(&self.process));
+        };
+        process._shell_snapshot = shell_snapshot;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn handoff(mut self) -> Arc<UnifiedExecProcess> {
+        self.disarm();
+        Arc::clone(&self.process)
+    }
+
+    pub(crate) fn disarm(&mut self) {
+        self.resolved = true;
+        self.early_exit_rx.take();
+    }
+
+    pub(crate) fn discard(mut self) {
+        self.resolved = true;
+        let resources = StartupProcessResources {
+            process: Arc::clone(&self.process),
+            early_exit_rx: self.early_exit_rx.take(),
+            started_at: self.started_at,
+            metrics_sidecar: self.metrics_sidecar.take(),
+        };
+        self.resolve_resources(resources, StartupProcessResolution::Discarded);
+    }
+
+    fn resolve_resources(
+        &self,
+        resources: StartupProcessResources,
+        resolution: StartupProcessResolution,
+    ) {
+        let Some(owner) = self.owner.as_ref() else {
+            self.resolve_without_owner(resources, resolution);
+            return;
+        };
+        if let Err(resources) = owner.resolve(resources, resolution) {
+            tracing::error!("unified exec startup completion owner rejected process handoff");
+            resources.process.request_terminate_for_completion();
+            let process = resources.process;
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(async move {
+                    process
+                        .reap_after_completion_termination(resources.early_exit_rx)
+                        .await;
+                });
+            }
+        }
+    }
+
+    fn resolve_without_owner(
+        &self,
+        resources: StartupProcessResources,
+        resolution: StartupProcessResolution,
+    ) {
+        match resolution {
+            StartupProcessResolution::Abandoned => {
+                resources.process.request_terminate_for_completion();
+                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                    let process = Arc::clone(&resources.process);
+                    runtime.spawn(async move {
+                        process
+                            .reap_after_completion_termination(resources.early_exit_rx)
+                            .await;
+                    });
+                } else {
+                    resources.process.terminate();
+                }
+            }
+            StartupProcessResolution::Discarded => {
+                resources.process.terminate();
+            }
+        }
+    }
+}
+
+impl std::ops::Deref for StartupProcessGuard {
+    type Target = UnifiedExecProcess;
+
+    fn deref(&self) -> &Self::Target {
+        self.process()
+    }
+}
+
+impl Drop for StartupProcessGuard {
+    fn drop(&mut self) {
+        if self.resolved {
+            return;
+        }
+        self.resolved = true;
+        let resources = StartupProcessResources {
+            process: Arc::clone(&self.process),
+            early_exit_rx: self.early_exit_rx.take(),
+            started_at: self.started_at,
+            metrics_sidecar: self.metrics_sidecar.take(),
+        };
+        self.resolve_resources(resources, StartupProcessResolution::Abandoned);
+    }
+}
 
 #[derive(Debug, Default)]
 /// Spawn lifecycle that performs no extra setup around process launch.
@@ -92,6 +284,9 @@ pub(crate) struct UnifiedExecProcess {
     process_handle: ProcessHandle,
     output_tx: broadcast::Sender<Vec<u8>>,
     output: OutputHandles,
+    // Owner-backed local runs retain a canonical bounded snapshot because the
+    // initial response collector drains `output_buffer` before terminal emit.
+    completion_output_buffer: Option<Arc<Mutex<HeadTailBuffer>>>,
     output_drained: Arc<Notify>,
     interaction_lock: Arc<Mutex<()>>,
     state_tx: watch::Sender<ProcessState>,
@@ -135,6 +330,7 @@ impl UnifiedExecProcess {
             process_handle,
             output_tx,
             output,
+            completion_output_buffer: None,
             output_drained,
             interaction_lock: Arc::new(Mutex::new(())),
             state_tx,
@@ -145,6 +341,16 @@ impl UnifiedExecProcess {
             _spawn_lifecycle: spawn_lifecycle,
             _shell_snapshot: None,
         }
+    }
+
+    pub(crate) fn cancellation_disposition(
+        &self,
+        call_id: &str,
+        turn_id: &str,
+    ) -> Option<ExecCancellationDisposition> {
+        self._spawn_lifecycle
+            .as_ref()?
+            .cancellation_disposition(call_id, turn_id)
     }
 
     pub(super) async fn write(&self, data: &[u8]) -> Result<(), UnifiedExecError> {
@@ -241,6 +447,45 @@ impl UnifiedExecProcess {
         self.finish_termination();
     }
 
+    pub(crate) fn request_terminate_for_completion(&self) {
+        match &self.process_handle {
+            ProcessHandle::Local(process_handle) => process_handle.request_terminate(),
+            ProcessHandle::ExecServer(process_handle) => {
+                let process_handle = Arc::clone(process_handle);
+                tokio::spawn(async move {
+                    let _ = process_handle.terminate().await;
+                });
+            }
+        }
+    }
+
+    pub(crate) async fn reap_after_completion_termination(
+        &self,
+        early_exit_rx: Option<oneshot::Receiver<i32>>,
+    ) {
+        if let Some(exit_rx) = early_exit_rx {
+            self.signal_exit(exit_rx.await.ok());
+        } else {
+            let mut state_rx = self.state_rx.clone();
+            while !state_rx.borrow().has_exited {
+                if state_rx.changed().await.is_err() {
+                    break;
+                }
+            }
+        }
+
+        if self.output.output_closed.load(Ordering::Acquire) {
+            return;
+        }
+        let output_closed = self.output.output_closed_notify.notified();
+        tokio::pin!(output_closed);
+        output_closed.as_mut().enable();
+        if self.output.output_closed.load(Ordering::Acquire) {
+            return;
+        }
+        let _ = tokio::time::timeout(Duration::from_millis(100), output_closed).await;
+    }
+
     pub(super) async fn terminate_confirmed(&self) -> Result<(), UnifiedExecError> {
         match &self.process_handle {
             ProcessHandle::Local(process_handle) => process_handle.terminate(),
@@ -276,9 +521,15 @@ impl UnifiedExecProcess {
         self.terminate();
     }
 
-    async fn snapshot_output(&self) -> Vec<u8> {
+    pub(crate) async fn snapshot_output(&self) -> Vec<u8> {
         let guard = self.output.output_buffer.lock().await;
         guard.to_bytes()
+    }
+
+    pub(crate) async fn snapshot_completion_output(&self) -> Option<Vec<u8>> {
+        let output_buffer = self.completion_output_buffer.as_ref()?;
+        let guard = output_buffer.lock().await;
+        Some(guard.to_bytes_with_omission_marker())
     }
 
     pub(crate) fn sandbox_type(&self) -> SandboxType {
@@ -344,12 +595,14 @@ impl UnifiedExecProcess {
         spawned: SpawnedPty,
         sandbox_type: SandboxType,
         spawn_lifecycle: SpawnLifecycleHandle,
-    ) -> Result<Self, UnifiedExecError> {
+        owner: Option<Arc<dyn StartupProcessOwner>>,
+        metrics_sidecar: Option<SharedPluginMetricsSidecar>,
+    ) -> Result<StartupProcessGuard, UnifiedExecError> {
         let SpawnedPty {
             session: process_handle,
             stdout_rx,
             stderr_rx,
-            mut exit_rx,
+            exit_rx,
         } = spawned;
         let output_rx = codex_utils_pty::combine_output_receivers(stdout_rx, stderr_rx);
         let mut managed = Self::new(
@@ -357,35 +610,74 @@ impl UnifiedExecProcess {
             sandbox_type,
             Some(spawn_lifecycle),
         );
+        let completion_output_buffer = owner
+            .as_ref()
+            .map(|_| Arc::new(Mutex::new(HeadTailBuffer::default())));
+        managed.completion_output_buffer = completion_output_buffer.clone();
         managed.output_task = Some(Self::spawn_local_output_task(
             output_rx,
             managed.output_handles().clone(),
             managed.output_tx.clone(),
+            completion_output_buffer,
         ));
+        let mut guard = StartupProcessGuard::new(managed, exit_rx, owner, metrics_sidecar);
 
-        match exit_rx.try_recv() {
+        let early_exit = match guard.early_exit_rx.as_mut() {
+            Some(exit_rx) => exit_rx.try_recv(),
+            None => {
+                return Err(UnifiedExecError::process_failed(
+                    "spawned process lost its startup exit receiver".to_string(),
+                ));
+            }
+        };
+        match early_exit {
             Ok(exit_code) => {
-                managed.signal_exit(Some(exit_code));
-                managed.check_for_sandbox_denial().await?;
-                return Ok(managed);
+                guard.early_exit_rx.take();
+                guard.process().signal_exit(Some(exit_code));
+                if let Err(error) = guard.process().check_for_sandbox_denial().await {
+                    guard.discard();
+                    return Err(error);
+                }
+                return Ok(guard);
             }
             Err(TryRecvError::Closed) => {
-                managed.signal_exit(/*exit_code*/ None);
-                managed.check_for_sandbox_denial().await?;
-                return Ok(managed);
+                guard.early_exit_rx.take();
+                guard.process().signal_exit(/*exit_code*/ None);
+                if let Err(error) = guard.process().check_for_sandbox_denial().await {
+                    guard.discard();
+                    return Err(error);
+                }
+                return Ok(guard);
             }
             Err(TryRecvError::Empty) => {}
         }
 
-        if let Ok(exit_result) = tokio::time::timeout(EARLY_EXIT_GRACE_PERIOD, &mut exit_rx).await {
-            managed.signal_exit(exit_result.ok());
-            managed.check_for_sandbox_denial().await?;
-            return Ok(managed);
+        let early_exit_result = match guard.early_exit_rx.as_mut() {
+            Some(exit_rx) => tokio::time::timeout(EARLY_EXIT_GRACE_PERIOD, exit_rx).await,
+            None => {
+                return Err(UnifiedExecError::process_failed(
+                    "spawned process lost its startup exit receiver".to_string(),
+                ));
+            }
+        };
+        if let Ok(exit_result) = early_exit_result {
+            guard.early_exit_rx.take();
+            guard.process().signal_exit(exit_result.ok());
+            if let Err(error) = guard.process().check_for_sandbox_denial().await {
+                guard.discard();
+                return Err(error);
+            }
+            return Ok(guard);
         }
 
+        let Some(exit_rx) = guard.early_exit_rx.take() else {
+            return Err(UnifiedExecError::process_failed(
+                "spawned process lost its startup exit receiver".to_string(),
+            ));
+        };
         tokio::spawn({
-            let state_tx = managed.state_tx.clone();
-            let cancellation_token = managed.output.cancellation_token.clone();
+            let state_tx = guard.process().state_tx.clone();
+            let cancellation_token = guard.process().output.cancellation_token.clone();
             async move {
                 let exit_code = exit_rx.await.ok();
                 let state = state_tx.borrow().clone();
@@ -394,7 +686,7 @@ impl UnifiedExecProcess {
             }
         });
 
-        Ok(managed)
+        Ok(guard)
     }
 
     pub(super) async fn from_exec_server_started(
@@ -605,6 +897,7 @@ impl UnifiedExecProcess {
         mut receiver: tokio::sync::broadcast::Receiver<Vec<u8>>,
         output_handles: OutputHandles,
         output_tx: broadcast::Sender<Vec<u8>>,
+        completion_output_buffer: Option<Arc<Mutex<HeadTailBuffer>>>,
     ) -> JoinHandle<()> {
         let OutputHandles {
             output_buffer,
@@ -621,6 +914,9 @@ impl UnifiedExecProcess {
             loop {
                 match receiver.recv().await {
                     Ok(chunk) => {
+                        if let Some(completion_output_buffer) = completion_output_buffer.as_ref() {
+                            completion_output_buffer.lock().await.push_chunk(&chunk);
+                        }
                         let mut guard = output_buffer.lock().await;
                         guard.push_chunk(&chunk);
                         drop(guard);
@@ -638,7 +934,7 @@ impl UnifiedExecProcess {
         })
     }
 
-    fn signal_exit(&self, exit_code: Option<i32>) {
+    pub(crate) fn signal_exit(&self, exit_code: Option<i32>) {
         let state = self.state_rx.borrow().clone();
         let _ = self.state_tx.send_replace(state.exited(exit_code));
         self.output.cancellation_token.cancel();

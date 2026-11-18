@@ -8,6 +8,7 @@ use super::extract_shell_script;
 use super::join_program_and_argv;
 use crate::config::Constrained;
 use crate::guardian::GuardianReviewContext;
+// Modified by RenCrow Switch Core, 2026-11-18: initialize optional command-owned cancellation receipts in provider fixtures.
 use crate::sandboxing::SandboxPermissions;
 use crate::session::tests::make_session_and_context;
 use crate::tools::runtimes::tests::test_credential_broker_network_proxy;
@@ -447,6 +448,7 @@ async fn preapproved_additional_permissions_escalate_intercepted_exec() -> anyho
         session: Arc::new(session),
         review_context: GuardianReviewContext::from(Arc::new(turn_context)),
         call_id: "preapproved-additional-permissions".to_string(),
+        explicit_exec_cancel_receipt: None,
         environment_id: "local".to_string(),
         source: GuardianCommandSource::UnifiedExec,
         tool_name: ToolName::plain("exec_command"),
@@ -615,6 +617,7 @@ async fn execve_permission_request_hook_short_circuits_prompt() -> anyhow::Resul
         session: Arc::clone(&session),
         review_context: GuardianReviewContext::from(turn_context),
         call_id: "execve-hook-call".to_string(),
+        explicit_exec_cancel_receipt: None,
         environment_id: "local".to_string(),
         source: GuardianCommandSource::UnifiedExec,
         tool_name: ToolName::plain("exec_command"),
@@ -826,6 +829,7 @@ prefix_rule(pattern = ["{cat_path_literal}"], decision = "allow")
         session: Arc::new(session),
         review_context: GuardianReviewContext::from(Arc::new(turn_context)),
         call_id: "deny-read-prefix-allow".to_string(),
+        explicit_exec_cancel_receipt: None,
         environment_id: "local".to_string(),
         source: GuardianCommandSource::UnifiedExec,
         tool_name: ToolName::plain("exec_command"),
@@ -863,6 +867,7 @@ async fn denied_reads_keep_granular_sandbox_rejection_for_escalation() -> anyhow
         session: Arc::new(session),
         review_context: GuardianReviewContext::from(Arc::new(turn_context)),
         call_id: "deny-read-granular-sandbox-reject".to_string(),
+        explicit_exec_cancel_receipt: None,
         environment_id: "local".to_string(),
         source: GuardianCommandSource::UnifiedExec,
         tool_name: ToolName::plain("exec_command"),

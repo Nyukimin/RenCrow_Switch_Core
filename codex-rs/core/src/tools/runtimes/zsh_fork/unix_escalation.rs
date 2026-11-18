@@ -1,9 +1,11 @@
+// Modified by RenCrow Switch Core, 2026-11-18: preserve explicit nested approval cancellation for parent command completion.
 use crate::exec::ExecCapturePolicy;
 use crate::exec::ExecExpiration;
 use crate::guardian::GuardianReviewContext;
 use crate::sandboxing::ExecOptions;
 use crate::sandboxing::ExecRequest;
 use crate::sandboxing::SandboxPermissions;
+use crate::state::ExplicitExecCancelReceipt;
 use crate::tools::approvals::ApprovalAction;
 use crate::tools::approvals::ApprovalContext;
 use crate::tools::runtimes::exec_env_for_sandbox_permissions;
@@ -59,6 +61,7 @@ use uuid::Uuid;
 pub(crate) struct PreparedUnifiedExecZshFork {
     pub(crate) exec_request: ExecRequest,
     pub(crate) escalation_session: EscalationSession,
+    pub(crate) explicit_exec_cancel_receipt: Arc<ExplicitExecCancelReceipt>,
 }
 
 const PROMPT_CONFLICT_REASON: &str =
@@ -144,11 +147,16 @@ pub(crate) async fn prepare_unified_exec_zsh_fork(
         codex_linux_sandbox_exe: ctx.step_context.turn.config.codex_linux_sandbox_exe.clone(),
         use_legacy_landlock: req.turn_environment.config().use_legacy_landlock,
     };
+    let explicit_exec_cancel_receipt = Arc::new(ExplicitExecCancelReceipt::new(
+        ctx.call_id.clone(),
+        ctx.step_context.turn.sub_id.clone(),
+    ));
     let escalation_policy = CoreShellActionProvider {
         policy: Arc::clone(&exec_policy),
         session: Arc::clone(&ctx.session),
         review_context: GuardianReviewContext::from(&ctx.step_context),
         call_id: ctx.call_id.clone(),
+        explicit_exec_cancel_receipt: Some(Arc::clone(&explicit_exec_cancel_receipt)),
         environment_id: req.turn_environment.selection.environment_id.clone(),
         source: GuardianCommandSource::UnifiedExec,
         tool_name: ctx.tool_name.clone(),
@@ -176,6 +184,7 @@ pub(crate) async fn prepare_unified_exec_zsh_fork(
     Ok(Some(PreparedUnifiedExecZshFork {
         exec_request,
         escalation_session,
+        explicit_exec_cancel_receipt,
     }))
 }
 
@@ -184,6 +193,7 @@ struct CoreShellActionProvider {
     session: Arc<crate::session::session::Session>,
     review_context: GuardianReviewContext,
     call_id: String,
+    explicit_exec_cancel_receipt: Option<Arc<ExplicitExecCancelReceipt>>,
     environment_id: String,
     source: GuardianCommandSource,
     tool_name: ToolName,
@@ -306,6 +316,7 @@ impl CoreShellActionProvider {
                     approval_reason: None,
                     retry_reason: None,
                     network_approval_context: None,
+                    explicit_exec_cancel_receipt: self.explicit_exec_cancel_receipt.clone(),
                 };
                 self.session.request_approval(action, approval_ctx).await
             })

@@ -21,9 +21,16 @@ use codex_app_server_protocol::CommandExecutionStatus;
 use codex_app_server_protocol::ItemCompletedNotification;
 use codex_app_server_protocol::ItemStartedNotification;
 use codex_app_server_protocol::ServerRequest;
+use codex_app_server_protocol::SortDirection;
 use codex_app_server_protocol::ThreadItem;
+use codex_app_server_protocol::ThreadItemsListParams;
+use codex_app_server_protocol::ThreadItemsListResponse;
+use codex_app_server_protocol::ThreadReadParams;
+use codex_app_server_protocol::ThreadReadResponse;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
+use codex_app_server_protocol::ThreadTurnsListParams;
+use codex_app_server_protocol::ThreadTurnsListResponse;
 use codex_app_server_protocol::TurnCompletedNotification;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
@@ -539,6 +546,8 @@ async fn turn_start_shell_zsh_fork_subcommand_decline_marks_parent_declined_v2()
         CommandExecutionApprovalDecision::Accept,
         CommandExecutionApprovalDecision::Cancel,
     ];
+    // This is a nested command approval: accept the first prompt, then cancel
+    // the second. The child decision must propagate as a declined parent item.
     let mut target_decision_index = 0;
     let first_file_str = first_file.to_string_lossy().into_owned();
     let second_file_str = second_file.to_string_lossy().into_owned();
@@ -619,101 +628,164 @@ async fn turn_start_shell_zsh_fork_subcommand_decline_marks_parent_declined_v2()
     assert_eq!(approved_subcommand_strings.len(), 2);
     assert!(approved_subcommand_strings[0].contains(&first_file.display().to_string()));
     assert!(approved_subcommand_strings[1].contains(&second_file.display().to_string()));
-    let parent_completed_command_execution = timeout(DEFAULT_READ_TIMEOUT, async {
-        loop {
-            let completed_notif = mcp
-                .read_stream_until_notification_message("item/completed")
-                .await?;
-            let completed: ItemCompletedNotification = serde_json::from_value(
-                completed_notif
-                    .params
-                    .clone()
-                    .expect("item/completed params"),
-            )?;
-            if let ThreadItem::CommandExecution { id, .. } = &completed.item
-                && id == "call-zsh-fork-subcommand-decline"
-            {
-                return Ok::<ThreadItem, anyhow::Error>(completed.item);
-            }
-        }
-    })
-    .await;
+    let mut parent_completion = None;
+    let mut turn_completion = None;
+    while parent_completion.is_none() || turn_completion.is_none() {
+        let notification = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_matching_notification(
+                "nested zsh cancellation completion",
+                |n| match n.method.as_str() {
+                    "item/completed" => n.params.as_ref().is_some_and(|params| {
+                        serde_json::from_value::<ItemCompletedNotification>(params.clone())
+                            .is_ok_and(|completed| {
+                                completed.thread_id == thread.id
+                                    && completed.turn_id == turn.id
+                                    && matches!(
+                                        completed.item,
+                                        ThreadItem::CommandExecution { ref id, .. }
+                                            if id == "call-zsh-fork-subcommand-decline"
+                                    )
+                            })
+                    }),
+                    "turn/completed" => n.params.as_ref().is_some_and(|params| {
+                        serde_json::from_value::<TurnCompletedNotification>(params.clone())
+                            .is_ok_and(|completed| {
+                                completed.thread_id == thread.id && completed.turn.id == turn.id
+                            })
+                    }),
+                    _ => false,
+                },
+            ),
+        )
+        .await??;
 
-    match parent_completed_command_execution {
-        Ok(Ok(parent_completed_command_execution)) => {
-            let ThreadItem::CommandExecution {
-                id,
-                status,
-                aggregated_output,
-                ..
-            } = parent_completed_command_execution
-            else {
-                unreachable!("loop ensures we break on parent command execution item");
-            };
-            assert_eq!(id, "call-zsh-fork-subcommand-decline");
-            assert_eq!(status, CommandExecutionStatus::Declined);
-            if let Some(output) = aggregated_output.as_deref() {
+        match notification.method.as_str() {
+            "item/completed" => {
+                let completed: ItemCompletedNotification = serde_json::from_value(
+                    notification
+                        .params
+                        .expect("item/completed params must be present"),
+                )?;
                 assert!(
-                    output == "exec command rejected by user"
-                        || output.contains("sandbox denied exec error"),
-                    "unexpected aggregated output: {output}"
+                    parent_completion.replace(completed.item).is_none(),
+                    "parent command emitted more than one terminal item"
                 );
             }
-
-            match timeout(
-                DEFAULT_READ_TIMEOUT,
-                mcp.read_stream_until_notification_message("turn/completed"),
-            )
-            .await
-            {
-                Ok(Ok(completed_notif)) => {
-                    let completed: TurnCompletedNotification = serde_json::from_value(
-                        completed_notif
-                            .params
-                            .expect("turn/completed params must be present"),
-                    )?;
-                    assert_eq!(completed.thread_id, thread.id);
-                    assert_eq!(completed.turn.id, turn.id);
-                    assert!(matches!(
-                        completed.turn.status,
-                        TurnStatus::Interrupted | TurnStatus::Completed
-                    ));
-                }
-                Ok(Err(error)) => return Err(error),
-                Err(_) => {
-                    mcp.interrupt_turn_and_wait_for_aborted(
-                        thread.id.clone(),
-                        turn.id.clone(),
-                        DEFAULT_READ_TIMEOUT,
-                    )
-                    .await?;
-                }
+            "turn/completed" => {
+                let completed: TurnCompletedNotification = serde_json::from_value(
+                    notification
+                        .params
+                        .expect("turn/completed params must be present"),
+                )?;
+                assert_eq!(completed.thread_id, thread.id);
+                assert_eq!(completed.turn.id, turn.id);
+                assert_eq!(completed.turn.status, TurnStatus::Interrupted);
+                assert!(
+                    turn_completion.replace(completed).is_none(),
+                    "turn emitted more than one completion notification"
+                );
             }
-        }
-        Ok(Err(error)) => return Err(error),
-        Err(_) => {
-            // Some zsh builds abort the turn immediately after the rejected
-            // subcommand without emitting a parent `item/completed`, and Linux
-            // sandbox failures can also complete the turn before the parent
-            // completion item is observed.
-            let completed_notif = timeout(
-                DEFAULT_READ_TIMEOUT,
-                mcp.read_stream_until_notification_message("turn/completed"),
-            )
-            .await??;
-            let completed: TurnCompletedNotification = serde_json::from_value(
-                completed_notif
-                    .params
-                    .expect("turn/completed params must be present"),
-            )?;
-            assert_eq!(completed.thread_id, thread.id);
-            assert_eq!(completed.turn.id, turn.id);
-            assert!(matches!(
-                completed.turn.status,
-                TurnStatus::Interrupted | TurnStatus::Completed
-            ));
+            _ => unreachable!("predicate only accepts target completion notifications"),
         }
     }
+
+    assert!(
+        !first_file.exists(),
+        "accepted first command should remove its file"
+    );
+    assert!(
+        second_file.exists(),
+        "canceled second command must leave its file"
+    );
+    let ThreadItem::CommandExecution {
+        id,
+        status,
+        aggregated_output,
+        ..
+    } = parent_completion.expect("parent terminal event was collected")
+    else {
+        unreachable!("predicate only collects the parent command execution");
+    };
+    assert_eq!(id, "call-zsh-fork-subcommand-decline");
+    assert_eq!(status, CommandExecutionStatus::Declined);
+    if let Some(output) = aggregated_output.as_deref() {
+        assert!(
+            output == "exec command rejected by user"
+                || output.contains("sandbox denied exec error"),
+            "unexpected aggregated output: {output}"
+        );
+    }
+
+    // The default non-ephemeral thread store uses paginated history. Read
+    // thread metadata as a persistence barrier, then use the paginated APIs.
+    let read_id = mcp
+        .send_thread_read_request(ThreadReadParams {
+            thread_id: thread.id.clone(),
+            include_turns: false,
+        })
+        .await?;
+    let ThreadReadResponse {
+        thread: read_thread,
+    } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(read_id)).await??;
+    assert_eq!(read_thread.id, thread.id);
+
+    let turns_id = mcp
+        .send_thread_turns_list_request(ThreadTurnsListParams {
+            thread_id: thread.id.clone(),
+            cursor: None,
+            limit: None,
+            sort_direction: Some(SortDirection::Asc),
+            items_view: None,
+        })
+        .await?;
+    let ThreadTurnsListResponse {
+        data: persisted_turns,
+        ..
+    } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(turns_id)).await??;
+    let persisted_turn = persisted_turns
+        .iter()
+        .find(|persisted_turn| persisted_turn.id == turn.id)
+        .expect("interrupted turn should be persisted by thread/turns/list");
+    assert_eq!(
+        persisted_turn.status,
+        TurnStatus::Interrupted,
+        "thread/turns/list must persist the interrupted status"
+    );
+
+    let mut items_cursor = None;
+    let mut persisted_parent_items = Vec::new();
+    loop {
+        let items_id = mcp
+            .send_thread_items_list_request(ThreadItemsListParams {
+                thread_id: thread.id.clone(),
+                turn_id: Some(turn.id.clone()),
+                cursor: items_cursor,
+                limit: None,
+                sort_direction: Some(SortDirection::Asc),
+            })
+            .await?;
+        let ThreadItemsListResponse {
+            data, next_cursor, ..
+        } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(items_id)).await??;
+        persisted_parent_items.extend(data.into_iter().filter_map(|entry| match entry.item {
+            ThreadItem::CommandExecution { id, status, .. }
+                if id == "call-zsh-fork-subcommand-decline" =>
+            {
+                Some(status)
+            }
+            _ => None,
+        }));
+        let Some(next_cursor) = next_cursor else {
+            break;
+        };
+        items_cursor = Some(next_cursor);
+    }
+    assert_eq!(
+        persisted_parent_items,
+        vec![CommandExecutionStatus::Declined],
+        "thread/items/list must persist exactly one declined parent command item"
+    );
 
     Ok(())
 }

@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-18: initialize cancellation metadata in approval fixtures.
 use super::*;
 use crate::session::tests::make_session_and_context_with_rx;
 use codex_models_manager::model_info::model_info_from_slug;
@@ -131,6 +132,7 @@ async fn non_utf8_cwd_preserves_approval_routing(
         approval_reason: None,
         retry_reason: None,
         network_approval_context: None,
+        explicit_exec_cancel_receipt: None,
     };
     let action = ApprovalAction::ExecCommand {
         id: context.call_id.clone(),
@@ -213,6 +215,7 @@ async fn explicit_mcp_reviewer_override_takes_precedence_over_action_context() {
         approval_reason: None,
         retry_reason: None,
         network_approval_context: None,
+        explicit_exec_cancel_receipt: None,
     };
 
     tokio::select! {

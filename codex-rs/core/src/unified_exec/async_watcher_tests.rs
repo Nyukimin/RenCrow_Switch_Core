@@ -7,6 +7,10 @@ use super::spawn_exit_watcher;
 use super::start_streaming_output;
 use super::utf8_boundary;
 use crate::session::tests::make_session_and_context_with_rx;
+use crate::unified_exec::CompletionOwnerContext;
+use crate::unified_exec::StartupProcessGuard;
+use crate::unified_exec::StartupProcessOwner;
+use crate::unified_exec::UnifiedExecCompletionOwner;
 use crate::unified_exec::UnifiedExecContext;
 use crate::unified_exec::head_tail_buffer::HeadTailBuffer;
 use crate::unified_exec::process::NoopSpawnLifecycle;
@@ -22,6 +26,102 @@ use codex_sandboxing::SandboxType;
 use pretty_assertions::assert_eq;
 use tokio::time::Duration;
 use tokio::time::Instant;
+
+async fn process_for_completion_test(
+    owner: Option<Arc<dyn StartupProcessOwner>>,
+) -> anyhow::Result<(
+    StartupProcessGuard,
+    tokio::sync::broadcast::Sender<Vec<u8>>,
+    tokio::sync::oneshot::Sender<i32>,
+)> {
+    let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+    let (stdout_tx, stdout_rx) = tokio::sync::broadcast::channel::<Vec<u8>>(8);
+    let (exit_tx, exit_rx) = tokio::sync::oneshot::channel::<i32>();
+    let spawned = codex_utils_pty::spawn_from_driver(codex_utils_pty::ProcessDriver {
+        writer_tx,
+        stdout_rx,
+        stderr_rx: None,
+        exit_rx,
+        terminator: None,
+        writer_handle: None,
+        resizer: None,
+        #[cfg(windows)]
+        tty: false,
+    });
+    let process = UnifiedExecProcess::from_spawned(
+        spawned,
+        SandboxType::None,
+        Box::new(NoopSpawnLifecycle),
+        owner,
+        None,
+    )
+    .await?;
+    Ok((process, stdout_tx, exit_tx))
+}
+
+async fn completed_command_event(
+    rx_event: &async_channel::Receiver<Event>,
+) -> anyhow::Result<codex_protocol::items::CommandExecutionItem> {
+    loop {
+        let event = rx_event.recv().await?;
+        if let EventMsg::ItemCompleted(completed) = event.msg
+            && let TurnItem::CommandExecution(item) = completed.item
+        {
+            return Ok(item);
+        }
+    }
+}
+
+fn assert_no_duplicate_command_execution_completion(
+    rx_event: &async_channel::Receiver<Event>,
+    call_id: &str,
+) {
+    let mut remaining_events = Vec::new();
+    while let Ok(event) = rx_event.try_recv() {
+        remaining_events.push(event);
+    }
+    let has_duplicate_completion = remaining_events.iter().any(|event| {
+        let EventMsg::ItemCompleted(completed) = &event.msg else {
+            return false;
+        };
+        let TurnItem::CommandExecution(item) = &completed.item else {
+            return false;
+        };
+        item.id == call_id
+    });
+    assert!(
+        !has_duplicate_completion,
+        "received another CommandExecution completion for {call_id}; remaining events: {remaining_events:?}"
+    );
+}
+
+fn completion_owner_for_test(
+    context: &UnifiedExecContext,
+    transcript: Arc<tokio::sync::Mutex<HeadTailBuffer>>,
+) -> Arc<UnifiedExecCompletionOwner> {
+    let cwd = context
+        .step_context
+        .environments
+        .primary()
+        .expect("turn environment")
+        .cwd()
+        .clone();
+    UnifiedExecCompletionOwner::new(CompletionOwnerContext {
+        context: Arc::new(UnifiedExecContext::new(
+            Arc::clone(&context.session),
+            Arc::clone(&context.step_context),
+            context.cancellation_token.clone(),
+            context.call_id.clone(),
+        )),
+        command: vec!["test-command".to_string()],
+        cwd,
+        process_id: 456,
+        plugin_attribution: None,
+        transcript,
+        task_evidence: None,
+        network_cleanup: std::sync::Mutex::new(None),
+    })
+}
 
 struct StreamingOutputHarness {
     process: Arc<UnifiedExecProcess>,
@@ -47,10 +147,15 @@ async fn streaming_output_harness() -> anyhow::Result<StreamingOutputHarness> {
         #[cfg(windows)]
         tty: false,
     });
-    let process = Arc::new(
-        UnifiedExecProcess::from_spawned(spawned, SandboxType::None, Box::new(NoopSpawnLifecycle))
-            .await?,
-    );
+    let process = UnifiedExecProcess::from_spawned(
+        spawned,
+        SandboxType::None,
+        Box::new(NoopSpawnLifecycle),
+        None,
+        None,
+    )
+    .await?
+    .handoff();
     let (session, turn, rx_event) = make_session_and_context_with_rx().await;
     let context = UnifiedExecContext::new(
         session,
@@ -69,6 +174,192 @@ async fn streaming_output_harness() -> anyhow::Result<StreamingOutputHarness> {
         context,
         rx_event,
     })
+}
+
+#[tokio::test]
+async fn startup_guard_drop_transfers_child_to_completion_owner() -> anyhow::Result<()> {
+    let (session, turn, rx_event) = make_session_and_context_with_rx().await;
+    let context = UnifiedExecContext::new(
+        session,
+        crate::session::step_context::StepContext::for_test(turn),
+        tokio_util::sync::CancellationToken::new(),
+        "startup-owner-drop".to_string(),
+    );
+    let owner = completion_owner_for_test(
+        &context,
+        Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::default())),
+    );
+    let startup_owner: Arc<dyn StartupProcessOwner> = owner.clone();
+    let (process_guard, stdout_tx, exit_tx) =
+        process_for_completion_test(Some(startup_owner)).await?;
+
+    let output_notify = Arc::clone(&process_guard.process().output_handles().output_notify);
+    let output_ready = output_notify.notified();
+    tokio::pin!(output_ready);
+    output_ready.as_mut().enable();
+    stdout_tx.send(b"prefix before Begin".to_vec())?;
+    tokio::time::timeout(Duration::from_secs(1), &mut output_ready).await?;
+    assert_eq!(
+        process_guard
+            .process()
+            .snapshot_completion_output()
+            .await
+            .as_deref(),
+        Some(b"prefix before Begin".as_slice()),
+    );
+
+    drop(process_guard);
+    exit_tx.send(7).expect("signal child exit");
+    drop(stdout_tx);
+
+    let item = completed_command_event(&rx_event).await?;
+    assert_eq!(item.status, CommandExecutionStatus::Failed);
+    assert_eq!(item.exit_code, Some(7));
+    assert_eq!(
+        item.aggregated_output.as_deref(),
+        Some("prefix before Begin"),
+    );
+    assert_eq!(item.id, context.call_id);
+    assert_no_duplicate_command_execution_completion(&rx_event, &context.call_id);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn startup_guard_drop_with_closed_exit_channel_finishes_terminal_once() -> anyhow::Result<()>
+{
+    let (session, turn, rx_event) = make_session_and_context_with_rx().await;
+    let context = UnifiedExecContext::new(
+        session,
+        crate::session::step_context::StepContext::for_test(turn),
+        tokio_util::sync::CancellationToken::new(),
+        "startup-owner-closed-exit".to_string(),
+    );
+    let owner = completion_owner_for_test(
+        &context,
+        Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::default())),
+    );
+    let startup_owner: Arc<dyn StartupProcessOwner> = owner;
+
+    let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+    let (stdout_tx, stdout_rx) = tokio::sync::broadcast::channel::<Vec<u8>>(8);
+    let (exit_tx, exit_rx) = tokio::sync::oneshot::channel::<i32>();
+    let spawned = codex_utils_pty::spawn_from_driver(codex_utils_pty::ProcessDriver {
+        writer_tx,
+        stdout_rx,
+        stderr_rx: None,
+        exit_rx,
+        terminator: None,
+        writer_handle: None,
+        resizer: None,
+        #[cfg(windows)]
+        tty: false,
+    });
+    let mut startup = Box::pin(UnifiedExecProcess::from_spawned(
+        spawned,
+        SandboxType::None,
+        Box::new(NoopSpawnLifecycle),
+        Some(startup_owner),
+        None,
+    ));
+    assert!(futures::poll!(startup.as_mut()).is_pending());
+
+    drop(startup);
+    drop(exit_tx);
+    drop(stdout_tx);
+
+    let item =
+        tokio::time::timeout(Duration::from_secs(1), completed_command_event(&rx_event)).await??;
+    assert_eq!(item.status, CommandExecutionStatus::Failed);
+    assert_eq!(item.exit_code, Some(-1));
+    assert_eq!(item.id, context.call_id);
+    assert_no_duplicate_command_execution_completion(&rx_event, &context.call_id);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn completion_owner_channel_close_finishes_active_child_once() -> anyhow::Result<()> {
+    let (session, turn, rx_event) = make_session_and_context_with_rx().await;
+    let context = UnifiedExecContext::new(
+        session,
+        crate::session::step_context::StepContext::for_test(turn),
+        tokio_util::sync::CancellationToken::new(),
+        "completion-owner-close".to_string(),
+    );
+    let (process_guard, stdout_tx, exit_tx) = process_for_completion_test(None).await?;
+    let process = process_guard.handoff();
+    let owner = completion_owner_for_test(
+        &context,
+        Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::default())),
+    );
+    owner
+        .begin(Arc::clone(&process), Instant::now(), None)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    drop(owner);
+    exit_tx.send(7).expect("signal child exit");
+    drop(stdout_tx);
+
+    let item = completed_command_event(&rx_event).await?;
+    assert_eq!(item.status, CommandExecutionStatus::Failed);
+    assert_eq!(item.exit_code, Some(7));
+    assert_eq!(item.id, context.call_id);
+    assert_no_duplicate_command_execution_completion(&rx_event, &context.call_id);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn owner_completion_does_not_wait_for_consumed_output_drain_notification()
+-> anyhow::Result<()> {
+    let (session, turn, rx_event) = make_session_and_context_with_rx().await;
+    let context = UnifiedExecContext::new(
+        session,
+        crate::session::step_context::StepContext::for_test(turn),
+        tokio_util::sync::CancellationToken::new(),
+        "completion-owner-drain".to_string(),
+    );
+    let (process_guard, stdout_tx, exit_tx) = process_for_completion_test(None).await?;
+    let started_at = process_guard.started_at();
+    let process = process_guard.handoff();
+    let transcript = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::default()));
+    let owner = completion_owner_for_test(&context, Arc::clone(&transcript));
+    owner
+        .begin(Arc::clone(&process), started_at, None)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let cwd = context
+        .step_context
+        .environments
+        .primary()
+        .expect("turn environment")
+        .cwd()
+        .clone();
+    spawn_exit_watcher(
+        Arc::clone(&process),
+        &context,
+        vec!["test-command".to_string()],
+        cwd,
+        456,
+        None,
+        transcript,
+        Instant::now(),
+        None,
+        None,
+        None,
+        Some(owner),
+    );
+
+    exit_tx.send(0).expect("signal child exit");
+    drop(stdout_tx);
+    let item = completed_command_event(&rx_event).await?;
+    assert_eq!(item.status, CommandExecutionStatus::Completed);
+    assert_eq!(item.exit_code, Some(0));
+    assert_eq!(item.id, context.call_id);
+    assert_no_duplicate_command_execution_completion(&rx_event, &context.call_id);
+
+    Ok(())
 }
 
 #[tokio::test]
@@ -244,6 +535,7 @@ async fn exit_watcher_waits_for_late_network_denial_before_classifying_end() -> 
         Some(network_denial_monitor),
         /*plugin_metrics_sidecar*/ None,
         /*task_evidence*/ None,
+        /*completion_owner*/ None,
     );
 
     let exited_at = Instant::now();

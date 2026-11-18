@@ -483,15 +483,17 @@ async fn failed_initial_end_for_unstored_process_uses_fallback_output() {
 
     emit_failed_initial_exec_end_if_unstored(
         /*process_started_alive*/ false,
+        None,
+        None,
         &context,
         &request,
-        #[allow(deprecated)]
-        turn.cwd.clone().into(),
+        request.turn_environment.cwd().clone(),
         /*plugin_attribution*/ None,
         transcript,
         "PRE_DENIAL_MARKER".to_string(),
         "Network access denied".to_string(),
         Duration::from_millis(7),
+        None,
     )
     .await;
 

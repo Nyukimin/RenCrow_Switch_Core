@@ -4,6 +4,7 @@ use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::sandboxing::ToolError;
+use crate::unified_exec::ExecCancellationDisposition;
 use codex_analytics::ArtifactOperation;
 use codex_analytics::ArtifactOperationLifecycle;
 use codex_analytics::build_track_events_context;
@@ -38,6 +39,7 @@ use std::time::Duration;
 use super::format_exec_output_str;
 
 const REJECTION_MESSAGE_MAX_TOKENS: usize = 900;
+const EXEC_COMMAND_REJECTED_BY_USER: &str = "exec command rejected by user";
 
 pub(super) fn truncate_rejection_message(message: &str) -> String {
     truncate_middle_with_token_budget(message, REJECTION_MESSAGE_MAX_TOKENS).0
@@ -209,6 +211,7 @@ pub(crate) enum ToolEmitter {
         process_id: Option<String>,
         plugin_attribution: Option<PluginCommandAttribution>,
         task_evidence: Option<Box<crate::task_check::TaskCheckExecution>>,
+        cancellation_disposition: Option<ExecCancellationDisposition>,
     },
 }
 
@@ -234,6 +237,7 @@ impl ToolEmitter {
         process_id: Option<String>,
         plugin_attribution: Option<PluginCommandAttribution>,
         task_evidence: Option<crate::task_check::TaskCheckExecution>,
+        cancellation_disposition: Option<ExecCancellationDisposition>,
     ) -> Self {
         let parsed_cmd = parse_command(command);
         Self::UnifiedExec {
@@ -244,6 +248,7 @@ impl ToolEmitter {
             process_id,
             plugin_attribution,
             task_evidence: task_evidence.map(Box::new),
+            cancellation_disposition,
         }
     }
 
@@ -370,6 +375,7 @@ impl ToolEmitter {
                     process_id,
                     plugin_attribution,
                     task_evidence,
+                    cancellation_disposition,
                 },
                 stage,
             ) => {
@@ -384,6 +390,7 @@ impl ToolEmitter {
                         process_id: process_id.as_deref(),
                         plugin_attribution: plugin_attribution.as_ref(),
                         task_evidence: task_evidence.as_deref(),
+                        cancellation_disposition: *cancellation_disposition,
                     },
                     stage,
                 )
@@ -468,7 +475,7 @@ impl ToolEmitter {
                 // TODO: We should add a new ToolError variant for user-declined approvals.
                 let normalized = if msg == "rejected by user" {
                     match self {
-                        Self::UnifiedExec { .. } => "exec command rejected by user".to_string(),
+                        Self::UnifiedExec { .. } => EXEC_COMMAND_REJECTED_BY_USER.to_string(),
                         Self::ApplyPatch { .. } => "patch rejected by user".to_string(),
                     }
                 } else {
@@ -497,6 +504,7 @@ struct ExecCommandInput<'a> {
     process_id: Option<&'a str>,
     plugin_attribution: Option<&'a PluginCommandAttribution>,
     task_evidence: Option<&'a crate::task_check::TaskCheckExecution>,
+    cancellation_disposition: Option<ExecCancellationDisposition>,
 }
 
 struct ExecCommandResult {
@@ -507,6 +515,28 @@ struct ExecCommandResult {
     duration: Duration,
     formatted_output: String,
     status: ExecCommandStatus,
+}
+
+fn exec_command_status(
+    exit_code: i32,
+    cancellation_disposition: Option<ExecCancellationDisposition>,
+) -> ExecCommandStatus {
+    match cancellation_disposition {
+        Some(ExecCancellationDisposition::ExplicitUserCancellation) => ExecCommandStatus::Declined,
+        Some(ExecCancellationDisposition::Interrupted) => ExecCommandStatus::Failed,
+        None if exit_code == 0 => ExecCommandStatus::Completed,
+        None => ExecCommandStatus::Failed,
+    }
+}
+
+fn exec_command_task_check_completed(
+    exit_code: i32,
+    status: &ExecCommandStatus,
+    cancellation_disposition: Option<ExecCancellationDisposition>,
+) -> bool {
+    exit_code != -1
+        && status != &ExecCommandStatus::Declined
+        && cancellation_disposition != Some(ExecCancellationDisposition::Interrupted)
 }
 
 async fn emit_exec_stage(
@@ -520,21 +550,27 @@ async fn emit_exec_stage(
         }
         ToolEventStage::Success { output, .. }
         | ToolEventStage::Failure(ToolEventFailure::Output(output)) => {
+            let empty_explicitly_cancelled_output = exec_input.cancellation_disposition
+                == Some(ExecCancellationDisposition::ExplicitUserCancellation)
+                && output.stdout.text.is_empty()
+                && output.stderr.text.is_empty()
+                && output.aggregated_output.text.is_empty();
+            let rejection_output = empty_explicitly_cancelled_output
+                .then(|| EXEC_COMMAND_REJECTED_BY_USER.to_string());
             let exec_result = ExecCommandResult {
-                stdout: output.stdout.text.clone(),
+                stdout: rejection_output
+                    .clone()
+                    .unwrap_or_else(|| output.stdout.text.clone()),
                 stderr: output.stderr.text.clone(),
-                aggregated_output: output.aggregated_output.text.clone(),
+                aggregated_output: rejection_output
+                    .clone()
+                    .unwrap_or_else(|| output.aggregated_output.text.clone()),
                 exit_code: output.exit_code,
                 duration: output.duration,
-                formatted_output: format_exec_output_str(
-                    &output,
-                    ctx.model_info.truncation_policy.into(),
-                ),
-                status: if output.exit_code == 0 {
-                    ExecCommandStatus::Completed
-                } else {
-                    ExecCommandStatus::Failed
-                },
+                formatted_output: rejection_output.unwrap_or_else(|| {
+                    format_exec_output_str(&output, ctx.model_info.truncation_policy.into())
+                }),
+                status: exec_command_status(output.exit_code, exec_input.cancellation_disposition),
             };
             emit_exec_end(ctx, exec_input, exec_result).await;
         }
@@ -547,7 +583,7 @@ async fn emit_exec_stage(
                 exit_code: -1,
                 duration: Duration::ZERO,
                 formatted_output: text,
-                status: ExecCommandStatus::Failed,
+                status: exec_command_status(-1, exec_input.cancellation_disposition),
             };
             emit_exec_end(ctx, exec_input, exec_result).await;
         }
@@ -579,7 +615,11 @@ async fn emit_exec_end(
             .finish_task_check(
                 ctx.call_id,
                 exec_result.exit_code,
-                exec_result.exit_code != -1 && exec_result.status != ExecCommandStatus::Declined,
+                exec_command_task_check_completed(
+                    exec_result.exit_code,
+                    &exec_result.status,
+                    exec_input.cancellation_disposition,
+                ),
                 after,
             )
             .await;
@@ -696,17 +736,325 @@ async fn emit_patch_end(
 mod tests {
     use super::*;
     use crate::session::tests::make_session_and_context_with_dynamic_tools_and_rx;
+    use crate::state::ActiveTaskScope;
+    use crate::task_check::TaskCheckExecution;
+    use crate::task_check::TaskEvidenceRequest;
     use crate::turn_diff_tracker::TurnDiffTracker;
     use codex_exec_server::LOCAL_FS;
     use codex_protocol::error::CodexErr;
     use codex_protocol::error::SandboxErr;
     use codex_protocol::exec_output::ExecToolCallOutput;
+    use codex_protocol::items::CommandExecutionItem;
+    use codex_protocol::items::CommandExecutionStatus;
     use codex_protocol::items::TurnItem;
     use codex_protocol::protocol::PatchApplyStatus;
     use codex_utils_path_uri::PathUri;
     use std::sync::Arc;
     use tempfile::tempdir;
     use tokio::sync::Mutex;
+
+    async fn emit_task_check_completion(
+        session: &Session,
+        turn: &TurnContext,
+        event_rx: &async_channel::Receiver<codex_protocol::protocol::Event>,
+        call_id: &str,
+        task_evidence: TaskCheckExecution,
+        exit_code: i32,
+        cancellation_disposition: Option<ExecCancellationDisposition>,
+    ) -> anyhow::Result<CommandExecutionItem> {
+        session
+            .begin_task_check_with_obligation(
+                call_id.to_string(),
+                task_evidence.request.clone(),
+                task_evidence.workspace_root.clone(),
+                task_evidence.before.clone(),
+                task_evidence.obligation.clone(),
+            )
+            .await;
+        let cwd = PathUri::from_host_native_path(&task_evidence.workspace_root)?;
+        let command = vec!["task-check".to_string(), "test".to_string()];
+        let emitter = ToolEmitter::unified_exec(
+            &command,
+            cwd,
+            ExecCommandSource::UnifiedExecStartup,
+            Some("task-check-process".to_string()),
+            None,
+            Some(task_evidence),
+            cancellation_disposition,
+        );
+        let event_ctx = ToolEventCtx::new(session, turn, turn.model_info(), call_id, None);
+        emitter.begin(event_ctx).await;
+        emitter
+            .emit(
+                event_ctx,
+                ToolEventStage::Success {
+                    output: ExecToolCallOutput {
+                        exit_code,
+                        duration: Duration::from_millis(12),
+                        ..Default::default()
+                    },
+                    applied_patch_delta: None,
+                },
+            )
+            .await;
+
+        loop {
+            let event = event_rx.recv().await?;
+            if let EventMsg::ItemCompleted(completed) = event.msg
+                && let TurnItem::CommandExecution(item) = completed.item
+                && item.id == call_id
+            {
+                return Ok(item);
+            }
+        }
+    }
+
+    fn task_check_execution(
+        workspace: &std::path::Path,
+        scope: ActiveTaskScope,
+    ) -> TaskCheckExecution {
+        let mut evidence = TaskCheckExecution::new(
+            TaskEvidenceRequest {
+                task_id: scope.task_id.clone(),
+                task_revision: scope.task_revision,
+                artifact_paths: vec![PathBuf::from("artifact.txt")],
+                check_kind: crate::task_check::TaskCheckKind::Verification,
+            },
+            workspace,
+        )
+        .expect("task check evidence should be valid");
+        evidence.bind_obligation(scope, "task-check test");
+        evidence
+    }
+
+    async fn emit_unified_exec_completion(
+        cancellation_disposition: Option<ExecCancellationDisposition>,
+        output: ExecToolCallOutput,
+    ) -> Result<CommandExecutionItem, String> {
+        let (session, turn, event_rx) =
+            make_session_and_context_with_dynamic_tools_and_rx(Vec::new()).await;
+        let dir = tempdir().map_err(|error| error.to_string())?;
+        let cwd = PathUri::from_host_native_path(dir.path()).map_err(|error| error.to_string())?;
+        let call_id = "exec-completion-contract";
+        let command = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "exit 1".to_string(),
+        ];
+        let emitter = ToolEmitter::unified_exec(
+            &command,
+            cwd,
+            ExecCommandSource::UnifiedExecStartup,
+            Some("process-1".to_string()),
+            None,
+            None,
+            cancellation_disposition,
+        );
+        let event_ctx = ToolEventCtx::new(
+            session.as_ref(),
+            turn.as_ref(),
+            turn.model_info(),
+            call_id,
+            None,
+        );
+        emitter.begin(event_ctx).await;
+        emitter
+            .emit(
+                event_ctx,
+                ToolEventStage::Success {
+                    output,
+                    applied_patch_delta: None,
+                },
+            )
+            .await;
+
+        let mut completion_count = 0;
+        let mut completion_item = None;
+        while let Ok(event) = event_rx.try_recv() {
+            if let EventMsg::ItemCompleted(completed) = event.msg
+                && let TurnItem::CommandExecution(item) = completed.item
+                && item.id == call_id
+            {
+                completion_count += 1;
+                completion_item = Some(item);
+            }
+        }
+        if completion_count != 1 {
+            return Err(format!(
+                "expected one command completion event for {call_id}, got {completion_count}"
+            ));
+        }
+        completion_item.ok_or_else(|| format!("command completion for {call_id} was missing"))
+    }
+
+    #[test]
+    fn explicit_user_cancellation_takes_precedence_over_exit_status() {
+        assert_eq!(
+            exec_command_status(
+                1,
+                Some(ExecCancellationDisposition::ExplicitUserCancellation),
+            ),
+            ExecCommandStatus::Declined
+        );
+        assert_eq!(
+            exec_command_status(
+                -1,
+                Some(ExecCancellationDisposition::ExplicitUserCancellation)
+            ),
+            ExecCommandStatus::Declined
+        );
+        assert_eq!(exec_command_status(1, None), ExecCommandStatus::Failed);
+        assert_eq!(exec_command_status(-1, None), ExecCommandStatus::Failed);
+        assert_eq!(exec_command_status(0, None), ExecCommandStatus::Completed);
+        assert_eq!(
+            exec_command_status(0, Some(ExecCancellationDisposition::Interrupted)),
+            ExecCommandStatus::Failed
+        );
+        assert_eq!(
+            exec_command_status(
+                0,
+                Some(ExecCancellationDisposition::ExplicitUserCancellation),
+            ),
+            ExecCommandStatus::Declined
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_failed_task_check_resolves_on_retry_and_cancel_stays_incomplete() {
+        let (session, turn, event_rx) =
+            make_session_and_context_with_dynamic_tools_and_rx(Vec::new()).await;
+        let workspace = tempdir().expect("task-check workspace");
+        std::fs::write(workspace.path().join("artifact.txt"), "unchanged")
+            .expect("write task-check artifact");
+        let scope = ActiveTaskScope {
+            root_task_id: "root-task".to_string(),
+            task_id: "retryable-task".to_string(),
+            task_revision: 1,
+            begin_call_id: "task-boundary-call".to_string(),
+            start_history_cursor: 0,
+        };
+
+        let failed = emit_task_check_completion(
+            &session,
+            &turn,
+            &event_rx,
+            "ordinary-failed-check",
+            task_check_execution(workspace.path(), scope.clone()),
+            1,
+            None,
+        )
+        .await
+        .expect("ordinary failed task-check completion");
+        assert_eq!(failed.status, CommandExecutionStatus::Failed);
+        let failed_receipt = session
+            .task_check_receipt("ordinary-failed-check")
+            .await
+            .expect("ordinary failure should produce a task-check receipt");
+        assert!(failed_receipt.completed);
+        assert!(!failed_receipt.succeeded);
+        assert_eq!(session.unresolved_task_check_obligations(&scope).await, 1);
+
+        let retried = emit_task_check_completion(
+            &session,
+            &turn,
+            &event_rx,
+            "ordinary-retry-success",
+            task_check_execution(workspace.path(), scope.clone()),
+            0,
+            None,
+        )
+        .await
+        .expect("successful retry completion");
+        assert_eq!(retried.status, CommandExecutionStatus::Completed);
+        let success_receipt = session
+            .task_check_receipt("ordinary-retry-success")
+            .await
+            .expect("successful retry should produce a receipt");
+        assert!(success_receipt.completed);
+        assert!(success_receipt.succeeded);
+        assert_eq!(session.unresolved_task_check_obligations(&scope).await, 0);
+
+        let cancelled_scope = ActiveTaskScope {
+            root_task_id: "root-task".to_string(),
+            task_id: "cancelled-task".to_string(),
+            task_revision: 2,
+            begin_call_id: "cancelled-task-boundary".to_string(),
+            start_history_cursor: 0,
+        };
+        let cancelled = emit_task_check_completion(
+            &session,
+            &turn,
+            &event_rx,
+            "explicitly-cancelled-check",
+            task_check_execution(workspace.path(), cancelled_scope.clone()),
+            0,
+            Some(ExecCancellationDisposition::ExplicitUserCancellation),
+        )
+        .await
+        .expect("explicit cancellation completion");
+        assert_eq!(cancelled.status, CommandExecutionStatus::Declined);
+        let cancelled_receipt = session
+            .task_check_receipt("explicitly-cancelled-check")
+            .await
+            .expect("explicit cancellation should finish as incomplete");
+        assert!(!cancelled_receipt.completed);
+        assert!(!cancelled_receipt.succeeded);
+        assert_eq!(
+            session
+                .unresolved_task_check_obligations(&cancelled_scope)
+                .await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn unified_exec_emits_one_declined_completion_with_rejection_text_when_output_is_empty() {
+        let cancelled_item = emit_unified_exec_completion(
+            Some(ExecCancellationDisposition::ExplicitUserCancellation),
+            ExecToolCallOutput {
+                exit_code: 1,
+                duration: Duration::from_millis(37),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("cancelled command completion");
+        assert_eq!(cancelled_item.status, CommandExecutionStatus::Declined);
+        assert_eq!(
+            cancelled_item.stdout.as_deref(),
+            Some(EXEC_COMMAND_REJECTED_BY_USER)
+        );
+        assert_eq!(
+            cancelled_item.aggregated_output.as_deref(),
+            Some(EXEC_COMMAND_REJECTED_BY_USER)
+        );
+        assert_eq!(cancelled_item.stderr.as_deref(), Some(""));
+        assert_eq!(cancelled_item.exit_code, Some(1));
+        assert_eq!(cancelled_item.duration, Some(Duration::from_millis(37)));
+
+        let ordinary_failure = emit_unified_exec_completion(
+            None,
+            ExecToolCallOutput {
+                exit_code: 1,
+                duration: Duration::from_millis(41),
+                stdout: codex_protocol::exec_output::StreamOutput::new("captured".to_string()),
+                aggregated_output: codex_protocol::exec_output::StreamOutput::new(
+                    "captured".to_string(),
+                ),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("ordinary command failure completion");
+        assert_eq!(ordinary_failure.status, CommandExecutionStatus::Failed);
+        assert_eq!(ordinary_failure.stdout.as_deref(), Some("captured"));
+        assert_eq!(
+            ordinary_failure.aggregated_output.as_deref(),
+            Some("captured")
+        );
+        assert_eq!(ordinary_failure.exit_code, Some(1));
+        assert_eq!(ordinary_failure.duration, Some(Duration::from_millis(41)));
+    }
 
     async fn assert_failed_apply_patch_tracks_committed_delta(
         out: Result<ExecToolCallOutput, ToolError>,

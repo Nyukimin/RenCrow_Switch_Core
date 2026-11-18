@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-18: classify explicit nested approval cancellation at process completion.
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -20,6 +21,7 @@ use crate::tools::events::ToolEmitter;
 use crate::tools::events::ToolEventCtx;
 use crate::tools::events::ToolEventFailure;
 use crate::tools::events::ToolEventStage;
+use crate::unified_exec::ExecCancellationDisposition;
 use crate::unified_exec::head_tail_buffer::HeadTailBuffer;
 use codex_core_plugins::PluginCommandAttribution;
 use codex_protocol::exec_output::ExecToolCallOutput;
@@ -175,6 +177,7 @@ pub(crate) fn spawn_exit_watcher(
     network_denial_monitor: Option<tokio::task::JoinHandle<()>>,
     plugin_metrics_sidecar: Option<SharedPluginMetricsSidecar>,
     task_evidence: Option<crate::task_check::TaskCheckExecution>,
+    completion_owner: Option<Arc<super::completion_owner::UnifiedExecCompletionOwner>>,
 ) {
     let session_ref = Arc::clone(&context.session);
     let turn_ref = Arc::clone(&context.step_context.turn);
@@ -197,56 +200,99 @@ pub(crate) fn spawn_exit_watcher(
         let _interaction_guard = interaction_lock.lock_owned().await;
 
         let duration = Instant::now().saturating_duration_since(started_at);
-        let plugin_metrics_sidecar = plugin_metrics_sidecar
-            .as_ref()
-            .and_then(take_plugin_metrics_sidecar);
+        let cancellation_disposition = process.cancellation_disposition(&call_id, &turn_ref.sub_id);
         if let Some(message) = process.failure_message() {
-            drop(plugin_metrics_sidecar);
-            emit_failed_exec_end_for_unified_exec(
-                session_ref,
-                turn_ref,
-                model_info,
-                call_id,
-                command,
-                cwd,
-                Some(process_id.to_string()),
-                plugin_attribution,
-                transcript,
-                String::new(),
-                message,
-                duration,
-                task_evidence,
-            )
-            .await;
+            if let Some(completion_owner) = completion_owner.as_ref() {
+                if let Err(error) = completion_owner
+                    .complete(
+                        Arc::clone(&process),
+                        super::completion_owner::CompletionResult::Failure {
+                            fallback_output: String::new(),
+                            message,
+                            duration,
+                            task_evidence,
+                            output_drained: true,
+                        },
+                    )
+                    .await
+                {
+                    tracing::error!(%error, "unified exec terminal submission failed");
+                }
+            } else {
+                drop(
+                    plugin_metrics_sidecar
+                        .as_ref()
+                        .and_then(take_plugin_metrics_sidecar),
+                );
+                emit_failed_exec_end_for_unified_exec(
+                    session_ref,
+                    turn_ref,
+                    model_info,
+                    call_id,
+                    command,
+                    cwd,
+                    Some(process_id.to_string()),
+                    plugin_attribution,
+                    transcript,
+                    String::new(),
+                    message,
+                    duration,
+                    task_evidence,
+                    cancellation_disposition,
+                )
+                .await;
+            }
         } else {
             let exit_code = process.exit_code().unwrap_or(-1);
             let timed_out = process.timed_out();
-            finish_and_track_measurements(
-                plugin_metrics_sidecar,
-                exit_code,
-                &session_ref,
-                &turn_ref,
-                &model_context,
-                &call_id,
-            )
-            .await;
-            emit_exec_end_for_unified_exec(
-                session_ref,
-                turn_ref,
-                model_info,
-                call_id,
-                command,
-                cwd,
-                Some(process_id.to_string()),
-                plugin_attribution,
-                transcript,
-                String::new(),
-                exit_code,
-                duration,
-                timed_out,
-                task_evidence,
-            )
-            .await;
+            if let Some(completion_owner) = completion_owner.as_ref() {
+                if let Err(error) = completion_owner
+                    .complete(
+                        Arc::clone(&process),
+                        super::completion_owner::CompletionResult::Success {
+                            fallback_output: String::new(),
+                            exit_code,
+                            duration,
+                            timed_out,
+                            task_evidence,
+                            output_drained: true,
+                        },
+                    )
+                    .await
+                {
+                    tracing::error!(%error, "unified exec terminal submission failed");
+                }
+            } else {
+                finish_and_track_measurements(
+                    plugin_metrics_sidecar
+                        .as_ref()
+                        .and_then(take_plugin_metrics_sidecar),
+                    exit_code,
+                    &session_ref,
+                    &turn_ref,
+                    &model_context,
+                    &call_id,
+                )
+                .await;
+                emit_exec_end_for_unified_exec(
+                    session_ref,
+                    turn_ref,
+                    model_info,
+                    call_id,
+                    command,
+                    cwd,
+                    Some(process_id.to_string()),
+                    plugin_attribution,
+                    transcript,
+                    String::new(),
+                    exit_code,
+                    duration,
+                    timed_out,
+                    task_evidence,
+                    cancellation_disposition,
+                )
+                .await;
+            }
         }
     });
 }
@@ -359,6 +405,7 @@ pub(crate) async fn emit_exec_end_for_unified_exec(
     duration: Duration,
     timed_out: bool,
     task_evidence: Option<crate::task_check::TaskCheckExecution>,
+    cancellation_disposition: Option<ExecCancellationDisposition>,
 ) {
     let aggregated_output = resolve_aggregated_output(&transcript, fallback_output).await;
     let output = ExecToolCallOutput {
@@ -383,6 +430,7 @@ pub(crate) async fn emit_exec_end_for_unified_exec(
         process_id,
         plugin_attribution,
         task_evidence,
+        cancellation_disposition,
     );
     emitter
         .emit(
@@ -410,6 +458,7 @@ pub(crate) async fn emit_failed_exec_end_for_unified_exec(
     message: String,
     duration: Duration,
     task_evidence: Option<crate::task_check::TaskCheckExecution>,
+    cancellation_disposition: Option<ExecCancellationDisposition>,
 ) {
     let stdout = if fallback_output.is_empty() {
         resolve_aggregated_output(&transcript, fallback_output).await
@@ -443,6 +492,7 @@ pub(crate) async fn emit_failed_exec_end_for_unified_exec(
         process_id,
         plugin_attribution,
         task_evidence,
+        cancellation_disposition,
     );
     emitter
         .emit(

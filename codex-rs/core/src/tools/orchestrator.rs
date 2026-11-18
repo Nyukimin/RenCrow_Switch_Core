@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-18: initialize cancellation metadata for ordinary approval contexts.
 /*
 Module: orchestrator
 
@@ -182,6 +183,7 @@ impl ToolOrchestrator {
                         approval_reason: None,
                         retry_reason: None,
                         network_approval_context: None,
+                        explicit_exec_cancel_receipt: None,
                     };
                     tool_ctx
                         .session
@@ -215,6 +217,7 @@ impl ToolOrchestrator {
                     approval_reason: reason.clone(),
                     retry_reason: None,
                     network_approval_context: None,
+                    explicit_exec_cancel_receipt: None,
                 };
                 tool_ctx
                     .session
@@ -438,6 +441,7 @@ impl ToolOrchestrator {
                         approval_reason,
                         retry_reason: Some(retry_reason),
                         network_approval_context: network_approval_context.clone(),
+                        explicit_exec_cancel_receipt: None,
                     };
 
                     tool_ctx

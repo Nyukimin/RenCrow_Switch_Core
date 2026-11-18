@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-18: initialize cancellation metadata for network approvals.
 use crate::config::NetworkProxySpec;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::guardian::GuardianNetworkAccessTrigger;
@@ -810,6 +811,7 @@ impl NetworkApprovalService {
             approval_reason: Some(prompt_reason),
             retry_reason: Some(policy_denial_message.clone()),
             network_approval_context: Some(network_approval_context.clone()),
+            explicit_exec_cancel_receipt: None,
         };
         let approval = session.request_approval(action, approval_context);
         let approval_result = if let Some(owner_call) = &owner_call {

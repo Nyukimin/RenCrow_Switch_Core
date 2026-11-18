@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-18: target explicit approval cancellation to its pending turn.
 use crate::realtime_conversation::handle_audio as handle_realtime_conversation_audio;
 use crate::realtime_conversation::handle_close as handle_realtime_conversation_close;
 use crate::realtime_conversation::handle_speech as handle_realtime_conversation_speech;
@@ -176,7 +177,7 @@ pub async fn exec_approval(
     turn_id: Option<String>,
     decision: ReviewDecision,
 ) {
-    let event_turn_id = turn_id.unwrap_or_else(|| approval_id.clone());
+    let event_turn_id = turn_id.clone().unwrap_or_else(|| approval_id.clone());
     if let ReviewDecision::ApprovedExecpolicyAmendment {
         proposed_execpolicy_amendment,
     } = &decision
@@ -195,7 +196,14 @@ pub async fn exec_approval(
     }
     match decision {
         ReviewDecision::Abort => {
-            sess.interrupt_task().await;
+            if let Some(approval_turn_id) = sess
+                .record_exec_approval_cancel(&approval_id, turn_id.as_deref())
+                .await
+            {
+                sess.pause_autonomous_completion().await;
+                sess.abort_turn_if_active(&approval_turn_id, TurnAbortReason::Interrupted)
+                    .await;
+            }
         }
         other => sess.notify_approval(&approval_id, other).await,
     }

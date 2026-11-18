@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-18: attach command-owned cancellation receipts to pending Execve approvals.
 //! Central approval policy-stage execution and reviewer routing.
 
 use crate::command_canonicalization::canonicalize_command_for_approval;
@@ -12,6 +13,7 @@ use crate::hook_runtime::run_permission_request_hooks;
 use crate::mcp_tool_call::request_mcp_tool_user_approval;
 use crate::sandboxing::SandboxPermissions;
 use crate::session::session::Session;
+use crate::state::ExplicitExecCancelReceipt;
 use crate::tools::hook_names::HookToolName;
 use crate::tools::runtimes::apply_patch::ApplyPatchApprovalKey;
 use crate::tools::runtimes::unified_exec::UnifiedExecApprovalKey;
@@ -60,6 +62,7 @@ pub(crate) struct ApprovalContext {
     pub(crate) approval_reason: Option<String>,
     pub(crate) retry_reason: Option<String>,
     pub(crate) network_approval_context: Option<NetworkApprovalContext>,
+    pub(crate) explicit_exec_cancel_receipt: Option<Arc<ExplicitExecCancelReceipt>>,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
@@ -720,6 +723,7 @@ impl Session {
                         additional_permissions.clone(),
                         /*available_decisions*/ None,
                         /*plugin_attribution_override*/ None,
+                        /*explicit_exec_cancel_receipt*/ None,
                     )
                     .await
                 })
@@ -755,6 +759,7 @@ impl Session {
                     additional_permissions.clone(),
                     Some(vec![ReviewDecision::Approved, ReviewDecision::Abort]),
                     /*plugin_attribution_override*/ None,
+                    /*explicit_exec_cancel_receipt*/ None,
                 )
                 .await
             }
@@ -782,6 +787,7 @@ impl Session {
                     additional_permissions.clone(),
                     Some(vec![ReviewDecision::Approved, ReviewDecision::Abort]),
                     /*plugin_attribution_override*/ None,
+                    ctx.explicit_exec_cancel_receipt.clone(),
                 )
                 .await
             }
@@ -855,6 +861,7 @@ impl Session {
                     /*additional_permissions*/ None,
                     /*available_decisions*/ None,
                     /*plugin_attribution_override*/ None,
+                    /*explicit_exec_cancel_receipt*/ None,
                 )
                 .await
             }

@@ -37,10 +37,12 @@ use crate::tools::sandboxing::ToolRuntime;
 use crate::tools::sandboxing::managed_network_for_sandbox_permissions;
 use crate::tools::sandboxing::sandbox_permissions_preserving_denied_reads;
 use crate::unified_exec::NoopSpawnLifecycle;
+use crate::unified_exec::SharedPluginMetricsSidecar;
+use crate::unified_exec::StartupProcessGuard;
 use crate::unified_exec::TerminalPermissions;
 use crate::unified_exec::TerminalSandboxSource;
+use crate::unified_exec::UnifiedExecCompletionOwner;
 use crate::unified_exec::UnifiedExecError;
-use crate::unified_exec::UnifiedExecProcess;
 use crate::unified_exec::UnifiedExecProcessManager;
 use codex_core_plugins::PluginMetricsSidecar;
 use codex_network_proxy::CREDENTIAL_BROKER_ACTIVE_ENV_KEY;
@@ -58,6 +60,7 @@ use codex_utils_path_uri::PathUri;
 use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
@@ -107,11 +110,12 @@ pub struct UnifiedExecApprovalKey {
 pub struct UnifiedExecRuntime<'a> {
     manager: &'a UnifiedExecProcessManager,
     shell_mode: UnifiedExecShellMode,
+    completion_owner: Option<Arc<UnifiedExecCompletionOwner>>,
 }
 
 pub(crate) struct UnifiedExecAttempt {
-    pub(crate) process: UnifiedExecProcess,
-    pub(crate) metrics_sidecar: Option<PluginMetricsSidecar>,
+    pub(crate) process: StartupProcessGuard,
+    pub(crate) metrics_sidecar: Option<SharedPluginMetricsSidecar>,
     pub(crate) permissions: TerminalPermissions,
 }
 
@@ -150,10 +154,15 @@ fn build_unified_exec_sandbox_command(
 
 impl<'a> UnifiedExecRuntime<'a> {
     /// Creates a runtime bound to the shared unified-exec process manager.
-    pub fn new(manager: &'a UnifiedExecProcessManager, shell_mode: UnifiedExecShellMode) -> Self {
+    pub fn new(
+        manager: &'a UnifiedExecProcessManager,
+        shell_mode: UnifiedExecShellMode,
+        completion_owner: Option<Arc<UnifiedExecCompletionOwner>>,
+    ) -> Self {
         Self {
             manager,
             shell_mode,
+            completion_owner,
         }
     }
 }
@@ -618,6 +627,8 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecAttempt> for UnifiedExecRunt
             req.additional_permissions.as_ref(),
             internal_permissions.as_ref(),
         );
+        let metrics_sidecar =
+            metrics_sidecar.map(|sidecar| Arc::new(std::sync::Mutex::new(Some(sidecar))));
 
         if let UnifiedExecShellMode::ZshFork(zsh_fork_config) = &self.shell_mode {
             let command = build_unified_exec_sandbox_command(
@@ -653,7 +664,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecAttempt> for UnifiedExecRunt
                                 .to_string(),
                         ));
                     }
-                    let mut process = self
+                    let process = self
                         .manager
                         .open_session_with_prepared_exec_env(
                             req.process_id,
@@ -663,6 +674,8 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecAttempt> for UnifiedExecRunt
                             /*network_policy_decider*/ None,
                             req.tty,
                             prepared.spawn_lifecycle,
+                            self.completion_owner.clone(),
+                            metrics_sidecar.clone(),
                             req.turn_environment.environment.as_ref(),
                         )
                         .await
@@ -675,7 +688,10 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecAttempt> for UnifiedExecRunt
                             }
                             other => ToolError::Rejected(other.to_string()),
                         })?;
-                    process._shell_snapshot = shell_snapshot;
+                    let mut process = process;
+                    process.set_shell_snapshot(shell_snapshot).map_err(|_| {
+                        ToolError::Rejected("process ownership changed during startup".to_string())
+                    })?;
                     return Ok(UnifiedExecAttempt {
                         process,
                         metrics_sidecar,
@@ -703,7 +719,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecAttempt> for UnifiedExecRunt
             error @ ToolError::Codex(_) => error,
         })?;
         let options = unified_exec_options(attempt.network_denial_cancellation_token.clone());
-        let mut process = self
+        let process = self
             .manager
             .open_session_with_exec_env(
                 req.process_id,
@@ -719,10 +735,15 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecAttempt> for UnifiedExecRunt
                 windows_sandbox_proxy_settings_mode,
                 req.tty,
                 Box::new(NoopSpawnLifecycle),
+                self.completion_owner.clone(),
+                metrics_sidecar.clone(),
                 req.turn_environment.environment.as_ref(),
             )
             .await?;
-        process._shell_snapshot = shell_snapshot;
+        let mut process = process;
+        process.set_shell_snapshot(shell_snapshot).map_err(|_| {
+            ToolError::Rejected("process ownership changed during startup".to_string())
+        })?;
         Ok(UnifiedExecAttempt {
             process,
             metrics_sidecar,
@@ -806,7 +827,7 @@ mod tests {
     #[tokio::test]
     async fn approval_key_includes_environment_id() {
         let manager = UnifiedExecProcessManager::default();
-        let runtime = UnifiedExecRuntime::new(&manager, UnifiedExecShellMode::Direct);
+        let runtime = UnifiedExecRuntime::new(&manager, UnifiedExecShellMode::Direct, None);
         let mut request = test_request(
             SandboxPermissions::UseDefault,
             ExecApprovalRequirement::Skip {
@@ -837,7 +858,7 @@ mod tests {
         let sandbox_cwd = AbsolutePathBuf::try_from(sandbox_dir.path().to_path_buf())
             .expect("absolute sandbox temp dir");
         let manager = UnifiedExecProcessManager::default();
-        let runtime = UnifiedExecRuntime::new(&manager, UnifiedExecShellMode::Direct);
+        let runtime = UnifiedExecRuntime::new(&manager, UnifiedExecShellMode::Direct, None);
         let request = UnifiedExecRequest {
             command: vec!["pwd".to_string()],
             shell_type: ShellType::Sh,
@@ -879,8 +900,8 @@ mod tests {
                 proposed_execpolicy_amendment: None,
             },
         );
-        let direct_runtime = UnifiedExecRuntime::new(&manager, UnifiedExecShellMode::Direct);
-        let zsh_fork_runtime = UnifiedExecRuntime::new(&manager, zsh_fork_mode());
+        let direct_runtime = UnifiedExecRuntime::new(&manager, UnifiedExecShellMode::Direct, None);
+        let zsh_fork_runtime = UnifiedExecRuntime::new(&manager, zsh_fork_mode(), None);
 
         assert_eq!(
             direct_runtime.sandbox_permissions(&request),
@@ -904,7 +925,7 @@ mod tests {
                 proposed_execpolicy_amendment: None,
             },
         );
-        let zsh_fork_runtime = UnifiedExecRuntime::new(&manager, zsh_fork_mode());
+        let zsh_fork_runtime = UnifiedExecRuntime::new(&manager, zsh_fork_mode(), None);
 
         assert_eq!(
             zsh_fork_runtime.sandbox_permissions(&request),
@@ -923,7 +944,7 @@ mod tests {
                 proposed_execpolicy_amendment: None,
             },
         );
-        let runtime = UnifiedExecRuntime::new(&manager, zsh_fork_mode());
+        let runtime = UnifiedExecRuntime::new(&manager, zsh_fork_mode(), None);
 
         assert_eq!(
             runtime.exec_approval_requirement(&request),

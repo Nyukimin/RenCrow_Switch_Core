@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-18: initialize new approval metadata for MCP approval contexts.
 use std::collections::HashMap;
 use std::time::Duration;
 use std::time::Instant;
@@ -1570,6 +1571,7 @@ async fn maybe_request_mcp_tool_approval(
         approval_reason: None,
         retry_reason: None,
         network_approval_context: None,
+        explicit_exec_cancel_receipt: None,
     };
     Some(
         match sess.request_approval(action, approval_context).await {

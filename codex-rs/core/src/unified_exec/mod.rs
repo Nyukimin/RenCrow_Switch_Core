@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-18: expose typed explicit cancellation disposition for completion.
 //! Unified Exec: interactive process execution orchestrated with approvals + sandboxing.
 //!
 //! Responsibilities
@@ -48,6 +49,7 @@ use crate::tools::network_approval::DeferredNetworkApproval;
 use codex_core_plugins::PluginMetricsSidecar;
 
 mod async_watcher;
+mod completion_owner;
 mod errors;
 mod head_tail_buffer;
 mod oneshot;
@@ -61,11 +63,17 @@ pub(crate) fn set_deterministic_process_ids_for_tests(enabled: bool) {
     process_manager::set_deterministic_process_ids_for_tests(enabled);
 }
 
+pub(crate) use completion_owner::CompletionOwnerContext;
+pub(crate) use completion_owner::CompletionResult;
+pub(crate) use completion_owner::UnifiedExecCompletionOwner;
 pub(crate) use errors::UnifiedExecError;
+pub(crate) use process::ExecCancellationDisposition;
 pub(crate) use process::NoopSpawnLifecycle;
 #[cfg(unix)]
 pub(crate) use process::SpawnLifecycle;
 pub(crate) use process::SpawnLifecycleHandle;
+pub(crate) use process::StartupProcessGuard;
+pub(crate) use process::StartupProcessOwner;
 pub(crate) use process::UnifiedExecProcess;
 pub(crate) use stdin_approval::TerminalPermissions;
 pub(crate) use stdin_approval::TerminalSandboxSource;
@@ -206,9 +214,9 @@ struct ProcessEntry {
     task_evidence: Option<crate::task_check::TaskCheckExecution>,
 }
 
-type SharedPluginMetricsSidecar = Arc<std::sync::Mutex<Option<PluginMetricsSidecar>>>;
+pub(crate) type SharedPluginMetricsSidecar = Arc<std::sync::Mutex<Option<PluginMetricsSidecar>>>;
 
-fn take_plugin_metrics_sidecar(
+pub(crate) fn take_plugin_metrics_sidecar(
     sidecar: &SharedPluginMetricsSidecar,
 ) -> Option<PluginMetricsSidecar> {
     sidecar
@@ -241,6 +249,10 @@ pub(crate) fn generate_chunk_id() -> String {
         .collect()
 }
 
+#[cfg(test)]
+#[cfg(unix)]
+#[path = "async_watcher_cancel_drop_tests.rs"]
+mod async_watcher_cancel_drop_tests;
 #[cfg(test)]
 #[cfg(unix)]
 #[path = "process_tests.rs"]

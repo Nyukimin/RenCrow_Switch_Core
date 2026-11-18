@@ -325,6 +325,8 @@ use crate::shell;
 use crate::state::AcceptedUserInputResponse;
 use crate::state::AutoCompactWindowIds;
 use crate::state::AutoCompactWindowSnapshot;
+use crate::state::ExplicitExecCancelReceipt;
+use crate::state::PendingApproval;
 use crate::state::PendingRequestPermissions;
 use crate::state::ReasoningEffortPin;
 use crate::state::SessionServices;
@@ -2983,7 +2985,7 @@ impl Session {
         clippy::await_holding_invalid_type,
         reason = "active turn checks and turn state updates must remain atomic"
     )]
-    pub async fn request_command_approval(
+    pub(crate) async fn request_command_approval(
         &self,
         turn_context: &TurnContext,
         kind: ExecApprovalKind,
@@ -2999,6 +3001,7 @@ impl Session {
         additional_permissions: Option<AdditionalPermissionProfile>,
         available_decisions: Option<Vec<ReviewDecision>>,
         plugin_attribution_override: Option<PluginCommandAttribution>,
+        explicit_exec_cancel_receipt: Option<Arc<ExplicitExecCancelReceipt>>,
     ) -> ReviewDecision {
         let _elicitation = self.services.elicitations.register();
         //  command-level approvals use `call_id`.
@@ -3008,10 +3011,30 @@ impl Session {
         let (tx_approve, rx_approve) = oneshot::channel();
         let prev_entry = {
             let mut active = self.active_turn.lock().await;
+            if explicit_exec_cancel_receipt.is_some() {
+                let Some(at) = active.as_mut() else {
+                    return ReviewDecision::Abort;
+                };
+                if at
+                    .task
+                    .as_ref()
+                    .is_none_or(|task| task.turn_context.sub_id != turn_context.sub_id)
+                {
+                    return ReviewDecision::Abort;
+                }
+            }
             match active.as_mut() {
                 Some(at) => {
                     let mut ts = at.turn_state.lock().await;
-                    ts.insert_pending_approval(effective_approval_id.clone(), tx_approve)
+                    ts.insert_pending_approval(
+                        effective_approval_id.clone(),
+                        PendingApproval {
+                            tx: tx_approve,
+                            call_id: call_id.clone(),
+                            turn_id: turn_context.sub_id.clone(),
+                            explicit_exec_cancel_receipt: explicit_exec_cancel_receipt.clone(),
+                        },
+                    )
                 }
                 None => None,
             }
@@ -3074,6 +3097,36 @@ impl Session {
         rx_approve.await.unwrap_or(ReviewDecision::Abort)
     }
 
+    pub(crate) async fn record_exec_approval_cancel(
+        &self,
+        approval_id: &str,
+        response_turn_id: Option<&str>,
+    ) -> Option<String> {
+        loop {
+            let retry_state = {
+                let active = self.active_turn.lock().await;
+                let active = active.as_ref()?;
+                let task_turn_id = active.task.as_ref()?.turn_context.sub_id.as_str();
+                if response_turn_id.is_some_and(|turn_id| turn_id != task_turn_id) {
+                    return None;
+                }
+                match active.turn_state.try_lock() {
+                    Ok(turn_state) => {
+                        return turn_state.record_explicit_exec_cancel(
+                            approval_id,
+                            response_turn_id,
+                            task_turn_id,
+                        );
+                    }
+                    Err(_) => Arc::clone(&active.turn_state),
+                }
+            };
+            {
+                let _turn_state = retry_state.lock().await;
+            }
+        }
+    }
+
     #[expect(
         clippy::await_holding_invalid_type,
         reason = "active turn checks and turn state updates must remain atomic"
@@ -3095,7 +3148,15 @@ impl Session {
             match active.as_mut() {
                 Some(at) => {
                     let mut ts = at.turn_state.lock().await;
-                    ts.insert_pending_approval(approval_id.clone(), tx_approve)
+                    ts.insert_pending_approval(
+                        approval_id.clone(),
+                        PendingApproval {
+                            tx: tx_approve,
+                            call_id: call_id.clone(),
+                            turn_id: turn_context.sub_id.clone(),
+                            explicit_exec_cancel_receipt: None,
+                        },
+                    )
                 }
                 None => None,
             }
@@ -3190,6 +3251,7 @@ impl Session {
                 approval_reason: None,
                 retry_reason: None,
                 network_approval_context: None,
+                explicit_exec_cancel_receipt: None,
             };
             let decision = tokio::select! {
                 biased;
@@ -3564,11 +3626,11 @@ impl Session {
             }
         };
         match entry {
-            Some(tx_approve) => {
+            Some(pending) => {
                 if self.features.enabled(Feature::RencrowChildMonitor) {
                     self.child_monitor.lock().await.input_received(approval_id);
                 }
-                tx_approve.send(decision).ok();
+                pending.tx.send(decision).ok();
             }
             None => {
                 warn!("No pending approval found for call_id: {approval_id}");
