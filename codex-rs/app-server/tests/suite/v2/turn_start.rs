@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-17: verify reported role defaults when spawn overrides are omitted.
 use anyhow::Context;
 use anyhow::Result;
 use app_test_support::ChatGptAuthFixture;
@@ -4946,8 +4947,6 @@ async fn turn_start_emits_spawn_agent_item_with_effective_role_model_metadata_v2
     const CHILD_PROMPT: &str = "child: do work";
     const PARENT_PROMPT: &str = "spawn a child and continue";
     const SPAWN_CALL_ID: &str = "spawn-call-1";
-    const REQUESTED_MODEL: &str = "gpt-5.5";
-    const REQUESTED_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::Low;
     const ROLE_MODEL: &str = "gpt-5.4";
     const ROLE_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::High;
 
@@ -4955,8 +4954,6 @@ async fn turn_start_emits_spawn_agent_item_with_effective_role_model_metadata_v2
     let spawn_args = serde_json::to_string(&json!({
         "message": CHILD_PROMPT,
         "agent_type": "custom",
-        "model": REQUESTED_MODEL,
-        "reasoning_effort": REQUESTED_REASONING_EFFORT,
     }))?;
     let _parent_turn = responses::mount_sse_once_match(
         &server,

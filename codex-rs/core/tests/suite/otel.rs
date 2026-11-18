@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-17: assert the typed response protocol failure telemetry.
 use codex_core::TurnInputRequest;
 use codex_core::config::Constrained;
 use codex_features::Feature;
@@ -460,7 +461,7 @@ async fn process_sse_failed_event_logs_missing_error() {
 
 #[tokio::test]
 #[traced_test]
-async fn process_sse_failed_event_logs_response_completed_parse_error() {
+async fn process_sse_invalid_completed_payload_logs_protocol_error() {
     let server = start_mock_server().await;
 
     mount_sse_once(
@@ -509,7 +510,9 @@ async fn process_sse_failed_event_logs_response_completed_parse_error() {
                 line.contains("codex.sse_event")
                     && line.contains("event.kind=response.completed")
                     && line.contains("error.message")
-                    && line.contains("failed to parse ResponseCompleted")
+                    && line.contains(
+                        "response protocol failure for None: response.completed carried an invalid payload",
+                    )
             })
             .map(|_| Ok(()))
             .unwrap_or(Err("missing codex.sse_event".to_string()))

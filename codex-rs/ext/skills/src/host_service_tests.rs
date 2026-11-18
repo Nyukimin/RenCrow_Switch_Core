@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-17: scope root precedence assertions to fixture-owned paths.
 use super::*;
 use codex_config::CONFIG_TOML_FILE;
 use codex_config::ConfigLayerEntry;
@@ -351,10 +352,15 @@ async fn snapshot_for_config_merges_extension_host_and_legacy_plugin_roots() {
     let snapshot = skills_service
         .snapshot_for_config(&input, Some(Arc::clone(&LOCAL_FS)))
         .await;
+    let fixture_home = dunce::canonicalize(codex_home.path()).expect("canonical fixture home");
     let skills = snapshot
         .outcome()
         .skills
         .iter()
+        .filter(|skill| {
+            dunce::canonicalize(&skill.path_to_skills_md)
+                .is_ok_and(|path| path.starts_with(&fixture_home))
+        })
         .map(|skill| (skill.name.as_str(), skill.plugin_id.as_deref()))
         .collect::<Vec<_>>();
 
@@ -399,9 +405,19 @@ async fn snapshot_for_config_preserves_host_precedence_for_symlinked_plugin_root
         &[plugin_skill_root],
     )
     .await;
+    let fixture_home = dunce::canonicalize(codex_home.path()).expect("canonical fixture home");
+    let fixture_skills = outcome
+        .skills
+        .iter()
+        .filter(|skill| {
+            dunce::canonicalize(&skill.path_to_skills_md)
+                .is_ok_and(|path| path.starts_with(&fixture_home))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
 
     assert_eq!(
-        outcome.skills,
+        fixture_skills,
         vec![codex_skills::SkillMetadata {
             name: "sample:search".to_string(),
             description: "shared skill".to_string(),

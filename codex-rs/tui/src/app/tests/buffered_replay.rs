@@ -629,6 +629,13 @@ fn buffered_replay_preserves_text_before_interactive_requests() {
 #[tokio::test]
 async fn misalignment_buffered_replay_preserves_input_after_continuation() {
     let (mut app, mut history, _) = make_test_app_with_channels().await;
+    let mut keymap = codex_config::types::TuiKeymap::default();
+    keymap.chat.edit_queued_message = Some(codex_config::types::KeybindingsSpec::One(
+        codex_config::types::KeybindingSpec("alt-up".into()),
+    ));
+    let runtime = RuntimeKeymap::from_config(&keymap).expect("valid test keymap");
+    app.chat_widget.apply_keymap_update(keymap, &runtime);
+    app.keymap = runtime;
     let thread_id = ThreadId::new();
     app.chat_widget
         .set_queue_autosend_suppressed(/*suppressed*/ true);

@@ -28,6 +28,13 @@ async fn unavailable_send_keeps_answer_and_skip_remains_available() {
 async fn accepted_question_answer_uses_existing_delivery_and_keeps_main_draft() {
     for queued in [false, true] {
         let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+        let mut keymap = codex_config::types::TuiKeymap::default();
+        keymap.chat.edit_queued_message = Some(codex_config::types::KeybindingsSpec::One(
+            codex_config::types::KeybindingSpec("alt-up".into()),
+        ));
+        let runtime =
+            crate::keymap::RuntimeKeymap::from_config(&keymap).expect("valid test keymap");
+        chat.apply_keymap_update(keymap, &runtime);
         chat.thread_id = Some(ThreadId::new());
         chat.bottom_pane
             .set_composer_text("main draft".into(), Vec::new(), Vec::new());
@@ -591,6 +598,12 @@ async fn question_history_search_uses_updated_bindings() {
 #[tokio::test]
 async fn question_editor_keeps_working_status_and_queued_messages_visible() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let mut keymap = codex_config::types::TuiKeymap::default();
+    keymap.chat.edit_queued_message = Some(codex_config::types::KeybindingsSpec::One(
+        codex_config::types::KeybindingSpec("alt-up".into()),
+    ));
+    let runtime = crate::keymap::RuntimeKeymap::from_config(&keymap).expect("valid test keymap");
+    chat.apply_keymap_update(keymap, &runtime);
     chat.show_welcome_banner = false;
     chat.bottom_pane.set_task_running(/*running*/ true);
     chat.bottom_pane
@@ -729,6 +742,12 @@ async fn question_key_repeats_do_not_consume_another_question() {
 #[tokio::test]
 async fn question_queue_pop_becomes_an_ordinary_composer_draft_and_clears_questions_on_send() {
     let (mut chat, _rx, mut ops) = make_chatwidget_manual(/*model_override*/ None).await;
+    let mut keymap = codex_config::types::TuiKeymap::default();
+    keymap.chat.edit_queued_message = Some(codex_config::types::KeybindingsSpec::One(
+        codex_config::types::KeybindingSpec("alt-up".into()),
+    ));
+    let runtime = crate::keymap::RuntimeKeymap::from_config(&keymap).expect("valid test keymap");
+    chat.apply_keymap_update(keymap, &runtime);
     for text in ["older", "newer"] {
         chat.input_queue
             .queued_user_messages

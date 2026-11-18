@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core on 2026-11-17: test fixtures force deterministic colors and synthetic geometry.
 // This is derived from `ratatui::Terminal`, which is licensed under the following terms:
 //
 // The MIT License (MIT)
@@ -156,6 +157,8 @@ where
     visible_history_rows: u16,
     #[cfg(test)]
     screen_size_override: Option<Size>,
+    #[cfg(test)]
+    cursor_position_is_synthetic: bool,
 }
 
 impl<B> Drop for Terminal<B>
@@ -236,6 +239,8 @@ where
             visible_history_rows: 0,
             #[cfg(test)]
             screen_size_override: None,
+            #[cfg(test)]
+            cursor_position_is_synthetic: false,
         }
     }
 
@@ -248,6 +253,7 @@ where
         let mut terminal =
             Self::with_screen_size_and_cursor_position(backend, screen_size, cursor_pos);
         terminal.screen_size_override = Some(screen_size);
+        terminal.cursor_position_is_synthetic = true;
         terminal
     }
 
@@ -495,6 +501,10 @@ where
     /// This is the position of the cursor after the last draw call.
     #[allow(dead_code)]
     pub fn get_cursor_position(&mut self) -> io::Result<Position> {
+        #[cfg(test)]
+        if self.cursor_position_is_synthetic {
+            return Ok(self.last_known_cursor_pos);
+        }
         self.backend.get_cursor_position()
     }
 
@@ -889,15 +899,18 @@ mod tests {
         size: Size,
         cursor: Position,
         size_call_count: std::cell::Cell<usize>,
+        cursor_position_call_count: std::cell::Cell<usize>,
     }
 
     impl CaptureBackend {
         fn new(width: u16, height: u16) -> Self {
+            crossterm::style::force_color_output(true);
             Self {
                 output: Vec::new(),
                 size: Size { width, height },
                 cursor: Position { x: 0, y: 0 },
                 size_call_count: std::cell::Cell::new(/*value*/ 0),
+                cursor_position_call_count: std::cell::Cell::new(/*value*/ 0),
             }
         }
 
@@ -936,6 +949,8 @@ mod tests {
         }
 
         fn get_cursor_position(&mut self) -> io::Result<Position> {
+            self.cursor_position_call_count
+                .set(self.cursor_position_call_count.get() + 1);
             Ok(self.cursor)
         }
 
@@ -990,6 +1005,36 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn test_geometry_uses_cached_cursor_without_querying_backend() {
+        let initial_cursor = Position { x: 3, y: 7 };
+        let mut terminal = Terminal::with_screen_size_and_cursor_position_for_test(
+            CaptureBackend::new(/*width*/ 80, /*height*/ 24),
+            Size {
+                width: 80,
+                height: 24,
+            },
+            initial_cursor,
+        );
+
+        assert_eq!(
+            terminal.get_cursor_position().expect("cursor position"),
+            initial_cursor
+        );
+        assert_eq!(terminal.backend().cursor_position_call_count.get(), 0);
+
+        let drawn_cursor = Position { x: 11, y: 13 };
+        terminal
+            .set_cursor_position(drawn_cursor)
+            .expect("set cached cursor position");
+
+        assert_eq!(
+            terminal.get_cursor_position().expect("cursor position"),
+            drawn_cursor
+        );
+        assert_eq!(terminal.backend().cursor_position_call_count.get(), 0);
     }
 
     #[test]

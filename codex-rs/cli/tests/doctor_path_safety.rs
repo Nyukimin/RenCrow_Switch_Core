@@ -1,4 +1,5 @@
 //! Black-box coverage for safe diagnostic execution and config error reporting.
+//! Modified by RenCrow Switch Core, 2026-11-17: isolate safe-config report cases from per-test timeouts.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -198,8 +199,24 @@ fn non_interactive_dumb_terminal_preserves_other_doctor_failures() -> Result<()>
     Ok(())
 }
 
-#[test]
-fn doctor_reports_only_safe_config_error_metadata() -> Result<()> {
+#[derive(Clone, Copy)]
+enum ConfigErrorCase {
+    UserSyntax,
+    ProjectSyntax,
+    MissingProvider,
+    InvalidUserHeaders,
+}
+
+#[derive(Clone, Copy)]
+enum ReportMode {
+    Json,
+    Feedback,
+}
+
+fn assert_safe_config_error_metadata(
+    config_error: ConfigErrorCase,
+    report_mode: ReportMode,
+) -> Result<()> {
     let fixture = Fixture::new()?;
     let user_config_file = fixture.home.join("config.toml");
     let original = std::fs::read_to_string(&user_config_file)?;
@@ -208,18 +225,18 @@ fn doctor_reports_only_safe_config_error_metadata() -> Result<()> {
     let original = format!("{original}\n[projects.{project_key}]\ntrust_level = \"trusted\"\n");
     let project_config_dir = fixture.workspace.join(".codex");
     std::fs::create_dir(&project_config_dir)?;
-    for (snapshot_name, config_file, config) in [
-        (
+    let (snapshot_name, config_file, config) = match config_error {
+        ConfigErrorCase::UserSyntax => (
             "doctor_config_error_location",
             user_config_file.clone(),
             "custom_header = \"doctor-test-credential\" trailing\n".to_string(),
         ),
-        (
+        ConfigErrorCase::ProjectSyntax => (
             "doctor_config_invalid_data",
             project_config_dir.join("config.toml"),
             "custom_header = \"doctor-test-credential\" trailing\n".to_string(),
         ),
-        (
+        ConfigErrorCase::MissingProvider => (
             "doctor_config_not_found",
             user_config_file.clone(),
             original.replace(
@@ -227,7 +244,7 @@ fn doctor_reports_only_safe_config_error_metadata() -> Result<()> {
                 "model_provider = \"doctor-test-credential\"",
             ),
         ),
-        (
+        ConfigErrorCase::InvalidUserHeaders => (
             "doctor_config_invalid_data",
             user_config_file.clone(),
             original.replace(
@@ -235,41 +252,79 @@ fn doctor_reports_only_safe_config_error_metadata() -> Result<()> {
                 "wire_api = \"responses\"\nhttp_headers = \"sk-proj-ABC123example\"",
             ),
         ),
-    ] {
-        std::fs::write(&user_config_file, &original)?;
-        std::fs::write(&config_file, config)?;
-        for args in [
-            vec!["doctor", "--json"],
-            vec!["doctor", "--json", "--feedback"],
-        ] {
-            let output = fixture.command()?.args(args).output()?;
-            assert_eq!(output.status.code(), Some(1));
-            let report: Value = serde_json::from_slice(&output.stdout)?;
-            let mut check = report["checks"]["config.load"].clone();
-            check
-                .as_object_mut()
-                .expect("config check")
-                .remove("durationMs");
-            if let Some(file) = check["details"]["file"].as_str() {
-                check["details"]["file"] = Value::String(
-                    file.replace(
-                        &fixture.root.path().canonicalize()?.display().to_string(),
-                        "FIXTURE",
-                    )
-                    .replace(&fixture.root.path().display().to_string(), "FIXTURE")
-                    .replace('\\', "/"),
-                );
-            }
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            assert!(!stdout.contains("doctor-test-credential"));
-            assert!(!stdout.contains("sk-proj-ABC123example"));
-            // Keep snapshots stable across serde_json feature sets in Cargo and Bazel.
-            check.sort_all_objects();
-            insta::assert_snapshot!(snapshot_name, serde_json::to_string_pretty(&check)?);
-        }
-        std::fs::remove_file(config_file)?;
+    };
+    std::fs::write(&user_config_file, &original)?;
+    std::fs::write(&config_file, config)?;
+    let args: &[&str] = match report_mode {
+        ReportMode::Json => &["doctor", "--json"],
+        ReportMode::Feedback => &["doctor", "--json", "--feedback"],
+    };
+    let output = fixture.command()?.args(args).output()?;
+    assert_eq!(output.status.code(), Some(1));
+    let report: Value = serde_json::from_slice(&output.stdout)?;
+    let mut check = report["checks"]["config.load"].clone();
+    check
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("config check is not an object"))?
+        .remove("durationMs");
+    if let Some(file) = check["details"]["file"].as_str() {
+        check["details"]["file"] = Value::String(
+            file.replace(
+                &fixture.root.path().canonicalize()?.display().to_string(),
+                "FIXTURE",
+            )
+            .replace(&fixture.root.path().display().to_string(), "FIXTURE")
+            .replace('\\', "/"),
+        );
     }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("doctor-test-credential"));
+    assert!(!stdout.contains("sk-proj-ABC123example"));
+    // Keep snapshots stable across serde_json feature sets in Cargo and Bazel.
+    check.sort_all_objects();
+    insta::assert_snapshot!(snapshot_name, serde_json::to_string_pretty(&check)?);
+    std::fs::remove_file(config_file)?;
     Ok(())
+}
+
+#[test]
+fn doctor_reports_safe_user_syntax_error_json() -> Result<()> {
+    assert_safe_config_error_metadata(ConfigErrorCase::UserSyntax, ReportMode::Json)
+}
+
+#[test]
+fn doctor_reports_safe_user_syntax_error_with_feedback() -> Result<()> {
+    assert_safe_config_error_metadata(ConfigErrorCase::UserSyntax, ReportMode::Feedback)
+}
+
+#[test]
+fn doctor_reports_safe_project_syntax_error_json() -> Result<()> {
+    assert_safe_config_error_metadata(ConfigErrorCase::ProjectSyntax, ReportMode::Json)
+}
+
+#[test]
+fn doctor_reports_safe_project_syntax_error_with_feedback() -> Result<()> {
+    assert_safe_config_error_metadata(ConfigErrorCase::ProjectSyntax, ReportMode::Feedback)
+}
+
+#[test]
+fn doctor_reports_safe_missing_provider_json() -> Result<()> {
+    assert_safe_config_error_metadata(ConfigErrorCase::MissingProvider, ReportMode::Json)
+}
+
+#[test]
+fn doctor_reports_safe_missing_provider_with_feedback() -> Result<()> {
+    assert_safe_config_error_metadata(ConfigErrorCase::MissingProvider, ReportMode::Feedback)
+}
+
+#[test]
+fn doctor_reports_safe_invalid_user_headers_json() -> Result<()> {
+    assert_safe_config_error_metadata(ConfigErrorCase::InvalidUserHeaders, ReportMode::Json)
+}
+
+#[test]
+fn doctor_reports_safe_invalid_user_headers_with_feedback() -> Result<()> {
+    assert_safe_config_error_metadata(ConfigErrorCase::InvalidUserHeaders, ReportMode::Feedback)
 }
 
 #[test]

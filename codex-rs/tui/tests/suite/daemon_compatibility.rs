@@ -82,10 +82,25 @@ async fn incompatible_daemon_falls_back_for_default_and_explicit_features() -> R
         };
         terminal.wait_for_screen(warning_end)?;
         let screen = terminal.screen_contents();
-        let warning = screen
+        let warning_start = screen
             .lines()
-            .find(|line| line.contains("Running without the shared background server"))
+            .position(|line| line.contains("Running without the shared background server"))
             .context("missing warning line")?;
+        let warning_rows = screen.lines().skip(warning_start);
+        let mut warning_lines = Vec::new();
+        for line in warning_rows {
+            warning_lines.push(line.trim());
+            if line.contains(warning_end) {
+                break;
+            }
+        }
+        ensure!(
+            warning_lines
+                .last()
+                .is_some_and(|line| line.contains(warning_end)),
+            "warning did not include its expected suffix {warning_end:?}; screen:\n{screen}"
+        );
+        let warning = warning_lines.join(" ");
         insta::assert_snapshot!(snapshot, warning);
         terminal.write_input(b"\x14")?;
         terminal.write_input(b"/status")?;

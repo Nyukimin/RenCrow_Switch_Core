@@ -115,6 +115,13 @@ async fn hidden_shell_paste_recalled_from_history_submits_literal_prompt() {
 async fn hidden_shell_paste_queued_during_turn_submits_literal_prompt() {
     for key in [KeyCode::Tab, KeyCode::Enter] {
         let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+        let mut keymap = codex_config::types::TuiKeymap::default();
+        keymap.chat.edit_queued_message = Some(codex_config::types::KeybindingsSpec::One(
+            codex_config::types::KeybindingSpec("alt-up".into()),
+        ));
+        let runtime =
+            crate::keymap::RuntimeKeymap::from_config(&keymap).expect("valid test keymap");
+        chat.apply_keymap_update(keymap, &runtime);
         chat.thread_id = Some(ThreadId::new());
         handle_turn_started(&mut chat, "turn-1");
         let payload = paste_hidden_shell_payload(&mut chat);
@@ -2751,6 +2758,13 @@ fn image_preparation_keeps_input_responsive_and_preserves_pending_input() {
             .block_on(async {
                 let (mut chat, mut rx, mut ops) =
                     make_chatwidget_manual(/*model_override*/ None).await;
+                let mut keymap = codex_config::types::TuiKeymap::default();
+                keymap.chat.edit_queued_message = Some(codex_config::types::KeybindingsSpec::One(
+                    codex_config::types::KeybindingSpec("alt-up".into()),
+                ));
+                let runtime =
+                    crate::keymap::RuntimeKeymap::from_config(&keymap).expect("valid test keymap");
+                chat.apply_keymap_update(keymap, &runtime);
                 chat.thread_id = Some(ThreadId::new());
                 chat.snapshot_local_images = true;
                 let dir = tempfile::tempdir().unwrap();

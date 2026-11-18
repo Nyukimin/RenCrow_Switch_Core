@@ -15,6 +15,14 @@ use tokio_tungstenite::tungstenite::Message;
 #[tokio::test]
 async fn lost_mutation_reply_preserves_work_without_resubmitting() -> Result<()> {
     let (mut app, mut events, mut ops) = make_test_app_with_channels().await;
+    let mut initial_keymap = codex_config::types::TuiKeymap::default();
+    initial_keymap.chat.edit_queued_message = Some(codex_config::types::KeybindingsSpec::One(
+        codex_config::types::KeybindingSpec("alt-up".into()),
+    ));
+    let initial_runtime = RuntimeKeymap::from_config(&initial_keymap).expect("valid test keymap");
+    app.chat_widget
+        .apply_keymap_update(initial_keymap, &initial_runtime);
+    app.keymap = initial_runtime;
     let id = ThreadId::new();
     app.active_thread_id = Some(id);
     app.primary_thread_id = Some(id);

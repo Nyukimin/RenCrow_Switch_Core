@@ -1,4 +1,5 @@
 //! Multi-turn Astra scenarios snapshot the model-visible request history of shipped features.
+//! Modified by RenCrow Switch Core, 2026-11-17: scope two skill snapshots to fixture-owned host roots.
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -39,10 +40,18 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::user_input::UserInput;
 use codex_skills_extension::ExecutorSkillProvider;
+use codex_skills_extension::HostSkillProvider;
+use codex_skills_extension::SkillProvider;
 use codex_skills_extension::SkillProviders;
 use codex_skills_extension::SkillsExtensionConfig;
-use codex_skills_extension::install;
+use codex_skills_extension::catalog::SkillCatalog;
+use codex_skills_extension::catalog::SkillReadResult;
+use codex_skills_extension::catalog::SkillSearchResult;
 use codex_skills_extension::install_with_providers;
+use codex_skills_extension::provider::SkillListQuery;
+use codex_skills_extension::provider::SkillProviderFuture;
+use codex_skills_extension::provider::SkillReadRequest;
+use codex_skills_extension::provider::SkillSearchRequest;
 use codex_utils_path_uri::PathUri;
 use core_test_support::context_snapshot;
 use core_test_support::context_snapshot::ContextSnapshotOptions;
@@ -84,15 +93,52 @@ mod preparation;
 #[path = "scenarios_shared_instructions.rs"]
 mod shared_instructions;
 
-fn skills_extensions() -> Arc<ExtensionRegistry<Config>> {
+struct FixtureHostSkillProvider {
+    inner: HostSkillProvider,
+    fixture_home: PathBuf,
+}
+
+impl SkillProvider for FixtureHostSkillProvider {
+    fn list(&self, query: SkillListQuery) -> SkillProviderFuture<'_, SkillCatalog> {
+        let catalog = self.inner.list(query);
+        let fixture_home = self.fixture_home.clone();
+        Box::pin(async move {
+            let mut catalog = catalog.await?;
+            catalog
+                .entries
+                .retain(|entry| Path::new(entry.main_prompt.as_str()).starts_with(&fixture_home));
+            Ok(catalog)
+        })
+    }
+
+    fn read<'a>(
+        &'a self,
+        request: SkillReadRequest<'a>,
+    ) -> SkillProviderFuture<'a, SkillReadResult> {
+        self.inner.read(request)
+    }
+
+    fn search(&self, request: SkillSearchRequest) -> SkillProviderFuture<'_, SkillSearchResult> {
+        self.inner.search(request)
+    }
+}
+
+fn skills_extensions(fixture_home: PathBuf) -> Arc<ExtensionRegistry<Config>> {
     let mut extensions = ExtensionRegistryBuilder::<Config>::new();
-    install(&mut extensions, |config: &Config| SkillsExtensionConfig {
-        include_instructions: config.include_skill_instructions,
-        max_context_tokens: config.skill_max_context_tokens,
-        bundled_skills_enabled: config.bundled_skills_enabled(),
-        cloud_skill_enabled: config.cloud_skill_enabled,
-        shadow_selection_enabled: config.features.enabled(Feature::SkillSearch),
-    });
+    install_with_providers(
+        &mut extensions,
+        SkillProviders::new().with_host_provider(Arc::new(FixtureHostSkillProvider {
+            inner: HostSkillProvider::new(),
+            fixture_home,
+        })),
+        |config: &Config| SkillsExtensionConfig {
+            include_instructions: config.include_skill_instructions,
+            max_context_tokens: config.skill_max_context_tokens,
+            bundled_skills_enabled: config.bundled_skills_enabled(),
+            cloud_skill_enabled: config.cloud_skill_enabled,
+            shadow_selection_enabled: config.features.enabled(Feature::SkillSearch),
+        },
+    );
     Arc::new(extensions.build())
 }
 
@@ -329,6 +375,9 @@ async fn astra_kickoff_with_skills_plugins_and_remote_compaction() -> Result<()>
 
     let server = start_mock_server().await;
     let home = Arc::new(TempDir::new()?);
+    let fixture_home = PathUri::from_host_native_path(fs::canonicalize(home.path())?)?
+        .to_abs_path()?
+        .to_path_buf();
     let skills = write_scenario_capabilities(&home)?;
     let mock = mount_sse_sequence(
         &server,
@@ -362,7 +411,7 @@ async fn astra_kickoff_with_skills_plugins_and_remote_compaction() -> Result<()>
         .with_model("gpt-6-astra")
         .with_home(home)
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
-        .with_extensions(skills_extensions())
+        .with_extensions(skills_extensions(fixture_home))
         .with_workspace_setup(|cwd, fs| async move {
             fs.write_file(
                 &executor_path_uri(cwd.join("AGENTS.md"))?,
@@ -886,6 +935,9 @@ async fn astra_refreshes_plugin_tools_and_skills_in_an_existing_thread() -> Resu
 
     let server = start_mock_server().await;
     let home = Arc::new(TempDir::new()?);
+    let fixture_home = PathUri::from_host_native_path(fs::canonicalize(home.path())?)?
+        .to_abs_path()?
+        .to_path_buf();
     let config = "[features]\nplugins = true\n\n[skills.bundled]\nenabled = false\n";
     fs::write(home.path().join("config.toml"), config)?;
     let lookup = r#"text(ALL_TOOLS.filter(({ name }) => name === "mcp__notes__echo").map(({ name }) => name));"#;
@@ -939,7 +991,7 @@ async fn astra_refreshes_plugin_tools_and_skills_in_an_existing_thread() -> Resu
         .with_model("gpt-6-astra")
         .with_home(Arc::clone(&home))
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
-        .with_extensions(skills_extensions())
+        .with_extensions(skills_extensions(fixture_home))
         .with_config(configure_scenario_catalog);
     let test = builder.build(&server).await?;
 

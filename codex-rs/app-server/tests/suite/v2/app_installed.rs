@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
+// Modified by RenCrow Switch Core, 2026-11-17: assert refresh deltas across startup warmup.
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
@@ -382,6 +383,7 @@ async fn installed_apps_failed_force_refresh_retains_previous_snapshot() -> Resu
     let mut app_server = start_app_server(codex_home.path()).await?;
 
     let committed = send_installed_request(&mut app_server, /*force_refresh*/ true).await?;
+    let list_tools_calls = fixture.list_tools_calls();
     fixture.fail_next_list_tools();
     let request_id = app_server
         .send_apps_installed_request(AppsInstalledParams {
@@ -395,10 +397,11 @@ async fn installed_apps_failed_force_refresh_retains_previous_snapshot() -> Resu
     )
     .await??;
     assert_eq!(error.error.code, -32603);
+    assert_eq!(fixture.list_tools_calls(), list_tools_calls + 1);
 
     let retained = send_installed_request(&mut app_server, /*force_refresh*/ false).await?;
     assert_eq!(retained, committed);
-    assert_eq!(fixture.list_tools_calls(), 2);
+    assert_eq!(fixture.list_tools_calls(), list_tools_calls + 1);
     Ok(())
 }
 

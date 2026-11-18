@@ -1,4 +1,5 @@
 //! Bazel-wired proof-of-concept crate reserved for future V8 experiments.
+// Modified by RenCrow Switch Core, 2026-11-17.
 
 /// Returns the Bazel label for this proof-of-concept crate.
 #[must_use]
@@ -65,8 +66,17 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_feature_matches_linked_v8() {
-        assert_eq!(super::linked_v8_has_sandbox(), cfg!(feature = "sandbox"));
+    fn requested_sandbox_is_enabled_in_linked_v8() {
+        let linked = super::linked_v8_has_sandbox();
+        // Cargo features are additive across the dependency graph. A sandbox
+        // request from this crate requires the linked library to enable it;
+        // this crate not requesting it does not disable another crate's request.
+        if cfg!(feature = "sandbox") {
+            assert!(
+                linked,
+                "the requested V8 sandbox is not enabled in the linked library"
+            );
+        }
     }
 
     #[test]

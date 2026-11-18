@@ -1,4 +1,7 @@
+// Modified by RenCrow Switch Core on 2026-11-17: keep marketplace import coverage hermetic.
 use super::super::*;
+use crate::migration_source::MarketplaceImportSource;
+use crate::source_cla;
 use pretty_assertions::assert_eq;
 
 #[tokio::test]
@@ -137,7 +140,8 @@ async fn import_plugins_treats_empty_cwd_as_home_scope() {
     )
     .expect("write plugin manifest");
 
-    let outcome = service_for_paths(external_agent_home, codex_home.clone())
+    let service = service_for_paths(external_agent_home, codex_home.clone());
+    let outcome = service
         .import_plugins(
             /*cwd*/ Some(std::path::Path::new("")),
             Some(MigrationDetails {
@@ -164,6 +168,43 @@ async fn import_plugins_treats_empty_cwd_as_home_scope() {
     let config = fs::read_to_string(codex_home.join("config.toml")).expect("read config");
     assert!(config.contains(r#"[plugins."cloudflare@my-plugins"]"#));
     assert!(config.contains("enabled = true"));
+
+    let missing_plugin_outcome = service
+        .import_plugins(
+            /*cwd*/ None,
+            Some(MigrationDetails {
+                plugins: vec![PluginsMigration {
+                    marketplace_name: "my-plugins".to_string(),
+                    plugin_names: vec!["sample".to_string()],
+                }],
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("import missing plugin");
+
+    assert_eq!(
+        missing_plugin_outcome.succeeded_marketplaces,
+        vec!["my-plugins".to_string()]
+    );
+    assert_eq!(
+        missing_plugin_outcome.succeeded_plugin_ids,
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        missing_plugin_outcome.failed_marketplaces,
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        missing_plugin_outcome.failed_plugin_ids,
+        vec!["sample@my-plugins".to_string()]
+    );
+    assert_single_plugin_raw_error(
+        &missing_plugin_outcome.raw_errors,
+        "plugin_import",
+        "sample@my-plugins",
+        Some("plugin_not_found"),
+    );
 }
 
 #[tokio::test]
@@ -478,53 +519,31 @@ async fn import_plugins_supports_relative_external_agent_plugin_marketplace_path
     assert!(config.contains("enabled = true"));
 }
 
-#[tokio::test]
-async fn import_plugins_infers_external_official_marketplace_when_missing_from_settings() {
-    let (_root, external_agent_home, codex_home) = fixture_paths();
+#[test]
+fn marketplace_import_sources_infers_external_official_marketplace_when_missing_from_settings() {
+    let (_root, external_agent_home, _codex_home) = fixture_paths();
     fs::create_dir_all(&external_agent_home).expect("create external agent home");
-    fs::create_dir_all(&codex_home).expect("create codex home");
+    let settings = serde_json::json!({
+        "enabledPlugins": {
+            (format!("sample@{EXTERNAL_OFFICIAL_MARKETPLACE_NAME}")): true,
+        }
+    });
 
-    fs::write(
-        external_agent_home.join("settings.json"),
-        format!(
-            r#"{{
-          "enabledPlugins": {{
-            "sample@{EXTERNAL_OFFICIAL_MARKETPLACE_NAME}": true
-          }}
-        }}"#
-        ),
-    )
-    .expect("write settings");
-
-    let outcome = service_for_paths(external_agent_home, codex_home)
-        .import_plugins(
-            /*cwd*/ None,
-            Some(MigrationDetails {
-                plugins: vec![PluginsMigration {
-                    marketplace_name: EXTERNAL_OFFICIAL_MARKETPLACE_NAME.to_string(),
-                    plugin_names: vec!["sample".to_string()],
-                }],
-                ..Default::default()
-            }),
-        )
-        .await
-        .expect("import plugins");
+    let import_sources = source_cla::marketplace_import_sources(
+        &settings,
+        &external_agent_home,
+        &external_agent_home,
+    );
 
     assert_eq!(
-        outcome.succeeded_marketplaces,
-        vec![EXTERNAL_OFFICIAL_MARKETPLACE_NAME.to_string()]
-    );
-    assert_eq!(outcome.succeeded_plugin_ids, Vec::<String>::new());
-    assert_eq!(outcome.failed_marketplaces, Vec::<String>::new());
-    assert_eq!(
-        outcome.failed_plugin_ids,
-        vec![format!("sample@{EXTERNAL_OFFICIAL_MARKETPLACE_NAME}")]
-    );
-    assert_single_plugin_raw_error(
-        &outcome.raw_errors,
-        "plugin_import",
-        &format!("sample@{EXTERNAL_OFFICIAL_MARKETPLACE_NAME}"),
-        Some("plugin_not_found"),
+        import_sources,
+        std::collections::BTreeMap::from([(
+            EXTERNAL_OFFICIAL_MARKETPLACE_NAME.to_string(),
+            MarketplaceImportSource {
+                source: "anthropics/claude-plugins-official".to_string(),
+                ref_name: None,
+            },
+        )])
     );
 }
 

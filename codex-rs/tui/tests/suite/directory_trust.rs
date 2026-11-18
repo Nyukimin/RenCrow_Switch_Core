@@ -1,4 +1,5 @@
 //! Exercises folder consent against a connected server through the real terminal event loop.
+// Modified by RenCrow Switch Core on 2026-11-17: use a short owned cwd so the path row is not wrapped.
 
 use super::focus_palette::PtyCodex;
 use super::focus_palette::write_test_config;
@@ -19,7 +20,8 @@ use tokio_tungstenite::tungstenite::Message;
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn connected_trust_cancellation_and_acceptance_control_task_creation() -> Result<()> {
     for trust_level in [None, Some("untrusted")] {
-        let repo_root = codex_utils_cargo_bin::repo_root()?;
+        let cwd_fixture = tempfile::tempdir_in("/tmp")?;
+        let repo_root = cwd_fixture.path().canonicalize()?;
         let codex_home = tempfile::tempdir_in("/tmp")?;
         // The server's trust decision must win over the client's trusted-folder setting.
         write_test_config(codex_home.path(), &repo_root)?;
