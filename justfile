@@ -91,6 +91,15 @@ test *args:
 test *args:
     $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; cargo nextest run --no-fail-fast @($args | Select-Object -Skip 1)
 
+# Run the fail-closed, Switch-specific basic regression set.
+[unix]
+test-switch-basic *args:
+    {{ python }} "{{ justfile_directory() }}/scripts/test_switch_basic.py" "$@"
+
+[windows]
+test-switch-basic *args:
+    {{ python }} "{{ justfile_directory() }}/scripts/test_switch_basic.py" @($args | Select-Object -Skip 1)
+
 # Run from the repository root so scripts that resolve paths from `cwd` see
 # the same layout they use in GitHub Actions.
 [no-cd]

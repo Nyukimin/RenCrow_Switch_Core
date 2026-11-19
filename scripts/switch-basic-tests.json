@@ -1,0 +1,218 @@
+{
+  "schema_version": 1,
+  "name": "switch-basic",
+  "description": "A small fail-closed regression set for Codex-switch contracts. It is not full Switch coverage and does not select unrelated upstream tests.",
+  "test_count": 36,
+  "groups": [
+    {
+      "id": "compaction_transaction_replay_and_rollback",
+      "contract": "Switch Compaction commit/replay, interrupted and uncertain persistence, rollback, recovery, and the boundary between compaction and a completed tool receipt.",
+      "tests": [
+        {
+          "binary_id": "codex-core::all",
+          "test_name": "suite::compact_rencrow_persistence::rencrow_cancel_during_persistence_requires_restart_and_keeps_the_original_history",
+          "package_name": "codex-core"
+        },
+        {
+          "binary_id": "codex-core::all",
+          "test_name": "suite::compact_rencrow_persistence::rencrow_interrupted_commit_requires_restart_and_replay_discards_it",
+          "package_name": "codex-core"
+        },
+        {
+          "binary_id": "codex-core::all",
+          "test_name": "suite::compact_rencrow_persistence::rencrow_replay_of_corrupt_transaction_is_integrity_blocked_without_restart_request",
+          "package_name": "codex-core"
+        },
+        {
+          "binary_id": "codex-core::all",
+          "test_name": "suite::compact_rencrow_persistence::rencrow_uncertain_flush_requires_restart_and_replay_adopts_the_committed_checkpoint",
+          "package_name": "codex-core"
+        },
+        {
+          "binary_id": "codex-core::all",
+          "test_name": "suite::compact_rencrow::rencrow_compaction_keeps_one_selected_history_through_resume_and_recompaction::automatic",
+          "package_name": "codex-core"
+        },
+        {
+          "binary_id": "codex-core::all",
+          "test_name": "suite::compact_rencrow::rencrow_malformed_summary_commits_emergency_and_next_normal_summarizes_its_work",
+          "package_name": "codex-core"
+        },
+        {
+          "binary_id": "codex-core::all",
+          "test_name": "suite::compact_rencrow::rencrow_completed_unified_exec_pair_is_summarized_after_terminal_receipt",
+          "package_name": "codex-core"
+        },
+        {
+          "binary_id": "codex-core",
+          "test_name": "session::rencrow_compaction::tests::stale_history_rejects_before_persistence_or_replacement",
+          "package_name": "codex-core"
+        },
+        {
+          "binary_id": "codex-core",
+          "test_name": "session::rencrow_compaction::tests::uncertain_checkpoint_prevents_subsequent_sampling",
+          "package_name": "codex-core"
+        },
+        {
+          "binary_id": "codex-history",
+          "test_name": "compaction_transaction::tests::every_truncated_transaction_prefix_discards_only_uncommitted_prefix",
+          "package_name": "codex-history"
+        },
+        {
+          "binary_id": "codex-history",
+          "test_name": "compaction_transaction::tests::mismatch_and_missing_marker_preserve_later_records",
+          "package_name": "codex-history"
+        },
+        {
+          "binary_id": "codex-history",
+          "test_name": "compaction_transaction::tests::valid_transaction_removes_marker_and_commits_checkpoint_metadata",
+          "package_name": "codex-history"
+        }
+      ]
+    },
+    {
+      "id": "raw_history_checkpoint_and_resume",
+      "contract": "Raw rollout reconstruction and history-first cold resume, including persisted permission and pending approval restoration.",
+      "tests": [
+        {
+          "binary_id": "codex-core",
+          "test_name": "session::rollout_reconstruction_tests::reconstruct_history_rollback_keeps_history_and_metadata_in_sync_for_incomplete_turn",
+          "package_name": "codex-core"
+        },
+        {
+          "binary_id": "codex-core",
+          "test_name": "session::rollout_reconstruction_tests::sender_context_follows_its_delivery_through_checkpoint_and_rollback",
+          "package_name": "codex-core"
+        },
+        {
+          "binary_id": "codex-thread-store",
+          "test_name": "local::tests::live_thread_resume_loads_history_before_observing_metadata",
+          "package_name": "codex-thread-store"
+        },
+        {
+          "binary_id": "codex-thread-store",
+          "test_name": "local::tests::live_thread_resume_loads_history_from_explicit_external_rollout_path",
+          "package_name": "codex-thread-store"
+        },
+        {
+          "binary_id": "codex-app-server::all",
+          "test_name": "suite::v2::thread_resume::cold_resume_permission_overrides_win_over_persisted_profile",
+          "package_name": "codex-app-server"
+        },
+        {
+          "binary_id": "codex-app-server::all",
+          "test_name": "suite::v2::thread_resume::thread_resume_replays_pending_command_execution_request_approval",
+          "package_name": "codex-app-server"
+        },
+        {
+          "binary_id": "codex-thread-store",
+          "test_name": "local::compaction_sources::tests::reads_same_thread_source_pairs_respects_cutoffs_and_excludes_foreign_segments",
+          "package_name": "codex-thread-store"
+        }
+      ]
+    },
+    {
+      "id": "task_completion_and_reviewer_lifecycle",
+      "contract": "Host task-boundary acceptance, completion evidence, independent reviewer decisions, and failed-review recovery.",
+      "tests": [
+        {
+          "binary_id": "codex-core::all",
+          "test_name": "suite::task_context_boundary_loop::parent_task_boundary_runs_in_model_loop_and_survives_cold_resume",
+          "package_name": "codex-core"
+        },
+        {
+          "binary_id": "codex-core::all",
+          "test_name": "suite::autonomous_completion_loop::task_evidence_recovery_accept_completes_final_guard",
+          "package_name": "codex-core"
+        },
+        {
+          "binary_id": "codex-core::all",
+          "test_name": "suite::autonomous_completion_loop::failed_review_close_preserves_history_and_allows_one_new_authorized_review",
+          "package_name": "codex-core"
+        },
+        {
+          "binary_id": "codex-core",
+          "test_name": "session::tests::completion_review_async_tests::failed_review_retry_reaches_adopted_completion_through_session_owner",
+          "package_name": "codex-core"
+        },
+        {
+          "binary_id": "codex-core",
+          "test_name": "session::tests::completion_recovery_tests::changed_artifact_invalidates_satisfied_condition_during_reconcile",
+          "package_name": "codex-core"
+        },
+        {
+          "binary_id": "codex-core",
+          "test_name": "tools::handlers::task_context_boundary::tests::accept_uses_host_receipt_and_stays_pending_until_safe_point",
+          "package_name": "codex-core"
+        },
+        {
+          "binary_id": "codex-history",
+          "test_name": "task_context::tests::review_evidence_does_not_satisfy_acceptance_condition",
+          "package_name": "codex-history"
+        },
+        {
+          "binary_id": "codex-history",
+          "test_name": "task_context::tests::review_unit_requires_collected_matching_host_evidence_and_parent_decision",
+          "package_name": "codex-history"
+        }
+      ]
+    },
+    {
+      "id": "role_policy_and_thread_title",
+      "contract": "Switch role tool allowlists/read-only narrowing, managed startup policy, and Switch thread-title configuration across a thread switch/resume.",
+      "tests": [
+        {
+          "binary_id": "codex-core",
+          "test_name": "agent::role::tests::apply_role_narrows_tool_allowlist_and_sets_read_only",
+          "package_name": "codex-core"
+        },
+        {
+          "binary_id": "codex-core",
+          "test_name": "agent::rencrow_read_only::tests::read_only_stays_read_only",
+          "package_name": "codex-core"
+        },
+        {
+          "binary_id": "codex-core",
+          "test_name": "tools::spec_plan::tests::reviewer_tool_policy_respect_managed_shell_restrictions",
+          "package_name": "codex-core"
+        },
+        {
+          "binary_id": "codex-core",
+          "test_name": "mcp_tool_exposure::tests::cached_app_handlers_still_obey_current_apps_enablement_and_tool_policy",
+          "package_name": "codex-core"
+        },
+        {
+          "binary_id": "codex-core::all",
+          "test_name": "suite::managed_threads::startup_tool_policy_controls_additional_permission_parameters::explicit_policy_overrides_identity",
+          "package_name": "codex-core"
+        },
+        {
+          "binary_id": "codex-core",
+          "test_name": "config::tests::rencrow_thread_title_reasoning_effort_is_read_from_config",
+          "package_name": "codex-core"
+        },
+        {
+          "binary_id": "codex-core::all",
+          "test_name": "suite::reasoning_effort_override::worker_reasoning_overrides_follow_effective_client_policy::persisted_thread_title",
+          "package_name": "codex-core"
+        },
+        {
+          "binary_id": "codex-tui",
+          "test_name": "app::thread_title::tests::automatic_thread_title_respects_origin_metadata_after_switching",
+          "package_name": "codex-tui"
+        }
+      ]
+    },
+    {
+      "id": "checkpoint_cli_selection",
+      "contract": "The Switch checkpoint CLI selects an embedded task-boundary checkpoint and rejects malformed selection targets.",
+      "tests": [
+        {
+          "binary_id": "codex-cli::bin/rencrow-compaction",
+          "test_name": "task_checkpoint::tests::latest_capacity_row_with_embedded_task_boundary_is_selected_and_malformed_target_fails",
+          "package_name": "codex-cli"
+        }
+      ]
+    }
+  ]
+}
