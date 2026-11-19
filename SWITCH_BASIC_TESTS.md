@@ -35,3 +35,8 @@ tests just to increase the count. This task's user instruction to test only
 functionality affected by Switch takes precedence over the upstream default of
 running the full suite after broad core changes; the ordinary `just test`
 recipe remains unchanged.
+
+For selecting and constructing change-specific tests in addition to this basic
+set, follow the change-specific testing procedure in [FORK_RULES.md](FORK_RULES.md).
+That procedure owns the impact analysis, reuse/addition decision, exact
+selection check, static gates, scoped execution, and acceptance record.
