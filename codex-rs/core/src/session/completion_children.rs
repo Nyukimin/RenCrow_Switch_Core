@@ -395,10 +395,30 @@ impl Session {
                 &contract.units[review_index].condition_refs,
             )?;
             let review_unit = &contract.units[review_index];
-            let mut brief = format!(
+            let mut brief = String::from("Accepted artifact locations:\n");
+            if let Some(check) = task_check_snapshot.iter().find(|entry| {
+                entry.task_id == target_task_id && entry.task_revision == target_task_revision
+            }) && let crate::task_check::TaskCheckAttemptStatus::Finished(receipt) =
+                &check.attempt.status
+            {
+                for artifact in receipt.artifact_after.iter().take(12) {
+                    let absolute_path = receipt.workspace_root.join(&artifact.path);
+                    let location = serde_json::json!({
+                        "workspace_root": receipt.workspace_root.to_string_lossy(),
+                        "absolute_path": absolute_path.to_string_lossy(),
+                    });
+                    brief.push_str(&format!("Verified artifact location: {location}\n"));
+                }
+            }
+            if brief.chars().count() > 7_000 {
+                return Err(
+                    "verified artifact locations exceed the completion review brief limit".into(),
+                );
+            }
+            brief.push_str(&format!(
                 "Review purpose: {}\nAccepted task result: {}\nAccepted artifact ref: {}",
                 review_unit.purpose, accepted.result, target_artifact_ref
-            );
+            ));
             for condition_id in review_unit.condition_refs.iter().take(8) {
                 if let Some(condition) = contract.conditions.iter().find(|c| c.id == *condition_id)
                 {
@@ -423,14 +443,6 @@ impl Session {
                     "\nHost verification: call_id={}; exit_code={}; succeeded={}",
                     receipt.call_id, receipt.exit_code, receipt.succeeded
                 ));
-                for artifact in receipt.artifact_after.iter().take(12) {
-                    let path = artifact
-                        .path
-                        .strip_prefix(&receipt.workspace_root)
-                        .unwrap_or(&artifact.path)
-                        .to_string_lossy();
-                    brief.push_str(&format!("\nVerified artifact path: {path}"));
-                }
             }
             if brief.chars().count() > 7_000 {
                 brief = brief.chars().take(7_000).collect();

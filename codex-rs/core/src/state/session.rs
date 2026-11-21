@@ -162,6 +162,12 @@ pub(crate) struct SessionState {
     pub(crate) rencrow_completion_review_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
     /// Receipt created only after the exact snapshot append succeeds.
     pub(crate) rencrow_completion_last_persisted_snapshot: Option<CompletionSnapshotReceipt>,
+    /// Bounded host proof closure for successor handoff; never model-authored state.
+    pub(crate) rencrow_completion_handoff_proofs:
+        std::collections::BTreeMap<String, serde_json::Value>,
+    pub(crate) rencrow_inherited_guard: Option<crate::rencrow_execution_guard::GuardState>,
+    pub(crate) rencrow_handoff_pending_input: Option<(String, String)>,
+    pub(crate) rencrow_handoff_pending_record: Option<PathBuf>,
     pub(crate) rencrow_completion_continued_for_turn: Option<String>,
     /// Host-marked internal continuation turns, distinct from user-submitted turns.
     pub(crate) rencrow_autonomous_turn_ids: HashSet<String>,
@@ -274,6 +280,10 @@ impl SessionState {
             rencrow_completion_persist_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             rencrow_completion_review_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             rencrow_completion_last_persisted_snapshot: None,
+            rencrow_completion_handoff_proofs: Default::default(),
+            rencrow_inherited_guard: None,
+            rencrow_handoff_pending_input: None,
+            rencrow_handoff_pending_record: None,
             rencrow_completion_continued_for_turn: None,
             rencrow_autonomous_turn_ids: HashSet::new(),
             rencrow_completion_bootstrap_turn_ids: HashSet::new(),

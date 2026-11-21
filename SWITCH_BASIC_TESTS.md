@@ -15,7 +15,7 @@ reuse options are forwarded to both list and run. When a reuse/remap option is
 provided, Cargo package/build selectors are omitted because they conflict with
 reused metadata; the exact binary/test filter remains in force.
 
-The 36 cases in `scripts/switch-basic-tests.json` cover these Switch contracts:
+The 45 cases in `scripts/switch-basic-tests.json` cover these Switch contracts:
 
 - Compaction transaction commit, interrupted or uncertain persistence, replay,
   rollback, emergency recovery, and completion receipts.

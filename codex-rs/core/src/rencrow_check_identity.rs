@@ -4,7 +4,8 @@ use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct CheckIdentity {
     pub(crate) cwd: PathBuf,
     pub(crate) cwd_reliable: bool,

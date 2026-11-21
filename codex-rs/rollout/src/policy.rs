@@ -1,4 +1,5 @@
 // Modified by RenCrow Switch Core, 2026-09-22: persist compaction transaction commits.
+// Modified by RenCrow Switch Core, 2026-11-21: persist compaction lifecycle starts.
 use crate::RolloutItem;
 use crate::protocol::EventMsg;
 use codex_extension_items::ExtensionItem;
@@ -120,6 +121,12 @@ pub fn should_persist_event_msg(ev: &EventMsg, history_mode: ThreadHistoryMode) 
         | EventMsg::TurnComplete(_)
         | EventMsg::ThreadSettingsApplied(_) => true,
 
+        // A compaction start is the durable opening edge for the persisted compaction lifecycle.
+        // Other item starts remain transient UI progress events.
+        EventMsg::ItemStarted(event) => {
+            matches!(&event.item, TurnItem::ContextCompaction(_))
+        }
+
         // Only persist these legacy events when the thread's history mode is Legacy.
         // New, paginated rollouts persist ItemCompleted events with TurnItems.
         EventMsg::UserMessage(_)
@@ -191,7 +198,6 @@ pub fn should_persist_event_msg(ev: &EventMsg, history_mode: ThreadHistoryMode) 
         | EventMsg::PlanUpdate(_)
         | EventMsg::ShutdownComplete
         | EventMsg::DeprecationNotice(_)
-        | EventMsg::ItemStarted(_)
         | EventMsg::HookStarted(_)
         | EventMsg::HookCompleted(_)
         | EventMsg::AgentMessageContentDelta(_)
@@ -204,5 +210,43 @@ pub fn should_persist_event_msg(ev: &EventMsg, history_mode: ThreadHistoryMode) 
         | EventMsg::CollabWaitingBegin(_)
         | EventMsg::CollabCloseBegin(_)
         | EventMsg::CollabResumeBegin(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codex_protocol::items::ContextCompactionItem;
+    use codex_protocol::items::PlanItem;
+    use codex_protocol::items::TurnItem;
+    use codex_protocol::protocol::ItemStartedEvent;
+    use codex_protocol::protocol::ThreadHistoryMode;
+
+    fn item_started(item: TurnItem) -> RolloutItem {
+        RolloutItem::EventMsg(EventMsg::ItemStarted(ItemStartedEvent {
+            thread_id: Default::default(),
+            turn_id: "turn-1".into(),
+            item,
+            started_at_ms: 1,
+        }))
+    }
+
+    #[test]
+    fn persists_only_context_compaction_item_started_for_each_history_mode() {
+        let compaction = item_started(TurnItem::ContextCompaction(ContextCompactionItem::new()));
+        let ordinary = item_started(TurnItem::Plan(PlanItem {
+            id: "plan-1".into(),
+            text: "ordinary progress".into(),
+        }));
+
+        for history_mode in [ThreadHistoryMode::Legacy, ThreadHistoryMode::Paginated] {
+            assert_eq!(
+                persisted_rollout_items(std::slice::from_ref(&compaction), history_mode).len(),
+                1
+            );
+            assert!(
+                persisted_rollout_items(std::slice::from_ref(&ordinary), history_mode).is_empty()
+            );
+        }
     }
 }

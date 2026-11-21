@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-21.
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::time::Duration;
@@ -16,12 +17,15 @@ const REGULAR_FILE_MODE: &str = "100644";
 // content-exact diff without stalling tool completion.
 const DIFF_TIMEOUT: Duration = Duration::from_millis(100);
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TrackedContent {
     content: String,
     revision: u64,
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TrackedPath {
     environment_id: String,
     path: PathUri,
@@ -36,7 +40,7 @@ impl TrackedPath {
     }
 }
 
-#[derive(Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct DiffCacheKey {
     left_path: TrackedPath,
     left_revision: Option<u64>,
@@ -46,6 +50,7 @@ struct DiffCacheKey {
 
 /// Tracks the net text diff for the current turn from committed apply_patch
 /// mutations, without rereading the workspace filesystem.
+#[derive(Clone, Debug)]
 pub struct TurnDiffTracker {
     valid: bool,
     display_roots_by_environment: HashMap<String, PathUri>,
@@ -58,6 +63,10 @@ pub struct TurnDiffTracker {
     #[cfg(test)]
     rendered_diff_count: std::cell::Cell<usize>,
 }
+
+#[path = "turn_diff_tracker/parent_handoff.rs"]
+mod parent_handoff;
+pub(crate) use parent_handoff::ParentHandoffDiffTracker;
 
 impl Default for TurnDiffTracker {
     fn default() -> Self {

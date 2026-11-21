@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-20: separate caller and host checkpoint budgets.
 // Modified by RenCrow Switch Core, 2026-11-16.
 use super::*;
 
@@ -226,6 +227,82 @@ fn completion_condition_rejects_empty_result_with_field_specific_error() {
     assert_eq!(
         validate_completion_state(Some(&state), &BTreeMap::new()).unwrap_err(),
         "acceptance condition AC-1 field `result` must be non-empty and at most 4096 bytes"
+    );
+}
+
+#[test]
+fn completion_state_uses_separate_caller_and_checkpoint_budgets() {
+    let mut state = review_unit_state(UnitStatus::Planned);
+    state.plan_reviews = (0..20)
+        .map(|_| PlanReviewRecord {
+            at: 1,
+            previous_plan: "previous plan ".repeat(100),
+            revised_plan: "revised plan ".repeat(100),
+            reason: "evidence-based reason ".repeat(100),
+        })
+        .collect();
+    let encoded_state = serde_json::to_vec(&state).unwrap();
+    assert!(encoded_state.len() > MAX_COMPLETION_INPUT_BYTES);
+    assert!(encoded_state.len() < MAX_COMPLETION_CHECKPOINT_BYTES);
+    let canonical_state_sha256 =
+        crate::archive_reference::content_sha256(&serde_json::to_string(&state).unwrap());
+    validate_completion_state(Some(&state), &BTreeMap::new()).unwrap();
+    validate_completion_state_snapshot(Some(&state), &BTreeMap::new()).unwrap();
+
+    let caller_input = serde_json::json!({
+        "completion_state": {"units": [], "conditions": []},
+        "forged_host_field": "x".repeat(MAX_COMPLETION_INPUT_BYTES),
+    });
+    assert_eq!(
+        validate_completion_state_input_size(&caller_input).unwrap_err(),
+        "completion state input exceeds caller size limit"
+    );
+
+    let mut candidate = candidate();
+    candidate.completion_state = Some(state);
+    assert_eq!(
+        validate_boundary(candidate.clone(), &facts()),
+        Err(BoundaryError::Oversized)
+    );
+    let accepted = validate_host_boundary_checkpoint(candidate, &facts()).unwrap();
+    let stored = accepted
+        .into_stored_state(
+            /*previous_revision*/ None,
+            /*previous_state_hash*/ None,
+            "nonce-large-completion".into(),
+        )
+        .unwrap();
+    let restored =
+        StoredTaskState::parse_and_validate(serde_json::to_value(stored).unwrap(), "th1").unwrap();
+    let rendered = restored.render_context().unwrap();
+    assert!(rendered.contains(&canonical_state_sha256));
+    assert!(rendered.contains("task_context_boundary status"));
+    assert!(!rendered.contains("previous plan "));
+    assert!(rendered.len() < 4_000);
+    assert_eq!(
+        restored
+            .boundary
+            .completion_state
+            .unwrap()
+            .plan_reviews
+            .len(),
+        20
+    );
+
+    let mut oversized_state = review_unit_state(UnitStatus::Planned);
+    oversized_state.plan_reviews = (0..80)
+        .map(|_| PlanReviewRecord {
+            at: 1,
+            previous_plan: "previous plan ".repeat(100),
+            revised_plan: "revised plan ".repeat(100),
+            reason: "evidence-based reason ".repeat(100),
+        })
+        .collect();
+    assert!(serde_json::to_vec(&oversized_state).unwrap().len() > MAX_COMPLETION_CHECKPOINT_BYTES);
+    assert!(
+        validate_completion_state(Some(&oversized_state), &BTreeMap::new())
+            .unwrap_err()
+            .contains("completion state exceeds checkpoint size limit")
     );
 }
 

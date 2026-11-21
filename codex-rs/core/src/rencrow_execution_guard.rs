@@ -37,7 +37,8 @@ pub(crate) struct GuardExecutionEvidence {
     pub(crate) checked: bool,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct GuardState {
     reads: u16,
     repeated: HashMap<String, u16>,
@@ -50,6 +51,8 @@ pub(crate) struct GuardState {
     baseline_failure_reads_stamp: Option<u64>,
     child_revision: u64,
     budget_rejections: u8,
+    #[serde(skip)]
+    fatal_on_next_budget_refusal: bool,
     patch_verification_failures: u8,
     checked: bool,
     failed_checks: HashSet<String>,
@@ -62,9 +65,65 @@ pub(crate) struct GuardState {
     children: HashSet<String>,
     child_results: HashSet<(codex_protocol::ThreadId, String)>,
     implementation_child_delegated: bool,
+    handoff_diff_tracker: Option<crate::turn_diff_tracker::ParentHandoffDiffTracker>,
 }
 
 impl GuardState {
+    /// A parent handoff must not drop pending checks, children, or unknown tool effects.
+    pub(crate) fn parent_handoff_is_quiescent(&self) -> bool {
+        self.pending_checks.is_empty() && self.started_checks.is_empty() && self.children.is_empty()
+    }
+
+    pub(crate) fn parent_handoff_snapshot(&self) -> Result<Value, String> {
+        let mut value = serde_json::to_value(self).map_err(|error| error.to_string())?;
+        for name in [
+            "verified_diff_stamps",
+            "diagnostic_diff_stamps",
+            "failed_checks",
+            "children",
+            "child_results",
+        ] {
+            let items = value
+                .get_mut(name)
+                .and_then(Value::as_array_mut)
+                .ok_or("native guard handoff set is missing")?;
+            items.sort_by_cached_key(Value::to_string);
+        }
+        Ok(value)
+    }
+
+    pub(crate) fn from_parent_handoff(value: &Value) -> Result<Self, String> {
+        let state: Self =
+            serde_json::from_value(value.clone()).map_err(|error| error.to_string())?;
+        if !state.parent_handoff_is_quiescent() {
+            return Err("native guard has pending checks or child work".into());
+        }
+        if let Some(snapshot) = &state.handoff_diff_tracker {
+            snapshot.restore()?;
+        }
+        Ok(state)
+    }
+
+    pub(crate) fn snapshot_with_diff_tracker(
+        &self,
+        tracker: Option<&crate::turn_diff_tracker::TurnDiffTracker>,
+    ) -> Result<Value, String> {
+        let mut state = self.clone();
+        if let Some(tracker) = tracker {
+            state.handoff_diff_tracker = Some(tracker.parent_handoff_snapshot()?);
+        }
+        state.parent_handoff_snapshot()
+    }
+
+    pub(crate) fn take_handoff_diff_tracker(
+        &mut self,
+    ) -> Result<Option<crate::turn_diff_tracker::TurnDiffTracker>, String> {
+        self.handoff_diff_tracker
+            .take()
+            .map(|snapshot| snapshot.restore())
+            .transpose()
+    }
+
     fn charge_read(&mut self, policy: &RencrowExecutionGuard, key: &str) -> Result<(), String> {
         let repeated =
             self.repeated.get(key).copied().unwrap_or(0) >= policy.max_repeated_reads.get();
@@ -131,6 +190,13 @@ impl GuardState {
         self.repeated.clear();
     }
 
+    fn settle_proven_task_evidence_launches(&mut self, obligation_keys: &[String]) {
+        for obligation_key in obligation_keys {
+            self.failed_checks
+                .remove(&format!("task-evidence:{obligation_key}"));
+        }
+    }
+
     fn check_stamp(&self) -> u64 {
         if self.child_revision == 0 {
             return self.diff_stamp;
@@ -144,6 +210,10 @@ impl GuardState {
     fn record_budget_rejection(&mut self) -> bool {
         self.budget_rejections = self.budget_rejections.saturating_add(1);
         self.budget_rejections >= 3
+    }
+
+    pub(crate) fn arm_fatal_on_next_budget_refusal(&mut self) {
+        self.fatal_on_next_budget_refusal = self.budget_rejections >= 3;
     }
 
     fn record_patch_verification_failure(&mut self, diff: Option<&str>) -> bool {
@@ -182,6 +252,7 @@ impl GuardState {
             self.reads = 0;
             if self.verified_diff_stamps.insert(self.diff_stamp) {
                 self.budget_rejections = 0;
+                self.fatal_on_next_budget_refusal = false;
                 self.reset_reads();
                 self.diagnostic_diff_stamps.clear();
             }
@@ -283,6 +354,7 @@ impl GuardState {
         self.checked = false;
         self.child_revision = self.child_revision.saturating_add(1);
         self.budget_rejections = 0;
+        self.fatal_on_next_budget_refusal = false;
         self.repeated.clear();
     }
 
@@ -622,6 +694,7 @@ fn supported_check_words(words: &[String]) -> bool {
             ..,
         ] => true,
         ["python" | "python3", "-m", "py_compile", ..] => true,
+        ["python3", "-m", "json.tool", input_file] if !input_file.starts_with('-') => true,
         ["just", "test" | "fmt-check", ..] | ["git", "diff", "--check", ..] => true,
         _ => false,
     }
@@ -750,7 +823,22 @@ pub(crate) async fn before_tool(invocation: &ToolInvocation) -> Result<(), Funct
     if matches!(invocation.turn.session_source, SessionSource::Internal(_)) {
         return Ok(());
     }
-    let Some(command) = shell_script_for_invocation(invocation) else {
+    let resolved_task_evidence_keys = if invocation.turn.config.rencrow_autonomous_completion {
+        invocation
+            .session
+            .resolved_task_check_launch_obligation_keys()
+            .await
+    } else {
+        Vec::new()
+    };
+    let args = arguments(invocation);
+    let task_context_status = invocation.tool_name.is_default_namespace()
+        && invocation.tool_name.name
+            == crate::tools::handlers::task_context_boundary_spec::TASK_CONTEXT_BOUNDARY_TOOL_NAME
+        && args["action"].as_str() == Some("status");
+    let Some(command) =
+        shell_script_for_invocation(invocation).or_else(|| task_context_status.then(String::new))
+    else {
         return Ok(());
     };
     let is_shell_edit =
@@ -763,7 +851,6 @@ pub(crate) async fn before_tool(invocation: &ToolInvocation) -> Result<(), Funct
     let embedded_direct_check = (!is_check)
         .then(|| direct_check_in_compound_command(&command))
         .flatten();
-    let args = arguments(invocation);
     let diff = invocation.tracker.lock().await.get_unified_diff();
     let turn_state = {
         let active = invocation.session.active_turn.lock().await;
@@ -776,18 +863,28 @@ pub(crate) async fn before_tool(invocation: &ToolInvocation) -> Result<(), Funct
     };
     {
         let mut turn = turn_state.lock().await;
+        turn.rencrow_execution_guard
+            .settle_proven_task_evidence_launches(&resolved_task_evidence_keys);
         turn.rencrow_execution_guard.observe_diff(diff.as_deref());
-        if is_read || !is_check {
+        if task_context_status || is_read || !is_check {
             // Cwd is part of the identity; identical relative reads in different roots are distinct.
-            let key = format!(
-                "{:?}:{}:{}",
-                invocation.turn.config.cwd,
-                args["workdir"],
-                command.trim()
-            );
+            let key = if task_context_status {
+                format!(
+                    "{:?}:task_context_boundary:status:{}",
+                    invocation.turn.config.cwd, args["root_task_id"]
+                )
+            } else {
+                format!(
+                    "{:?}:{}:{}",
+                    invocation.turn.config.cwd,
+                    args["workdir"],
+                    command.trim()
+                )
+            };
             if let Err(message) = turn.rencrow_execution_guard.charge_read(policy, &key) {
                 let state = &mut turn.rencrow_execution_guard;
-                if state.record_budget_rejection() {
+                let fatal = state.record_budget_rejection() && state.fatal_on_next_budget_refusal;
+                if fatal {
                     return Err(FunctionCallError::Fatal(format!(
                         "RENCROW_READ_BUDGET_EXCEEDED: repeated host refusals stopped the turn; {message}"
                     )));
@@ -1001,6 +1098,14 @@ pub(crate) async fn after_tool(invocation: &ToolInvocation, receipt: ToolReceipt
     if invocation.turn.config.rencrow_execution_guard.is_none() {
         return;
     }
+    let resolved_task_evidence_keys = if invocation.turn.config.rencrow_autonomous_completion {
+        invocation
+            .session
+            .resolved_task_check_launch_obligation_keys()
+            .await
+    } else {
+        Vec::new()
+    };
     let diff = invocation.tracker.lock().await.get_unified_diff();
     let value = receipt.value;
     let command = shell_script_for_invocation(invocation);
@@ -1108,6 +1213,7 @@ pub(crate) async fn after_tool(invocation: &ToolInvocation, receipt: ToolReceipt
     };
     let mut turn = turn_state.lock().await;
     let state = &mut turn.rencrow_execution_guard;
+    state.settle_proven_task_evidence_launches(&resolved_task_evidence_keys);
     state.observe_diff(diff.as_deref());
     if command
         .as_ref()
@@ -1235,6 +1341,11 @@ pub(crate) async fn check_completion(
     if matches!(turn.session_source, SessionSource::Internal(_)) {
         return Ok(());
     }
+    let resolved_task_evidence_keys = if turn.config.rencrow_autonomous_completion {
+        session.resolved_task_check_launch_obligation_keys().await
+    } else {
+        Vec::new()
+    };
     if turn.config.rencrow_autonomous_completion
         && let Some(root_task_id) = session.task_check_completion_root_id().await
         && session
@@ -1269,6 +1380,9 @@ pub(crate) async fn check_completion(
     };
     let outcome = {
         let mut state = turn_state.lock().await;
+        state
+            .rencrow_execution_guard
+            .settle_proven_task_evidence_launches(&resolved_task_evidence_keys);
         state.rencrow_execution_guard.observe_diff(diff.as_deref());
         let missing = state
             .rencrow_execution_guard

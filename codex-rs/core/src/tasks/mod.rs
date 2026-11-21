@@ -319,7 +319,14 @@ impl Session {
             debug_assert!(turn.task.is_none());
             Arc::clone(&turn.turn_state)
         };
-        turn_state.lock().await.token_usage_at_turn_start = token_usage_at_turn_start.clone();
+        let inherited_guard = self.take_parent_handoff_guard().await;
+        {
+            let mut state = turn_state.lock().await;
+            state.token_usage_at_turn_start = token_usage_at_turn_start.clone();
+            if let Some(guard) = inherited_guard {
+                state.rencrow_execution_guard = guard;
+            }
+        }
         self.input_queue
             .extend_pending_input_for_turn_state(turn_state.as_ref(), pending_items)
             .await;

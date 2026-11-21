@@ -1,10 +1,13 @@
+// Modified by RenCrow Switch Core, 2026-11-21.
 use super::*;
 use crate::responses_metadata::CompactionTurnMetadata;
+use crate::session::tests::attach_thread_persistence;
 use crate::session::tests::make_session_and_context_with_auth_and_config_and_rx;
 use codex_analytics::CompactionImplementation;
 use codex_analytics::CompactionPhase;
 use codex_analytics::CompactionReason;
 use codex_analytics::CompactionTrigger;
+use codex_history::CodexHarnessMetadata;
 use codex_history::compaction_candidate::CandidateInput;
 use codex_history::compaction_candidate::CandidateRecord;
 use codex_history::compaction_candidate::Origin;
@@ -17,7 +20,16 @@ use codex_history::compaction_preprocess::collect_instruction_candidates;
 use codex_history::compaction_selection_wire::SelectionRequest;
 use codex_login::CodexAuth;
 use codex_model_provider_info::ModelProviderInfo;
+use codex_protocol::items::TurnItem;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::ContentItemKind;
+use codex_protocol::models::InternalChatMessageMetadataPassthrough;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
+use codex_protocol::protocol::EventMsg;
+use codex_rollout::InitialHistory;
+use codex_rollout::RolloutItem;
+use codex_rollout::RolloutRecorder;
 use core_test_support::responses;
 use core_test_support::streaming_sse::StreamingSseChunk;
 use core_test_support::streaming_sse::start_streaming_sse_server;
@@ -130,6 +142,99 @@ async fn v2_selection_skips_request_when_candidates_are_absent() {
     let protected_result = selection_request(&selection_input(), Some(protected)).unwrap();
     assert!(protected_result.is_none());
     assert!(mock.requests().is_empty());
+}
+
+#[tokio::test]
+async fn native_compaction_start_is_readable_from_rollout_while_model_request_waits() {
+    let (gate_tx, gate_rx) = oneshot::channel();
+    let (server, mut completions) = start_streaming_sse_server(vec![vec![
+        StreamingSseChunk {
+            gate: None,
+            body: responses::sse(vec![responses::ev_assistant_message("pending", "{}")]),
+        },
+        StreamingSseChunk {
+            gate: Some(gate_rx),
+            body: responses::sse(vec![responses::ev_completed("pending-response")]),
+        },
+    ]])
+    .await;
+    let (mut session, turn) = test_context(server.uri().to_string(), true).await;
+    let rollout_path = attach_thread_persistence(
+        Arc::get_mut(&mut session).expect("session has no competing owner"),
+    )
+    .await;
+    session
+        .record_conversation_items(
+            &turn,
+            turn.model_info(),
+            &[
+                responses::user_message_item("Keep this context in the summary."),
+                ResponseItem::Message {
+                    id: None,
+                    role: "assistant".into(),
+                    content: vec![ContentItem::InputText {
+                        text: "old work ".repeat(2_000),
+                    }],
+                    phase: None,
+                    internal_chat_message_metadata_passthrough: None,
+                },
+            ],
+        )
+        .await;
+    static ACTIVE_TURNS: codex_diagnostics::Gauge =
+        codex_diagnostics::Gauge::new("rencrow_compaction_rollout_test_active_turns");
+    let cancellation = CancellationToken::new();
+    *session.active_turn.lock().await = Some(crate::state::ActiveTurn {
+        task: Some(crate::state::RunningTask {
+            done: Arc::new(tokio::sync::Notify::new()),
+            kind: crate::state::TaskKind::Regular,
+            task: Arc::new(crate::tasks::RegularTask::new()),
+            cancellation_token: cancellation.clone(),
+            handle: tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async {
+                std::future::pending::<()>().await;
+            })),
+            turn_context: Arc::clone(&turn),
+            _agent_execution_guard: None,
+            _diagnostics_guard: ACTIVE_TURNS.track(),
+            _timer: None,
+        }),
+        ..Default::default()
+    });
+
+    let task_session = Arc::clone(&session);
+    let task_turn = Arc::clone(&turn);
+    let task = tokio::spawn(async move {
+        run(
+            task_session,
+            task_turn,
+            crate::compact::InitialContextInjection::DoNotInject,
+            compaction_metadata(CompactionPhase::MidTurn),
+            None,
+        )
+        .await
+    });
+    server.wait_for_request_count(1).await;
+    assert!(matches!(
+        completions[0].try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+
+    let InitialHistory::Resumed(resumed) = RolloutRecorder::get_rollout_history(&rollout_path)
+        .await
+        .expect("read canonical rollout while the model request is pending")
+    else {
+        panic!("attached live thread should have a resumable rollout");
+    };
+    assert!(resumed.history.iter().any(|item| matches!(
+        item,
+        RolloutItem::EventMsg(EventMsg::ItemStarted(event))
+            if matches!(&event.item, TurnItem::ContextCompaction(_))
+    )));
+
+    cancellation.cancel();
+    assert!(task.await.expect("compaction task should finish").is_err());
+    let _ = gate_tx.send(());
+    server.shutdown().await;
 }
 
 #[tokio::test]
@@ -592,6 +697,96 @@ async fn v2_turn_prefix_summary_does_not_inherit_turn_output_schema() {
 
     let body = mock.single_request().body_json();
     assert!(body["text"]["format"].is_null());
+}
+
+#[tokio::test]
+async fn v2_mid_turn_normal_summary_prefix_drops_stale_completion_continuations() {
+    let server = responses::start_mock_server().await;
+    let (session, turn) = test_context(server.uri().to_string(), true).await;
+    let mock = responses::mount_sse_once(
+        &server,
+        responses::sse(vec![
+            responses::ev_assistant_message("summary", "Continue from the current state."),
+            responses::ev_completed("turn-prefix-stale-continue"),
+        ]),
+    )
+    .await;
+    let step_context = StepContext::for_test(Arc::clone(&turn));
+    let continue_item = |text: &str| {
+        let mut envelope = ResponseItemEnvelope::new(ResponseItem::Message {
+            id: None,
+            role: "developer".into(),
+            content: vec![ContentItem::InputText { text: text.into() }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: Some(
+                InternalChatMessageMetadataPassthrough {
+                    content_item_kinds: Some(vec![ContentItemKind(
+                        "rencrow.autonomous_completion_continue".into(),
+                    )]),
+                    ..Default::default()
+                },
+            ),
+        });
+        envelope.metadata = Some(CodexHarnessMetadata::default());
+        envelope
+    };
+    let stale_continue = "stale completion continue: inspect old status";
+    let latest_continue = "latest completion continue: implement the fix";
+    session
+        .record_annotated_conversation_items(
+            &turn,
+            turn.model_info().as_ref(),
+            vec![
+                ResponseItemEnvelope::new(responses::user_message_item("continue the task")),
+                ResponseItemEnvelope::new(ResponseItem::Message {
+                    id: None,
+                    role: "assistant".into(),
+                    content: vec![ContentItem::InputText {
+                        text: "old work ".repeat(2_000),
+                    }],
+                    phase: None,
+                    internal_chat_message_metadata_passthrough: None,
+                }),
+                continue_item(stale_continue),
+                continue_item(latest_continue),
+            ],
+        )
+        .await;
+
+    let snapshot = session.clone_history().await;
+    let source_thread = session.thread_id();
+    let active_call_ids = std::collections::HashSet::new();
+    let settings = session.thread_settings_snapshot().await;
+    let prepared = super::stages::prepare_v2(
+        &session,
+        &turn,
+        &snapshot,
+        &[],
+        &source_thread,
+        &active_call_ids,
+        "mid-turn-stale-continuation-history",
+        &settings,
+        Vec::new(),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("actual V2 preparation failed: {}", error.into_error()));
+
+    super::stages::normal_candidate(
+        &session,
+        &turn,
+        compaction_metadata(CompactionPhase::MidTurn),
+        &CancellationToken::new(),
+        &snapshot,
+        &prepared,
+        Some(&step_context),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("actual Normal candidate failed: {}", error.into_error()));
+
+    let request = mock.single_request();
+    let developer_text = request.message_input_texts("developer").join("\n");
+    assert!(!developer_text.contains(stale_continue));
+    assert!(developer_text.contains(latest_continue));
 }
 
 #[test]

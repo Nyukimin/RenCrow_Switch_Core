@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-20: separate caller and host checkpoint budgets.
 use super::session::Session;
 use crate::context::ContextualUserFragment;
 use crate::context::HookAdditionalContext;
@@ -340,11 +341,7 @@ impl Session {
         .await?;
         if let Some(completion_state) = accepted_completion_state
             && let Err(error) = self
-                .set_rencrow_completion_state(
-                    accepted_root_task_id,
-                    serde_json::to_value(completion_state)
-                        .map_err(|error| CodexErr::InvalidRequest(error.to_string()))?,
-                )
+                .set_accepted_rencrow_completion_state(accepted_root_task_id, completion_state)
                 .await
         {
             self.pause_autonomous_completion().await;

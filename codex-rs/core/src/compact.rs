@@ -221,6 +221,24 @@ async fn run_compact_task_inner(
         phase,
     )
     .await;
+    // Save summary/next work and original host facts before any PreCompact hook runs.
+    let parent_handoff = if turn_context.config.rencrow_compaction {
+        match crate::session::completion_persistence::parent_handoff::runtime::prepare(
+            &sess,
+            &turn_context,
+            phase,
+        )
+        .await
+        {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                tracing::warn!(%error, "parent handoff preparation unavailable; compaction retains its normal contract");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let pre_compact_outcome = run_pre_compact_hooks(&sess, &turn_context, trigger).await;
     match pre_compact_outcome {
         PreCompactHookOutcome::Continue => {}
@@ -243,6 +261,7 @@ async fn run_compact_task_inner(
         input,
         initial_context_injection,
         compaction_metadata,
+        parent_handoff.as_ref(),
     )
     .await;
     let status = compaction_status_from_result(&result);
@@ -292,6 +311,9 @@ async fn run_compact_task_inner_impl(
     input: Vec<UserInput>,
     initial_context_injection: InitialContextInjection,
     compaction_metadata: CompactionTurnMetadata,
+    parent_handoff: Option<
+        &crate::session::completion_persistence::parent_handoff::runtime::PreparedHandoff,
+    >,
 ) -> CodexResult<String> {
     if turn_context.config.rencrow_compaction {
         return rencrow::run(
@@ -299,6 +321,7 @@ async fn run_compact_task_inner_impl(
             turn_context,
             initial_context_injection,
             compaction_metadata,
+            parent_handoff,
         )
         .await;
     }

@@ -106,6 +106,7 @@ pub(crate) struct TurnState {
     /// Tool futures that have been emitted by the model but have not completed or been dropped.
     pub(crate) in_flight_tool_calls: Arc<AtomicUsize>,
     pub(crate) rencrow_execution_guard: crate::rencrow_execution_guard::GuardState,
+    pub(crate) rencrow_handoff_diff_tracker: Option<crate::tools::context::SharedTurnDiffTracker>,
     pub(crate) has_memory_citation: bool,
     pub(crate) token_usage_at_turn_start: TokenUsage,
     pub(crate) token_usage_by_model: TurnTokenUsage,

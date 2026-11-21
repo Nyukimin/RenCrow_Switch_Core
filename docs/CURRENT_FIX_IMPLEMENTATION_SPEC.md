@@ -117,10 +117,12 @@ RenCrow 経路: `compaction_route` → `compact_rencrow::run` → `compact_v2`�
 ### 受入条件
 
 - [x] 通常 TUI 経路（StartOrSteer）で「続けて」→ `paused=false`、snapshot 永続化成功。
-- [ ] 再開後、自律継続ターンが `mark_autonomous_completion_turn` を通る（pause 中は拒否される現行契約を満たす）。
+- [x] 再開後、自律継続ターンが `mark_autonomous_completion_turn` を通る（pause 中は拒否される現行契約を満たす）。
 - [x] 検査・監督で「人間入力受付」と「pause 解除」を別イベントとして混同しない。
 
 **2026-11-14 状態**: `turn_input.rs` の共通判定を両開始経路に接続済み。focused test green。status evidenceでhuman intake true、paused true→false、resume_generation 0→1を別々に確認。snapshotは `Tmp/autonomous-completion-20261111/candidate-18/post-composer-observation-1.json` の `completion_snapshots`、再開後の処理は同ディレクトリの `runtime-progress-verification.json` に記録。ただし `autonomous_mark_verified=false` のため、自律継続mark条件は未確認でFIX-001全体は閉じていない。根拠: `Tmp/ren2-supervision/periodic/human-resume-20261112/fix001-green-focused.log`, `Tmp/ren2-supervision/periodic/human-resume-20261112/status-verification.json`。
+
+**2026-11-15 受入完了**: 本番配置済みと同一バイナリ（SHA-256 `0d56cd7e63d5e8e63a0e68adf5b20e0219d68d98daea3d5446684a68e91c5fa7`）を用いた隔離TUIで、人間が実際に「続けて」を入力。human receiptのclient_idと受付イベント、paused true→false、resume_generation 0→1を照合した。同じthreadで親ターン終了後にKAT子が完了し、未消費のchild-resultを契機に別IDの自律ターンが開始。子の結果回収後、親の確認コマンドもexit 0となった。新規自律ターン開始とchild-resultの永続化、および開始前の必須markゲートを通るソース経路を照合し、未確認だった受入条件をPASSとした（関数呼出し自体の直接ログではない）。証拠: `Tmp/ren2-supervision/periodic/private/autonomous-resume-acceptance-20261115/acceptance.json`（実ログ照合20項目PASS）。確認後は隔離TUIをpauseし、子の未回収は0。本番の既存タスクと監督ループは再開していない。Compactionの発生はこの受入条件には含めていない。
 
 ---
 

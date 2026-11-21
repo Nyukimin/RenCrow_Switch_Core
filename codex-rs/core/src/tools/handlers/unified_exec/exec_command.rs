@@ -472,6 +472,9 @@ impl ExecCommandHandler {
                             }
                             TaskCheckExecution::new(request, workspace_root.as_path())
                                 .map(|mut execution| {
+                                    execution.execution_environment_id = Some(
+                                        turn_environment.selection.environment_id.clone(),
+                                    );
                                     if turn.config.rencrow_autonomous_completion
                                         && let Some(scope) = active_scope.clone()
                                     {

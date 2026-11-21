@@ -1,4 +1,6 @@
 // Modified by RenCrow Switch Core, 2026-11-16.
+#[path = "parent_handoff_review_tests.rs"]
+mod parent_handoff_review_tests;
 use super::InitialHistory;
 use super::RolloutItem;
 use super::RolloutRecorder;
@@ -15,17 +17,35 @@ use codex_history::compaction_candidate::digest;
 use codex_history::task_context::AcceptanceCondition;
 use codex_history::task_context::AcceptanceStatus;
 use codex_history::task_context::CompletionEvidenceRef;
+use codex_history::task_context::CompletionReviewAttemptStatus;
+use codex_history::task_context::CompletionReviewRecordLocator;
 use codex_history::task_context::CompletionReviewSnapshotRef;
 use codex_history::task_context::CompletionReviewTarget;
+use codex_history::task_context::CompletionReviewTerminalEvent;
+use codex_history::task_context::CompletionReviewTerminalSource;
+use codex_history::task_context::CompletionReviewTerminalStatus;
 use codex_history::task_context::CompletionReviewWithdrawalSource;
 use codex_history::task_context::CompletionState;
 use codex_history::task_context::CompletionUnit;
 use codex_history::task_context::CompletionUnitKind;
 use codex_history::task_context::UnitStatus;
 use codex_protocol::ThreadId;
+use codex_protocol::models::BaseInstructions;
 use codex_protocol::protocol::AgentStatus;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::SubAgentSource;
+use codex_protocol::protocol::ThreadHistoryMode;
+use codex_protocol::protocol::ThreadMemoryMode;
+use codex_protocol::protocol::TurnAbortReason;
+use codex_protocol::protocol::TurnAbortedEvent;
+use codex_thread_store::CreateThreadParams;
+use codex_thread_store::LiveThread;
+use codex_thread_store::PersistedTurnAbortLocator;
+use codex_thread_store::ThreadPersistenceMetadata;
 use serde_json::Value;
 use std::path::Path;
+use std::sync::Arc;
 
 const ROOT_TASK_ID: &str = "root";
 const TARGET_TASK_ID: &str = "task-a";
@@ -89,7 +109,15 @@ async fn install_accepted_task_receipt_with_content(
 ) -> anyhow::Result<(String, RolloutItem)> {
     let artifact_path = std::path::PathBuf::from("review-target.txt");
     std::fs::write(workspace.join(&artifact_path), artifact_contents)?;
-    let artifact_paths = vec![artifact_path];
+    install_accepted_task_receipt_for_paths(session, call_id, workspace, vec![artifact_path]).await
+}
+
+async fn install_accepted_task_receipt_for_paths(
+    session: &Session,
+    call_id: &str,
+    workspace: &Path,
+    artifact_paths: Vec<std::path::PathBuf>,
+) -> anyhow::Result<(String, RolloutItem)> {
     let artifact_before =
         crate::task_check::hash_workspace_artifacts(workspace, &artifact_paths)
             .ok_or_else(|| anyhow::anyhow!("accepted task artifact fixture could not be hashed"))?;
@@ -474,6 +502,135 @@ async fn withdraw_unlaunched_review(
 }
 
 #[tokio::test]
+async fn completion_review_brief_preserves_receipt_workspace_and_artifact_paths()
+-> anyhow::Result<()> {
+    let (mut session, _) = make_session_and_context().await;
+    attach_thread_persistence(&mut session).await;
+    let (artifact_ref, workspace, _) =
+        install_accepted_task_receipt(&session, "accepted-task-check-path-packet").await?;
+    install_host_completion_fixture(&session, ROOT_TASK_ID, completion_state(&artifact_ref))
+        .await
+        .map_err(anyhow::Error::msg)?;
+    {
+        let mut state = session.state.lock().await;
+        let (_, contract) = state
+            .rencrow_completion_state
+            .as_mut()
+            .expect("completion fixture is installed");
+        contract
+            .units
+            .iter_mut()
+            .find(|unit| unit.id == REVIEW_UNIT_ID)
+            .expect("review obligation is present")
+            .purpose = "p".repeat(4_096);
+        let condition = contract
+            .conditions
+            .iter_mut()
+            .find(|condition| condition.id == "AC-1")
+            .expect("review condition is present");
+        condition.result = "r".repeat(4_096);
+        condition.scope = "s".repeat(4_096);
+        condition.verification = "v".repeat(4_096);
+        condition.acceptance_criteria = "c".repeat(4_096);
+    }
+
+    let launch = session
+        .prepare_completion_review_launch(
+            TARGET_TASK_ID,
+            Some(REVIEW_UNIT_ID),
+            "review-spawn-path-packet",
+            Some(REVIEWER_ROLE),
+            Some(REVIEWER_MODEL),
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let workspace_root = workspace.path();
+    let location = launch
+        .review_brief
+        .lines()
+        .find_map(|line| line.strip_prefix("Verified artifact location: "))
+        .map(serde_json::from_str::<Value>)
+        .transpose()?
+        .expect("review brief contains a complete structured artifact location");
+    let artifact_path = std::path::PathBuf::from(
+        location["absolute_path"]
+            .as_str()
+            .expect("artifact path is a string"),
+    );
+
+    assert!(launch.should_spawn);
+    assert!(launch.review_brief.chars().count() <= 7_000);
+    assert_eq!(
+        location["workspace_root"].as_str(),
+        Some(workspace_root.to_string_lossy().as_ref())
+    );
+    assert!(artifact_path.is_absolute());
+    assert_eq!(
+        std::fs::read_to_string(&artifact_path)?,
+        "accepted artifact\n"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn oversized_verified_artifact_locations_do_not_reserve_a_review() -> anyhow::Result<()> {
+    let (session, _) = make_session_and_context().await;
+    let workspace = tempfile::tempdir()?;
+    let mut artifact_paths = Vec::new();
+    for index in 0..12 {
+        let relative_path = std::path::PathBuf::from(format!("dir-{index}-{}", "d".repeat(180)))
+            .join(format!("subdir-{}", "s".repeat(180)))
+            .join(format!("artifact-{}", "a".repeat(180)));
+        let absolute_path = workspace.path().join(&relative_path);
+        std::fs::create_dir_all(
+            absolute_path
+                .parent()
+                .expect("artifact path has a parent directory"),
+        )?;
+        std::fs::write(&absolute_path, "verified artifact")?;
+        artifact_paths.push(relative_path);
+    }
+    let (artifact_ref, _) = install_accepted_task_receipt_for_paths(
+        &session,
+        "accepted-task-check-long-paths",
+        workspace.path(),
+        artifact_paths,
+    )
+    .await?;
+    install_host_completion_fixture(&session, ROOT_TASK_ID, completion_state(&artifact_ref))
+        .await
+        .map_err(anyhow::Error::msg)?;
+
+    let result = session
+        .prepare_completion_review_launch(
+            TARGET_TASK_ID,
+            Some(REVIEW_UNIT_ID),
+            "review-spawn-long-paths",
+            Some(REVIEWER_ROLE),
+            Some(REVIEWER_MODEL),
+        )
+        .await;
+    assert!(matches!(
+        result,
+        Err(ref error) if error.contains("verified artifact locations exceed the completion review brief limit")
+    ));
+
+    let contract = session
+        .rencrow_completion_state(ROOT_TASK_ID)
+        .await
+        .expect("completion state remains available");
+    let review_unit = contract
+        .units
+        .iter()
+        .find(|unit| unit.id == REVIEW_UNIT_ID)
+        .expect("review obligation remains present");
+    assert_eq!(review_unit.status, UnitStatus::Ready);
+    assert!(review_unit.review_launch.is_none());
+    assert!(review_unit.review_state.is_none());
+    Ok(())
+}
+
+#[tokio::test]
 async fn planned_review_without_accepted_task_state_has_no_current_scope_reason() {
     let (session, _) = make_session_and_context().await;
     let contract = completion_state("task-check:planned-only");
@@ -793,6 +950,47 @@ async fn setup_completed_unadopted_retry() -> anyhow::Result<(FailedReviewFixtur
             })
     }), "fixture must contain one exact native-wait completed, unadopted attempt");
     Ok((fixture, child_id, turn_id))
+}
+
+async fn create_persisted_review_thread(session: &Session, child_id: ThreadId) -> LiveThread {
+    let config = session.get_config().await;
+    LiveThread::create(
+        Arc::clone(&session.services.thread_store),
+        CreateThreadParams {
+            creator_user_id: None,
+            creator_account_id: None,
+            session_id: session.session_id(),
+            thread_id: child_id,
+            extra_config: None,
+            forked_from_id: None,
+            parent_thread_id: Some(session.thread_id()),
+            source: SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: session.thread_id(),
+                depth: 1,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: Some(REVIEWER_ROLE.into()),
+            }),
+            thread_source: None,
+            originator: "test_originator".into(),
+            base_instructions: BaseInstructions::default(),
+            dynamic_tools: Vec::new(),
+            selected_capability_roots: Vec::new(),
+            multi_agent_version: None,
+            history_mode: ThreadHistoryMode::Legacy,
+            history_base: None,
+            subagent_history_start_ordinal: None,
+            initial_window_id: uuid::Uuid::now_v7().to_string(),
+            runtime_workspace_roots: None,
+            metadata: ThreadPersistenceMetadata {
+                cwd: Some(config.cwd.to_path_buf()),
+                model_provider: config.model_provider_id.clone(),
+                memory_mode: ThreadMemoryMode::Disabled,
+            },
+        },
+    )
+    .await
+    .expect("create persisted reviewer thread for cold-restore fixture")
 }
 
 #[tokio::test]
@@ -1530,14 +1728,18 @@ async fn cold_restore_completion_history(session: &Session, path: &Path) -> anyh
     let InitialHistory::Resumed(resumed) = RolloutRecorder::get_rollout_history(path).await? else {
         anyhow::bail!("completion fixture rollout must be reloadable");
     };
+    cold_restore_completion_items(session, resumed.history.as_ref()).await;
+    Ok(())
+}
+
+async fn cold_restore_completion_items(session: &Session, items: &[RolloutItem]) {
     {
         let mut state = session.state.lock().await;
         state.rencrow_completion_state = None;
         state.rencrow_completion_paused = false;
         state.task_check_ledger = crate::task_check::TaskCheckLedger::default();
         state.rencrow_completion_last_persisted_snapshot = None;
-        let cold_response_history = resumed
-            .history
+        let cold_response_history = items
             .iter()
             .filter_map(|item| match item {
                 RolloutItem::ResponseItem(envelope) => Some(envelope.clone()),
@@ -1546,10 +1748,7 @@ async fn cold_restore_completion_history(session: &Session, path: &Path) -> anyh
             .collect();
         state.history.replace_annotated(cold_response_history);
     }
-    session
-        .restore_autonomous_completion_snapshot(resumed.history.as_ref())
-        .await;
-    Ok(())
+    session.restore_autonomous_completion_snapshot(items).await;
 }
 
 fn durable_unit<'a>(snapshot: &'a Value, unit_id: &str) -> &'a Value {
@@ -1557,6 +1756,439 @@ fn durable_unit<'a>(snapshot: &'a Value, unit_id: &str) -> &'a Value {
         .as_array()
         .and_then(|units| units.iter().find(|unit| unit["id"] == unit_id))
         .expect("durable completion unit")
+}
+
+#[tokio::test]
+async fn completion_update_preserves_host_plan_history_when_omitted_or_forged() -> anyhow::Result<()>
+{
+    let (fixture, _, _) = setup_completed_unadopted_retry().await?;
+    let session = &fixture.session;
+    let before = session
+        .rencrow_completion_state(ROOT_TASK_ID)
+        .await
+        .expect("host retry contract exists");
+    anyhow::ensure!(
+        !before.plan_reviews.is_empty(),
+        "fixture has a host retry decision"
+    );
+
+    let mut omitted = serde_json::to_value(&before)?;
+    omitted.as_object_mut().unwrap().remove("plan_reviews");
+    session
+        .set_rencrow_completion_state(ROOT_TASK_ID.into(), omitted)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let after = session
+        .rencrow_completion_state(ROOT_TASK_ID)
+        .await
+        .unwrap();
+    assert_eq!(after.plan_reviews, before.plan_reviews);
+
+    let mut forged = serde_json::to_value(&after)?;
+    forged["plan_reviews"][0]["reason"] = serde_json::json!("model-authored replacement");
+    session
+        .set_rencrow_completion_state(ROOT_TASK_ID.into(), forged)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    assert_eq!(
+        session
+            .rencrow_completion_state(ROOT_TASK_ID)
+            .await
+            .unwrap()
+            .plan_reviews,
+        before.plan_reviews
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn cold_restore_accepts_legacy_review_ended_retry_terminal_and_adjacent_wait_collection()
+-> anyhow::Result<()> {
+    let fixture = setup_failed_review().await?;
+    let session = &fixture.session;
+
+    let second_retry = CompletionReviewRetryRequest {
+        unit_id: REVIEW_UNIT_ID.into(),
+        expected_attempt_id: fixture.first_attempt_id.clone(),
+        invocation_call_id: "cold-restore-second-plan-review".into(),
+        previous_plan: session
+            .rencrow_completion_state(ROOT_TASK_ID)
+            .await
+            .and_then(|state| state.next_action)
+            .expect("copy the current host plan before the second retry"),
+        revised_plan: REVISED_PLAN.into(),
+        reason: RETRY_REASON.into(),
+    };
+    let second_retry_call_id = second_retry.invocation_call_id.clone();
+    session
+        .record_autonomous_plan_review(
+            ROOT_TASK_ID,
+            &second_retry_call_id,
+            second_retry.previous_plan.clone(),
+            second_retry.revised_plan.clone(),
+            second_retry.reason.clone(),
+            Some(second_retry),
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let second_launch = session
+        .prepare_completion_review_launch(
+            TARGET_TASK_ID,
+            Some(REVIEW_UNIT_ID),
+            "cold-restore-second-spawn",
+            Some(REVIEWER_ROLE),
+            Some(REVIEWER_MODEL),
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
+    anyhow::ensure!(second_launch.should_spawn, "second retry must be reserved");
+    let second_child_id =
+        ThreadId::try_from("01a1c606-48b8-7cf3-bb78-77b47f6b8c44").expect("valid child ID");
+    let second_turn_id = "cold-restore-second-turn";
+    spawn_and_bind_attempt(
+        session,
+        REVIEW_UNIT_ID,
+        &fixture.target_artifact_ref,
+        "cold-restore-second-spawn",
+        second_child_id,
+        second_turn_id,
+    )
+    .await?;
+    session
+        .collect_completion_review_results(
+            "cold-restore-second-wait",
+            &[(
+                second_child_id,
+                Some(second_turn_id.into()),
+                AgentStatus::Errored("second exact reviewer failure".into()),
+            )],
+        )
+        .await;
+    observe_native_wait_result(
+        session,
+        second_child_id,
+        AgentStatus::Errored("second exact reviewer failure".into()),
+    )
+    .await;
+
+    let third_retry = CompletionReviewRetryRequest {
+        unit_id: REVIEW_UNIT_ID.into(),
+        expected_attempt_id: "cold-restore-second-spawn".into(),
+        invocation_call_id: "cold-restore-third-plan-review".into(),
+        previous_plan: session
+            .rencrow_completion_state(ROOT_TASK_ID)
+            .await
+            .and_then(|state| state.next_action)
+            .expect("copy the current host plan before the third retry"),
+        revised_plan: "Collect the third exact retry and verify its cold restoration".into(),
+        reason: RETRY_REASON.into(),
+    };
+    let third_retry_call_id = third_retry.invocation_call_id.clone();
+    session
+        .record_autonomous_plan_review(
+            ROOT_TASK_ID,
+            &third_retry_call_id,
+            third_retry.previous_plan.clone(),
+            third_retry.revised_plan.clone(),
+            third_retry.reason.clone(),
+            Some(third_retry),
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let third_launch = session
+        .prepare_completion_review_launch(
+            TARGET_TASK_ID,
+            Some(REVIEW_UNIT_ID),
+            "cold-restore-third-spawn",
+            Some(REVIEWER_ROLE),
+            Some(REVIEWER_MODEL),
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
+    anyhow::ensure!(third_launch.should_spawn, "third retry must be reserved");
+    let third_child_id =
+        ThreadId::try_from("01a1c606-48b8-7cf3-bb78-77b47f6b8c45").expect("valid child ID");
+    let third_turn_id = "cold-restore-third-turn";
+    spawn_and_bind_attempt(
+        session,
+        REVIEW_UNIT_ID,
+        &fixture.target_artifact_ref,
+        "cold-restore-third-spawn",
+        third_child_id,
+        third_turn_id,
+    )
+    .await?;
+    let bound = session
+        .rencrow_completion_state(ROOT_TASK_ID)
+        .await
+        .expect("third bound retry is present");
+    anyhow::ensure!(
+        bound.units.iter().any(|unit| {
+            unit.review_state.as_ref().is_some_and(|review| {
+                review.retry_reservation_prior_historical_failure.is_some()
+                    && review.active_attempt.as_ref().is_some_and(|attempt| {
+                        attempt.attempt_id == "cold-restore-third-spawn"
+                            && attempt.status == CompletionReviewAttemptStatus::Bound
+                    })
+            })
+        }),
+        "third bound retry must retain the rollback history that triggered the old bug"
+    );
+
+    let child = create_persisted_review_thread(session, third_child_id).await;
+    child
+        .append_items(&[RolloutItem::EventMsg(EventMsg::TurnAborted(
+            TurnAbortedEvent {
+                turn_id: Some(third_turn_id.into()),
+                reason: TurnAbortReason::ReviewEnded,
+                started_at: None,
+                completed_at: None,
+                duration_ms: None,
+            },
+        ))])
+        .await
+        .expect("persist exact typed ReviewEnded event in the reviewer thread");
+    let proof = child
+        .read_persisted_turn_abort(third_turn_id.into())
+        .await
+        .expect("read canonical typed reviewer abort proof")
+        .expect("exact reviewer abort event exists");
+    let mut terminal = bound.clone();
+    let safety_fingerprint =
+        crate::session::completion_review_deadline::review_ended_durable_fingerprint(third_turn_id);
+    let escalation = "fixture reviewer exceeded the host SLA".to_string();
+    let terminal_unit = terminal
+        .units
+        .iter_mut()
+        .find(|unit| unit.id == REVIEW_UNIT_ID)
+        .expect("review unit exists");
+    terminal_unit.status = UnitStatus::Failed;
+    let terminal_attempt = terminal_unit
+        .review_state
+        .as_mut()
+        .and_then(|review| review.active_attempt.as_mut())
+        .expect("third attempt exists");
+    terminal_attempt.status = CompletionReviewAttemptStatus::Failed;
+    terminal_attempt.deadline_escalation = Some(escalation.clone());
+    terminal_attempt.deadline_safety_fingerprint = Some(safety_fingerprint.clone());
+    terminal_attempt.terminal_source = Some(CompletionReviewTerminalSource {
+        status: CompletionReviewTerminalStatus::Failed,
+        event: Some(CompletionReviewTerminalEvent {
+            rollout_id: proof.source.rollout_id.to_string(),
+            locator: match proof.source.locator {
+                PersistedTurnAbortLocator::Ordinal(value) => {
+                    CompletionReviewRecordLocator::Ordinal(value)
+                }
+                PersistedTurnAbortLocator::LegacyLineIndex(value) => {
+                    CompletionReviewRecordLocator::LegacyLineIndex(value)
+                }
+            },
+            owner_thread_id: proof.owner.thread_id.to_string(),
+            turn_id: proof.event.turn_id.clone().expect("exact turn id"),
+            owner_parent_thread_id: proof.owner.parent_thread_id.map(|id| id.to_string()),
+            owner_agent_role: proof.owner.agent_role,
+            reason: format!("{:?}", proof.event.reason),
+        }),
+    });
+    *terminal_unit = codex_history::task_context::project_completion_review_state(terminal_unit)
+        .map_err(anyhow::Error::msg)?;
+    terminal.blocker = Some(codex_history::task_context::CompletionBlocker {
+        category: codex_history::task_context::BlockerCategory::Unknown,
+        reason: escalation,
+        required_input: None,
+        authority: None,
+        evidence: Vec::new(),
+        recheck_condition: None,
+        review_owner: Some(codex_history::task_context::CompletionReviewBlockerOwner {
+            unit_id: REVIEW_UNIT_ID.into(),
+            attempt_id: "cold-restore-third-spawn".into(),
+            safety_fingerprint,
+        }),
+    });
+    session.state.lock().await.rencrow_completion_state = Some((ROOT_TASK_ID.into(), terminal));
+    session
+        .persist_autonomous_completion_snapshot()
+        .await
+        .map_err(anyhow::Error::msg)?;
+
+    session
+        .collect_completion_review_results(
+            "cold-restore-third-wait",
+            &[(
+                third_child_id,
+                Some(third_turn_id.into()),
+                AgentStatus::Errored("ReviewEnded".into()),
+            )],
+        )
+        .await;
+    observe_native_wait_result(
+        session,
+        third_child_id,
+        AgentStatus::Errored("ReviewEnded".into()),
+    )
+    .await;
+    let collected = session
+        .rencrow_completion_state(ROOT_TASK_ID)
+        .await
+        .expect("native wait collection retains the failed review");
+    session.flush_rollout().await?;
+    cold_restore_completion_history(session, &fixture.rollout_path).await?;
+
+    assert!(!session.autonomous_completion_paused().await);
+    let restored = session
+        .rencrow_completion_state(ROOT_TASK_ID)
+        .await
+        .expect("legacy terminal-to-wait pair restores completion history");
+    assert_eq!(restored, collected);
+    assert_eq!(
+        restored.conditions, bound.conditions,
+        "the acceptance conditions remain attached through the legacy transition"
+    );
+    assert!(restored.blocker.is_some());
+    assert!(restored.units.iter().any(|unit| {
+        unit.id == REVIEW_UNIT_ID
+            && unit.status == UnitStatus::Failed
+            && unit.review_state.as_ref().is_some_and(|review| {
+                review.retry_reservation_prior_historical_failure.is_none()
+                    && review.active_attempt.as_ref().is_some_and(|attempt| {
+                        attempt.attempt_id == "cold-restore-third-spawn"
+                            && attempt.status == CompletionReviewAttemptStatus::Failed
+                            && attempt.wait_call_id.as_deref() == Some("cold-restore-third-wait")
+                    })
+            })
+    }));
+
+    let InitialHistory::Resumed(resumed_rollout) =
+        RolloutRecorder::get_rollout_history(&fixture.rollout_path).await?
+    else {
+        anyhow::bail!("accepted retry rollout remains reloadable");
+    };
+    let items = resumed_rollout.history.as_ref().clone();
+    let third_terminal_index = items
+        .iter()
+        .position(|item| match item {
+            RolloutItem::ResponseItem(envelope) => envelope
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.rencrow_completion.as_ref())
+                .is_some_and(|snapshot| {
+                    snapshot["state"]["units"].as_array().is_some_and(|units| {
+                        units.iter().any(|unit| {
+                            unit["id"] == REVIEW_UNIT_ID
+                                && unit["status"] == "failed"
+                                && unit["review_state"]["active_attempt"]["attempt_id"]
+                                    == "cold-restore-third-spawn"
+                                && unit["review_state"]["active_attempt"]["wait_call_id"].is_null()
+                        })
+                    })
+                }),
+            _ => false,
+        })
+        .expect("persisted legacy terminal snapshot is present");
+    let collected_index = items
+        .iter()
+        .position(|item| match item {
+            RolloutItem::ResponseItem(envelope) => envelope
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.rencrow_completion.as_ref())
+                .is_some_and(|snapshot| {
+                    snapshot["state"]["units"].as_array().is_some_and(|units| {
+                        units.iter().any(|unit| {
+                            unit["id"] == REVIEW_UNIT_ID
+                                && unit["review_state"]["active_attempt"]["wait_call_id"]
+                                    == "cold-restore-third-wait"
+                        })
+                    })
+                }),
+            _ => false,
+        })
+        .expect("immediately adjacent native wait collection snapshot is present");
+    anyhow::ensure!(
+        collected_index == third_terminal_index + 1,
+        "collected snapshot immediately follows the legacy failed terminal snapshot"
+    );
+
+    cold_restore_completion_items(session, &items[..=third_terminal_index]).await;
+    assert!(
+        session.autonomous_completion_paused().await,
+        "a malformed legacy terminal without its immediate wait collection remains fail-closed"
+    );
+
+    let mut wrong_generation = items.clone();
+    let RolloutItem::ResponseItem(envelope) = &mut wrong_generation[third_terminal_index] else {
+        anyhow::bail!("legacy terminal snapshot item is a response envelope");
+    };
+    let terminal_snapshot = envelope
+        .metadata
+        .as_mut()
+        .and_then(|metadata| metadata.rencrow_completion.as_mut())
+        .expect("legacy terminal completion snapshot metadata");
+    let terminal_unit = terminal_snapshot["state"]["units"]
+        .as_array_mut()
+        .and_then(|units| units.iter_mut().find(|unit| unit["id"] == REVIEW_UNIT_ID))
+        .expect("terminal review unit");
+    terminal_unit["review_state"]["active_attempt"]["attempt_id"] =
+        Value::String("different-generation".into());
+    cold_restore_completion_items(session, &wrong_generation).await;
+    assert!(
+        session.autonomous_completion_paused().await,
+        "a wait result for a different generation cannot validate the legacy terminal"
+    );
+
+    let mut changed_successor = items.clone();
+    let RolloutItem::ResponseItem(envelope) = &mut changed_successor[collected_index] else {
+        anyhow::bail!("collected snapshot item is a response envelope");
+    };
+    let successor = envelope
+        .metadata
+        .as_mut()
+        .and_then(|metadata| metadata.rencrow_completion.as_mut())
+        .expect("collected completion snapshot metadata");
+    successor["state"]["next_action"] = Value::String("unrelated successor mutation".into());
+    cold_restore_completion_items(session, &changed_successor).await;
+    assert!(
+        session.autonomous_completion_paused().await,
+        "an extra successor mutation cannot use the legacy transition proof"
+    );
+
+    let mut invalid_earlier_history = items.clone();
+    let earlier_failure_index = invalid_earlier_history
+        .iter()
+        .position(|item| match item {
+            RolloutItem::ResponseItem(envelope) => envelope
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.rencrow_completion.as_ref())
+                .is_some_and(|snapshot| {
+                    snapshot["state"]["units"].as_array().is_some_and(|units| {
+                        units.iter().any(|unit| {
+                            unit["id"] == REVIEW_UNIT_ID
+                                && unit["status"] == "failed"
+                                && unit["review_state"]["active_attempt"]["attempt_id"]
+                                    == fixture.first_attempt_id
+                        })
+                    })
+                }),
+            _ => false,
+        })
+        .expect("first generation's native failure snapshot is present");
+    let RolloutItem::ResponseItem(envelope) = &mut invalid_earlier_history[earlier_failure_index]
+    else {
+        anyhow::bail!("earlier failure snapshot item is a response envelope");
+    };
+    let earlier = envelope
+        .metadata
+        .as_mut()
+        .and_then(|metadata| metadata.rencrow_completion.as_mut())
+        .expect("earlier completion snapshot metadata");
+    earlier["state"]["contract_revision"] = serde_json::json!(0);
+    cold_restore_completion_items(session, &invalid_earlier_history).await;
+    assert!(
+        session.autonomous_completion_paused().await,
+        "the transition exception cannot repair an independently invalid earlier snapshot"
+    );
+    Ok(())
 }
 
 #[tokio::test]

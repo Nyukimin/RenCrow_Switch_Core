@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-21.
 //! Native-history projection for the validated instruction-removal map.
 
 use super::super::CompactedMessageIdentity;
@@ -6,6 +7,7 @@ use super::super::build_compacted_history_with_limit;
 use super::super::collect_annotated_user_messages;
 use super::super::insert_initial_context_before_last_real_user_or_summary;
 use super::super::is_summary_message;
+use super::history::is_host_autonomous_completion_continue;
 use super::timeline::TIMELINE_SOURCE;
 use super::timeline::internal_context_source;
 use codex_history::ResponseItemEnvelope;
@@ -195,6 +197,15 @@ pub(super) fn filter_retained_instructions_with_task_context(
             latest_internal_context.insert(source, index);
         }
     }
+    let latest_autonomous_completion_continue = originals
+        .iter()
+        .enumerate()
+        .filter_map(|(index, original)| {
+            (input.records[index].origin == Origin::Host
+                && is_host_autonomous_completion_continue(original))
+            .then_some(index)
+        })
+        .next_back();
     let mut retained = Vec::new();
     for (original_index, (record, original)) in input.records.iter().zip(originals).enumerate() {
         let is_task_context = task_context == Some(original_index);
@@ -274,6 +285,13 @@ pub(super) fn filter_retained_instructions_with_task_context(
                     }) =>
                 {
                     original.clone()
+                }
+                Origin::Host if is_host_autonomous_completion_continue(original) => {
+                    if latest_autonomous_completion_continue == Some(original_index) {
+                        original.clone()
+                    } else {
+                        continue;
+                    }
                 }
                 Origin::Work | Origin::Host
                     if record.opaque.is_none() && record.protected.is_empty() =>

@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-20: separate caller and host checkpoint budgets.
 //! Typed, host-verified task-boundary state and deterministic derived context.
 
 // Modified by RenCrow Switch Core, 2026-11-16.
@@ -8,6 +9,16 @@ use std::collections::BTreeSet;
 
 const MAX_BOUNDARY_BYTES: usize = 32 * 1024;
 const MAX_TEXT_BYTES: usize = 4096;
+pub const MAX_COMPLETION_INPUT_BYTES: usize = MAX_BOUNDARY_BYTES;
+pub const MAX_COMPLETION_CHECKPOINT_BYTES: usize = 256 * 1024;
+
+pub fn validate_completion_state_input_size(value: &serde_json::Value) -> Result<(), String> {
+    let encoded = serde_json::to_vec(value).map_err(|error| error.to_string())?;
+    if encoded.len() > MAX_COMPLETION_INPUT_BYTES {
+        return Err("completion state input exceeds caller size limit".into());
+    }
+    Ok(())
+}
 
 fn is_default<T: Default + PartialEq>(value: &T) -> bool {
     value == &T::default()
@@ -744,12 +755,12 @@ impl StoredTaskState {
                 if revision < self.boundary.revision && is_sha256(hash) => {}
             _ => return Err("stored task state previous revision binding is invalid".into()),
         }
-        validate_size_and_text(&self.boundary)
+        validate_host_size_and_text(&self.boundary)
             .map_err(|error| format!("invalid stored task state: {error:?}"))?;
         if serde_json::to_vec(self)
             .map_err(|error| error.to_string())?
             .len()
-            > MAX_BOUNDARY_BYTES
+            > MAX_COMPLETION_CHECKPOINT_BYTES
         {
             return Err("stored task state exceeds the checkpoint size limit".into());
         }
@@ -821,6 +832,27 @@ pub fn validate_boundary(
     candidate: BoundaryCandidate,
     facts: &HostBoundaryFacts,
 ) -> Result<ValidatedBoundary, BoundaryError> {
+    validate_boundary_with_size(candidate, facts, BoundarySizeContract::CallerInput)
+}
+
+pub fn validate_host_boundary_checkpoint(
+    candidate: BoundaryCandidate,
+    facts: &HostBoundaryFacts,
+) -> Result<ValidatedBoundary, BoundaryError> {
+    validate_boundary_with_size(candidate, facts, BoundarySizeContract::HostCheckpoint)
+}
+
+#[derive(Clone, Copy)]
+enum BoundarySizeContract {
+    CallerInput,
+    HostCheckpoint,
+}
+
+fn validate_boundary_with_size(
+    candidate: BoundaryCandidate,
+    facts: &HostBoundaryFacts,
+    size_contract: BoundarySizeContract,
+) -> Result<ValidatedBoundary, BoundaryError> {
     if candidate.version != 1 {
         return Err(BoundaryError::UnsupportedVersion);
     }
@@ -844,7 +876,10 @@ pub fn validate_boundary(
     {
         return Err(BoundaryError::StaleRevision);
     }
-    validate_size_and_text(&candidate)?;
+    match size_contract {
+        BoundarySizeContract::CallerInput => validate_size_and_text(&candidate)?,
+        BoundarySizeContract::HostCheckpoint => validate_host_size_and_text(&candidate)?,
+    }
     let artifact = facts
         .artifact_ref
         .as_deref()
@@ -1477,7 +1512,7 @@ fn validate_completion_state_inner(
     if serde_json::to_vec(state)
         .map_err(|error| error.to_string())?
         .len()
-        > MAX_BOUNDARY_BYTES
+        > MAX_COMPLETION_CHECKPOINT_BYTES
     {
         return Err("completion state exceeds checkpoint size limit".into());
     }
@@ -2000,6 +2035,25 @@ fn validate_size_and_text(candidate: &BoundaryCandidate) -> Result<(), BoundaryE
     if encoded.len() > MAX_BOUNDARY_BYTES {
         return Err(BoundaryError::Oversized);
     }
+    validate_boundary_text(candidate)
+}
+
+fn validate_host_size_and_text(candidate: &BoundaryCandidate) -> Result<(), BoundaryError> {
+    let mut generic_boundary = candidate.clone();
+    generic_boundary.completion_state = None;
+    let generic_encoded =
+        serde_json::to_vec(&generic_boundary).map_err(|_| BoundaryError::InvalidTasks)?;
+    if generic_encoded.len() > MAX_BOUNDARY_BYTES {
+        return Err(BoundaryError::Oversized);
+    }
+    let encoded = serde_json::to_vec(candidate).map_err(|_| BoundaryError::InvalidTasks)?;
+    if encoded.len() > MAX_COMPLETION_CHECKPOINT_BYTES {
+        return Err(BoundaryError::Oversized);
+    }
+    validate_boundary_text(candidate)
+}
+
+fn validate_boundary_text(candidate: &BoundaryCandidate) -> Result<(), BoundaryError> {
     let required = [
         &candidate.thread_id,
         &candidate.root_task_id,
@@ -2115,6 +2169,24 @@ fn validate_tasks(candidate: &BoundaryCandidate) -> Result<(), BoundaryError> {
 /// so they remain preserved without being promoted into trusted instructions.
 pub fn render_task_context(boundary: &ValidatedBoundary) -> String {
     let c = &boundary.candidate;
+    let completion_state_reference = c.completion_state.as_ref().and_then(|state| {
+        let canonical_state = serde_json::to_string(state).ok()?;
+        Some(serde_json::json!({
+            "root_task_id": c.root_task_id,
+            "contract_revision": state.contract_revision,
+            "canonical_state_sha256": crate::archive_reference::content_sha256(&canonical_state),
+            "paused": state.paused,
+            "current_unit": state.current_unit,
+            "next_action": state.next_action,
+            "conditions": state.conditions.iter().map(|condition| {
+                serde_json::json!({"id": condition.id, "status": condition.status})
+            }).collect::<Vec<_>>(),
+            "units": state.units.iter().map(|unit| {
+                serde_json::json!({"id": unit.id, "kind": unit.kind, "status": unit.status})
+            }).collect::<Vec<_>>(),
+            "status_lookup": "Call task_context_boundary status for full host state.",
+        }))
+    });
     let completed = c.tasks.iter().filter(|t| t.status == TaskStatus::Completed).map(|t| {
         if t.id == c.closed_task_id {
             serde_json::json!({"id":t.id,"purpose":t.purpose,"result":boundary_current_result(boundary),"artifact_ref":c.artifact_ref,"verification_ref":c.verification_ref,"parent_review_ref":boundary.parent_review_ref})
@@ -2126,7 +2198,7 @@ pub fn render_task_context(boundary: &ValidatedBoundary) -> String {
     serde_json::json!({"format":"task_context_v1","goal":c.goal,"completed":completed,
         "remaining":c.tasks.iter().filter(|t| t.status != TaskStatus::Completed).collect::<Vec<_>>(),
         "current_task_id":c.current_task_id,"decisions":c.decisions,"constraints_as_source":c.constraints,
-        "completion_state":c.completion_state}).to_string()
+        "completion_state":completion_state_reference}).to_string()
 }
 
 fn boundary_current_result(boundary: &ValidatedBoundary) -> &str {

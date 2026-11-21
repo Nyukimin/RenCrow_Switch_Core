@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-21.
 // Modified by RenCrow Switch Core, 2026-09-22.
 //! Adapt owner-reconstructed history without guessing human provenance.
 use codex_history::CodexHarnessMetadata;
@@ -17,6 +18,14 @@ use codex_rollout::PreparedCompactionSources;
 use serde_json::Value;
 use serde_json::json;
 use std::collections::HashMap;
+
+/// Identify the exact host-owned developer fragment whose next-action value is last-write-wins.
+///
+/// Content kind, role, and an otherwise-default harness sidecar distinguish this runtime state
+/// from client-authored, mixed-kind, or otherwise opaque messages that must remain fail-closed.
+pub(super) fn is_host_autonomous_completion_continue(envelope: &ResponseItemEnvelope) -> bool {
+    crate::context::AutonomousCompletionContinue::is_host_generated(envelope)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct CompletedWorkProjection {
@@ -143,6 +152,7 @@ pub(super) fn capture(
     let mut records = Vec::new();
     let mut prior_invalidations = Vec::new();
     for (index, envelope) in items.iter().enumerate() {
+        let host_autonomous_completion_continue = is_host_autonomous_completion_continue(envelope);
         if let Some(value) = envelope
             .metadata
             .as_ref()
@@ -166,7 +176,8 @@ pub(super) fn capture(
             text: String::new(),
             protected: vec![],
             execution_evidence: false,
-            opaque: Some(json!({"item":envelope.item,"metadata":envelope.metadata})),
+            opaque: (!host_autonomous_completion_continue)
+                .then(|| json!({"item":envelope.item,"metadata":envelope.metadata})),
         };
         if let ResponseItem::Message {
             role,
@@ -196,29 +207,30 @@ pub(super) fn capture(
             let kinds = internal_chat_message_metadata_passthrough
                 .as_ref()
                 .and_then(|m| m.content_item_kinds.as_ref());
-            let host = kinds.is_some_and(|kinds| {
-                !kinds.is_empty()
-                    && kinds.len() == content.len()
-                    && kinds.iter().all(|kind| {
-                        // Runtime-owned `<codex_internal_context>` fragments (goal steering and
-                        // the compaction timeline) are host context, never user input.
-                        kind.0.ends_with(".internal_context")
-                            || matches!(
-                                kind.0.as_str(),
-                                "agents_md.instructions"
-                                    | "environments.environment_context"
-                                    | "host_skills.instructions"
-                                    | "permissions.instructions"
-                                    | "multi_agent.usage_hint"
-                                    | "generic.developer_instructions"
-                                    | "managed_config.developer_instructions"
-                                    | "collaboration_mode.instructions"
-                                    | "persistent_mode.instructions"
-                                    | "multi_agent.mode_instructions"
-                                    | "apps.instructions"
-                            )
-                    })
-            });
+            let host = host_autonomous_completion_continue
+                || kinds.is_some_and(|kinds| {
+                    !kinds.is_empty()
+                        && kinds.len() == content.len()
+                        && kinds.iter().all(|kind| {
+                            // Runtime-owned `<codex_internal_context>` fragments (goal steering
+                            // and the compaction timeline) are host context, never user input.
+                            kind.0.ends_with(".internal_context")
+                                || matches!(
+                                    kind.0.as_str(),
+                                    "agents_md.instructions"
+                                        | "environments.environment_context"
+                                        | "host_skills.instructions"
+                                        | "permissions.instructions"
+                                        | "multi_agent.usage_hint"
+                                        | "generic.developer_instructions"
+                                        | "managed_config.developer_instructions"
+                                        | "collaboration_mode.instructions"
+                                        | "persistent_mode.instructions"
+                                        | "multi_agent.mode_instructions"
+                                        | "apps.instructions"
+                                )
+                        })
+                });
             let summary = role == "user"
                 && (metadata.is_some_and(|m| m.rencrow_compaction.is_some())
                     || kinds.is_some_and(|kinds| {

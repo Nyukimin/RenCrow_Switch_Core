@@ -1661,6 +1661,7 @@ impl Session {
             }
             InitialHistory::Resumed(resumed_history) => {
                 let turn_context = self.new_default_turn().await;
+                let same_thread_resume = resumed_history.conversation_id == self.thread_id();
                 let rollout_items = resumed_history.history;
                 if matches!(
                     rollout_items.iter().rev().find_map(|item| match item {
@@ -1674,6 +1675,10 @@ impl Session {
                 let previous_turn_settings = self
                     .apply_rollout_reconstruction(&turn_context, &rollout_items)
                     .await;
+                if same_thread_resume {
+                    self.recover_legacy_blocked_tool_calls(&turn_context, &rollout_items)
+                        .await;
+                }
 
                 // If resuming, warn when the last recorded model differs from the current one.
                 let curr: &str = turn_context.model_info().slug.as_str();
@@ -1900,6 +1905,65 @@ impl Session {
                 .await;
         }
         previous_turn_settings
+    }
+
+    async fn recover_legacy_blocked_tool_calls(
+        &self,
+        turn_context: &Arc<TurnContext>,
+        rollout_items: &[RolloutItem],
+    ) {
+        let candidates = rollout_reconstruction::legacy_blocked_tool_call_responses(
+            rollout_items,
+            &self.thread_id().to_string(),
+        );
+        if candidates.is_empty() {
+            return;
+        }
+
+        let history = self.clone_history().await;
+        let call_ids = history
+            .annotated_items()
+            .iter()
+            .filter_map(|envelope| match &envelope.item {
+                ResponseItem::FunctionCall { call_id, .. }
+                | ResponseItem::CustomToolCall { call_id, .. } => Some(call_id.clone()),
+                _ => None,
+            })
+            .collect::<std::collections::HashSet<_>>();
+        let output_call_ids = history
+            .annotated_items()
+            .iter()
+            .filter_map(|envelope| match &envelope.item {
+                ResponseItem::FunctionCallOutput {
+                    call_id: Some(call_id),
+                    ..
+                }
+                | ResponseItem::CustomToolCallOutput { call_id, .. } => Some(call_id.clone()),
+                _ => None,
+            })
+            .collect::<std::collections::HashSet<_>>();
+        let recoveries = candidates
+            .into_iter()
+            .filter(|envelope| match &envelope.item {
+                ResponseItem::FunctionCallOutput {
+                    call_id: Some(call_id),
+                    ..
+                } => call_ids.contains(call_id) && !output_call_ids.contains(call_id),
+                ResponseItem::CustomToolCallOutput { call_id, .. } => {
+                    call_ids.contains(call_id) && !output_call_ids.contains(call_id)
+                }
+                _ => false,
+            })
+            .collect::<Vec<_>>();
+        if recoveries.is_empty() {
+            return;
+        }
+        self.record_annotated_conversation_items(
+            turn_context,
+            turn_context.model_info(),
+            recoveries,
+        )
+        .await;
     }
 
     async fn set_auto_compact_window_estimated_prefill_for_scope(

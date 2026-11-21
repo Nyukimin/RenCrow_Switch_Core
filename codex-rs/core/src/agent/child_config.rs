@@ -8,10 +8,13 @@ use crate::agent::role::DEFAULT_ROLE_NAME;
 use crate::agent::role::apply_role_to_config;
 use crate::agent::role::ensure_agent_role_enabled;
 use crate::config::Config;
+use crate::models_manager_binding::ModelsManagerBinding;
+use crate::models_manager_binding::select_models_manager;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
 use codex_models_manager::manager::RefreshStrategy;
+use codex_models_manager::manager::SharedModelsManager;
 use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::openai_models::ModelPreset;
@@ -80,7 +83,7 @@ pub(crate) async fn prepare_agent_spawn_config(
     if !options.full_history_fork
         || (options.version == SpawnConfigVersion::V2 && options.role_name.is_some())
     {
-        apply_spawn_agent_role(session, &mut config, options.role_name).await?;
+        apply_spawn_agent_role(session, &mut config, options.role_name, turn).await?;
         if options.version == SpawnConfigVersion::V2
             && options.full_history_fork
             && config.developer_instructions.is_none()
@@ -103,7 +106,7 @@ pub(crate) async fn prepare_agent_spawn_config(
         )
         .await?;
     }
-    apply_spawn_agent_service_tier(session, &mut config).await?;
+    apply_spawn_agent_service_tier(session, &mut config, turn).await?;
     apply_spawn_agent_runtime_overrides(&mut config, turn)?;
     // Narrow after inheriting the parent's permissions, so a read-only role can only lose access.
     if config.rencrow_read_only {
@@ -244,11 +247,10 @@ async fn apply_requested_spawn_agent_model_overrides(
     if requested_model.is_none() && requested_reasoning_effort.is_none() {
         return Ok(());
     }
+    let models_manager = models_manager_for_spawn_config(session, config, turn);
 
     if let Some(requested_model) = requested_model {
-        let available_models = session
-            .services
-            .models_manager
+        let available_models = models_manager
             .list_models(RefreshStrategy::Offline, config.http_client_factory())
             .await;
         let selected_model_name = find_spawn_agent_model_name(
@@ -256,9 +258,7 @@ async fn apply_requested_spawn_agent_model_overrides(
             requested_model,
             turn.multi_agent_version,
         )?;
-        let selected_model_info = session
-            .services
-            .models_manager
+        let selected_model_info = models_manager
             .get_model_info(&selected_model_name, &config.to_models_manager_config())
             .await;
 
@@ -282,9 +282,7 @@ async fn apply_requested_spawn_agent_model_overrides(
             "spawn_agent could not resolve the child model for reasoning effort validation"
                 .to_string()
         })?;
-        let model_info = session
-            .services
-            .models_manager
+        let model_info = models_manager
             .get_model_info(model, &config.to_models_manager_config())
             .await;
         validate_spawn_agent_reasoning_effort(
@@ -322,6 +320,7 @@ fn resolve_spawn_agent_model_overrides<'a>(
 pub(crate) async fn apply_spawn_agent_service_tier(
     session: &Session,
     config: &mut Config,
+    turn: &TurnContext,
 ) -> Result<(), String> {
     let Some(service_tier) = session.services.agent_control.root_service_tier() else {
         config.service_tier = None;
@@ -335,9 +334,8 @@ pub(crate) async fn apply_spawn_agent_service_tier(
     let model = config.model.clone().ok_or_else(|| {
         "spawn_agent could not resolve the child model for service tier validation".to_string()
     })?;
-    let model_info = session
-        .services
-        .models_manager
+    let models_manager = models_manager_for_spawn_config(session, config, turn);
+    let model_info = models_manager
         .get_model_info(model.as_str(), &config.to_models_manager_config())
         .await;
 
@@ -351,11 +349,15 @@ async fn apply_spawn_agent_role(
     session: &Session,
     config: &mut Config,
     role_name: Option<&str>,
+    turn: &TurnContext,
 ) -> Result<(), String> {
     let previous_model = config.model.clone();
     let previous_reasoning_effort = config.model_reasoning_effort.clone();
+    let previous_models_manager_binding = ModelsManagerBinding::from_config(config);
     apply_role_to_config(config, role_name).await?;
-    if config.model == previous_model && config.model_reasoning_effort == previous_reasoning_effort
+    if config.model == previous_model
+        && config.model_reasoning_effort == previous_reasoning_effort
+        && ModelsManagerBinding::from_config(config) == previous_models_manager_binding
     {
         return Ok(());
     }
@@ -366,9 +368,8 @@ async fn apply_spawn_agent_role(
     let model = config.model.clone().ok_or_else(|| {
         "spawn_agent could not resolve the child model for reasoning effort validation".to_string()
     })?;
-    let model_info = session
-        .services
-        .models_manager
+    let models_manager = models_manager_for_spawn_config(session, config, turn);
+    let model_info = models_manager
         .get_model_info(&model, &config.to_models_manager_config())
         .await;
     if model_info.used_fallback_model_metadata {
@@ -379,6 +380,24 @@ async fn apply_spawn_agent_role(
         &model,
         &model_info.supported_reasoning_levels,
         &reasoning_effort,
+    )
+}
+
+fn models_manager_for_spawn_config(
+    session: &Session,
+    config: &Config,
+    turn: &TurnContext,
+) -> SharedModelsManager {
+    let inherited_binding = ModelsManagerBinding::new(
+        turn.config.model_provider_id.clone(),
+        turn.provider.info().clone(),
+        turn.config.model_catalog.clone(),
+    );
+    select_models_manager(
+        config,
+        std::sync::Arc::clone(&session.services.auth_manager),
+        &session.services.models_manager,
+        &inherited_binding,
     )
 }
 

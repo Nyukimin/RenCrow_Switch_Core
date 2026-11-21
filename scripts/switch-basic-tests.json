@@ -2,7 +2,7 @@
   "schema_version": 1,
   "name": "switch-basic",
   "description": "A small fail-closed regression set for Codex-switch contracts. It is not full Switch coverage and does not select unrelated upstream tests.",
-  "test_count": 36,
+  "test_count": 45,
   "groups": [
     {
       "id": "compaction_transaction_replay_and_rollback",
@@ -211,6 +211,57 @@
           "binary_id": "codex-cli::bin/rencrow-compaction",
           "test_name": "task_checkpoint::tests::latest_capacity_row_with_embedded_task_boundary_is_selected_and_malformed_target_fails",
           "package_name": "codex-cli"
+        }
+      ]
+    },
+    {
+      "id": "parent_thread_handoff",
+      "contract": "Host-owned parent transfer preserves original evidence, checks, failed review attempts, pause/unknown-work barriers and exclusive successor start.",
+      "tests": [
+        {
+          "binary_id": "codex-core",
+          "test_name": "session::completion_persistence::tests::parent_handoff_tests::parent_handoff_projects_owner_but_preserves_conditions_failures_and_original",
+          "package_name": "codex-core"
+        },
+        {
+          "binary_id": "codex-core",
+          "test_name": "session::completion_persistence::tests::parent_handoff_tests::parent_handoff_rejects_pause_unknown_work_foreign_or_missing_proofs",
+          "package_name": "codex-core"
+        },
+        {
+          "binary_id": "codex-core",
+          "test_name": "session::completion_persistence::tests::parent_handoff_tests::parent_handoff_cold_restore_keeps_open_task_and_does_not_accept_it",
+          "package_name": "codex-core"
+        },
+        {
+          "binary_id": "codex-core",
+          "test_name": "session::completion_persistence::tests::parent_handoff_tests::parent_handoff_exclusive_start_does_not_resend_unknown_result",
+          "package_name": "codex-core"
+        },
+        {
+          "binary_id": "codex-core",
+          "test_name": "session::completion_persistence::tests::parent_handoff_tests::parent_handoff_unsealed_record_cannot_import",
+          "package_name": "codex-core"
+        },
+        {
+          "binary_id": "codex-core",
+          "test_name": "session::tests::completion_review_async_tests::parent_handoff_review_tests::parent_handoff_failed_review_preserves_exact_attempt_and_acceptance_on_cold_restore",
+          "package_name": "codex-core"
+        },
+        {
+          "binary_id": "codex-core",
+          "test_name": "session::completion_persistence::tests::parent_handoff_tests::parent_handoff_failure_seal_rejects_live_contract_drift",
+          "package_name": "codex-core"
+        },
+        {
+          "binary_id": "codex-core",
+          "test_name": "session::completion_persistence::tests::parent_handoff_tests::parent_handoff_pre_turn_seals_only_after_preserving_exact_input",
+          "package_name": "codex-core"
+        },
+        {
+          "binary_id": "codex-core",
+          "test_name": "rencrow_execution_guard::tests::parent_handoff_first_tool_preserves_patch_and_exhausted_read_budget",
+          "package_name": "codex-core"
         }
       ]
     }

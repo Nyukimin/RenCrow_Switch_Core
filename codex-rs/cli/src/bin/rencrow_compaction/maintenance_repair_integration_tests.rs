@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-21: explicit authorized resume regressions.
 use super::*;
 use codex_history::RolloutItem;
 use codex_protocol::protocol::EventMsg;
@@ -292,6 +293,61 @@ async fn write_repair_fixture(
     (root, home, rollout, request_path, current_hash, source_path)
 }
 
+async fn write_authorized_resume_fixture() -> (TempDir, PathBuf, PathBuf, PathBuf, String) {
+    let root = tempfile::tempdir().expect("fixture root");
+    let canonical_root = root.path().canonicalize().expect("canonical fixture root");
+    let home = canonical_root.join(CODEX_HOME_NAME);
+    let rollout = home
+        .join("sessions/2026/11/11")
+        .join(format!("rollout-2026-11-11T05-00-00-{THREAD}.jsonl"));
+    std::fs::create_dir_all(rollout.parent().expect("rollout parent"))
+        .expect("create rollout directory");
+    let thread_id = ThreadId::from_string(THREAD).expect("valid thread id");
+    let paused = snapshot(true, None);
+    let mut file = std::fs::File::create(&rollout).expect("create rollout");
+    write_metadata(&mut file, thread_id, &home);
+    write_row(&mut file, 1, CURRENT_AT, &host_snapshot(paused.clone()));
+    file.sync_all().expect("sync initial rollout");
+    let items = super::super::thread_rollout_items(&rollout, &thread_id)
+        .await
+        .expect("read seeded rollout");
+    let current_hash = super::completion_snapshots(&items).expect("find paused snapshot")[0]
+        .1
+        .clone();
+    let tip = super::history_tip(&rollout).expect("history tip");
+    let authorization_path = canonical_root.join("state.json");
+    let authorization = serde_json::json!({
+        "thread_id":THREAD, "root_task_id":ROOT_TASK,
+        "recorded_by":"official Codex supervisor",
+        "authorization": {
+            "issuer":"user in current official Codex conversation",
+            "original_text":"作業再開、ではなく作業完了まですすめて",
+            "interpretation":"Existing latest explicit continuation supersedes prior pause; no new approval is needed. This is not a native Human intake receipt."
+        }
+    });
+    let authorization_text =
+        serde_json::to_string(&authorization).expect("serialize auth evidence");
+    std::fs::write(&authorization_path, &authorization_text).expect("write auth evidence");
+    let authorization_path = authorization_path
+        .canonicalize()
+        .expect("canonical auth evidence");
+    let request_path = canonical_root.join("authorized-resume-request.json");
+    let request = serde_json::json!({
+        "version":2, "reason":"explicit_authorized_resume", "thread_id":THREAD,
+        "root_task_id":ROOT_TASK, "expected_resume_generation":0,
+        "expected_current_snapshot_sha256":current_hash,
+        "expected_history_tip":{"ordinal":tip.ordinal,"sha256":tip.sha256},
+        "authorization":{"path":authorization_path,
+            "sha256":codex_history::archive_reference::content_sha256(&authorization_text)}
+    });
+    std::fs::write(
+        &request_path,
+        serde_json::to_vec(&request).expect("serialize request"),
+    )
+    .expect("write authorized resume request");
+    (root, home, rollout, request_path, current_hash)
+}
+
 #[tokio::test]
 async fn maintenance_repair_full_run_is_dry_then_applied_and_idempotent() {
     let (_root, home, rollout, request, _, _) =
@@ -361,6 +417,194 @@ async fn maintenance_repair_full_run_is_dry_then_applied_and_idempotent() {
     assert!(checkpoint.0 >= std::fs::metadata(&rollout).unwrap().len());
     let tip = super::history_tip(&rollout).expect("read repaired rollout tip");
     assert!(checkpoint.1 >= tip.ordinal.saturating_add(1));
+}
+
+#[tokio::test]
+async fn explicit_authorized_resume_is_dry_then_applied_and_idempotent() {
+    let (_root, home, rollout, request, _) = write_authorized_resume_fixture().await;
+    let before = std::fs::read(&rollout).expect("read initial rollout");
+    run(home.clone(), THREAD.into(), request.clone(), false)
+        .await
+        .expect("dry-run explicit authorized resume");
+    assert_eq!(std::fs::read(&rollout).expect("read after dry-run"), before);
+    run(home.clone(), THREAD.into(), request.clone(), true)
+        .await
+        .expect("apply explicit authorized resume");
+    let after_apply = std::fs::read(&rollout).expect("read applied rollout");
+    let thread_id = ThreadId::from_string(THREAD).unwrap();
+    let items = super::super::thread_rollout_items(&rollout, &thread_id)
+        .await
+        .expect("read applied rollout");
+    let snapshots = super::completion_snapshots(&items).expect("find applied snapshot");
+    let (_, _, resumed) = snapshots.last().expect("resumed host snapshot");
+    assert_eq!(resumed["state"]["paused"], false);
+    assert_eq!(resumed["resume_generation"], 1);
+    assert_eq!(
+        resumed["state"]["conditions"],
+        snapshot(true, None)["state"]["conditions"]
+    );
+    assert_eq!(resumed["active_scope"], Value::Null);
+    let receipt = &resumed["maintenance_repair_receipt"];
+    assert_eq!(receipt["version"], 2);
+    assert_eq!(receipt["reason"], "explicit_authorized_resume");
+    assert!(receipt.get("shutdown_before_snapshot_sha256").is_none());
+    assert!(
+        receipt
+            .get("legacy_scope_mismatch_snapshot_sha256")
+            .is_none()
+    );
+    run(home, THREAD.into(), request, true)
+        .await
+        .expect("idempotent resume retry");
+    assert_eq!(
+        std::fs::read(&rollout).expect("read after retry"),
+        after_apply
+    );
+}
+
+#[tokio::test]
+async fn explicit_authorized_resume_rejects_stale_or_unbound_requests() {
+    let (_root, home, rollout, request_path, _) = write_authorized_resume_fixture().await;
+    let initial_rollout = std::fs::read(&rollout).expect("read initial rollout");
+    let original: Value =
+        serde_json::from_slice(&std::fs::read(&request_path).expect("read request"))
+            .expect("parse request");
+    let mut cases = Vec::new();
+    let mut value = original.clone();
+    value["thread_id"] = Value::String("01a1c0b9-582b-71c0-a6d6-552f2d581a8f".into());
+    cases.push(("wrong thread", value));
+    let mut value = original.clone();
+    value["root_task_id"] = Value::String("another-root".into());
+    cases.push(("wrong root", value));
+    let mut value = original.clone();
+    value["expected_current_snapshot_sha256"] = Value::String("1".repeat(64));
+    cases.push(("wrong snapshot", value));
+    let mut value = original.clone();
+    value["expected_history_tip"]["sha256"] = Value::String("2".repeat(64));
+    cases.push(("wrong history tip", value));
+    let mut value = original.clone();
+    value["expected_resume_generation"] = Value::from(4);
+    cases.push(("wrong generation", value));
+    let mut value = original.clone();
+    value["authorization"]["sha256"] = Value::String("3".repeat(64));
+    cases.push(("wrong authorization hash", value));
+    let mut value = original.clone();
+    value["authorization"]["path"] = Value::String(
+        home.join("missing-authorization.json")
+            .to_string_lossy()
+            .into_owned(),
+    );
+    cases.push(("missing authorization", value));
+    for (label, request) in cases {
+        std::fs::write(&request_path, serde_json::to_vec(&request).unwrap())
+            .expect("write changed request");
+        assert!(
+            run(home.clone(), THREAD.into(), request_path.clone(), false)
+                .await
+                .is_err(),
+            "{label} must be rejected"
+        );
+        assert_eq!(
+            std::fs::read(&rollout).expect("read unchanged rollout"),
+            initial_rollout,
+            "{label} must not modify canonical history"
+        );
+    }
+}
+
+#[tokio::test]
+async fn explicit_authorized_resume_rejects_an_active_live_writer() {
+    let (_root, home, rollout, request, _) = write_authorized_resume_fixture().await;
+    let thread_id = ThreadId::from_string(THREAD).unwrap();
+    let initial_items = super::super::thread_rollout_items(&rollout, &thread_id)
+        .await
+        .expect("load actual canonical history before resuming writer");
+    let config = codex_core::config::ConfigBuilder::default()
+        .codex_home(home.clone())
+        .build()
+        .await
+        .expect("build isolated config");
+    let state_db = codex_rollout::state_db::try_init(&config)
+        .await
+        .expect("initialize isolated state DB");
+    let store = Arc::new(LocalThreadStore::new(
+        LocalThreadStoreConfig::from_config(&config),
+        Some(state_db),
+    ));
+    let metadata = store
+        .read_thread(ReadThreadParams {
+            thread_id,
+            include_archived: true,
+            include_history: false,
+        })
+        .await
+        .expect("read thread metadata");
+    let persistence: Arc<dyn ThreadStore> = store;
+    let _active_writer = LiveThread::resume(
+        persistence,
+        metadata.history_mode,
+        ResumeThreadParams {
+            thread_id,
+            rollout_path: Some(rollout.clone()),
+            history: Some(std::sync::Arc::new(initial_items)),
+            include_archived: true,
+            metadata: ThreadPersistenceMetadata {
+                cwd: Some(metadata.cwd),
+                model_provider: metadata.model_provider,
+                memory_mode: ThreadMemoryMode::Disabled,
+            },
+        },
+    )
+    .await
+    .expect("hold existing writer lock");
+    let before_attempt = std::fs::read(&rollout).expect("read locked canonical rollout");
+    let error = run(home, THREAD.into(), request, true)
+        .await
+        .expect_err("second writer must be rejected");
+    let raw_error = format!("{error:#}");
+    assert_eq!(
+        raw_error,
+        format!("thread-store conflict: thread {THREAD} already has an active writer"),
+        "the second store must be rejected by the shared writer lock"
+    );
+    assert_eq!(
+        std::fs::read(&rollout).expect("read unchanged locked canonical rollout"),
+        before_attempt,
+        "a rejected second writer must not modify canonical history"
+    );
+}
+
+#[tokio::test]
+async fn explicit_authorized_resume_rejects_a_stop_after_authorization_tip() {
+    let (_root, home, rollout, request, _) = write_authorized_resume_fixture().await;
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&rollout)
+        .expect("open rollout for newer stop");
+    write_row(
+        &mut file,
+        2,
+        "2026-11-11T05:06:33.000000+00:00",
+        &RolloutItem::EventMsg(EventMsg::TurnAborted(
+            codex_protocol::protocol::TurnAbortedEvent {
+                turn_id: Some("stop-after-grant".into()),
+                reason: codex_protocol::protocol::TurnAbortReason::Interrupted,
+                started_at: None,
+                completed_at: None,
+                duration_ms: None,
+            },
+        )),
+    );
+    file.sync_all().expect("sync newer stop");
+    let after_stop = std::fs::read(&rollout).expect("read rollout with newer stop");
+    let error = run(home, THREAD.into(), request, false)
+        .await
+        .expect_err("newer stop must invalidate the authorization tip");
+    assert!(error.to_string().contains("history tip changed"));
+    assert_eq!(
+        std::fs::read(&rollout).expect("read unchanged stopped rollout"),
+        after_stop
+    );
 }
 
 #[tokio::test]

@@ -13,6 +13,8 @@ use crate::current_time::TimeProvider;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::environment_selection::default_thread_environment_selections;
 use crate::mcp::McpManager;
+use crate::models_manager_binding::ModelsManagerBinding;
+use crate::models_manager_binding::select_models_manager;
 use crate::rollout::truncation;
 use crate::session::ForkPersistence;
 use crate::session::GitEnrichmentPolicy;
@@ -404,6 +406,7 @@ pub(crate) struct ThreadManagerState {
     thread_id_generator: ThreadIdGenerator,
     auth_manager: Arc<AuthManager>,
     models_manager: SharedModelsManager,
+    models_manager_binding: ModelsManagerBinding,
     git_root_discovery: Arc<GitRootDiscovery>,
     environment_manager: Arc<EnvironmentManager>,
     starting_mcp_runtimes: std::sync::Mutex<Vec<std::sync::Weak<AtomicBool>>>,
@@ -565,6 +568,7 @@ impl ThreadManager {
                 thread_created_tx,
                 thread_id_generator: default_thread_id_generator(),
                 models_manager,
+                models_manager_binding: ModelsManagerBinding::from_config(config),
                 git_root_discovery: Arc::default(),
                 environment_manager,
                 starting_mcp_runtimes: std::sync::Mutex::new(Vec::new()),
@@ -713,8 +717,13 @@ impl ThreadManager {
                 shared_thread_instructions: Default::default(),
                 thread_created_tx,
                 thread_id_generator: default_thread_id_generator(),
-                models_manager: create_model_provider(provider, Some(auth_manager.clone()))
+                models_manager: create_model_provider(provider.clone(), Some(auth_manager.clone()))
                     .models_manager(codex_home, /*config_model_catalog*/ None),
+                models_manager_binding: ModelsManagerBinding::new(
+                    OPENAI_PROVIDER_ID.to_string(),
+                    provider,
+                    None,
+                ),
                 git_root_discovery: Arc::default(),
                 environment_manager,
                 starting_mcp_runtimes: std::sync::Mutex::new(Vec::new()),
@@ -1035,11 +1044,41 @@ impl ThreadManager {
         Ok(subtree_thread_ids)
     }
 
-    pub async fn start_thread(&self, options: StartThreadOptions) -> CodexResult<NewThread> {
-        Box::pin(self.start_thread_inner(
-            options, /*forked_from_thread_id*/ None, /*startup*/ None,
-        ))
-        .await
+    pub async fn start_thread(&self, mut options: StartThreadOptions) -> CodexResult<NewThread> {
+        use crate::session::completion_persistence::parent_handoff::runtime;
+        let mut source = None;
+        let mut settings = None;
+        if let Some(path) = options.config.rencrow_parent_handoff_file.clone() {
+            if !matches!(options.initial_history, InitialHistory::New)
+                || options.internal_parent.is_some()
+                || options.reserved_thread_id.is_some()
+                || options
+                    .session_source
+                    .as_ref()
+                    .is_some_and(SessionSource::is_non_root_agent)
+            {
+                return Err(CodexErr::InvalidRequest(
+                    "parent handoff requires one fresh root start".into(),
+                ));
+            }
+            let (predecessor, successor, expected, history) =
+                runtime::initial_history(&path, &options.config)?;
+            runtime::claim(&path, successor)?;
+            options.initial_history = InitialHistory::Forked(history);
+            options.reserved_thread_id = Some(successor);
+            source = Some(predecessor);
+            settings = Some(expected);
+        }
+        let started = Box::pin(self.start_thread_inner(options, source, /*startup*/ None)).await?;
+        if let Some(expected) = settings
+            && started.thread.thread_settings_snapshot().await != expected
+        {
+            started.thread.shutdown_and_wait().await?;
+            return Err(CodexErr::InvalidRequest(
+                "parent handoff settings differ from source; successor stopped".into(),
+            ));
+        }
+        Ok(started)
     }
 
     /// Starts a fresh internal session associated with an existing parent thread.
@@ -2213,6 +2252,12 @@ impl ThreadManagerState {
         };
         let attachment_source =
             forked_from_thread_id.filter(|_| matches!(&initial_history, InitialHistory::Forked(_)));
+        let models_manager = select_models_manager(
+            &config,
+            Arc::clone(&auth_manager),
+            &self.models_manager,
+            &self.models_manager_binding,
+        );
         let (session, io) = Session::spawn(SessionSpawnArgs {
             startup,
             config,
@@ -2220,7 +2265,7 @@ impl ThreadManagerState {
             instructions,
             installation_id: self.installation_id.clone(),
             auth_manager,
-            models_manager: Arc::clone(&self.models_manager),
+            models_manager,
             git_root_discovery: Arc::clone(&self.git_root_discovery),
             environment_manager: Arc::clone(&self.environment_manager),
             skills_service: Arc::clone(&self.skills_service),

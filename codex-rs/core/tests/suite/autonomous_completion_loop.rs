@@ -996,11 +996,12 @@ async fn planned_review_runs_through_host_spawn_wait_same_child_followup_and_ado
                 "multi_agent_v1::wait_agent".into(),
             ]);
             config.features.enable(Feature::Collab).unwrap();
+            let model_provider_id = config.model_provider_id.clone();
             let role_path = config.codex_home.join("completion-reviewer.toml");
             fs::write(
                 &role_path,
                 format!(
-                    "model = \"{REVIEW_MODEL}\"\nrencrow_read_only = true\nmodel_provider = \"mock\"\n\n[rencrow_execution_guard]\ntask_kind = \"read_only\"\n\n[model_providers.mock]\nname = \"mock\"\nbase_url = \"{provider_url}\"\nenv_key = \"PATH\"\nwire_api = \"responses\"\n"
+                    "model = \"{REVIEW_MODEL}\"\nrencrow_read_only = true\nmodel_provider = \"{model_provider_id}\"\n\n[rencrow_execution_guard]\ntask_kind = \"read_only\"\n\n[model_providers.mock]\nname = \"mock\"\nbase_url = \"{provider_url}\"\nenv_key = \"PATH\"\nwire_api = \"responses\"\n"
                 ),
             )
             .unwrap();
@@ -1480,11 +1481,12 @@ async fn failed_review_close_preserves_history_and_allows_one_new_authorized_rev
                 "multi_agent_v1::close_agent".into(),
             ]);
             config.features.enable(Feature::Collab).unwrap();
+            let model_provider_id = config.model_provider_id.clone();
             let role_path = config.codex_home.join("completion-reviewer.toml");
             fs::write(
                 &role_path,
                 format!(
-                    "model = \"{REVIEW_MODEL}\"\nrencrow_read_only = true\nmodel_provider = \"mock\"\n\n[rencrow_execution_guard]\ntask_kind = \"read_only\"\n\n[model_providers.mock]\nname = \"mock\"\nbase_url = \"{provider_url}\"\nenv_key = \"PATH\"\nwire_api = \"responses\"\n"
+                    "model = \"{REVIEW_MODEL}\"\nrencrow_read_only = true\nmodel_provider = \"{model_provider_id}\"\n\n[rencrow_execution_guard]\ntask_kind = \"read_only\"\n\n[model_providers.mock]\nname = \"mock\"\nbase_url = \"{provider_url}\"\nenv_key = \"PATH\"\nwire_api = \"responses\"\n"
                 ),
             )
             .unwrap();

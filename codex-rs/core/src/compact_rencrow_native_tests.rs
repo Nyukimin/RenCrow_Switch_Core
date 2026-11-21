@@ -1,4 +1,6 @@
+// Modified by RenCrow Switch Core, 2026-11-21.
 use super::*;
+use codex_history::CodexHarnessMetadata;
 use codex_history::ResponseItemEnvelope;
 use codex_history::compaction_candidate::CandidateInput;
 use codex_history::compaction_candidate::Origin;
@@ -6,7 +8,11 @@ use codex_history::compaction_plan::ByteRange;
 use codex_history::compaction_preprocess::prune_known_obsolete;
 use codex_history::compaction_selection::InstructionSelectionApplication;
 use codex_protocol::ResponseItemId;
+use codex_protocol::mcp::McpAttribution;
+use codex_protocol::mcp::McpAttributionSource;
+use codex_protocol::mcp::McpAttributionStatus;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::ContentItemKind;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ImageReference;
@@ -585,6 +591,214 @@ fn v2_native_projection_keeps_only_the_latest_internal_context_per_source() {
         filter_retained_instructions(&items, &captured, application(&captured, &[])).unwrap();
 
     assert_eq!(retained_ids(&projection), vec!["user-1", "goal-3"]);
+}
+
+#[test]
+fn v2_native_projection_keeps_only_latest_host_completion_continue_across_compaction() {
+    let host_continue = |body: &str, id: &str| {
+        let mut item = message("developer", body, Some(id));
+        let ResponseItem::Message {
+            internal_chat_message_metadata_passthrough,
+            ..
+        } = &mut item.item
+        else {
+            unreachable!();
+        };
+        *internal_chat_message_metadata_passthrough =
+            Some(InternalChatMessageMetadataPassthrough {
+                content_item_kinds: Some(vec![ContentItemKind(
+                    "rencrow.autonomous_completion_continue".into(),
+                )]),
+                ..Default::default()
+            });
+        item.metadata = Some(CodexHarnessMetadata::default());
+        item
+    };
+
+    let first_continue = host_continue("next action before update", "continue-first");
+    let mut latest_continue = host_continue("current next action", "continue-latest");
+    latest_continue.metadata.as_mut().unwrap().mcp_attribution = Some(McpAttribution::default());
+    let mut attributed_continue = host_continue("non-empty MCP attribution", "continue-attributed");
+    attributed_continue
+        .metadata
+        .as_mut()
+        .unwrap()
+        .mcp_attribution = Some(McpAttribution {
+        status: McpAttributionStatus::Complete,
+        sources: vec![McpAttributionSource {
+            connector_id: None,
+            plugin_id: None,
+            server_name: "mcp-server".into(),
+            tool_name: "lookup".into(),
+            first_turn_id: "turn-1".into(),
+        }],
+    });
+    let mut client_authored_continue =
+        host_continue("client supplied lookalike", "continue-client");
+    client_authored_continue
+        .metadata
+        .as_mut()
+        .unwrap()
+        .client_authored = true;
+    let mut unowned_continue = host_continue("tag without host ownership", "continue-unowned");
+    unowned_continue.metadata = None;
+
+    let mut mixed_kind_continue =
+        message("developer", "mixed kind lookalike", Some("continue-mixed"));
+    if let ResponseItem::Message {
+        content,
+        internal_chat_message_metadata_passthrough,
+        ..
+    } = &mut mixed_kind_continue.item
+    {
+        content.push(ContentItem::InputText {
+            text: "additional untyped content".into(),
+        });
+        *internal_chat_message_metadata_passthrough =
+            Some(InternalChatMessageMetadataPassthrough {
+                content_item_kinds: Some(vec![
+                    ContentItemKind("rencrow.autonomous_completion_continue".into()),
+                    ContentItemKind("unrecognized.kind".into()),
+                ]),
+                ..Default::default()
+            });
+    }
+
+    let mut completion_snapshot = message(
+        "developer",
+        "saved completion snapshot",
+        Some("completion-snapshot"),
+    );
+    completion_snapshot
+        .metadata
+        .get_or_insert_default()
+        .rencrow_completion = Some(json!({"root_task_id":"root","revision":7}));
+    if let ResponseItem::Message {
+        internal_chat_message_metadata_passthrough,
+        ..
+    } = &mut completion_snapshot.item
+    {
+        *internal_chat_message_metadata_passthrough =
+            Some(InternalChatMessageMetadataPassthrough {
+                content_item_kinds: Some(vec![ContentItemKind(
+                    "rencrow.completion_snapshot".into(),
+                )]),
+                ..Default::default()
+            });
+    }
+
+    let summary_text = format!("{}\ncurrent task context", crate::compact::SUMMARY_PREFIX);
+    let mut task_context = message("user", &summary_text, Some("current-task-context"));
+    task_context
+        .metadata
+        .get_or_insert_default()
+        .rencrow_compaction = Some(json!({"version":2}));
+    if let ResponseItem::Message {
+        internal_chat_message_metadata_passthrough,
+        ..
+    } = &mut task_context.item
+    {
+        *internal_chat_message_metadata_passthrough =
+            Some(InternalChatMessageMetadataPassthrough {
+                content_item_kinds: Some(vec![ContentItemKind("compaction.summary".into())]),
+                ..Default::default()
+            });
+    }
+
+    let begin_call = ResponseItemEnvelope::new(ResponseItem::FunctionCall {
+        id: Some(ResponseItemId::from_server(
+            "protected-begin-call-item".into(),
+        )),
+        name: "task_context_boundary".into(),
+        namespace: None,
+        arguments: "{\"action\":\"begin\"}".into(),
+        call_id: "protected-begin-call".into(),
+        encrypted_function_args: None,
+        internal_chat_message_metadata_passthrough: None,
+    });
+    let begin_output = ResponseItemEnvelope::new(ResponseItem::FunctionCallOutput {
+        id: Some(ResponseItemId::from_server(
+            "protected-begin-output-item".into(),
+        )),
+        call_id: Some("protected-begin-call".into()),
+        name: Some("task_context_boundary".into()),
+        namespace: None,
+        output: FunctionCallOutputPayload::from_text("Task scope begun.".into()),
+        internal_chat_message_metadata_passthrough: None,
+    });
+    let items = vec![
+        human("continue the current task", "continue-user"),
+        first_continue.clone(),
+        latest_continue.clone(),
+        attributed_continue.clone(),
+        client_authored_continue.clone(),
+        unowned_continue.clone(),
+        mixed_kind_continue.clone(),
+        completion_snapshot.clone(),
+        task_context.clone(),
+        begin_call.clone(),
+        begin_output.clone(),
+    ];
+    let captured = input(&items);
+    assert_eq!(captured.records[1].origin, Origin::Host);
+    assert_eq!(captured.records[2].origin, Origin::Host);
+    assert_eq!(captured.records[1].text, "");
+    assert_eq!(captured.records[1].opaque, None);
+    assert_eq!(captured.records[2].opaque, None);
+    assert_eq!(captured.records[3].origin, Origin::Unknown);
+    assert!(captured.records[3].opaque.is_some());
+    assert_eq!(captured.records[4].origin, Origin::Unknown);
+    assert!(captured.records[4].opaque.is_some());
+    assert_eq!(captured.records[5].origin, Origin::Unknown);
+    assert!(captured.records[5].opaque.is_some());
+    assert_eq!(captured.records[6].origin, Origin::Unknown);
+    assert!(captured.records[6].opaque.is_some());
+    assert_eq!(captured.records[7].origin, Origin::Unknown);
+    assert!(captured.records[7].opaque.is_some());
+    assert_eq!(captured.records[8].origin, Origin::Work);
+
+    let mut protected_begin_call_ids = std::collections::HashSet::new();
+    protected_begin_call_ids.insert("protected-begin-call".to_owned());
+    let projection = filter_retained_instructions_with_task_context(
+        &items,
+        &captured,
+        application(&captured, &[]),
+        Some(8),
+        &protected_begin_call_ids,
+    )
+    .unwrap();
+    let summary_request = super::super::summary::build_summary_history_with_task_context(
+        &items,
+        &captured,
+        &projection,
+        &[],
+        None,
+        None,
+        Some(8),
+    )
+    .unwrap();
+    assert!(!summary_request.contains(&first_continue));
+    assert!(summary_request.contains(&latest_continue));
+    assert!(summary_request.contains(&attributed_continue));
+    assert!(summary_request.contains(&client_authored_continue));
+    assert!(summary_request.contains(&unowned_continue));
+    assert!(summary_request.contains(&mixed_kind_continue));
+    assert!(summary_request.contains(&completion_snapshot));
+    assert!(summary_request.contains(&task_context));
+    assert!(summary_request.contains(&begin_call));
+    assert!(summary_request.contains(&begin_output));
+
+    let replacement = build_native_replacement(&projection, "compacted summary", vec![]).unwrap();
+    assert!(!replacement.contains(&first_continue));
+    assert!(replacement.contains(&latest_continue));
+    assert!(replacement.contains(&attributed_continue));
+    assert!(replacement.contains(&client_authored_continue));
+    assert!(replacement.contains(&unowned_continue));
+    assert!(replacement.contains(&mixed_kind_continue));
+    assert!(replacement.contains(&completion_snapshot));
+    assert!(replacement.contains(&task_context));
+    assert!(replacement.contains(&begin_call));
+    assert!(replacement.contains(&begin_output));
 }
 
 #[test]

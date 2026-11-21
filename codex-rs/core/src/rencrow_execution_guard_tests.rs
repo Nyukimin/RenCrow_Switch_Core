@@ -3,8 +3,244 @@ use super::*;
 use pretty_assertions::assert_eq;
 use std::future::Future;
 use std::num::NonZeroU16;
+use std::path::PathBuf;
 use std::task::Context;
 use std::task::Poll;
+
+#[tokio::test]
+async fn prehandler_fatal_is_persisted_before_the_fatal_still_propagates() {
+    use crate::session::step_context::StepContext;
+    use crate::session::tests::tool_registry_for_test_step;
+    use crate::tools::context::ToolPayload;
+    use crate::tools::parallel::ToolCallRuntime;
+    use crate::tools::router::ToolCall;
+    use crate::tools::router::ToolRouter;
+
+    let (mut session, mut turn_context) = crate::session::tests::make_session_and_context().await;
+    let policy = RencrowExecutionGuard {
+        max_read_only_calls: NonZeroU16::new(1).expect("nonzero test budget"),
+        ..Default::default()
+    };
+    std::sync::Arc::make_mut(&mut turn_context.config).rencrow_execution_guard =
+        Some(policy.clone());
+    let turn_context = std::sync::Arc::new(turn_context);
+    let rollout_path = crate::session::tests::attach_thread_persistence(&mut session).await;
+    let session = std::sync::Arc::new(session);
+    let active = crate::state::ActiveTurn::default();
+    {
+        let mut turn_state = active.turn_state.lock().await;
+        let guard = &mut turn_state.rencrow_execution_guard;
+        guard.observe_diff(None);
+        let baseline_stamp = guard.check_stamp();
+        guard.finish_check("fixture-baseline-check", baseline_stamp, 1);
+        guard
+            .charge_read(&policy, "prior baseline diagnostic")
+            .expect("failed baseline check grants one bounded diagnostic read");
+        assert_eq!(guard.reads, 1);
+        assert_eq!(guard.baseline_failure_reads_stamp, Some(guard.diff_stamp));
+        guard.budget_rejections = 3;
+        guard.arm_fatal_on_next_budget_refusal();
+        assert!(guard.fatal_on_next_budget_refusal);
+    }
+    *session.active_turn.lock().await = Some(active);
+
+    let step_context = StepContext::for_test(std::sync::Arc::clone(&turn_context));
+    let (registry, hosted_specs) = tool_registry_for_test_step(step_context.as_ref());
+    let router = std::sync::Arc::new(ToolRouter::from_registry(
+        step_context.turn.as_ref(),
+        step_context.turn.model_info(),
+        registry,
+        hosted_specs,
+        &Default::default(),
+    ));
+    let step_context = step_context.with_tool_router_for_test(router);
+    let runtime = ToolCallRuntime::new(
+        std::sync::Arc::clone(&session),
+        step_context,
+        std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::turn_diff_tracker::TurnDiffTracker::new(),
+        )),
+    );
+    let call_id = "prehandler-fatal-call";
+    let result = runtime
+        .handle_tool_call(
+            ToolCall {
+                tool_name: codex_tools::ToolName::plain("exec_command"),
+                call_id: call_id.to_owned(),
+                payload: ToolPayload::Function {
+                    arguments: serde_json::json!({"cmd":"cat README.md"}).to_string(),
+                },
+                encrypted_function_args: None,
+            },
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+    let fatal = match result {
+        Err(error) => error,
+        Ok(response) => panic!(
+            "the fatal read-budget rejection must remain fatal; runtime returned {response:?}"
+        ),
+    };
+    assert!(fatal.to_string().contains("RENCROW_READ_BUDGET_EXCEEDED"));
+
+    let history = session.clone_history().await;
+    let response = history
+        .annotated_items()
+        .iter()
+        .find(|envelope| {
+            matches!(
+                &envelope.item,
+                codex_protocol::models::ResponseItem::FunctionCallOutput {
+                    call_id: Some(id), ..
+                } if id == call_id
+            )
+        })
+        .expect("the blocked call must have a durable false output despite Fatal");
+    let codex_protocol::models::ResponseItem::FunctionCallOutput { output, .. } = &response.item
+    else {
+        unreachable!("the response was selected by its function-call output ID");
+    };
+    assert_eq!(output.success, Some(false));
+    assert!(
+        output
+            .text_content()
+            .is_some_and(|body| body.contains("RENCROW_READ_BUDGET_EXCEEDED"))
+    );
+    assert!(
+        output
+            .body
+            .to_text()
+            .is_some_and(|body| body.contains("RENCROW_READ_BUDGET_EXCEEDED"))
+    );
+    assert!(
+        response
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.rencrow_blocked_tool_call.as_ref())
+            .is_some()
+    );
+    assert!(matches!(
+        &response.item,
+        codex_protocol::models::ResponseItem::FunctionCallOutput {
+            internal_chat_message_metadata_passthrough: Some(metadata),
+            ..
+        } if metadata.turn_id.is_some()
+    ));
+
+    session
+        .flush_rollout()
+        .await
+        .expect("fatal response is flushed to the canonical rollout");
+    let codex_history::InitialHistory::Resumed(persisted) =
+        crate::rollout::recorder::RolloutRecorder::get_rollout_history(&rollout_path)
+            .await
+            .expect("read canonical rollout")
+    else {
+        panic!("expected persisted rollout");
+    };
+    let persisted_response = persisted
+        .history
+        .iter()
+        .find_map(|item| match item {
+            codex_history::RolloutItem::ResponseItem(envelope)
+                if matches!(
+                    &envelope.item,
+                    codex_protocol::models::ResponseItem::FunctionCallOutput {
+                        call_id: Some(id), ..
+                    } if id == call_id
+                ) =>
+            {
+                Some(envelope)
+            }
+            _ => None,
+        })
+        .expect("canonical rollout retains the blocked false result");
+    let codex_protocol::models::ResponseItem::FunctionCallOutput { output, .. } =
+        &persisted_response.item
+    else {
+        unreachable!();
+    };
+    // `success` is an in-memory hint and is intentionally omitted from the
+    // canonical FunctionCallOutput wire representation.
+    assert_eq!(output.success, None);
+    assert!(
+        output
+            .text_content()
+            .is_some_and(|body| body.contains("RENCROW_READ_BUDGET_EXCEEDED"))
+    );
+    assert!(
+        persisted_response
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.rencrow_blocked_tool_call.as_ref())
+            .is_some()
+    );
+    assert!(matches!(
+        &persisted_response.item,
+        codex_protocol::models::ResponseItem::FunctionCallOutput {
+            internal_chat_message_metadata_passthrough: Some(metadata),
+            ..
+        } if metadata.turn_id.is_some()
+    ));
+}
+
+#[tokio::test]
+async fn parent_handoff_first_tool_preserves_patch_and_exhausted_read_budget() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = codex_utils_path_uri::PathUri::from_host_native_path(directory.path()).unwrap();
+    let mut tracker =
+        crate::turn_diff_tracker::TurnDiffTracker::with_environment_display_roots([(
+            String::new(),
+            root.clone(),
+        )]);
+    let delta = codex_apply_patch::apply_patch(
+        "*** Begin Patch\n*** Add File: a.txt\n+foo\n*** End Patch",
+        &root,
+        &mut Vec::new(),
+        &mut Vec::new(),
+        codex_exec_server::LOCAL_FS.as_ref(),
+        None,
+    )
+    .await
+    .unwrap();
+    tracker.track_delta("", &delta);
+    let mut guard = GuardState::default();
+    guard.observe_diff(tracker.get_unified_diff().as_deref());
+    guard.finish_check("cargo test", guard.check_stamp(), 1);
+    guard.reads = 2;
+    guard.budget_rejections = 2;
+    guard.repeated.insert("cat a.txt".into(), 3);
+    let saved = guard.snapshot_with_diff_tracker(Some(&tracker)).unwrap();
+    let mut restored = GuardState::from_parent_handoff(&saved).unwrap();
+    let mut tracker = restored.take_handoff_diff_tracker().unwrap().unwrap();
+    restored.observe_diff(tracker.get_unified_diff().as_deref());
+    assert_eq!(
+        restored.snapshot_with_diff_tracker(Some(&tracker)).unwrap(),
+        saved
+    );
+    let policy = RencrowExecutionGuard {
+        max_read_only_calls: NonZeroU16::new(2).unwrap(),
+        ..Default::default()
+    };
+    assert!(restored.charge_read(&policy, "new read").is_err());
+    assert!(restored.record_budget_rejection());
+    let delta = codex_apply_patch::apply_patch(
+        "*** Begin Patch\n*** Update File: a.txt\n@@\n foo\n+bar\n*** End Patch",
+        &root,
+        &mut Vec::new(),
+        &mut Vec::new(),
+        codex_exec_server::LOCAL_FS.as_ref(),
+        None,
+    )
+    .await
+    .unwrap();
+    tracker.track_delta("", &delta);
+    let diff = tracker.get_unified_diff().unwrap();
+    assert!(diff.contains("+foo\n+bar"));
+    restored.observe_diff(Some(&diff));
+    assert!(!restored.checked);
+    assert!(restored.diff_nonempty);
+}
 
 #[test]
 fn repeated_read_is_blocked_until_real_progress() {
@@ -50,7 +286,11 @@ fn only_a_successful_check_of_a_new_diff_resets_read_budget() {
     };
     let mut state = GuardState::default();
     state.observe_diff(Some("small first patch"));
+    state.budget_rejections = 3;
+    state.arm_fatal_on_next_budget_refusal();
     state.finish_check("cargo test", state.diff_stamp, 0);
+    assert_eq!(state.budget_rejections, 0);
+    assert!(!state.fatal_on_next_budget_refusal);
     assert!(state.charge_read(&policy, "cat a").is_ok());
     assert!(state.charge_read(&policy, "cat a").is_err());
 
@@ -211,6 +451,133 @@ fn repeated_budget_refusals_have_a_finite_host_stop_threshold() {
     assert!(!state.record_budget_rejection());
     assert!(!state.record_budget_rejection());
     assert!(state.record_budget_rejection());
+}
+
+#[tokio::test]
+async fn task_context_status_uses_the_read_identity_and_mutations_do_not() {
+    let mut invocation = exec_guard_invocation(
+        "",
+        RencrowExecutionGuard {
+            max_repeated_reads: NonZeroU16::new(1).unwrap(),
+            ..Default::default()
+        },
+        None,
+    )
+    .await;
+    invocation.tool_name = codex_tools::ToolName::plain("task_context_boundary");
+    invocation.payload = ToolPayload::Function {
+        arguments: serde_json::json!({"action": "status", "root_task_id": "root"}).to_string(),
+    };
+    before_tool(&invocation).await.unwrap();
+
+    let turn_state = {
+        let active = invocation.session.active_turn.lock().await;
+        std::sync::Arc::clone(&active.as_ref().expect("fixture has active turn").turn_state)
+    };
+    assert_eq!(
+        turn_state
+            .lock()
+            .await
+            .rencrow_execution_guard
+            .repeated
+            .len(),
+        1
+    );
+
+    let mut mutation = invocation.clone();
+    mutation.payload = ToolPayload::Function {
+        arguments: serde_json::json!({"action": "update", "root_task_id": "root"}).to_string(),
+    };
+    before_tool(&mutation).await.unwrap();
+    assert_eq!(
+        turn_state
+            .lock()
+            .await
+            .rencrow_execution_guard
+            .repeated
+            .len(),
+        1
+    );
+
+    let Err(FunctionCallError::RespondToModel(message)) = before_tool(&invocation).await else {
+        panic!("a repeated status read must be refused");
+    };
+    assert!(message.contains("same read command repeated"));
+}
+
+#[tokio::test]
+async fn same_sampling_batch_refusals_wait_for_model_feedback_before_fatal() {
+    let mut invocation = exec_guard_invocation(
+        "",
+        RencrowExecutionGuard {
+            max_repeated_reads: NonZeroU16::new(1).unwrap(),
+            ..Default::default()
+        },
+        None,
+    )
+    .await;
+    invocation.tool_name = codex_tools::ToolName::plain("task_context_boundary");
+    invocation.payload = ToolPayload::Function {
+        arguments: serde_json::json!({"action": "status", "root_task_id": "root"}).to_string(),
+    };
+    before_tool(&invocation).await.unwrap();
+
+    let turn_state = {
+        let active = invocation.session.active_turn.lock().await;
+        std::sync::Arc::clone(&active.as_ref().expect("fixture has active turn").turn_state)
+    };
+    let refusals = tokio::join!(
+        before_tool(&invocation),
+        before_tool(&invocation),
+        before_tool(&invocation),
+    );
+    assert!(matches!(
+        refusals.0,
+        Err(FunctionCallError::RespondToModel(_))
+    ));
+    assert!(matches!(
+        refusals.1,
+        Err(FunctionCallError::RespondToModel(_))
+    ));
+    assert!(matches!(
+        refusals.2,
+        Err(FunctionCallError::RespondToModel(_))
+    ));
+    assert_eq!(
+        turn_state
+            .lock()
+            .await
+            .rencrow_execution_guard
+            .budget_rejections,
+        3
+    );
+
+    turn_state
+        .lock()
+        .await
+        .rencrow_execution_guard
+        .arm_fatal_on_next_budget_refusal();
+    assert!(matches!(
+        before_tool(&invocation).await,
+        Err(FunctionCallError::Fatal(_))
+    ));
+}
+
+#[test]
+fn handoff_preserves_refusal_count_and_next_sampling_rearms_fatal() {
+    let mut state = GuardState {
+        budget_rejections: 3,
+        ..Default::default()
+    };
+    state.arm_fatal_on_next_budget_refusal();
+    let snapshot = state.parent_handoff_snapshot().unwrap();
+    assert!(snapshot.get("fatal_on_next_budget_refusal").is_none());
+
+    let mut restored = GuardState::from_parent_handoff(&snapshot).unwrap();
+    assert_eq!(restored.budget_rejections, 3);
+    assert!(!restored.fatal_on_next_budget_refusal);
+    restored.arm_fatal_on_next_budget_refusal();
+    assert!(restored.fatal_on_next_budget_refusal);
 }
 
 async fn exec_guard_invocation(
@@ -778,6 +1145,274 @@ fn orchestrator_noop_turn_still_rejects_failed_or_incomplete_checks() {
 }
 
 #[test]
+fn proven_task_evidence_settlement_removes_only_exact_keys_and_is_idempotent() {
+    let mut state = GuardState::default();
+    state.failed_checks.insert("task-evidence:resolved".into());
+    state.failed_checks.insert("task-evidence:other".into());
+    state.failed_checks.insert("cargo test".into());
+    state.reads = 4;
+    state.budget_rejections = 2;
+    state.verified_diff_stamps.insert(17);
+    state.children.insert("child-id".into());
+    let before = (
+        state.reads,
+        state.budget_rejections,
+        state.verified_diff_stamps.clone(),
+        state.children.clone(),
+    );
+
+    state.settle_proven_task_evidence_launches(&["resolved".into()]);
+    assert!(!state.failed_checks.contains("task-evidence:resolved"));
+    assert!(state.failed_checks.contains("task-evidence:other"));
+    assert!(state.failed_checks.contains("cargo test"));
+    assert_eq!(
+        (
+            state.reads,
+            state.budget_rejections,
+            state.verified_diff_stamps.clone(),
+            state.children.clone(),
+        ),
+        before,
+        "settlement does not alter budgets, stamps, or child evidence"
+    );
+
+    let after_first = state.failed_checks.clone();
+    state.settle_proven_task_evidence_launches(&["resolved".into()]);
+    assert_eq!(
+        state.failed_checks, after_first,
+        "repeating settlement is a no-op"
+    );
+}
+
+fn go_command_item(
+    call_id: &str,
+    cwd: &std::path::Path,
+    success: bool,
+    output: &str,
+) -> codex_protocol::items::TurnItem {
+    codex_protocol::items::TurnItem::CommandExecution(codex_protocol::items::CommandExecutionItem {
+        model_context: None,
+        id: call_id.into(),
+        plugin_id: None,
+        script_path: None,
+        process_id: Some(format!("process-{call_id}")),
+        command: vec![
+            "/bin/zsh".into(),
+            "-lc".into(),
+            "go vet ./internal/portal".into(),
+        ],
+        cwd: codex_utils_path_uri::PathUri::from_host_native_path(cwd)
+            .expect("fixture cwd converts to a native path URI"),
+        parsed_cmd: Vec::new(),
+        source: codex_protocol::protocol::ExecCommandSource::UnifiedExecStartup,
+        interaction_input: None,
+        status: if success {
+            codex_protocol::items::CommandExecutionStatus::Completed
+        } else {
+            codex_protocol::items::CommandExecutionStatus::Failed
+        },
+        stdout: Some(output.into()),
+        stderr: Some(String::new()),
+        aggregated_output: Some(output.into()),
+        exit_code: Some(if success { 0 } else { 1 }),
+        duration: Some(std::time::Duration::from_millis(1)),
+        formatted_output: Some(output.into()),
+    })
+}
+
+#[tokio::test]
+async fn proven_launch_correction_settles_the_guard_before_the_next_read() {
+    let invocation =
+        exec_guard_invocation("cat Cargo.toml", RencrowExecutionGuard::default(), None).await;
+    let workspace = tempfile::tempdir().unwrap();
+    let canonical_workspace_root = workspace.path().canonicalize().unwrap();
+    let source_root = canonical_workspace_root.as_path();
+    let target_root = source_root.join("RenCrow_PORTAL");
+    let artifact_path = PathBuf::from("internal/portal/action.go");
+    let target_artifact = target_root.join(&artifact_path);
+    std::fs::create_dir_all(target_artifact.parent().unwrap()).unwrap();
+    std::fs::write(&target_artifact, "same retained artifact\n").unwrap();
+    std::fs::write(target_root.join("go.mod"), "module example.test/portal\n").unwrap();
+
+    let scope = crate::state::ActiveTaskScope {
+        root_task_id: "root".into(),
+        task_id: "unit-1".into(),
+        task_revision: 1,
+        begin_call_id: "begin-1".into(),
+        start_history_cursor: 0,
+    };
+    let command = vec![
+        "/bin/zsh".into(),
+        "-lc".into(),
+        "go vet ./internal/portal".into(),
+    ];
+    let source_paths = vec![PathBuf::from("RenCrow_PORTAL").join(&artifact_path)];
+    let source_before = crate::task_check::hash_workspace_artifacts(source_root, &source_paths)
+        .expect("source verification artifacts can be hashed");
+    let source_obligation = crate::task_check::TaskCheckObligation::new(
+        scope.clone(),
+        source_root.to_path_buf(),
+        "go vet ./internal/portal",
+        source_paths.clone(),
+    )
+    .expect("source obligation is valid");
+    let source_guard_key = format!("task-evidence:{}", source_obligation.key());
+    invocation
+        .session
+        .begin_task_check_with_obligation(
+            "failed-go-launch".into(),
+            crate::task_check::TaskEvidenceRequest {
+                task_id: scope.task_id.clone(),
+                task_revision: scope.task_revision,
+                artifact_paths: source_paths,
+                check_kind: crate::task_check::TaskCheckKind::Verification,
+            },
+            source_root.to_path_buf(),
+            source_before.clone(),
+            Some(source_obligation),
+        )
+        .await;
+    let diagnostic = "go: go.mod file not found in current directory or any parent directory; see 'go help modules'\n";
+    invocation
+        .session
+        .emit_turn_item_completed(
+            &invocation.turn,
+            go_command_item("failed-go-launch", source_root, false, diagnostic),
+        )
+        .await;
+    invocation
+        .session
+        .observe_task_check_terminal_event("failed-go-launch")
+        .await;
+    let source_observation = crate::task_check::TaskCheckObservation::from_execution(
+        "failed-go-launch",
+        &command,
+        source_root,
+        diagnostic,
+        1,
+        true,
+        false,
+    );
+    invocation
+        .session
+        .finish_task_check_observed(
+            "failed-go-launch",
+            1,
+            true,
+            source_before,
+            Some(source_observation),
+        )
+        .await
+        .expect("failed host verification is retained");
+
+    let target_paths = vec![artifact_path];
+    let target_before = crate::task_check::hash_workspace_artifacts(&target_root, &target_paths)
+        .expect("target verification artifacts can be hashed");
+    let target_obligation = crate::task_check::TaskCheckObligation::new(
+        scope,
+        target_root.clone(),
+        "go vet ./internal/portal",
+        target_paths.clone(),
+    )
+    .expect("target obligation is valid");
+    invocation
+        .session
+        .begin_task_check_with_obligation(
+            "corrected-go-success".into(),
+            crate::task_check::TaskEvidenceRequest {
+                task_id: "unit-1".into(),
+                task_revision: 1,
+                artifact_paths: target_paths,
+                check_kind: crate::task_check::TaskCheckKind::Verification,
+            },
+            target_root.clone(),
+            target_before.clone(),
+            Some(target_obligation),
+        )
+        .await;
+    invocation
+        .session
+        .emit_turn_item_completed(
+            &invocation.turn,
+            go_command_item("corrected-go-success", &target_root, true, ""),
+        )
+        .await;
+    invocation
+        .session
+        .observe_task_check_terminal_event("corrected-go-success")
+        .await;
+    let target_observation = crate::task_check::TaskCheckObservation::from_execution(
+        "corrected-go-success",
+        &command,
+        &target_root,
+        "",
+        0,
+        true,
+        false,
+    );
+    invocation
+        .session
+        .finish_task_check_observed(
+            "corrected-go-success",
+            0,
+            true,
+            target_before,
+            Some(target_observation),
+        )
+        .await
+        .expect("corrected host verification is retained");
+
+    assert_eq!(
+        invocation
+            .session
+            .resolved_task_check_launch_obligation_keys()
+            .await,
+        vec![
+            source_guard_key
+                .trim_start_matches("task-evidence:")
+                .to_owned()
+        ]
+    );
+    let turn_state = {
+        let active = invocation.session.active_turn.lock().await;
+        std::sync::Arc::clone(&active.as_ref().expect("active turn").turn_state)
+    };
+    {
+        let mut turn = turn_state.lock().await;
+        turn.rencrow_execution_guard
+            .failed_checks
+            .insert(source_guard_key.clone());
+        turn.rencrow_execution_guard
+            .failed_checks
+            .insert("task-evidence:another-obligation".into());
+        turn.rencrow_execution_guard
+            .failed_checks
+            .insert("ordinary failed check".into());
+    }
+
+    before_tool(&invocation)
+        .await
+        .expect("the next read is admitted after proof-backed settlement");
+    let turn = turn_state.lock().await;
+    assert!(
+        !turn
+            .rencrow_execution_guard
+            .failed_checks
+            .contains(&source_guard_key)
+    );
+    assert!(
+        turn.rencrow_execution_guard
+            .failed_checks
+            .contains("task-evidence:another-obligation")
+    );
+    assert!(
+        turn.rencrow_execution_guard
+            .failed_checks
+            .contains("ordinary failed check")
+    );
+}
+
+#[test]
 fn only_completed_results_are_candidates_for_host_child_evidence() {
     use serde_json::json;
     let completed = serde_json::to_value(AgentStatus::Completed(Some("done".into()))).unwrap();
@@ -846,12 +1481,15 @@ fn child_receipt_invalidates_parent_checks_started_before_acceptance() {
 #[test]
 fn a_new_child_receipt_applies_budget_progress_once() {
     let mut state = GuardState {
-        budget_rejections: 2,
+        budget_rejections: 3,
         ..Default::default()
     };
     state.repeated.insert("same read".into(), 2);
+    state.arm_fatal_on_next_budget_refusal();
     state.record_child_progress();
     assert!(state.repeated.is_empty());
+    assert_eq!(state.budget_rejections, 0);
+    assert!(!state.fatal_on_next_budget_refusal);
     assert!(!state.record_budget_rejection());
     assert!(!state.record_budget_rejection());
     assert!(state.record_budget_rejection());
@@ -1178,6 +1816,56 @@ fn direct_python_scripts_are_not_checks_but_the_unittest_runner_is() {
     assert!(check_command(command));
     state.finish_check(command, state.check_stamp(), 0);
     assert!(state.missing(&policy, true).is_empty());
+}
+
+#[test]
+fn direct_json_tool_input_check_is_credited_only_for_the_current_diff() {
+    use codex_config::RencrowTaskKind;
+    let policy = RencrowExecutionGuard {
+        task_kind: Some(RencrowTaskKind::Orchestrate),
+        ..Default::default()
+    };
+    let command = "python3 -m json.tool /absolute/path/progress.json";
+    assert!(check_command(command));
+    assert!(check_command(
+        "python -m json.tool '/absolute/path/progress file.json'"
+    ));
+    assert!(check_command(
+        "/usr/bin/python3 -m json.tool /absolute/path/progress.json"
+    ));
+
+    for command in [
+        "python3 -m json.tool",
+        "python3 -m json.tool --help",
+        "python3 -m json.tool --sort-keys /absolute/path/progress.json",
+        "python3 -m json.tool /absolute/path/input.json /absolute/path/output.json",
+        "python3 -m json.tool /absolute/path/progress.json && echo valid",
+        "echo python3 -m json.tool /absolute/path/progress.json",
+        "python3 -m json.tool /absolute/path/progress.json > /absolute/path/output.json",
+    ] {
+        assert!(!check_command(command), "{command}");
+    }
+
+    let mut state = GuardState::default();
+    state.observe_diff(Some("progress.json patch"));
+    let stamp = state.check_stamp();
+    state.finish_check(command, stamp, 1);
+    assert!(state.failed_checks.contains(command));
+    assert_eq!(
+        state.missing(&policy, true),
+        vec!["successful check after the last edit (failed checks must be rerun)"]
+    );
+
+    state.finish_check(command, stamp, 0);
+    assert!(!state.failed_checks.contains(command));
+    assert!(state.missing(&policy, true).is_empty());
+
+    state.observe_diff(Some("progress.json changed after validation"));
+    assert!(!state.checked);
+    assert_eq!(
+        state.missing(&policy, true),
+        vec!["successful check after the last edit (failed checks must be rerun)"]
+    );
 }
 
 #[test]

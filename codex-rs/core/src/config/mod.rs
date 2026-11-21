@@ -731,6 +731,12 @@ pub struct Config {
     /// Opt-in parent continuation from host-verified completion state.
     pub rencrow_autonomous_completion: bool,
 
+    /// Opt-in pre-compaction capsule directory; never grants migration authority to models.
+    pub rencrow_parent_handoff_dir: Option<AbsolutePathBuf>,
+
+    /// Host-selected capsule for exactly one new parent thread.
+    pub rencrow_parent_handoff_file: Option<AbsolutePathBuf>,
+
     /// Native, opt-in execution progress limits.
     pub rencrow_execution_guard: Option<codex_config::RencrowExecutionGuard>,
 
@@ -4264,6 +4270,8 @@ impl Config {
             compact_prompt,
             rencrow_compaction: cfg.rencrow_compaction.unwrap_or(false),
             rencrow_autonomous_completion: cfg.rencrow_autonomous_completion.unwrap_or(false),
+            rencrow_parent_handoff_dir: cfg.rencrow_parent_handoff_dir,
+            rencrow_parent_handoff_file: cfg.rencrow_parent_handoff_file,
             rencrow_execution_guard: cfg.rencrow_execution_guard,
             rencrow_tool_allowlist: cfg.rencrow_tool_allowlist,
             // Only an agent role file narrows the sandbox; a top-level value is ignored.

@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-21: verify durable blocked-call recovery.
 use super::*;
 use crate::context::GuardianContextMode;
 
@@ -13,6 +14,8 @@ use codex_history::ResumedHistory;
 use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::FunctionCallOutputBody;
+use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::SessionContextWindow;
@@ -30,6 +33,127 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use test_case::test_case;
 use uuid::Uuid;
+
+fn legacy_blocked_exec_call(call_id: &str, turn_id: &str) -> RolloutItem {
+    RolloutItem::ResponseItem(ResponseItemEnvelope {
+        item: serde_json::from_value(json!({
+            "type": "function_call",
+            "call_id": call_id,
+            "name": "exec_command",
+            "arguments": "{\"cmd\":\"git status --porcelain\"}",
+            "internal_chat_message_metadata_passthrough": {"turn_id": turn_id}
+        }))
+        .expect("exec call fixture"),
+        metadata: None,
+    })
+}
+
+fn legacy_blocked_turn_complete(turn_id: &str, message: &str) -> RolloutItem {
+    RolloutItem::EventMsg(EventMsg::TurnComplete(
+        serde_json::from_value(json!({
+            "turn_id": turn_id,
+            "last_agent_message": null,
+            "error": {"message": message, "codex_error_info": "other"},
+            "started_at": null,
+            "completed_at": null,
+            "duration_ms": null,
+            "time_to_first_token_ms": null
+        }))
+        .expect("fatal turn-complete fixture"),
+    ))
+}
+
+fn legacy_blocked_rollout() -> Vec<RolloutItem> {
+    let calls = [
+        (
+            "call_4086ff8b87ed4ac899346458",
+            "01a1f776-0f5b-7db3-98bd-bff717fc5e3a",
+            "Fatal error: RENCROW_READ_BUDGET_EXCEEDED: repeated host refusals stopped the turn; RENCROW_READ_BUDGET_EXCEEDED: same read command repeated without accepted progress; command not executed. Do not make further reads. If this contract permits completion without a patch or check, report evidence-backed findings or a plan now; if more investigation is essential, use allowed delegation and collect its result. State any unknowns. Do not invent a patch or run an unrelated check.",
+        ),
+        (
+            "call_6efcf002dc8b488eb2636681",
+            "01a1f91e-9680-7532-ac6e-6083b332c48b",
+            "Fatal error: RENCROW_READ_BUDGET_EXCEEDED: repeated host refusals stopped the turn; RENCROW_READ_BUDGET_EXCEEDED: same read command repeated without accepted progress; command not executed. Do not make further reads. If this contract permits completion without a patch or check, report evidence-backed findings or a plan now; if more investigation is essential, use allowed delegation and collect its result. State any unknowns. Do not invent a patch or run an unrelated check.",
+        ),
+        (
+            "call_4515721a156c404aa1978bb0",
+            "01a1fcfa-b360-7ee3-bd06-ee7cc17a58b9",
+            "Fatal error: RENCROW_READ_BUDGET_EXCEEDED: repeated host refusals stopped the turn; RENCROW_READ_BUDGET_EXCEEDED: bounded diagnostics for the failed current diff are exhausted; command not executed. Do not make further reads. Run and pass the required check directly, then complete with evidence-backed results. If investigation is still essential, use allowed delegation and collect its result.",
+        ),
+    ];
+    let mut items = Vec::new();
+    for (call_id, turn_id, error) in calls {
+        items.push(legacy_blocked_exec_call(call_id, turn_id));
+        items.push(legacy_blocked_turn_complete(turn_id, error));
+    }
+    items
+}
+
+fn legacy_exact_blocked_fatal_output(
+    call_id: &str,
+    thread_id: &str,
+    fatal_message: &str,
+) -> RolloutItem {
+    let body = fatal_message
+        .strip_prefix("Fatal error: ")
+        .expect("reserved Fatal message prefix");
+    let reference = codex_history::ObservationReference::new(
+        thread_id,
+        call_id,
+        codex_history::archive_reference::content_sha256(body),
+    );
+    RolloutItem::ResponseItem(ResponseItemEnvelope {
+        item: ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: Some(call_id.to_owned()),
+            name: Some("exec_command".to_owned()),
+            namespace: None,
+            output: FunctionCallOutputPayload {
+                body: FunctionCallOutputBody::Text(body.to_owned()),
+                success: Some(false),
+            },
+            internal_chat_message_metadata_passthrough: None,
+        },
+        metadata: Some(codex_history::CodexHarnessMetadata {
+            rencrow_blocked_tool_call: Some(Box::new(
+                codex_history::BlockedToolCallReference::new(reference),
+            )),
+            ..Default::default()
+        }),
+    })
+}
+
+fn legacy_command_started(call_id: &str, turn_id: &str, thread_id: &ThreadId) -> RolloutItem {
+    RolloutItem::EventMsg(EventMsg::ItemStarted(
+        codex_protocol::protocol::ItemStartedEvent {
+            thread_id: *thread_id,
+            turn_id: turn_id.to_owned(),
+            item: codex_protocol::items::TurnItem::CommandExecution(
+                codex_protocol::items::CommandExecutionItem {
+                    model_context: None,
+                    id: call_id.to_owned(),
+                    plugin_id: None,
+                    script_path: None,
+                    process_id: None,
+                    command: vec!["cat".to_owned(), "README.md".to_owned()],
+                    cwd: codex_utils_path_uri::PathUri::from_host_native_path(std::env::temp_dir())
+                        .expect("temporary directory is a valid local path"),
+                    parsed_cmd: Vec::new(),
+                    source: codex_protocol::protocol::ExecCommandSource::Agent,
+                    interaction_input: None,
+                    status: codex_protocol::items::CommandExecutionStatus::InProgress,
+                    stdout: None,
+                    stderr: None,
+                    aggregated_output: None,
+                    exit_code: None,
+                    duration: None,
+                    formatted_output: None,
+                },
+            ),
+            started_at_ms: 1,
+        },
+    ))
+}
 
 #[tokio::test]
 async fn recorded_questions_share_queued_input_order_across_resume() {
@@ -463,6 +587,472 @@ async fn record_initial_history_resumed_bare_turn_context_does_not_hydrate_previ
 
     assert_eq!(session.previous_turn_settings().await, None);
     assert!(session.reference_context_item().await.is_none());
+}
+
+#[test]
+fn legacy_blocked_tool_call_responses_require_one_exact_call_per_closed_turn() {
+    let event_thread_id = ThreadId::default();
+    let thread_id = event_thread_id.to_string();
+    let current_turn_id = "01a1fcfa-b360-7ee3-bd06-ee7cc17a58b9";
+    let valid = legacy_blocked_rollout();
+    let recovered =
+        super::rollout_reconstruction::legacy_blocked_tool_call_responses(&valid, &thread_id);
+    assert_eq!(recovered.len(), 3);
+
+    let recovered_ids = recovered
+        .iter()
+        .map(|envelope| match &envelope.item {
+            ResponseItem::FunctionCallOutput {
+                call_id: Some(call_id),
+                output,
+                ..
+            } => {
+                assert_eq!(output.success, Some(false));
+                let FunctionCallOutputBody::Text(body) = &output.body else {
+                    panic!("recovery output must retain the blocked-call proof body");
+                };
+                let proof: serde_json::Value =
+                    serde_json::from_str(body).expect("recovery proof JSON");
+                assert_eq!(proof["kind"], "blocked_before_handler");
+                assert_eq!(proof["source_call_id"].as_str(), Some(call_id.as_str()));
+                assert!(proof["source_payload_sha256"].as_str().is_some());
+                assert!(proof["source_rollout_ordinal"].as_u64().is_some());
+                assert!(
+                    envelope
+                        .metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.rencrow_blocked_tool_call.as_ref())
+                        .is_some()
+                );
+                call_id.clone()
+            }
+            _ => panic!("expected a blocked function-call output"),
+        })
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(recovered_ids.len(), 3);
+
+    let mut ambiguous = valid.clone();
+    let second_call = legacy_blocked_exec_call(
+        "call_ambiguous_same_turn",
+        "01a1fcfa-b360-7ee3-bd06-ee7cc17a58b9",
+    );
+    let terminal = ambiguous
+        .iter()
+        .position(|item| matches!(item, RolloutItem::EventMsg(EventMsg::TurnComplete(event)) if event.turn_id == "01a1fcfa-b360-7ee3-bd06-ee7cc17a58b9"))
+        .expect("current-turn terminal");
+    ambiguous.insert(terminal, second_call);
+    let recovered =
+        super::rollout_reconstruction::legacy_blocked_tool_call_responses(&ambiguous, &thread_id);
+    assert_eq!(recovered.len(), 2);
+    assert!(!recovered.iter().any(|envelope| matches!(
+        &envelope.item,
+        ResponseItem::FunctionCallOutput { call_id: Some(call_id), .. }
+            if call_id == "call_4515721a156c404aa1978bb0"
+    )));
+
+    // An ordinary earlier refusal is not proof of the reserved pre-handler Fatal.
+    // The final unique unmatched call remains eligible for compatibility recovery.
+    let mut ordinary_refusal_compatibility = valid.clone();
+    let current_call = ordinary_refusal_compatibility
+        .iter()
+        .position(|item| {
+            matches!(
+                item,
+                RolloutItem::ResponseItem(envelope)
+                    if matches!(&envelope.item,
+                        ResponseItem::FunctionCall { call_id, .. }
+                            if call_id == "call_4515721a156c404aa1978bb0")
+            )
+        })
+        .expect("current call exists");
+    let ordinary_call_id = "call_ordinary_refusal_same_turn";
+    ordinary_refusal_compatibility.splice(
+        current_call..current_call,
+        [
+            legacy_blocked_exec_call(ordinary_call_id, current_turn_id),
+            RolloutItem::ResponseItem(ResponseItemEnvelope::new(
+                ResponseItem::FunctionCallOutput {
+                    id: None,
+                    call_id: Some(ordinary_call_id.to_owned()),
+                    name: Some("exec_command".to_owned()),
+                    namespace: None,
+                    output: FunctionCallOutputPayload::from_text(
+                        "ordinary read refusal; command not executed".to_owned(),
+                    ),
+                    internal_chat_message_metadata_passthrough: None,
+                },
+            )),
+        ],
+    );
+    let recovered = super::rollout_reconstruction::legacy_blocked_tool_call_responses(
+        &ordinary_refusal_compatibility,
+        &thread_id,
+    );
+    assert_eq!(recovered.len(), 3);
+    assert!(recovered.iter().any(|envelope| matches!(
+        &envelope.item,
+        ResponseItem::FunctionCallOutput { call_id: Some(call_id), .. }
+            if call_id == "call_4515721a156c404aa1978bb0"
+    )));
+
+    // An exact existing false Fatal output paired with call A does not prove that
+    // a later unmatched call B was blocked before handler execution.
+    let mut exact_fatal_already_paired = valid.clone();
+    let fatal_message = exact_fatal_already_paired
+        .iter()
+        .find_map(|item| match item {
+            RolloutItem::EventMsg(EventMsg::TurnComplete(event))
+                if event.turn_id == current_turn_id =>
+            {
+                event.error.as_ref().map(|error| error.message.clone())
+            }
+            _ => None,
+        })
+        .expect("current turn has the reserved Fatal message");
+    let candidate_call_id = "call_unmatched_after_exact_fatal";
+    let current_terminal = exact_fatal_already_paired
+        .iter()
+        .position(|item| {
+            matches!(
+                item,
+                RolloutItem::EventMsg(EventMsg::TurnComplete(event))
+                    if event.turn_id == current_turn_id
+            )
+        })
+        .expect("current-turn terminal");
+    exact_fatal_already_paired.splice(
+        current_terminal..current_terminal,
+        [
+            legacy_exact_blocked_fatal_output(
+                "call_4515721a156c404aa1978bb0",
+                &thread_id,
+                &fatal_message,
+            ),
+            legacy_blocked_exec_call(candidate_call_id, current_turn_id),
+        ],
+    );
+    let exact_fatal_already_paired: Vec<RolloutItem> = serde_json::from_value(
+        serde_json::to_value(&exact_fatal_already_paired)
+            .expect("serialize canonical fatal output"),
+    )
+    .expect("deserialize canonical fatal output");
+    assert!(exact_fatal_already_paired.iter().any(|item| matches!(
+        item,
+        RolloutItem::ResponseItem(ResponseItemEnvelope {
+            item: ResponseItem::FunctionCallOutput {
+                call_id: Some(call_id), output, ..
+            },
+            ..
+        }) if call_id == "call_4515721a156c404aa1978bb0" && output.success.is_none()
+    )));
+    let recovered = super::rollout_reconstruction::legacy_blocked_tool_call_responses(
+        &exact_fatal_already_paired,
+        &thread_id,
+    );
+    assert_eq!(recovered.len(), 2);
+    assert!(!recovered.iter().any(|envelope| matches!(
+        &envelope.item,
+        ResponseItem::FunctionCallOutput { call_id: Some(call_id), .. }
+            if call_id == candidate_call_id
+    )));
+
+    let explicit_success_fatal = exact_fatal_already_paired
+        .iter()
+        .cloned()
+        .map(|mut item| {
+            if let RolloutItem::ResponseItem(ResponseItemEnvelope {
+                item:
+                    ResponseItem::FunctionCallOutput {
+                        call_id: Some(call_id),
+                        output,
+                        ..
+                    },
+                ..
+            }) = &mut item
+                && call_id == "call_4515721a156c404aa1978bb0"
+            {
+                output.success = Some(true);
+            }
+            item
+        })
+        .collect::<Vec<_>>();
+    let recovered = super::rollout_reconstruction::legacy_blocked_tool_call_responses(
+        &explicit_success_fatal,
+        &thread_id,
+    );
+    assert_eq!(recovered.len(), 2);
+    assert!(!recovered.iter().any(|envelope| matches!(
+        &envelope.item,
+        ResponseItem::FunctionCallOutput { call_id: Some(call_id), .. }
+            if call_id == candidate_call_id
+    )));
+
+    // Duplicate call IDs invalidate the candidate before unmatched-call counting.
+    let mut duplicate_call_id = valid.clone();
+    let duplicate_terminal = duplicate_call_id
+        .iter()
+        .position(|item| {
+            matches!(
+                item,
+                RolloutItem::EventMsg(EventMsg::TurnComplete(event))
+                    if event.turn_id == current_turn_id
+            )
+        })
+        .expect("current-turn terminal");
+    duplicate_call_id.splice(
+        duplicate_terminal..duplicate_terminal,
+        [
+            legacy_blocked_exec_call("call_4515721a156c404aa1978bb0", current_turn_id),
+            legacy_blocked_exec_call("call_unique_after_duplicate", current_turn_id),
+        ],
+    );
+    let recovered = super::rollout_reconstruction::legacy_blocked_tool_call_responses(
+        &duplicate_call_id,
+        &thread_id,
+    );
+    assert_eq!(recovered.len(), 2);
+    assert!(!recovered.iter().any(|envelope| matches!(
+        &envelope.item,
+        ResponseItem::FunctionCallOutput { call_id: Some(call_id), .. }
+            if call_id == "call_4515721a156c404aa1978bb0"
+    )));
+
+    // A matching ItemStarted proves execution began, so do not synthesize a
+    // blocked-before-handler response for that candidate.
+    let mut command_started = valid.clone();
+    let started_call_id = "call_started_candidate";
+    let started_terminal = command_started
+        .iter()
+        .position(|item| {
+            matches!(
+                item,
+                RolloutItem::EventMsg(EventMsg::TurnComplete(event))
+                    if event.turn_id == current_turn_id
+            )
+        })
+        .expect("current-turn terminal");
+    command_started.splice(
+        started_terminal..started_terminal,
+        [
+            RolloutItem::ResponseItem(ResponseItemEnvelope::new(
+                ResponseItem::FunctionCallOutput {
+                    id: None,
+                    call_id: Some("call_4515721a156c404aa1978bb0".to_owned()),
+                    name: Some("exec_command".to_owned()),
+                    namespace: None,
+                    output: FunctionCallOutputPayload::from_text(
+                        "ordinary prior refusal".to_owned(),
+                    ),
+                    internal_chat_message_metadata_passthrough: None,
+                },
+            )),
+            legacy_blocked_exec_call(started_call_id, current_turn_id),
+            legacy_command_started(started_call_id, current_turn_id, &event_thread_id),
+        ],
+    );
+    let recovered = super::rollout_reconstruction::legacy_blocked_tool_call_responses(
+        &command_started,
+        &thread_id,
+    );
+    assert_eq!(recovered.len(), 2);
+    assert!(!recovered.iter().any(|envelope| matches!(
+        &envelope.item,
+        ResponseItem::FunctionCallOutput { call_id: Some(call_id), .. }
+            if call_id == started_call_id
+    )));
+
+    let no_exact_marker = valid
+        .iter()
+        .map(|item| match item {
+            RolloutItem::EventMsg(EventMsg::TurnComplete(event))
+                if event.turn_id == current_turn_id =>
+            {
+                let mut event = event.clone();
+                event.error.as_mut().expect("fatal error").message =
+                    "Fatal error: another reason; command not executed".to_owned();
+                RolloutItem::EventMsg(EventMsg::TurnComplete(event))
+            }
+            _ => item.clone(),
+        })
+        .collect::<Vec<_>>();
+    let recovered = super::rollout_reconstruction::legacy_blocked_tool_call_responses(
+        &no_exact_marker,
+        &thread_id,
+    );
+    assert_eq!(recovered.len(), 2);
+
+    let unknown_fatal = valid
+        .iter()
+        .map(|item| match item {
+            RolloutItem::EventMsg(EventMsg::TurnComplete(event))
+                if event.turn_id == current_turn_id =>
+            {
+                let mut event = event.clone();
+                event.error.as_mut().expect("fatal error").codex_error_info = None;
+                RolloutItem::EventMsg(EventMsg::TurnComplete(event))
+            }
+            _ => item.clone(),
+        })
+        .collect::<Vec<_>>();
+    let recovered = super::rollout_reconstruction::legacy_blocked_tool_call_responses(
+        &unknown_fatal,
+        &thread_id,
+    );
+    assert_eq!(recovered.len(), 2);
+
+    let already_paired = valid
+        .iter()
+        .cloned()
+        .chain(std::iter::once(RolloutItem::ResponseItem(
+            ResponseItemEnvelope::new(ResponseItem::FunctionCallOutput {
+                id: None,
+                call_id: Some("call_4515721a156c404aa1978bb0".to_owned()),
+                name: Some("exec_command".to_owned()),
+                namespace: None,
+                output: FunctionCallOutputPayload::from_text("blocked before handler".to_owned()),
+                internal_chat_message_metadata_passthrough: None,
+            }),
+        )))
+        .collect::<Vec<_>>();
+    let recovered = super::rollout_reconstruction::legacy_blocked_tool_call_responses(
+        &already_paired,
+        &thread_id,
+    );
+    assert_eq!(recovered.len(), 2);
+
+    let missing_terminal = valid
+        .into_iter()
+        .filter(|item| {
+            !matches!(
+                item,
+                RolloutItem::EventMsg(EventMsg::TurnComplete(event))
+                    if event.turn_id == current_turn_id
+            )
+        })
+        .collect::<Vec<_>>();
+    let recovered = super::rollout_reconstruction::legacy_blocked_tool_call_responses(
+        &missing_terminal,
+        &thread_id,
+    );
+    assert_eq!(recovered.len(), 2);
+}
+
+#[tokio::test]
+async fn resumed_legacy_blocked_tool_calls_are_persisted_once() {
+    let (mut session, turn_context) = make_session_and_context().await;
+    let rollout_path = super::tests::attach_thread_persistence(&mut session).await;
+    let source_rollout = legacy_blocked_rollout();
+    for item in &source_rollout {
+        match item {
+            RolloutItem::ResponseItem(envelope) => {
+                session
+                    .record_annotated_conversation_items(
+                        &turn_context,
+                        turn_context.model_info().as_ref(),
+                        vec![envelope.clone()],
+                    )
+                    .await;
+            }
+            RolloutItem::EventMsg(event) => {
+                session.send_event(&turn_context, event.clone()).await;
+            }
+            _ => panic!("legacy fixture contains only calls and terminal events"),
+        }
+    }
+    session
+        .flush_rollout()
+        .await
+        .expect("source calls and terminal events are persisted");
+    let InitialHistory::Resumed(source) =
+        crate::rollout::recorder::RolloutRecorder::get_rollout_history(&rollout_path)
+            .await
+            .expect("read persisted source rollout")
+    else {
+        panic!("expected persisted source rollout");
+    };
+    session
+        .record_initial_history(InitialHistory::Resumed(ResumedHistory {
+            conversation_id: source.conversation_id,
+            history: source.history,
+            rollout_path: Some(rollout_path.clone()),
+        }))
+        .await;
+    session
+        .flush_rollout()
+        .await
+        .expect("recovered false outputs are persisted");
+
+    let InitialHistory::Resumed(persisted) =
+        crate::rollout::recorder::RolloutRecorder::get_rollout_history(&rollout_path)
+            .await
+            .expect("read rollout after recovery")
+    else {
+        panic!("expected persisted recovered rollout");
+    };
+    let persisted_outputs = persisted
+        .history
+        .iter()
+        .filter(|item| {
+            matches!(
+                item,
+                RolloutItem::ResponseItem(ResponseItemEnvelope {
+                    item: ResponseItem::FunctionCallOutput {
+                        call_id: Some(call_id), ..
+                    },
+                    ..
+                }) if call_id.starts_with("call_")
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(persisted_outputs.len(), 3);
+    for item in persisted_outputs {
+        let RolloutItem::ResponseItem(envelope) = item else {
+            unreachable!();
+        };
+        assert!(
+            envelope
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.rencrow_blocked_tool_call.as_ref())
+                .is_some()
+        );
+    }
+
+    // Reopening the actual persisted rollout must not append another refusal.
+    session
+        .record_initial_history(InitialHistory::Resumed(ResumedHistory {
+            conversation_id: persisted.conversation_id,
+            history: persisted.history,
+            rollout_path: Some(rollout_path.clone()),
+        }))
+        .await;
+    session
+        .flush_rollout()
+        .await
+        .expect("idempotent resume leaves persisted output count stable");
+    let InitialHistory::Resumed(after_second_resume) =
+        crate::rollout::recorder::RolloutRecorder::get_rollout_history(&rollout_path)
+            .await
+            .expect("reread rollout after idempotent resume")
+    else {
+        panic!("expected persisted rollout after second resume");
+    };
+    let output_count = after_second_resume
+        .history
+        .iter()
+        .filter(|envelope| {
+            matches!(
+                envelope,
+                RolloutItem::ResponseItem(ResponseItemEnvelope {
+                    item: ResponseItem::FunctionCallOutput {
+                        call_id: Some(call_id), ..
+                    },
+                    ..
+                }) if call_id.starts_with("call_")
+            )
+        })
+        .count();
+    assert_eq!(output_count, 3);
 }
 
 #[tokio::test]

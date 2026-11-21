@@ -1,3 +1,5 @@
+// Modified by RenCrow Switch Core, 2026-11-21: cover host verification diagnostics in status and accept.
+// Modified by RenCrow Switch Core, 2026-11-20: separate caller and host checkpoint budgets.
 // Modified by RenCrow Switch Core, 2026-11-16.
 use super::*;
 use crate::session::session::Session;
@@ -23,6 +25,9 @@ use pretty_assertions::assert_eq;
 use serde_json::json;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+
+#[path = "completion_checkpoint_budget_tests.rs"]
+mod completion_checkpoint_budget_tests;
 
 static TEST_ACTIVE_TURNS: codex_diagnostics::Gauge =
     codex_diagnostics::Gauge::new("task_context_boundary_test_active_turns");
@@ -172,11 +177,22 @@ fn status_presents_current_review_reason_without_changing_canonical_next_action(
     }))
     .expect("minimal completion state deserializes");
 
+    let diagnostics = json!({
+        "count": 1,
+        "omitted": 0,
+        "attempts": [{
+            "call_id": "verify-call-17",
+            "launch_phase": "go_module_discovery",
+            "observed_cwd": "/repo",
+            "diagnostic": {"excerpt": "go.mod was not found", "truncated": false}
+        }]
+    });
     let rendered = super::render_completion_status(
         &state,
         Some(
             "review-a is stale for the current accepted artifact; add an explicitly linked review",
         ),
+        Some(&diagnostics),
     )
     .expect("status output serializes");
     let status_value: serde_json::Value = serde_json::from_str(&rendered)
@@ -184,6 +200,11 @@ fn status_presents_current_review_reason_without_changing_canonical_next_action(
     assert_eq!(
         status_value["current_review_obligation"],
         "review-a is stale for the current accepted artifact; add an explicitly linked review"
+    );
+    assert_eq!(status_value["verification_obligations"], diagnostics);
+    assert_eq!(
+        status_value["next_action"],
+        "Keep the canonical plan action unchanged"
     );
     assert!(
         serde_json::from_value::<codex_history::task_context::CompletionState>(
@@ -202,17 +223,382 @@ fn status_presents_current_review_reason_without_changing_canonical_next_action(
             "review-a is stale for the current accepted artifact; add an explicitly linked review"
         ))
     );
+    assert!(
+        rendered_state
+            .as_object_mut()
+            .unwrap()
+            .remove("verification_obligations")
+            .is_some()
+    );
     assert_eq!(rendered_state, serde_json::to_value(&state).unwrap());
     assert_eq!(
         rendered_state["next_action"],
         "Keep the canonical plan action unchanged"
     );
 
+    let empty_diagnostics = json!({"count":0,"omitted":0,"attempts":[]});
     assert_eq!(
-        super::render_completion_status(&state, /*reason*/ None)
-            .expect("no-reason output serializes"),
+        super::render_completion_status(&state, /*reason*/ None, Some(&empty_diagnostics))
+            .expect("empty diagnostics do not add a wire annotation"),
         serde_json::to_string(&state).expect("canonical state serializes")
     );
+    assert_eq!(
+        super::render_completion_status(
+            &state, /*reason*/ None, /*verification_obligations*/ None
+        )
+        .expect("no-reason output serializes"),
+        serde_json::to_string(&state).expect("canonical state serializes")
+    );
+}
+
+#[tokio::test]
+async fn status_reports_host_verification_attempts_and_accept_points_to_status() {
+    let (mut session, mut turn_context) = make_session_and_context().await;
+    turn_context.session_source = SessionSource::Cli;
+    Arc::make_mut(&mut turn_context.config).rencrow_compaction = true;
+    Arc::make_mut(&mut turn_context.config).rencrow_autonomous_completion = true;
+    let turn = Arc::new(turn_context);
+    let _store = attach_boundary_owner(&mut session, Arc::clone(&turn)).await;
+    let session = Arc::new(session);
+
+    let initial_contract = json!({
+        "contract_revision": 1,
+        "conditions": [{
+            "id": "AC-1", "revision": 1, "result": "Deliver AC-1", "scope": "AC-1",
+            "verification": "Run AC-1 checks", "acceptance_criteria": "Checks pass",
+            "status": "open"
+        }],
+        "units": [{
+            "id": "task-a", "purpose": "Verify task A", "status": "running",
+            "kind": "execution", "condition_refs": ["AC-1"], "depends_on": [], "task_refs": []
+        }],
+        "current_unit": "task-a",
+        "next_action": "Keep the host verification decision visible"
+    });
+    let begin_args = json!({
+        "action": "begin", "root_task_id": "root", "task_id": "task-a",
+        "task_revision": 1, "completion_state": initial_contract
+    });
+    TaskContextBoundaryHandler::new(true)
+        .handle(invocation_in_session(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            "begin-diagnostics",
+            begin_args,
+        ))
+        .await
+        .expect("register completion contract and active task scope");
+    record_call(
+        &session,
+        &turn,
+        "begin-diagnostics",
+        TASK_CONTEXT_BOUNDARY_TOOL_NAME,
+    )
+    .await;
+    record_output(
+        &session,
+        &turn,
+        "begin-diagnostics",
+        TASK_CONTEXT_BOUNDARY_TOOL_NAME,
+    )
+    .await;
+
+    let failed_workspace = tempfile::tempdir().expect("failed verification workspace");
+    std::fs::write(
+        failed_workspace.path().join("artifact.txt"),
+        "failed attempt",
+    )
+    .unwrap();
+    let failed_request = TaskEvidenceRequest {
+        task_id: "task-a".into(),
+        task_revision: 1,
+        artifact_paths: vec![std::path::PathBuf::from("artifact.txt")],
+        check_kind: TaskCheckKind::Verification,
+    };
+    let mut failed_evidence =
+        TaskCheckExecution::new(failed_request.clone(), failed_workspace.path())
+            .expect("capture failed attempt artifacts");
+    failed_evidence.bind_obligation(
+        session
+            .active_task_scope()
+            .await
+            .expect("active task scope"),
+        "go vet ./internal/portal",
+    );
+    session
+        .begin_task_check_with_obligation(
+            "failed-vet-call".into(),
+            failed_request,
+            failed_evidence.workspace_root.clone(),
+            failed_evidence.before.clone(),
+            failed_evidence.obligation.clone(),
+        )
+        .await;
+    session
+        .finish_task_check(
+            "failed-vet-call",
+            /*exit_code*/ 1,
+            /*completed*/ true,
+            failed_evidence.hash_artifacts().unwrap(),
+        )
+        .await
+        .expect("record failed verification attempt");
+    record_call(&session, &turn, "failed-vet-call", "exec_command").await;
+    record_output(&session, &turn, "failed-vet-call", "exec_command").await;
+
+    let latest_failure = TaskContextBoundaryHandler::new(true)
+        .handle(invocation_in_session(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            "accept-with-latest-failure",
+            json!({"action": "accept", "result": "Task A completed"}),
+        ))
+        .await;
+    let latest_failure = match latest_failure {
+        Err(FunctionCallError::RespondToModel(message)) => message,
+        Err(error) => panic!("expected actionable latest-check failure, got {error}"),
+        Ok(_) => panic!("latest failed verification must block acceptance"),
+    };
+    assert!(
+        latest_failure.contains("failed-vet-call"),
+        "{latest_failure}"
+    );
+    assert!(latest_failure.contains("exit_code=1"), "{latest_failure}");
+    assert!(
+        latest_failure.contains("task_context_boundary status"),
+        "{latest_failure}"
+    );
+    assert!(latest_failure.contains("observed_cwd"), "{latest_failure}");
+    assert!(
+        !latest_failure.contains("rerun each failed check"),
+        "{latest_failure}"
+    );
+
+    let successful_workspace =
+        tempfile::tempdir().expect("later successful verification workspace");
+    std::fs::write(
+        successful_workspace.path().join("artifact.txt"),
+        "later successful attempt",
+    )
+    .unwrap();
+    let successful_request = TaskEvidenceRequest {
+        task_id: "task-a".into(),
+        task_revision: 1,
+        artifact_paths: vec![std::path::PathBuf::from("artifact.txt")],
+        check_kind: TaskCheckKind::Verification,
+    };
+    let mut successful_evidence =
+        TaskCheckExecution::new(successful_request.clone(), successful_workspace.path())
+            .expect("capture later successful attempt artifacts");
+    successful_evidence.bind_obligation(
+        session
+            .active_task_scope()
+            .await
+            .expect("active task scope"),
+        "go vet ./internal/portal",
+    );
+    session
+        .begin_task_check_with_obligation(
+            "later-success-call".into(),
+            successful_request,
+            successful_evidence.workspace_root.clone(),
+            successful_evidence.before.clone(),
+            successful_evidence.obligation.clone(),
+        )
+        .await;
+    session
+        .finish_task_check(
+            "later-success-call",
+            /*exit_code*/ 0,
+            /*completed*/ true,
+            successful_evidence.hash_artifacts().unwrap(),
+        )
+        .await
+        .expect("record later successful verification");
+    record_call(&session, &turn, "later-success-call", "exec_command").await;
+    record_output(&session, &turn, "later-success-call", "exec_command").await;
+
+    let status_output = TaskContextBoundaryHandler::new(true)
+        .handle(invocation_in_session(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            "status-diagnostics",
+            json!({"action": "status", "root_task_id": "root"}),
+        ))
+        .await
+        .expect("status remains available with verification diagnostics");
+    let status_value: serde_json::Value = serde_json::from_str(&status_output.log_output())
+        .expect("status output remains parseable completion JSON");
+    assert_eq!(status_value["verification_obligations"]["count"], 2);
+    assert_eq!(status_value["verification_obligations"]["omitted"], 0);
+    assert_eq!(
+        status_value["verification_obligations"]["unresolved_count"],
+        1
+    );
+    assert!(
+        status_value["verification_obligations"]["attempts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|attempt| attempt["call_id"] == "failed-vet-call" && attempt["exit_code"] == 1)
+    );
+    assert!(
+        status_value["verification_obligations"]["attempts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|attempt| attempt["call_id"] == "later-success-call"
+                && attempt["succeeded"] == true)
+    );
+    let canonical_state = session
+        .rencrow_completion_state("root")
+        .await
+        .expect("registered completion state remains available");
+    assert_eq!(
+        status_value["next_action"],
+        serde_json::to_value(canonical_state.next_action).unwrap()
+    );
+    assert!(
+        serde_json::from_value::<codex_history::task_context::CompletionState>(
+            status_value.clone()
+        )
+        .is_err(),
+        "host verification annotation must not become model-authored state"
+    );
+
+    let accept_error = TaskContextBoundaryHandler::new(true)
+        .handle(invocation_in_session(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            "accept-with-unresolved-check",
+            json!({"action": "accept", "result": "Task A completed"}),
+        ))
+        .await;
+    let accept_error = match accept_error {
+        Err(error) => error,
+        Ok(_) => panic!("unresolved prior verification must block acceptance"),
+    };
+    let FunctionCallError::RespondToModel(message) = accept_error else {
+        panic!("accept should return an actionable model-facing verification error")
+    };
+    assert!(
+        message.contains("task_context_boundary status"),
+        "{message}"
+    );
+    assert!(message.contains("root_task_id root"), "{message}");
+    assert!(
+        message.contains("verification_obligations.attempts"),
+        "{message}"
+    );
+    assert!(message.contains("observed_cwd"), "{message}");
+    assert!(
+        message.contains("diagnostic excerpt or omission/hash markers"),
+        "{message}"
+    );
+    assert!(!message.contains("rerun each failed check"), "{message}");
+}
+
+#[tokio::test]
+async fn accept_closes_a_blocked_tool_call_only_after_its_false_output_is_recorded() {
+    let (mut session, mut turn_context) = make_session_and_context().await;
+    turn_context.session_source = SessionSource::Cli;
+    Arc::make_mut(&mut turn_context.config).rencrow_compaction = true;
+    let turn = Arc::new(turn_context);
+    attach_boundary_owner(&mut session, Arc::clone(&turn)).await;
+    let session = Arc::new(session);
+    begin_scope(&session, &turn, "task-a", 1, "begin-call").await;
+
+    let workspace = tempfile::tempdir().expect("verification workspace");
+    std::fs::write(workspace.path().join("artifact.txt"), "verified").unwrap();
+    record_call(&session, &turn, "legacy-blocked-call", "exec_command").await;
+    record_successful_verification(
+        &session,
+        &turn,
+        workspace.path(),
+        "task-a",
+        1,
+        "verification-call",
+    )
+    .await;
+
+    let accept_args = json!({
+        "action":"accept",
+        "goal":"Finish task A",
+        "tasks":[{"id":"task-a", "purpose":"Verify task A", "status":"completed"}],
+        "current_task_id":null,
+        "result":"Task A verification passed"
+    });
+    record_call_with_arguments(
+        &session,
+        &turn,
+        "accept-with-unpaired-blocked-call",
+        TASK_CONTEXT_BOUNDARY_TOOL_NAME,
+        &accept_args.to_string(),
+    )
+    .await;
+    let error = match TaskContextBoundaryHandler::new(false)
+        .handle(invocation_in_session(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            "accept-with-unpaired-blocked-call",
+            accept_args.clone(),
+        ))
+        .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("accept must remain held while the blocked call has no result"),
+    };
+    assert!(
+        error.to_string().contains("legacy-blocked-call"),
+        "unexpected accept blocker: {error}"
+    );
+    record_output(
+        &session,
+        &turn,
+        "accept-with-unpaired-blocked-call",
+        TASK_CONTEXT_BOUNDARY_TOOL_NAME,
+    )
+    .await;
+
+    session
+        .record_annotated_conversation_items(
+            &turn,
+            turn.model_info().as_ref(),
+            vec![ResponseItemEnvelope::new(
+                ResponseItem::FunctionCallOutput {
+                    id: None,
+                    call_id: Some("legacy-blocked-call".to_owned()),
+                    name: Some("exec_command".to_owned()),
+                    namespace: None,
+                    output: FunctionCallOutputPayload {
+                        body: codex_protocol::models::FunctionCallOutputBody::Text(
+                            "blocked before handler; command not executed".to_owned(),
+                        ),
+                        success: Some(false),
+                    },
+                    internal_chat_message_metadata_passthrough: None,
+                },
+            )],
+        )
+        .await;
+
+    record_call_with_arguments(
+        &session,
+        &turn,
+        "accept-after-blocked-result",
+        TASK_CONTEXT_BOUNDARY_TOOL_NAME,
+        &accept_args.to_string(),
+    )
+    .await;
+    TaskContextBoundaryHandler::new(false)
+        .handle(invocation_in_session(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            "accept-after-blocked-result",
+            accept_args,
+        ))
+        .await
+        .expect("the exact false output closes the unresolved-call gate");
 }
 
 #[tokio::test]

@@ -1,7 +1,13 @@
+// Modified by RenCrow Switch Core, 2026-11-21.
 //! Host-origin continuation after a child terminal result, never user authorization.
 // Modified by RenCrow Switch Core, 2026-11-11: distinguish execution, review, and final reporting.
 use super::ContextualUserFragment;
+use codex_history::CodexHarnessMetadata;
+use codex_history::ResponseItemEnvelope;
+use codex_protocol::mcp::McpAttribution;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::ContentItemKind;
+use codex_protocol::models::ResponseItem;
 
 pub(crate) struct AutonomousChildResult;
 
@@ -32,9 +38,48 @@ pub(crate) struct AutonomousCompletionContinue {
     pub(crate) next_action: String,
 }
 
+const AUTONOMOUS_COMPLETION_CONTINUE_KIND: &str = "rencrow.autonomous_completion_continue";
+
+impl AutonomousCompletionContinue {
+    pub(crate) fn is_host_generated(envelope: &ResponseItemEnvelope) -> bool {
+        let ResponseItem::Message {
+            role,
+            content,
+            internal_chat_message_metadata_passthrough,
+            ..
+        } = &envelope.item
+        else {
+            return false;
+        };
+        if role != "developer" || !matches!(content.as_slice(), [ContentItem::InputText { .. }]) {
+            return false;
+        }
+        let has_completion_continue_kind = internal_chat_message_metadata_passthrough
+            .as_ref()
+            .and_then(|metadata| metadata.content_item_kinds.as_deref())
+            .is_some_and(
+                |kinds| matches!(kinds, [kind] if kind.0 == AUTONOMOUS_COMPLETION_CONTINUE_KIND),
+            );
+        if !has_completion_continue_kind {
+            return false;
+        }
+        let Some(metadata) = envelope.metadata.as_ref() else {
+            return false;
+        };
+        let expected_metadata = CodexHarnessMetadata {
+            mcp_attribution: metadata
+                .mcp_attribution
+                .as_ref()
+                .map(|_| McpAttribution::default()),
+            ..Default::default()
+        };
+        metadata == &expected_metadata
+    }
+}
+
 impl ContextualUserFragment for AutonomousCompletionContinue {
     fn content_kind(&self) -> ContentItemKind {
-        ContentItemKind("rencrow.autonomous_completion_continue".to_string())
+        ContentItemKind(AUTONOMOUS_COMPLETION_CONTINUE_KIND.to_string())
     }
 
     fn role(&self) -> &'static str {

@@ -112,6 +112,344 @@ fn ledger_only_accepts_unchanged_artifacts_and_success_status() {
     assert!(!failed.succeeded);
 }
 
+#[test]
+fn host_observation_classifies_only_complete_exact_go_module_launch_failure() {
+    let command = vec![
+        "/bin/zsh".to_string(),
+        "-lc".to_string(),
+        "go vet ./internal/portal".to_string(),
+    ];
+    let diagnostic = "go: go.mod file not found in current directory or any parent directory; see 'go help modules'\n";
+    let cwd = std::env::current_dir().unwrap();
+    let observation = TaskCheckObservation::from_execution(
+        "call-failed",
+        &command,
+        &cwd,
+        diagnostic,
+        1,
+        true,
+        false,
+    );
+    assert_eq!(
+        observation.launch_failure,
+        Some(TaskCheckLaunchFailure::GoModuleDiscovery)
+    );
+    assert!(observation.diagnostic_complete);
+    assert!(!observation.diagnostic_truncated);
+
+    let truncated = TaskCheckObservation::from_execution(
+        "call-truncated",
+        &command,
+        &cwd,
+        diagnostic,
+        1,
+        true,
+        true,
+    );
+    assert_eq!(truncated.launch_failure, None);
+    assert!(!truncated.diagnostic_complete);
+    assert!(truncated.diagnostic_truncated);
+
+    let ordinary_failure = TaskCheckObservation::from_execution(
+        "call-code-failure",
+        &command,
+        &cwd,
+        "internal/portal: vet: found code issue\n",
+        1,
+        true,
+        false,
+    );
+    assert_eq!(ordinary_failure.launch_failure, None);
+}
+
+#[test]
+fn old_task_check_receipt_serialization_omits_new_observation_field() {
+    let stamp = TaskArtifactStamp {
+        path: "result.txt".into(),
+        sha256: "abc".into(),
+    };
+    let mut ledger = TaskCheckLedger::default();
+    ledger.begin(
+        "legacy".into(),
+        request_for(1, &stamp.path),
+        "/w".into(),
+        vec![stamp.clone()],
+    );
+    ledger.finish("legacy", 0, true, vec![stamp]).unwrap();
+    let wire = serde_json::to_value(ledger.snapshot()).unwrap();
+    assert!(
+        wire[0]["attempt"]["status"]["Finished"]
+            .get("observation")
+            .is_none()
+    );
+}
+
+#[test]
+fn live_launch_correction_retains_failure_and_imports_only_matching_success() {
+    let temp = tempfile::tempdir().expect("workspace");
+    let source_root = temp.path().canonicalize().expect("canonical workspace");
+    let target_root = source_root.join("RenCrow_PORTAL");
+    let package_root = target_root.join("internal/portal");
+    std::fs::create_dir_all(&package_root).unwrap();
+    for name in [
+        "dev_story_player_action.go",
+        "dev_story_player_test.go",
+        "server.go",
+    ] {
+        std::fs::write(package_root.join(name), "fixture").unwrap();
+    }
+    let source_paths = [
+        "RenCrow_PORTAL/internal/portal/dev_story_player_action.go",
+        "RenCrow_PORTAL/internal/portal/dev_story_player_test.go",
+        "RenCrow_PORTAL/internal/portal/server.go",
+    ]
+    .map(PathBuf::from);
+    let target_paths = [
+        "internal/portal/dev_story_player_action.go",
+        "internal/portal/dev_story_player_test.go",
+        "internal/portal/server.go",
+    ]
+    .map(PathBuf::from);
+    let stamps = |paths: &[PathBuf]| {
+        paths
+            .iter()
+            .map(|path| TaskArtifactStamp {
+                path: path.clone(),
+                sha256: "same-artifact-hash".into(),
+            })
+            .collect::<Vec<_>>()
+    };
+    let scope = crate::state::ActiveTaskScope {
+        root_task_id: "root".into(),
+        task_id: "task-a".into(),
+        task_revision: 1,
+        begin_call_id: "begin-a".into(),
+        start_history_cursor: 5,
+    };
+    let command = vec![
+        "/bin/zsh".to_string(),
+        "-lc".to_string(),
+        "go vet ./internal/portal".to_string(),
+    ];
+    let source_obligation = TaskCheckObligation::new(
+        scope.clone(),
+        source_root.clone(),
+        "go vet ./internal/portal",
+        source_paths.to_vec(),
+    )
+    .unwrap();
+    let source_obligation_key = source_obligation.key();
+    let source_stamps = stamps(&source_paths);
+    let mut ledger = TaskCheckLedger::default();
+    ledger.begin_with_obligation(
+        "failed-launch".into(),
+        TaskEvidenceRequest {
+            task_id: "task-a".into(),
+            task_revision: 1,
+            artifact_paths: source_paths.to_vec(),
+            check_kind: TaskCheckKind::Verification,
+        },
+        source_root.clone(),
+        source_stamps.clone(),
+        Some(source_obligation),
+    );
+    ledger.observe_terminal_event("failed-launch");
+    let diagnostic = "go: go.mod file not found in current directory or any parent directory; see 'go help modules'\n";
+    ledger
+        .finish_observed(
+            "failed-launch",
+            1,
+            true,
+            source_stamps,
+            Some(TaskCheckObservation::from_execution(
+                "failed-launch",
+                &command,
+                &source_root,
+                diagnostic,
+                1,
+                true,
+                false,
+            )),
+        )
+        .unwrap();
+
+    let target_obligation = TaskCheckObligation::new(
+        scope.clone(),
+        target_root.clone(),
+        "go vet ./internal/portal",
+        target_paths.to_vec(),
+    )
+    .unwrap();
+    let target_stamps = stamps(&target_paths);
+    ledger.begin_with_obligation(
+        "corrected-success".into(),
+        TaskEvidenceRequest {
+            task_id: "task-a".into(),
+            task_revision: 1,
+            artifact_paths: target_paths.to_vec(),
+            check_kind: TaskCheckKind::Verification,
+        },
+        target_root.clone(),
+        target_stamps.clone(),
+        Some(target_obligation),
+    );
+    ledger.observe_terminal_event("corrected-success");
+    let target_observation = TaskCheckObservation::from_execution(
+        "corrected-success",
+        &command,
+        &target_root,
+        "",
+        0,
+        true,
+        false,
+    );
+    ledger
+        .finish_observed(
+            "corrected-success",
+            0,
+            true,
+            target_stamps,
+            Some(target_observation),
+        )
+        .unwrap();
+    assert_eq!(
+        ledger.resolved_launch_obligation_keys(),
+        vec![source_obligation_key.clone()]
+    );
+    assert!(
+        ledger
+            .get("corrected-success")
+            .unwrap()
+            .observation
+            .is_none()
+    );
+    let snapshot = ledger.snapshot();
+    assert_eq!(snapshot.len(), 2);
+    assert_eq!(
+        ledger
+            .latest_for_task("task-a", 1)
+            .map(|attempt| attempt.call_id.as_str()),
+        Some("corrected-success")
+    );
+    let mut restored = TaskCheckLedger::default();
+    restored.restore_snapshot(snapshot.clone()).unwrap();
+    assert_eq!(
+        restored.resolved_launch_obligation_keys(),
+        vec![source_obligation_key]
+    );
+    assert!(
+        restored
+            .unresolved_obligations(&crate::state::ActiveTaskScope {
+                root_task_id: "root".into(),
+                task_id: "task-a".into(),
+                task_revision: 1,
+                begin_call_id: "begin-a".into(),
+                start_history_cursor: 99,
+            })
+            .is_empty()
+    );
+    assert_eq!(restored.snapshot().len(), 2);
+
+    for newer_state in ["pending", "ordinary_failure", "changed_artifacts"] {
+        let mut conflicted = TaskCheckLedger::default();
+        conflicted.restore_snapshot(snapshot.clone()).unwrap();
+        let newer_obligation = TaskCheckObligation::new(
+            scope.clone(),
+            source_root.clone(),
+            "go vet ./internal/portal",
+            source_paths.to_vec(),
+        )
+        .unwrap();
+        let newer_stamps = stamps(&source_paths);
+        conflicted.begin_with_obligation(
+            format!("newer-{newer_state}"),
+            TaskEvidenceRequest {
+                task_id: "task-a".into(),
+                task_revision: 1,
+                artifact_paths: source_paths.to_vec(),
+                check_kind: TaskCheckKind::Verification,
+            },
+            source_root.clone(),
+            newer_stamps.clone(),
+            Some(newer_obligation),
+        );
+        if newer_state == "ordinary_failure" {
+            conflicted
+                .finish_observed(&format!("newer-{newer_state}"), 1, true, newer_stamps, None)
+                .unwrap();
+        } else if newer_state == "changed_artifacts" {
+            assert!(
+                conflicted
+                    .finish_observed(&format!("newer-{newer_state}"), 1, true, Vec::new(), None,)
+                    .is_none()
+            );
+        }
+        assert!(
+            conflicted.resolved_launch_obligation_keys().is_empty(),
+            "an older correction cannot settle the newer same-key {newer_state} attempt"
+        );
+    }
+}
+
+#[test]
+fn diagnostics_prioritize_unresolved_failure_and_bound_total_status_payload() {
+    let root = std::env::current_dir().unwrap();
+    let scope = crate::state::ActiveTaskScope {
+        root_task_id: "root".into(),
+        task_id: "critical-task".into(),
+        task_revision: 1,
+        begin_call_id: "begin-critical".into(),
+        start_history_cursor: 0,
+    };
+    let path = PathBuf::from(format!("{}.go", "p".repeat(3000)));
+    let command = format!("go vet {}", "x".repeat(3000));
+    let obligation =
+        TaskCheckObligation::new(scope, root.clone(), &command, vec![path.clone()]).unwrap();
+    let stamp = TaskArtifactStamp {
+        path: path.clone(),
+        sha256: "artifact-hash".into(),
+    };
+    let mut ledger = TaskCheckLedger::default();
+    ledger.begin_with_obligation(
+        "call-critical".into(),
+        TaskEvidenceRequest {
+            task_id: "critical-task".into(),
+            task_revision: 1,
+            artifact_paths: vec![path],
+            check_kind: TaskCheckKind::Verification,
+        },
+        root.clone(),
+        vec![stamp.clone()],
+        Some(obligation),
+    );
+    ledger
+        .finish_observed(
+            "call-critical",
+            1,
+            true,
+            vec![stamp],
+            Some(TaskCheckObservation::from_execution(
+                "call-critical",
+                &["/bin/zsh".into(), "-lc".into(), command],
+                &root,
+                &"diagnostic".repeat(4000),
+                1,
+                true,
+                false,
+            )),
+        )
+        .unwrap();
+    let diagnostics = ledger.diagnostics_for_root("root");
+    let serialized = serde_json::to_vec(&diagnostics).unwrap();
+    assert!(serialized.len() <= 8 * 1024);
+    assert_eq!(diagnostics["count"], 1);
+    assert_eq!(diagnostics["unresolved_count"], 1);
+    assert_eq!(diagnostics["attempts"][0]["call_id"], "call-critical");
+    assert_eq!(diagnostics["attempts"][0]["command_identity_omitted"], true);
+    assert_eq!(diagnostics["attempts"][0]["artifact_paths_omitted"], true);
+    assert_eq!(diagnostics["attempts"][0]["diagnostic"]["truncated"], true);
+}
+
 fn request_for(task_revision: u64, path: &Path) -> TaskEvidenceRequest {
     TaskEvidenceRequest {
         task_id: "task-a".into(),

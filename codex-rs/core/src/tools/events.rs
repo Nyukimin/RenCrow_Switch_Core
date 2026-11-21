@@ -515,6 +515,7 @@ struct ExecCommandResult {
     duration: Duration,
     formatted_output: String,
     status: ExecCommandStatus,
+    output_truncated: bool,
 }
 
 fn exec_command_status(
@@ -571,6 +572,9 @@ async fn emit_exec_stage(
                     format_exec_output_str(&output, ctx.model_info.truncation_policy.into())
                 }),
                 status: exec_command_status(output.exit_code, exec_input.cancellation_disposition),
+                output_truncated: output.stdout.truncated_after_lines.is_some()
+                    || output.stderr.truncated_after_lines.is_some()
+                    || output.aggregated_output.truncated_after_lines.is_some(),
             };
             emit_exec_end(ctx, exec_input, exec_result).await;
         }
@@ -584,6 +588,7 @@ async fn emit_exec_stage(
                 duration: Duration::ZERO,
                 formatted_output: text,
                 status: exec_command_status(-1, exec_input.cancellation_disposition),
+                output_truncated: true,
             };
             emit_exec_end(ctx, exec_input, exec_result).await;
         }
@@ -597,6 +602,7 @@ async fn emit_exec_stage(
                 duration: Duration::ZERO,
                 formatted_output: text,
                 status: ExecCommandStatus::Declined,
+                output_truncated: true,
             };
             emit_exec_end(ctx, exec_input, exec_result).await;
         }
@@ -608,22 +614,27 @@ async fn emit_exec_end(
     exec_input: ExecCommandInput<'_>,
     exec_result: ExecCommandResult,
 ) {
-    if let Some(evidence) = exec_input.task_evidence {
-        let after = evidence.hash_artifacts().unwrap_or_default();
-        let _ = ctx
-            .session
-            .finish_task_check(
-                ctx.call_id,
-                exec_result.exit_code,
-                exec_command_task_check_completed(
-                    exec_result.exit_code,
-                    &exec_result.status,
-                    exec_input.cancellation_disposition,
-                ),
-                after,
-            )
-            .await;
-    }
+    let task_evidence = exec_input.task_evidence;
+    let task_check_completed = exec_command_task_check_completed(
+        exec_result.exit_code,
+        &exec_result.status,
+        exec_input.cancellation_disposition,
+    );
+    let task_check_observation = task_evidence.map(|evidence| {
+        let mut observation = crate::task_check::TaskCheckObservation::from_execution(
+            ctx.call_id,
+            exec_input.command,
+            exec_input.cwd.to_path_buf().as_path(),
+            &exec_result.aggregated_output,
+            exec_result.exit_code,
+            task_check_completed,
+            exec_result.output_truncated,
+        );
+        observation.execution_environment_id = evidence.execution_environment_id.clone();
+        observation
+    });
+    let task_check_after =
+        task_evidence.map(|evidence| evidence.hash_artifacts().unwrap_or_default());
     let (plugin_id, script_path) = plugin_attribution_fields(exec_input.plugin_attribution);
     ctx.session
         .emit_turn_item_completed(
@@ -649,6 +660,21 @@ async fn emit_exec_end(
             }),
         )
         .await;
+    if task_evidence.is_some() {
+        ctx.session
+            .observe_task_check_terminal_event(ctx.call_id)
+            .await;
+        let _ = ctx
+            .session
+            .finish_task_check_observed(
+                ctx.call_id,
+                exec_result.exit_code,
+                task_check_completed,
+                task_check_after.unwrap_or_default(),
+                task_check_observation,
+            )
+            .await;
+    }
 }
 
 fn plugin_attribution_fields(

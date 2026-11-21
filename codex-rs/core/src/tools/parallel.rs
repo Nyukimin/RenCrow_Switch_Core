@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-21: durably close host-blocked fatal tool calls.
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::Ordering;
@@ -86,8 +87,10 @@ impl ToolCallRuntime {
         let response_call_id = call.call_id.clone();
         let thread_id = self.session.thread_id.to_string();
         let source = call.direct_source();
+        let session = Arc::clone(&self.session);
         let recorder = self.session.services.executed_tool_calls.clone();
         let recorded_call = recorder.prepare_direct_call(&call, &source, &self.step_context);
+        let turn_context = Arc::clone(&self.step_context.turn);
         let step_context = Arc::clone(&self.step_context);
         let call_state = Arc::new(ToolCallState::default());
         let future = self.handle_tool_call_with_source(
@@ -110,7 +113,31 @@ impl ToolCallRuntime {
                     }
                     result.into_response()
                 }
-                Err(FunctionCallError::Fatal(message)) => return Err(CodexErr::Fatal(message)),
+                Err(FunctionCallError::Fatal(message)) => {
+                    if call_state.blocked_before_handler.load(Ordering::Acquire) {
+                        let mut response = ResponseItemEnvelope::new(
+                            Self::failure_response(
+                                error_call,
+                                FunctionCallError::RespondToModel(message.clone()),
+                            )
+                            .into(),
+                        );
+                        attach_blocked_tool_call_reference(
+                            &mut response,
+                            &thread_id,
+                            &response_call_id,
+                        );
+                        recorder.attach_direct_call_to_output(&mut response.item, recorded_call);
+                        session
+                            .record_annotated_conversation_items(
+                                &turn_context,
+                                turn_context.model_info().as_ref(),
+                                vec![response],
+                            )
+                            .await;
+                    }
+                    return Err(CodexErr::Fatal(message));
+                }
                 Err(other) => {
                     ResponseItemEnvelope::new(Self::failure_response(error_call, other).into())
                 }

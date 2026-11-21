@@ -1,11 +1,260 @@
 // Modified by RenCrow Switch Core, 2026-09-22: handle durable compaction markers.
+// Modified by RenCrow Switch Core, 2026-11-21: recover canonical blocked-call proofs.
 use super::*;
 use crate::context::GuardianContextMode;
 use crate::context::world_state::WorldStateSnapshot;
 use crate::context_manager::is_user_turn_boundary;
+use codex_history::BlockedToolCallReference;
+use codex_history::CodexHarnessMetadata;
+use codex_history::ObservationReference;
 use codex_history::ResponseItemEnvelope;
+use codex_history::archive_reference::content_sha256;
+use codex_history::compaction_candidate::digest;
+use codex_protocol::items::TurnItem;
+use codex_protocol::models::FunctionCallOutputBody;
+use codex_protocol::models::FunctionCallOutputPayload;
+use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::CodexErrorInfo;
+use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::SessionContextWindow;
+use serde::Serialize;
 use uuid::Uuid;
+
+const MAX_LEGACY_BLOCKED_ERROR_BYTES: usize = 16 * 1024;
+const RESERVED_READ_BUDGET_FATAL: &str = "Fatal error: RENCROW_READ_BUDGET_EXCEEDED:";
+
+#[derive(Serialize)]
+struct LegacyBlockedCallProof<'a> {
+    kind: &'static str,
+    error: &'a str,
+    source_call_id: &'a str,
+    source_payload_sha256: &'a str,
+    source_rollout_ordinal: usize,
+}
+
+/// Reconstruct only an exact old fatal whose single direct exec call was blocked before
+/// execution. The returned false output closes the call/result pair and retains source proof.
+pub(super) fn legacy_blocked_tool_call_responses(
+    items: &[RolloutItem],
+    thread_id: &str,
+) -> Vec<ResponseItemEnvelope> {
+    const MAX_RECOVERIES_PER_RESUME: usize = 8;
+    let mut fatal_turns = Vec::new();
+    for (ordinal, item) in items.iter().enumerate() {
+        let RolloutItem::EventMsg(EventMsg::TurnComplete(event)) = item else {
+            continue;
+        };
+        let Some(error) = event.error.as_ref() else {
+            continue;
+        };
+        if error.codex_error_info != Some(CodexErrorInfo::Other)
+            || !error.message.starts_with(RESERVED_READ_BUDGET_FATAL)
+            || !error.message.contains("command not executed")
+            || error.message.len() > MAX_LEGACY_BLOCKED_ERROR_BYTES
+        {
+            continue;
+        }
+        fatal_turns.push((ordinal, event.turn_id.as_str(), error.message.as_str()));
+    }
+    if fatal_turns.is_empty() || fatal_turns.len() > MAX_RECOVERIES_PER_RESUME {
+        return Vec::new();
+    }
+    fatal_turns
+        .into_iter()
+        .filter_map(|(terminal_ordinal, turn_id, error)| {
+            legacy_blocked_tool_call_response_for_turn(
+                items,
+                thread_id,
+                terminal_ordinal,
+                turn_id,
+                error,
+            )
+        })
+        .collect()
+}
+
+fn legacy_blocked_tool_call_response_for_turn(
+    items: &[RolloutItem],
+    thread_id: &str,
+    terminal_ordinal: usize,
+    turn_id: &str,
+    error: &str,
+) -> Option<ResponseItemEnvelope> {
+    let mut turn_completions = 0usize;
+    let mut same_turn_calls = Vec::new();
+    let mut output_call_ids = std::collections::HashSet::new();
+    let mut completed_exec_call_ids = std::collections::HashSet::new();
+    let mut started_exec_call_ids = std::collections::HashSet::new();
+    let mut duplicate_call_ids = std::collections::HashSet::new();
+    let mut seen_call_ids = std::collections::HashSet::new();
+    let expected_blocked_output = error.strip_prefix("Fatal error: ").unwrap_or(error);
+    let mut exact_fatal_output_call_ids = std::collections::HashSet::new();
+    for (ordinal, item) in items.iter().enumerate() {
+        match item {
+            RolloutItem::EventMsg(EventMsg::TurnComplete(event)) if event.turn_id == turn_id => {
+                turn_completions += 1;
+            }
+            RolloutItem::ResponseItem(envelope) => match &envelope.item {
+                ResponseItem::FunctionCall {
+                    name,
+                    call_id,
+                    internal_chat_message_metadata_passthrough,
+                    ..
+                } => {
+                    if !seen_call_ids.insert(call_id.clone()) {
+                        duplicate_call_ids.insert(call_id.clone());
+                    }
+                    if internal_chat_message_metadata_passthrough
+                        .as_ref()
+                        .and_then(|metadata| metadata.turn_id.as_deref())
+                        == Some(turn_id)
+                    {
+                        same_turn_calls.push((
+                            ordinal,
+                            envelope,
+                            name.as_str(),
+                            call_id.as_str(),
+                            true,
+                        ));
+                    }
+                }
+                ResponseItem::CustomToolCall {
+                    name,
+                    call_id,
+                    internal_chat_message_metadata_passthrough,
+                    ..
+                } => {
+                    if !seen_call_ids.insert(call_id.clone()) {
+                        duplicate_call_ids.insert(call_id.clone());
+                    }
+                    if internal_chat_message_metadata_passthrough
+                        .as_ref()
+                        .and_then(|metadata| metadata.turn_id.as_deref())
+                        == Some(turn_id)
+                    {
+                        same_turn_calls.push((
+                            ordinal,
+                            envelope,
+                            name.as_str(),
+                            call_id.as_str(),
+                            false,
+                        ));
+                    }
+                }
+                ResponseItem::FunctionCallOutput {
+                    call_id: Some(call_id),
+                    output,
+                    ..
+                } => {
+                    output_call_ids.insert(call_id.clone());
+                    let blocked_reference = envelope
+                        .metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.rencrow_blocked_tool_call.as_deref());
+                    let observation = output.text_content().map(|body| {
+                        ObservationReference::new(thread_id, call_id, content_sha256(body))
+                    });
+                    // The durable proof already attributes this Fatal to its call. The
+                    // ephemeral success hint is omitted from canonical output; even a
+                    // contradictory hint cannot justify inferring a closure for another call.
+                    if output.text_content() == Some(expected_blocked_output)
+                        && blocked_reference.is_some_and(|blocked| {
+                            observation
+                                .as_ref()
+                                .is_some_and(|observation| blocked.validates(observation))
+                        })
+                    {
+                        exact_fatal_output_call_ids.insert(call_id.clone());
+                    }
+                }
+                ResponseItem::CustomToolCallOutput { call_id, .. } => {
+                    output_call_ids.insert(call_id.clone());
+                }
+                _ => {}
+            },
+            RolloutItem::EventMsg(EventMsg::ItemStarted(event))
+                if event.thread_id.to_string() == thread_id && event.turn_id == turn_id =>
+            {
+                if let TurnItem::CommandExecution(command) = &event.item {
+                    started_exec_call_ids.insert(command.id.clone());
+                }
+            }
+            RolloutItem::EventMsg(EventMsg::ItemCompleted(event))
+                if event.thread_id.to_string() == thread_id =>
+            {
+                if let TurnItem::CommandExecution(command) = &event.item {
+                    completed_exec_call_ids.insert(command.id.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    if turn_completions != 1
+        || same_turn_calls.is_empty()
+        || same_turn_calls
+            .iter()
+            .any(|(_, _, _, call_id, _)| exact_fatal_output_call_ids.contains(*call_id))
+        || same_turn_calls
+            .iter()
+            .any(|(_, _, _, call_id, _)| duplicate_call_ids.contains(*call_id))
+    {
+        return None;
+    }
+
+    let mut unmatched = same_turn_calls
+        .iter()
+        .filter(|(_, _, _, call_id, _)| {
+            !output_call_ids.contains(*call_id) && !duplicate_call_ids.contains(*call_id)
+        })
+        .collect::<Vec<_>>();
+    if unmatched.len() != 1 {
+        return None;
+    }
+    let (source_ordinal, source_envelope, name, call_id, direct) = unmatched.pop()?;
+    let source_ordinal = *source_ordinal;
+    let source_envelope = *source_envelope;
+    let name = *name;
+    let call_id = *call_id;
+    let direct = *direct;
+    if !direct
+        || name != "exec_command"
+        || source_ordinal >= terminal_ordinal
+        || source_ordinal != same_turn_calls.last()?.0
+        || output_call_ids.contains(call_id)
+        || duplicate_call_ids.contains(call_id)
+        || started_exec_call_ids.contains(call_id)
+        || completed_exec_call_ids.contains(call_id)
+    {
+        return None;
+    }
+    let source_payload_sha256 = digest(&(&source_envelope.item, &source_envelope.metadata)).ok()?;
+    let proof = LegacyBlockedCallProof {
+        kind: "blocked_before_handler",
+        error,
+        source_call_id: call_id,
+        source_payload_sha256: &source_payload_sha256,
+        source_rollout_ordinal: source_ordinal,
+    };
+    let body = serde_json::to_string(&proof).ok()?;
+    let reference = ObservationReference::new(thread_id, call_id, content_sha256(&body));
+    Some(ResponseItemEnvelope {
+        item: ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: Some(call_id.to_owned()),
+            name: None,
+            namespace: None,
+            output: FunctionCallOutputPayload {
+                body: FunctionCallOutputBody::Text(body),
+                success: Some(false),
+            },
+            internal_chat_message_metadata_passthrough: None,
+        },
+        metadata: Some(CodexHarnessMetadata {
+            rencrow_blocked_tool_call: Some(Box::new(BlockedToolCallReference::new(reference))),
+            ..Default::default()
+        }),
+    })
+}
 
 // Return value of `Session::reconstruct_history_from_rollout`, bundling the rebuilt history with
 // the resume/fork hydration metadata derived from the same replay.

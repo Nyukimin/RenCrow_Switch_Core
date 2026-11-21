@@ -318,6 +318,9 @@ pub(super) async fn run(
     ctx: Arc<TurnContext>,
     injection: InitialContextInjection,
     metadata: CompactionTurnMetadata,
+    parent_handoff: Option<
+        &crate::session::completion_persistence::parent_handoff::runtime::PreparedHandoff,
+    >,
 ) -> CodexResult<String> {
     sess.check_rencrow_checkpoint().await?;
     let cancellation = sess
@@ -364,7 +367,12 @@ pub(super) async fn run(
     .await;
     let outcome = match result {
         Ok(outcome) => outcome,
-        Err(error) => {
+        Err(failure) => {
+            let eligible = matches!(
+                &failure,
+                StageFailure::Capacity(_) | StageFailure::Semantic(_)
+            );
+            let error = failure.into_error();
             let snapshot_unchanged = history_digest(sess.clone_history().await.annotated_items())
                 .is_ok_and(|current| current == history_hash)
                 && sess.thread_settings_snapshot().await == settings;
@@ -377,11 +385,42 @@ pub(super) async fn run(
                 sess.set_rencrow_auto_compaction_failed_hash(Some(history_hash))
                     .await;
             }
+            if let Some(prepared) = parent_handoff {
+                let outcome = if eligible && snapshot_unchanged && !cancellation.is_cancelled() {
+                    "failed"
+                } else {
+                    "blocked"
+                };
+                if let Err(cause) =
+                    crate::session::completion_persistence::parent_handoff::runtime::finish(
+                        &sess,
+                        &ctx,
+                        prepared,
+                        outcome,
+                        Some(error.to_string()),
+                    )
+                    .await
+                {
+                    tracing::warn!(%cause, "parent handoff failure could not be sealed; no automatic migration");
+                }
+            }
             return Err(error);
         }
     };
     sess.set_rencrow_auto_compaction_failed_hash(/*hash*/ None)
         .await;
+    if let Some(prepared) = parent_handoff
+        && let Err(error) = crate::session::completion_persistence::parent_handoff::runtime::finish(
+            &sess,
+            &ctx,
+            prepared,
+            "compacted",
+            None,
+        )
+        .await
+    {
+        tracing::warn!(%error, "successful compaction handoff status could not be saved");
+    }
     sess.set_rencrow_normal_failed_hash(/*hash*/ None).await;
     sess.recompute_token_usage(&ctx).await;
     sess.emit_turn_item_completed(&ctx, item).await;
@@ -427,7 +466,7 @@ async fn compact_v2(
     history_hash: String,
     settings: codex_protocol::protocol::ThreadSettingsSnapshot,
     skip_normal: bool,
-) -> CodexResult<CommittedOutcome> {
+) -> Result<CommittedOutcome, StageFailure> {
     // Only a mid-turn compaction has the step of the ordinary request its summary can extend.
     let step_context = match &injection {
         InitialContextInjection::BeforeLastUserMessage { step_context, .. } => {
@@ -436,9 +475,7 @@ async fn compact_v2(
         InitialContextInjection::DoNotInject => None,
     };
     let (canonical, source_thread, active_call_ids) =
-        load_canonical_rollout(sess, snapshot.annotated_items())
-            .await
-            .map_err(StageFailure::into_error)?;
+        load_canonical_rollout(sess, snapshot.annotated_items()).await?;
     let expected_world = snapshot.world_state_checkpoint();
     let (initial_context, world_state) = build_compaction_initial_context(sess, &injection).await;
     let prepared = stages::prepare_v2(
@@ -452,8 +489,7 @@ async fn compact_v2(
         &settings,
         initial_context,
     )
-    .await
-    .map_err(StageFailure::into_error)?;
+    .await?;
 
     let normal = if skip_normal {
         None
@@ -476,13 +512,12 @@ async fn compact_v2(
                     .await;
                 None
             }
-            Err(failure) => return Err(failure.into_error()),
+            Err(failure) => return Err(failure),
         }
     };
     let candidate = match normal {
         Some(candidate) => candidate,
-        None => stages::emergency_candidate(ctx, snapshot, &prepared)
-            .map_err(StageFailure::into_error)?,
+        None => stages::emergency_candidate(ctx, snapshot, &prepared)?,
     };
     let reference_context = match injection {
         InitialContextInjection::DoNotInject => None,
@@ -503,7 +538,8 @@ async fn compact_v2(
         expected_base_text: base.text,
         expected_world,
     })
-    .await?;
+    .await
+    .map_err(StageFailure::Abort)?;
     Ok(CommittedOutcome {
         summary_text: candidate.summary_text,
         removals: candidate.removals,

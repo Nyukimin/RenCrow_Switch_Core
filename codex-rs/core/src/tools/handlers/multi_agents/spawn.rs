@@ -123,7 +123,7 @@ pub(crate) async fn spawn_configured_completion_review(
     validate_completion_reviewer_depth(&turn.session_source, turn.config.agent_max_depth)
         .map_err(FunctionCallError::RespondToModel)?;
     let prompt = format!(
-        "Host-assigned read-only review. Inspect task `{target_task_id}` revision {target_task_revision} against accepted artifact reference `{target_ref}`.\n{review_brief}\nUse the listed repository-relative artifact paths and stated acceptance criteria as your review basis. Use code and existing host evidence only; do not edit files or rerun tests. Return findings to the parent for an explicit adoption decision."
+        "Host-assigned read-only review. Inspect task `{target_task_id}` revision {target_task_revision} against accepted artifact reference `{target_ref}`.\n{review_brief}\nUse each verified artifact's exact absolute path together with its stated workspace root; do not resolve paths relative to the reviewer working directory or infer ownership from another repository. Use the stated acceptance criteria and existing host evidence only; do not edit files or rerun tests. Return findings to the parent for an explicit adoption decision."
     );
     let input_items = vec![UserInput::Text {
         text: prompt.clone(),

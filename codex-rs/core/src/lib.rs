@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-21: expose explicit authorized resume receipts.
 //! Root of the `codex-core` library.
 
 // Prevent accidental direct writes to stdout/stderr in library code. All
@@ -53,8 +54,11 @@ pub use codex_thread::GuardianRootMessage;
 pub use codex_thread::GuardianRootSnapshot;
 pub use codex_thread::ThreadConfigSnapshot;
 pub use session::completion_persistence::MaintenanceRepairEvidenceDigest;
+pub use session::completion_persistence::MaintenanceRepairHistoryTip;
+pub use session::completion_persistence::MaintenanceRepairReason;
 pub use session::completion_persistence::MaintenanceRepairReceipt;
 pub use session::completion_persistence::MaintenanceRepairSnapshotInfo;
+pub use session::completion_persistence::build_explicit_authorized_resume_snapshot;
 pub use session::completion_persistence::build_maintenance_repair_snapshot;
 pub use session::completion_persistence::inspect_maintenance_repair_snapshot;
 pub use session::completion_persistence::maintenance_snapshot_digest;
@@ -155,6 +159,7 @@ pub use client::X_RESPONSESAPI_INCLUDE_TIMING_METRICS_HEADER;
 pub use codex_protocol::config_types::ModelProviderAuthInfo;
 mod event_mapping;
 pub use codex_prompts as review_prompts;
+mod models_manager_binding;
 mod thread_manager;
 pub(crate) mod web_search;
 pub(crate) mod windows_sandbox_read_grants;

@@ -279,6 +279,12 @@ pub struct ConfigToml {
     /// Continue parent work from a persisted finite completion contract.
     pub rencrow_autonomous_completion: Option<bool>,
 
+    /// Opt-in host directory for pre-compaction parent handoff capsules.
+    pub rencrow_parent_handoff_dir: Option<AbsolutePathBuf>,
+
+    /// One immutable, source-audited parent capsule admitted only for a new root thread.
+    pub rencrow_parent_handoff_file: Option<AbsolutePathBuf>,
+
     /// Opt-in native tool-loop and executor completion guard (no external hooks).
     pub rencrow_execution_guard: Option<crate::RencrowExecutionGuard>,
 

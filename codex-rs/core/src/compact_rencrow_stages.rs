@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-21.
 //! Prepare, Normal, and Emergency stages of V2 compaction (Annex A F01, Part 2 §3–7, §24–55).
 
 use super::super::*;
@@ -13,6 +14,7 @@ use super::selection_required;
 use super::summary;
 use super::summary::AdoptedV2Checkpoint;
 use super::summary::SemanticContext;
+use crate::context::AutonomousCompletionContinue;
 use crate::context_manager::ContextManager;
 use crate::session::context_window::ContextWindowTokenStatus;
 use codex_history::ObservationReference;
@@ -594,9 +596,18 @@ pub(super) async fn normal_candidate(
     .map_err(after_selection)?;
     // The extended prompt shows removed passages verbatim, so it is used only when none were
     // removed or replaced by this compaction.
+    // This raw snapshot predates native deduplication; using it would reintroduce stale state.
+    let has_multiple_host_completion_continues = p
+        .originals
+        .iter()
+        .filter(|envelope| AutonomousCompletionContinue::is_host_generated(envelope))
+        .take(2)
+        .count()
+        > 1;
     let turn_prefix = step_context
         .filter(|_| {
-            application.pruning.applied.len() == p.pruning.applied.len()
+            !has_multiple_host_completion_continues
+                && application.pruning.applied.len() == p.pruning.applied.len()
                 && application.results.is_empty()
         })
         .and_then(|step| turn_prefix(snapshot, p, step));

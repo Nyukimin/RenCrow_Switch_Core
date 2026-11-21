@@ -1,3 +1,5 @@
+// Modified by RenCrow Switch Core, 2026-11-21: expose bounded host verification diagnostics in status.
+// Modified by RenCrow Switch Core, 2026-11-20: separate caller and host checkpoint budgets.
 // Modified by RenCrow Switch Core, 2026-11-16.
 use crate::agent::child_config::SpawnConfigOptions;
 use crate::agent::child_config::SpawnConfigVersion;
@@ -30,7 +32,7 @@ use codex_history::task_context::StoredTaskState;
 use codex_history::task_context::TaskState;
 use codex_history::task_context::TaskStatus;
 use codex_history::task_context::UnitStatus;
-use codex_history::task_context::validate_boundary;
+use codex_history::task_context::validate_host_boundary_checkpoint;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::SessionSource;
@@ -114,18 +116,34 @@ struct ReviewRetryArgs {
 fn render_completion_status(
     state: &codex_history::task_context::CompletionState,
     current_review_reason: Option<&str>,
+    verification_obligations: Option<&serde_json::Value>,
 ) -> Result<String, String> {
-    let Some(reason) = current_review_reason.filter(|reason| !reason.trim().is_empty()) else {
+    let reason = current_review_reason.filter(|reason| !reason.trim().is_empty());
+    let verification_obligations = verification_obligations.filter(|diagnostics| {
+        diagnostics
+            .get("count")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|count| count > 0)
+    });
+    if reason.is_none() && verification_obligations.is_none() {
         return serde_json::to_string(state).map_err(|error| error.to_string());
-    };
+    }
     let mut rendered = serde_json::to_value(state).map_err(|error| error.to_string())?;
     let object = rendered
         .as_object_mut()
         .ok_or_else(|| "completion state did not serialize as a JSON object".to_string())?;
-    object.insert(
-        "current_review_obligation".into(),
-        serde_json::Value::String(reason.to_string()),
-    );
+    if let Some(reason) = reason {
+        object.insert(
+            "current_review_obligation".into(),
+            serde_json::Value::String(reason.to_string()),
+        );
+    }
+    if let Some(verification_obligations) = verification_obligations {
+        object.insert(
+            "verification_obligations".into(),
+            verification_obligations.clone(),
+        );
+    }
     serde_json::to_string(&rendered).map_err(|error| error.to_string())
 }
 
@@ -434,9 +452,16 @@ impl ToolExecutor<ToolInvocation> for TaskContextBoundaryHandler {
                         .session
                         .autonomous_completion_current_review_scope_reason()
                         .await;
-                    let rendered =
-                        render_completion_status(&state, current_review_reason.as_deref())
-                            .map_err(FunctionCallError::RespondToModel)?;
+                    let verification_obligations = invocation
+                        .session
+                        .task_verification_diagnostics(&root_task_id)
+                        .await;
+                    let rendered = render_completion_status(
+                        &state,
+                        current_review_reason.as_deref(),
+                        Some(&verification_obligations),
+                    )
+                    .map_err(FunctionCallError::RespondToModel)?;
                     Ok(boxed_tool_output(FunctionToolOutput::from_text(
                         rendered,
                         Some(true),
@@ -1006,11 +1031,9 @@ impl ToolExecutor<ToolInvocation> for TaskContextBoundaryHandler {
                             ))?;
                         invocation
                             .session
-                            .set_rencrow_completion_state(
+                            .set_accepted_rencrow_completion_state(
                                 active.root_task_id.clone(),
-                                serde_json::to_value(&contract).map_err(|error| {
-                                    FunctionCallError::RespondToModel(error.to_string())
-                                })?,
+                                contract,
                             )
                             .await
                             .map_err(FunctionCallError::RespondToModel)?;
@@ -1091,9 +1114,18 @@ impl ToolExecutor<ToolInvocation> for TaskContextBoundaryHandler {
                         crate::task_check::TaskCheckAttemptStatus::Finished(receipt) => receipt,
                     };
                     if !receipt.succeeded || receipt.exit_code != 0 {
-                        return Err(FunctionCallError::RespondToModel(
-                            "the latest verification for this task did not succeed".into(),
-                        ));
+                        let message = if invocation.turn.config.rencrow_autonomous_completion {
+                            format!(
+                                "latest verification attempt {} for root_task_id {} did not succeed (exit_code={}); call task_context_boundary status and inspect verification_obligations.attempts for launch_phase, observed_cwd, and diagnostic excerpt or omission/hash markers before choosing a correction",
+                                attempt.call_id, active.root_task_id, receipt.exit_code
+                            )
+                        } else {
+                            format!(
+                                "latest verification attempt {} did not succeed (exit_code={}); inspect its recorded command and result before choosing a correction",
+                                attempt.call_id, receipt.exit_code
+                            )
+                        };
+                        return Err(FunctionCallError::RespondToModel(message));
                     }
                     if invocation.turn.config.rencrow_autonomous_completion {
                         let unresolved = invocation
@@ -1102,7 +1134,8 @@ impl ToolExecutor<ToolInvocation> for TaskContextBoundaryHandler {
                             .await;
                         if unresolved > 0 {
                             return Err(FunctionCallError::RespondToModel(format!(
-                                "task has {unresolved} unresolved verification obligation(s); rerun each failed check with the same scope, working directory, command, and artifact set"
+                                "task has {unresolved} unresolved verification obligation(s); call task_context_boundary status for root_task_id {} and inspect verification_obligations.attempts for call_id, launch_phase, observed_cwd, and diagnostic excerpt or omission/hash markers before choosing a correction. A failure before verification started is not a completed check to rerun blindly",
+                                active.root_task_id
                             )));
                         }
                     }
@@ -1326,11 +1359,12 @@ impl ToolExecutor<ToolInvocation> for TaskContextBoundaryHandler {
                             .map(|state| state.completed.clone())
                             .unwrap_or_default(),
                     };
-                    let validated = validate_boundary(candidate, &facts).map_err(|error| {
-                        FunctionCallError::RespondToModel(format!(
-                            "task boundary candidate was rejected: {error:?}"
-                        ))
-                    })?;
+                    let validated =
+                        validate_host_boundary_checkpoint(candidate, &facts).map_err(|error| {
+                            FunctionCallError::RespondToModel(format!(
+                                "task boundary candidate was rejected: {error:?}"
+                            ))
+                        })?;
                     let stored = validated
                         .into_stored_state(
                             latest_state.as_ref().map(|state| state.boundary.revision),

@@ -1,4 +1,4 @@
-// Modified by RenCrow Switch Core, 2026-11-16.
+// Modified by RenCrow Switch Core, 2026-11-19: finish retry rollback cleanup before terminal persistence.
 use super::session::Session;
 use crate::agent::CompletionReviewAbort;
 use codex_history::task_context::BlockerCategory;
@@ -540,6 +540,7 @@ impl Session {
                                     attempt.terminal_source = Some(terminal_source);
                                 }
                             }
+                            review_state.retry_reservation_prior_historical_failure = None;
                         } else {
                             let failure = CompletionReviewHistoricalFailure {
                                 attempt_id: expected_review.spawn_call_id.clone(),

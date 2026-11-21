@@ -228,6 +228,8 @@ fn new_config(model: Option<String>, arg0_paths: Arg0DispatchPaths) -> anyhow::R
         compact_prompt: None,
         rencrow_compaction: false,
         rencrow_autonomous_completion: false,
+        rencrow_parent_handoff_dir: None,
+        rencrow_parent_handoff_file: None,
         rencrow_execution_guard: None,
         rencrow_tool_allowlist: None,
         rencrow_read_only: false,

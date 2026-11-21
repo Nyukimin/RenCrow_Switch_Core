@@ -7483,6 +7483,22 @@
       ],
       "description": "Opt-in native tool-loop and executor completion guard (no external hooks)."
     },
+    "rencrow_parent_handoff_dir": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/AbsolutePathBuf"
+        }
+      ],
+      "description": "Opt-in host directory for pre-compaction parent handoff capsules."
+    },
+    "rencrow_parent_handoff_file": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/AbsolutePathBuf"
+        }
+      ],
+      "description": "One immutable, source-audited parent capsule admitted only for a new root thread."
+    },
     "rencrow_read_only": {
       "description": "Agent role files only: run the role's agents with a read-only sandbox (ROLE_TOOL_POLICY.md).",
       "type": "boolean"

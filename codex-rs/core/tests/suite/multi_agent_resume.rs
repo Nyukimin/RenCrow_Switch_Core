@@ -3,6 +3,7 @@ use codex_core::TurnInputRequest;
 use codex_core::config::AgentRoleConfig;
 use codex_features::Feature;
 use codex_protocol::models::PermissionProfile;
+use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
@@ -47,6 +48,11 @@ const SIBLING_PROMPT: &str = "spawn a second durable worker";
 const SIBLING_TASK: &str = "inspect the release lifecycle";
 const SIBLING_FOLLOWUP_PROMPT: &str = "continue the surviving worker";
 const SIBLING_FOLLOWUP_TASK: &str = "verify the surviving worker";
+const CROSS_PROVIDER_PROMPT: &str = "spawn the OpenAI analyst";
+const CROSS_PROVIDER_TASK: &str = "inspect the provider-specific route";
+const CROSS_PROVIDER_CALL_ID: &str = "spawn-openai-analyst";
+const CROSS_PROVIDER_ANALYST_MODEL: &str = "gpt-6.1-sol";
+const LOCAL_PARENT_MODEL: &str = "gpt-5.5";
 const INTERRUPT_PROMPT: &str = "release the interrupted worker";
 const SIBLING_NAME: &str = "survivor";
 const ROLE_NAME: &str = "durable_worker";
@@ -151,7 +157,7 @@ fn configure_multi_agent_v2_with_role(
     std::fs::write(
         &role_path,
         format!(
-            "model = \"{ROLE_MODEL}\"\nmodel_reasoning_effort = \"high\"\ndeveloper_instructions = \"{ROLE_DEVELOPER_INSTRUCTIONS}\"\nsandbox_mode = \"read-only\"\nmodel_provider = \"mock\"\n\n[model_providers.mock]\nname = \"mock\"\nbase_url = \"{model_provider_base_url}\"\nenv_key = \"PATH\"\nwire_api = \"responses\"\n"
+            "model = \"{ROLE_MODEL}\"\nmodel_reasoning_effort = \"high\"\ndeveloper_instructions = \"{ROLE_DEVELOPER_INSTRUCTIONS}\"\nrencrow_read_only = true\nmodel_provider = \"{ROLE_MODEL_PROVIDER_ID}\"\n\n[model_providers.mock]\nname = \"mock\"\nbase_url = \"{model_provider_base_url}\"\nenv_key = \"PATH\"\nwire_api = \"responses\"\n"
         ),
     )
     .expect("write durable worker role config");
@@ -317,7 +323,7 @@ async fn cold_root_resume_restores_agent_identity_and_role_on_followup() -> Resu
     assert!(initial_child_request.requests().iter().any(|request| {
         request.body_contains_text(INITIAL_TASK)
             && request.body_contains_text(ROLE_DEVELOPER_INSTRUCTIONS)
-            && request.body_contains_text("<permission_profile type=\"disabled\">")
+            && request.body_contains_text("<permission_profile type=\"managed\">")
             && !request.body_contains_text(SUBAGENT_DEVELOPER_INSTRUCTIONS)
     }));
     assert_eq!(
@@ -338,7 +344,7 @@ async fn cold_root_resume_restores_agent_identity_and_role_on_followup() -> Resu
             ROLE_MODEL.to_string(),
             ROLE_MODEL_PROVIDER_ID.to_string(),
             Some(ReasoningEffort::High),
-            PermissionProfile::Disabled,
+            PermissionProfile::read_only(),
         )
     );
 
@@ -537,7 +543,7 @@ openai_base_url = "{redirected_base_url}"
     assert!(followup_child_request.requests().iter().any(|request| {
         request.body_contains_text(FOLLOWUP_TASK)
             && request.body_contains_text(ROLE_DEVELOPER_INSTRUCTIONS)
-            && request.body_contains_text("<permission_profile type=\"disabled\">")
+            && request.body_contains_text("<permission_profile type=\"managed\">")
             && !request.body_contains_text(SUBAGENT_DEVELOPER_INSTRUCTIONS)
     }));
     // The worker is loaded again, while its alphabetically earlier sibling remains unloaded.
@@ -732,5 +738,154 @@ openai_base_url = "{redirected_base_url}"
         "a changed role must not redirect resumed model requests",
     );
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn v1_registered_provider_role_uses_its_own_manager_and_endpoint() -> Result<()> {
+    let local_parent_server = start_mock_server().await;
+    let openai_server = start_mock_server().await;
+    let local_parent_base_url = format!("{}/v1", local_parent_server.uri());
+    let openai_base_url = format!("{}/v1", openai_server.uri());
+    let spawn_args = json!({
+        "message": CROSS_PROVIDER_TASK,
+        "task_name": "analyst",
+        "agent_type": "analyst",
+        "fork_turns": "none",
+    })
+    .to_string();
+    let parent_spawn = mount_sse_once_match(
+        &local_parent_server,
+        |request: &wiremock::Request| {
+            request_has_model(request, LOCAL_PARENT_MODEL)
+                && body_contains(request, CROSS_PROVIDER_PROMPT)
+        },
+        sse(vec![
+            ev_response_created("cross-provider-parent-spawn"),
+            ev_function_call_with_namespace(
+                CROSS_PROVIDER_CALL_ID,
+                "multi_agent_v1",
+                "spawn_agent",
+                &spawn_args,
+            ),
+            ev_completed("cross-provider-parent-spawn"),
+        ]),
+    )
+    .await;
+    let parent_followup = mount_sse_once_match(
+        &local_parent_server,
+        |request: &wiremock::Request| {
+            request_has_model(request, LOCAL_PARENT_MODEL)
+                && body_contains(request, CROSS_PROVIDER_CALL_ID)
+        },
+        sse(vec![
+            ev_response_created("cross-provider-parent-followup"),
+            ev_assistant_message("cross-provider-parent-message", "analyst completed"),
+            ev_completed("cross-provider-parent-followup"),
+        ]),
+    )
+    .await;
+    let analyst_response = mount_sse_once_match(
+        &openai_server,
+        |request: &wiremock::Request| {
+            request_has_model(request, CROSS_PROVIDER_ANALYST_MODEL)
+                && request_has_input_type(request, "agent_message")
+                && body_contains(request, CROSS_PROVIDER_TASK)
+        },
+        sse(vec![
+            ev_response_created("cross-provider-analyst-response"),
+            ev_assistant_message("cross-provider-analyst-message", "provider route verified"),
+            ev_completed("cross-provider-analyst-response"),
+        ]),
+    )
+    .await;
+
+    let mut local_catalog = codex_models_manager::bundled_models_response()?;
+    let local_parent_model = local_catalog
+        .models
+        .iter()
+        .find(|model| model.slug == LOCAL_PARENT_MODEL)
+        .expect("local parent model should exist in bundled metadata")
+        .clone();
+    local_catalog.models = vec![local_parent_model];
+    let mut builder = test_codex()
+        .with_model(LOCAL_PARENT_MODEL)
+        .with_config(move |config| {
+            config.features.enable(Feature::Collab).unwrap();
+            config.features.disable(Feature::MultiAgentV2).unwrap();
+
+            let mut local_provider = config.model_provider.clone();
+            local_provider.base_url = Some(local_parent_base_url);
+            config.model_provider_id = "rencrow".to_string();
+            config.model_provider = local_provider.clone();
+            config
+                .model_providers
+                .insert("rencrow".to_string(), local_provider);
+
+            let mut openai_provider = config.model_providers["openai"].clone();
+            openai_provider.base_url = Some(openai_base_url);
+            openai_provider.supports_websockets = false;
+            config
+                .model_providers
+                .insert("openai".to_string(), openai_provider);
+            config.model_catalog = Some(local_catalog);
+
+            let role_path = config.codex_home.join("openai-analyst.toml");
+            std::fs::write(
+                &role_path,
+                format!(
+                    "model = \"{CROSS_PROVIDER_ANALYST_MODEL}\"\nmodel_provider = \"openai\"\nmodel_reasoning_effort = \"high\"\nrencrow_read_only = true\n\n[rencrow_execution_guard]\ntask_kind = \"read_only\"\n"
+                ),
+            )
+            .expect("write analyst role config");
+            config.agent_roles.insert(
+                "analyst".to_string(),
+                AgentRoleConfig {
+                    enabled: None,
+                    description: Some("Registered OpenAI analyst".to_string()),
+                    config_file: Some(role_path),
+                    nickname_candidates: None,
+                },
+            );
+        });
+    let fixture = builder.build(&local_parent_server).await?;
+    fixture.submit_turn(CROSS_PROVIDER_PROMPT).await?;
+    wait_for_event(&fixture.codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+
+    let parent_spawn_request = parent_spawn.single_request();
+    let parent_followup_request = parent_followup.single_request();
+    assert_eq!(parent_spawn_request.body_json()["model"], LOCAL_PARENT_MODEL);
+    assert_eq!(parent_followup_request.body_json()["model"], LOCAL_PARENT_MODEL);
+
+    let analyst_request = analyst_response.single_request();
+    assert_eq!(analyst_request.body_json()["model"], CROSS_PROVIDER_ANALYST_MODEL);
+    assert_eq!(analyst_request.body_json()["reasoning"]["effort"], "high");
+    assert!(analyst_request.body_contains_text("<permission_profile type=\"managed\">"));
+
+    let root_thread_id = fixture.session_configured.thread_id;
+    let child_thread_id = fixture
+        .thread_manager
+        .list_thread_ids()
+        .await
+        .into_iter()
+        .find(|thread_id| *thread_id != root_thread_id)
+        .expect("analyst child thread should be registered");
+    let child_thread = fixture.thread_manager.get_thread(child_thread_id).await?;
+    let child_config = child_thread.config_snapshot().await;
+    assert_eq!(child_config.model_provider_id, "openai");
+    assert_eq!(child_config.model, CROSS_PROVIDER_ANALYST_MODEL);
+    assert_eq!(child_config.reasoning_effort, Some(ReasoningEffort::High));
+    assert_eq!(child_config.permission_profile, PermissionProfile::read_only());
+
+    assert!(local_parent_server
+        .received_requests()
+        .await?
+        .iter()
+        .all(|request| request_has_model(request, LOCAL_PARENT_MODEL)));
+    assert!(openai_server
+        .received_requests()
+        .await?
+        .iter()
+        .any(|request| request_has_model(request, CROSS_PROVIDER_ANALYST_MODEL)));
     Ok(())
 }

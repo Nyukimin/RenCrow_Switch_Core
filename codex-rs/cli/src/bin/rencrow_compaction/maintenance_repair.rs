@@ -1,10 +1,14 @@
+// Modified by RenCrow Switch Core, 2026-11-21: explicit authorized native resume.
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::ensure;
 use chrono::DateTime;
 use chrono::NaiveDateTime;
 use codex_core::MaintenanceRepairEvidenceDigest;
+use codex_core::MaintenanceRepairHistoryTip;
+use codex_core::MaintenanceRepairReason;
 use codex_core::MaintenanceRepairReceipt;
+use codex_core::build_explicit_authorized_resume_snapshot;
 use codex_core::build_maintenance_repair_snapshot;
 use codex_core::inspect_maintenance_repair_snapshot;
 use codex_core::maintenance_snapshot_digest;
@@ -73,11 +77,57 @@ struct Request {
     evidence: Vec<EvidenceFile>,
 }
 
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct AuthorizedResumeRequest {
+    version: u32,
+    reason: String,
+    thread_id: String,
+    root_task_id: String,
+    expected_resume_generation: u64,
+    expected_current_snapshot_sha256: String,
+    expected_history_tip: HistoryTip,
+    authorization: AuthorizationFile,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct AuthorizationFile {
+    path: PathBuf,
+    sha256: String,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct AuthorizationEvidence {
+    thread_id: String,
+    root_task_id: String,
+    authorization: AuthorizationClaim,
+    recorded_by: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct AuthorizationClaim {
+    issuer: String,
+    original_text: String,
+    interpretation: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct HistoryTip {
     ordinal: u64,
     sha256: String,
+}
+
+impl From<&HistoryTip> for MaintenanceRepairHistoryTip {
+    fn from(value: &HistoryTip) -> Self {
+        Self {
+            ordinal: value.ordinal,
+            sha256: value.sha256.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -784,12 +834,382 @@ fn repair_item(value: Value) -> RolloutItem {
     })
 }
 
+fn load_authorized_resume_request(
+    path: &Path,
+    thread_id: &str,
+) -> Result<(AuthorizedResumeRequest, String, String, String)> {
+    ensure!(path.is_absolute(), "request path must be absolute");
+    let bytes = secure_regular_file(path, MAX_REQUEST_BYTES as u64)?;
+    let value: Value = serde_json::from_slice(&bytes)?;
+    let request: AuthorizedResumeRequest = serde_json::from_value(value.clone())
+        .context("explicit authorized resume request schema is invalid")?;
+    ensure!(
+        request.version == 2,
+        "unsupported authorized resume request version"
+    );
+    ensure!(
+        request.reason == "explicit_authorized_resume",
+        "unsupported authorized resume reason"
+    );
+    ensure!(
+        request.thread_id == thread_id,
+        "request thread does not match --thread"
+    );
+    ensure!(
+        !request.root_task_id.trim().is_empty(),
+        "request root task id is empty"
+    );
+    ensure!(
+        request.expected_resume_generation.checked_add(1).is_some(),
+        "resume generation is exhausted"
+    );
+    ensure!(
+        request.expected_current_snapshot_sha256.len() == 64
+            && request
+                .expected_current_snapshot_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+        "expected current snapshot hash is invalid"
+    );
+    ensure!(
+        request.expected_history_tip.sha256.len() == 64
+            && request
+                .expected_history_tip
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+        "expected history tip hash is invalid"
+    );
+    ensure!(
+        request.authorization.path.is_absolute(),
+        "authorization reference must be absolute"
+    );
+    let authorization_path = request
+        .authorization
+        .path
+        .canonicalize()
+        .context("authorization reference does not resolve")?;
+    ensure!(
+        authorization_path == request.authorization.path,
+        "authorization reference must already be canonical"
+    );
+    let auth_bytes = secure_regular_file(&authorization_path, MAX_REQUEST_BYTES as u64)?;
+    let auth_text =
+        std::str::from_utf8(&auth_bytes).context("authorization evidence must be UTF-8")?;
+    let auth_hash = codex_history::archive_reference::content_sha256(auth_text);
+    ensure!(
+        auth_hash == request.authorization.sha256,
+        "authorization evidence hash mismatch"
+    );
+    let auth: AuthorizationEvidence =
+        serde_json::from_str(auth_text).context("authorization evidence schema is invalid")?;
+    ensure!(
+        auth.thread_id == request.thread_id
+            && auth.root_task_id == request.root_task_id
+            && auth.recorded_by == "official Codex supervisor"
+            && !auth.authorization.issuer.trim().is_empty()
+            && !auth.authorization.original_text.trim().is_empty()
+            && !auth.authorization.interpretation.trim().is_empty(),
+        "authorization evidence does not match the recorded explicit host-user continuation or request identity"
+    );
+    let request_hash = maintenance_snapshot_digest(&value).map_err(anyhow::Error::msg)?;
+    Ok((request, request_hash, auth_hash, auth.authorization.issuer))
+}
+
+async fn run_explicit_authorized_resume(
+    codex_home: PathBuf,
+    thread: String,
+    request_path: PathBuf,
+    apply: bool,
+) -> Result<()> {
+    let home = codex_home
+        .canonicalize()
+        .context("explicit CODEX_HOME does not resolve")?;
+    ensure!(home.is_dir(), "CODEX_HOME is not a directory");
+    let thread_id = ThreadId::from_string(&thread).context("invalid thread UUID")?;
+    ensure!(
+        thread_id.to_string() == thread,
+        "thread UUID is not canonical"
+    );
+    let rollout_path = super::thread_rollout(&thread, Some(home.clone())).await?;
+    let (request, request_sha256, authorization_sha256, authorization_issuer) =
+        load_authorized_resume_request(&request_path, &thread)?;
+    let initial_items = super::thread_rollout_items(&rollout_path, &thread_id).await?;
+    let mut store: Option<Arc<LocalThreadStore>> = None;
+    let mut live: Option<LiveThread> = None;
+    if apply {
+        let config = codex_core::config::ConfigBuilder::default()
+            .codex_home(home.clone())
+            .build()
+            .await?;
+        let state_db = codex_rollout::state_db::try_init(&config).await?;
+        let local_store = Arc::new(LocalThreadStore::new(
+            LocalThreadStoreConfig::from_config(&config),
+            Some(state_db),
+        ));
+        let metadata = local_store
+            .read_thread(ReadThreadParams {
+                thread_id,
+                include_archived: true,
+                include_history: false,
+            })
+            .await?;
+        ensure!(
+            metadata.parent_thread_id.is_none() && metadata.forked_from_id.is_none(),
+            "resume is limited to the owning root thread, not a child or fork"
+        );
+        ensure!(
+            metadata.rollout_path.as_deref() == Some(rollout_path.as_path()),
+            "thread store resolved a different canonical rollout"
+        );
+        let persistence: Arc<dyn ThreadStore> = local_store.clone();
+        let writer = LiveThread::resume(
+            persistence,
+            metadata.history_mode,
+            ResumeThreadParams {
+                thread_id,
+                rollout_path: Some(rollout_path.clone()),
+                history: Some(Arc::new(initial_items.clone())),
+                include_archived: true,
+                metadata: ThreadPersistenceMetadata {
+                    cwd: Some(metadata.cwd.clone()),
+                    model_provider: metadata.model_provider.clone(),
+                    memory_mode: ThreadMemoryMode::Disabled,
+                },
+            },
+        )
+        .await?;
+        store = Some(local_store);
+        live = Some(writer);
+    }
+
+    let mut write_started = false;
+    let mut write_confirmed = false;
+    let mut existing_receipt_retry = false;
+    let result = async {
+        if apply {
+            let (rechecked, request_hash, auth_hash, issuer) =
+                load_authorized_resume_request(&request_path, &thread)?;
+            ensure!(
+                rechecked == request
+                    && request_hash == request_sha256
+                    && auth_hash == authorization_sha256
+                    && issuer == authorization_issuer,
+                "authorized resume request or evidence changed after writer acquisition"
+            );
+        }
+        let items = if apply {
+            super::thread_rollout_items(&rollout_path, &thread_id).await?
+        } else {
+            initial_items
+        };
+        let rows = canonical_rollout_rows(&rollout_path)?;
+        ensure!(
+            rows.len() == items.len(),
+            "canonical row metadata and rollout items do not align"
+        );
+        let tip = history_tip(&rollout_path)?;
+        let (current_index, current_hash, current_value, current_info) =
+            latest_snapshot(&items, &thread, &request.root_task_id)?;
+
+        if current_value
+            .get("maintenance_repair_receipt")
+            .and_then(|receipt| receipt.get("request_sha256"))
+            .and_then(Value::as_str)
+            == Some(request_sha256.as_str())
+        {
+            let receipt: MaintenanceRepairReceipt =
+                serde_json::from_value(current_value["maintenance_repair_receipt"].clone())
+                    .context("latest authorized resume receipt is malformed")?;
+            ensure!(
+                receipt.version == 2
+                    && receipt.reason == Some(MaintenanceRepairReason::ExplicitAuthorizedResume)
+                    && receipt.thread_id == thread
+                    && receipt.root_task_id == request.root_task_id,
+                "latest receipt is not this explicit authorized resume"
+            );
+            ensure!(
+                receipt.resume_generation_before == request.expected_resume_generation
+                    && receipt.resume_generation_after == current_info.resume_generation
+                    && current_info.resume_generation
+                        == request.expected_resume_generation.saturating_add(1)
+                    && !current_info.state.paused,
+                "latest authorized resume receipt generation/state differs from request"
+            );
+            let authorization_ref = request.authorization.path.to_string_lossy().into_owned();
+            ensure!(
+                receipt.authorization_ref.as_deref() == Some(authorization_ref.as_str())
+                    && receipt.authorization_sha256.as_deref()
+                        == Some(authorization_sha256.as_str())
+                    && receipt.history_tip_before.as_ref().is_some_and(|saved| {
+                        saved.ordinal == request.expected_history_tip.ordinal
+                            && saved.sha256 == request.expected_history_tip.sha256
+                    }),
+                "latest authorized resume receipt differs from authorization/CAS"
+            );
+            ensure!(
+                !interrupted_after(&items, current_index),
+                "an explicit interruption followed the prior resume receipt"
+            );
+            if apply {
+                let writer = live.as_ref().context("apply writer is missing")?;
+                write_confirmed = true;
+                existing_receipt_retry = true;
+                writer.flush().await?;
+                verify_projection_checkpoint(
+                    store
+                        .as_ref()
+                        .context("apply projection store is missing")?,
+                    thread_id,
+                    &rollout_path,
+                )
+                .await?;
+                return Ok(("already_applied", current_hash, tip));
+            }
+            return Ok(("canonical_receipt_present", current_hash, tip));
+        }
+
+        ensure!(
+            current_hash == request.expected_current_snapshot_sha256,
+            "latest completion snapshot changed since request creation"
+        );
+        ensure!(
+            current_info.resume_generation == request.expected_resume_generation,
+            "completion resume generation changed since request creation"
+        );
+        ensure!(
+            current_info.state.paused,
+            "latest completion snapshot is not paused"
+        );
+        ensure!(
+            tip.ordinal == request.expected_history_tip.ordinal
+                && tip.sha256 == request.expected_history_tip.sha256,
+            "canonical history tip changed since request creation"
+        );
+
+        let receipt = MaintenanceRepairReceipt {
+            version: 2,
+            reason: Some(MaintenanceRepairReason::ExplicitAuthorizedResume),
+            thread_id: thread.clone(),
+            root_task_id: request.root_task_id.clone(),
+            request_sha256: request_sha256.clone(),
+            snapshot_before_sha256: current_hash.clone(),
+            shutdown_before_snapshot_sha256: None,
+            shutdown_paused_snapshot_sha256: None,
+            legacy_scope_mismatch_snapshot_sha256: None,
+            evidence: Vec::new(),
+            resume_generation_before: current_info.resume_generation,
+            resume_generation_after: current_info
+                .resume_generation
+                .checked_add(1)
+                .context("resume generation overflow")?,
+            authorization_issuer: Some(authorization_issuer.clone()),
+            authorization_ref: Some(request.authorization.path.to_string_lossy().into_owned()),
+            authorization_sha256: Some(authorization_sha256.clone()),
+            history_tip_before: Some((&request.expected_history_tip).into()),
+        };
+        let resumed = build_explicit_authorized_resume_snapshot(&current_value, receipt)
+            .map_err(anyhow::Error::msg)?;
+        if !apply {
+            return Ok(("dry_run_ready", current_hash, tip));
+        }
+        let writer = live.as_ref().context("apply writer is missing")?;
+        write_started = true;
+        writer.append_items(&[repair_item(resumed.clone())]).await?;
+        writer.flush().await?;
+        write_confirmed = true;
+        let canonical = super::thread_rollout_items(&rollout_path, &thread_id).await?;
+        let canonical_snapshots = completion_snapshots(&canonical)?;
+        ensure!(
+            canonical_snapshots
+                .last()
+                .is_some_and(|(_, _, value)| value == &resumed),
+            "canonical rollout readback does not match authorized resume snapshot"
+        );
+        verify_projection_checkpoint(
+            store
+                .as_ref()
+                .context("apply projection store is missing")?,
+            thread_id,
+            &rollout_path,
+        )
+        .await?;
+        Ok((
+            "applied",
+            maintenance_snapshot_digest(&resumed).map_err(anyhow::Error::msg)?,
+            tip,
+        ))
+    }
+    .await;
+
+    match result {
+        Ok((status, snapshot_sha256, tip)) => {
+            if let Some(writer) = live {
+                if apply && status == "applied" {
+                    writer.shutdown().await.map_err(|error| {
+                        repair_failure(
+                            error.into(),
+                            Some(true),
+                            "canonical-receipt-and-projection-verified-writer-shutdown-failed",
+                        )
+                    })?;
+                } else {
+                    writer.discard().await?;
+                }
+            }
+            let output = ResultRecord {
+                status,
+                thread_id: &thread,
+                root_task_id: &request.root_task_id,
+                request_sha256: &request_sha256,
+                snapshot_sha256: &snapshot_sha256,
+                history_tip: &tip,
+                live_session_modified: status == "applied",
+            };
+            println!("{}", serde_json::to_string(&output)?);
+            Ok(())
+        }
+        Err(error) => {
+            if let Some(writer) = live {
+                let _ = writer.discard().await;
+            }
+            if write_confirmed {
+                let phase = if existing_receipt_retry {
+                    "existing-canonical-receipt-projection-retry-or-verification-failed"
+                } else {
+                    "canonical-append-flushed-but-readback-or-projection-verification-failed"
+                };
+                Err(repair_failure(error, Some(true), phase))
+            } else if write_started {
+                Err(repair_failure(
+                    error,
+                    None,
+                    "append-started-outcome-unknown-discard-is-not-rollback",
+                ))
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
 pub(super) async fn run(
     codex_home: PathBuf,
     thread: String,
     request_path: PathBuf,
     apply: bool,
 ) -> Result<()> {
+    if request_path.is_absolute() {
+        let canonical = request_path
+            .canonicalize()
+            .context("request path does not resolve")?;
+        let bytes = secure_regular_file(&canonical, MAX_REQUEST_BYTES as u64)?;
+        let value: Value =
+            serde_json::from_slice(&bytes).context("maintenance request is invalid JSON")?;
+        if value["version"].as_u64() == Some(2) {
+            return run_explicit_authorized_resume(codex_home, thread, canonical, apply).await;
+        }
+    }
     let home = codex_home
         .canonicalize()
         .context("explicit CODEX_HOME does not resolve")?;
@@ -902,8 +1322,8 @@ pub(super) async fn run(
                 "latest repaired snapshot is paused again"
             );
             ensure!(
-                receipt.legacy_scope_mismatch_snapshot_sha256
-                    == request.legacy_scope_mismatch_snapshot_sha256,
+                receipt.legacy_scope_mismatch_snapshot_sha256.as_deref()
+                    == Some(request.legacy_scope_mismatch_snapshot_sha256.as_slice()),
                 "latest repair receipt mismatch set differs from this request"
             );
             ensure!(
@@ -1074,21 +1494,26 @@ pub(super) async fn run(
 
         let receipt = MaintenanceRepairReceipt {
             version: 1,
+            reason: None,
             thread_id: thread.clone(),
             root_task_id: request.root_task_id.clone(),
             request_sha256: request_sha256.clone(),
             snapshot_before_sha256: current_hash.clone(),
-            shutdown_before_snapshot_sha256: request.shutdown_before_snapshot_sha256.clone(),
-            shutdown_paused_snapshot_sha256: request.shutdown_paused_snapshot_sha256.clone(),
-            legacy_scope_mismatch_snapshot_sha256: request
-                .legacy_scope_mismatch_snapshot_sha256
-                .clone(),
+            shutdown_before_snapshot_sha256: Some(request.shutdown_before_snapshot_sha256.clone()),
+            shutdown_paused_snapshot_sha256: Some(request.shutdown_paused_snapshot_sha256.clone()),
+            legacy_scope_mismatch_snapshot_sha256: Some(
+                request.legacy_scope_mismatch_snapshot_sha256.clone(),
+            ),
             evidence: evidence.receipt.clone(),
             resume_generation_before: current_info.resume_generation,
             resume_generation_after: current_info
                 .resume_generation
                 .checked_add(1)
                 .context("resume generation overflow")?,
+            authorization_issuer: None,
+            authorization_ref: None,
+            authorization_sha256: None,
+            history_tip_before: None,
         };
         let repaired = build_maintenance_repair_snapshot(&current_value, receipt)
             .map_err(anyhow::Error::msg)?;

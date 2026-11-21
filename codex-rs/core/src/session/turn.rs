@@ -179,6 +179,8 @@ pub(crate) async fn run_turn(
 
     let mut client_session =
         prewarmed_client_session.unwrap_or_else(|| sess.services.model_client.new_session());
+    sess.remember_parent_handoff_input(&turn_context, &input)
+        .await;
     // TODO(ccunningham): Pre-turn compaction runs before context updates and the
     // new user message are recorded. Estimate pending incoming items (context
     // diffs/full reinjection + user input) and trigger compaction preemptively
@@ -192,7 +194,7 @@ pub(crate) async fn run_turn(
     .await
     {
         // Compaction runs before the new input is recorded, so preserve it on every failure.
-        run_hooks_and_record_inputs(
+        let stopped = run_hooks_and_record_inputs(
             &sess,
             &turn_context,
             &turn_context.capture_current_model_info(),
@@ -200,6 +202,17 @@ pub(crate) async fn run_turn(
             PersistContext::Standard,
         )
         .await;
+        let preserved = if stopped {
+            super::completion_persistence::parent_handoff::runtime::PreservedHandoffInput::Stopped
+        } else {
+            super::completion_persistence::parent_handoff::runtime::PreservedHandoffInput::Accepted
+        };
+        if let Err(error) = sess
+            .finalize_parent_handoff_input(&turn_context, preserved)
+            .await
+        {
+            tracing::warn!(%error, "pre-turn parent handoff blocked; original input retained");
+        }
         if matches!(err.details(), CodexErrorDetails::TurnAborted) {
             return Err(err);
         }
@@ -415,9 +428,27 @@ pub(crate) async fn run_turn(
     let mut completion_recovery_attempts = 0;
     // Although from the perspective of codex.rs, TurnDiffTracker has the lifecycle of a Task which contains
     // many turns, from the perspective of the user, it is a single turn.
+    let turn_state = {
+        let active = sess.active_turn.lock().await;
+        active.as_ref().map(|turn| Arc::clone(&turn.turn_state))
+    };
+    let inherited_tracker = if let Some(state) = &turn_state {
+        state
+            .lock()
+            .await
+            .rencrow_execution_guard
+            .take_handoff_diff_tracker()
+            .map_err(CodexErr::Fatal)?
+    } else {
+        None
+    };
     let turn_diff_tracker = Arc::new(tokio::sync::Mutex::new(
-        TurnDiffTracker::with_environment_display_roots(display_roots),
+        inherited_tracker
+            .unwrap_or_else(|| TurnDiffTracker::with_environment_display_roots(display_roots)),
     ));
+    if let Some(state) = turn_state {
+        state.lock().await.rencrow_handoff_diff_tracker = Some(Arc::clone(&turn_diff_tracker));
+    }
 
     // `ModelClientSession` is turn-scoped and caches WebSocket + sticky routing state, so we reuse
     // one instance across retries within this turn.
@@ -595,6 +626,18 @@ pub(crate) async fn run_turn(
             }
             .instrument(trace_span!("run_turn.prepare_sampling_request_input"))
             .await;
+
+            let active_turn_state = {
+                let active = sess.active_turn.lock().await;
+                active.as_ref().map(|active| Arc::clone(&active.turn_state))
+            };
+            if let Some(active_turn_state) = active_turn_state {
+                active_turn_state
+                    .lock()
+                    .await
+                    .rencrow_execution_guard
+                    .arm_fatal_on_next_budget_refusal();
+            }
 
             run_sampling_request(
                 Arc::clone(&sess),

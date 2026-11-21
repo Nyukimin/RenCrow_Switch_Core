@@ -1,4 +1,6 @@
+// Modified by RenCrow Switch Core, 2026-11-20: separate caller and host checkpoint budgets.
 // Modified by RenCrow Switch Core, 2026-09-22: handle durable compaction markers; 2026-09-28: role tool allowlist.
+// Modified 2026-11-19: validate retry bindings against the host plan-review history.
 use super::completion_review::completion_unit_obligation_is_satisfied;
 use super::input_queue::InputQueue;
 use super::mcp_refresh::McpRefresh;
@@ -879,7 +881,8 @@ impl Session {
         root_task_id: String,
         completion_state: serde_json::Value,
     ) -> Result<(), String> {
-        self.set_rencrow_completion_state_with_call_id(
+        codex_history::task_context::validate_completion_state_input_size(&completion_state)?;
+        self.install_rencrow_completion_state(
             root_task_id,
             completion_state,
             /*update_call_id*/ None,
@@ -888,6 +891,36 @@ impl Session {
     }
 
     pub(crate) async fn set_rencrow_completion_state_with_call_id(
+        &self,
+        root_task_id: String,
+        completion_state: serde_json::Value,
+        update_call_id: Option<String>,
+    ) -> Result<(), String> {
+        codex_history::task_context::validate_completion_state_input_size(&completion_state)?;
+        self.install_rencrow_completion_state(root_task_id, completion_state, update_call_id)
+            .await
+    }
+
+    pub(crate) async fn set_accepted_rencrow_completion_state(
+        &self,
+        root_task_id: String,
+        completion_state: codex_history::task_context::CompletionState,
+    ) -> Result<(), String> {
+        let encoded = serde_json::to_vec(&completion_state).map_err(|error| error.to_string())?;
+        if encoded.len() > codex_history::task_context::MAX_COMPLETION_CHECKPOINT_BYTES {
+            return Err("host completion state exceeds checkpoint size limit".into());
+        }
+        let completion_state =
+            serde_json::to_value(completion_state).map_err(|error| error.to_string())?;
+        self.install_rencrow_completion_state(
+            root_task_id,
+            completion_state,
+            /*update_call_id*/ None,
+        )
+        .await
+    }
+
+    async fn install_rencrow_completion_state(
         &self,
         root_task_id: String,
         mut completion_state: serde_json::Value,
@@ -1674,6 +1707,11 @@ impl Session {
         if completion_state.contract_revision == 0 {
             return Err("completion state requires a positive contract revision".into());
         }
+        // Retry bindings are host-owned, so validate them against the same host plan history.
+        completion_state.plan_reviews = previous_contract
+            .as_ref()
+            .map(|previous| previous.plan_reviews.clone())
+            .unwrap_or_default();
         codex_history::task_context::validate_completion_state(
             Some(&completion_state),
             &completed,
@@ -3392,6 +3430,7 @@ impl Session {
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn finish_task_check(
         &self,
         call_id: &str,
@@ -3399,12 +3438,25 @@ impl Session {
         completed: bool,
         after: Vec<crate::task_check::TaskArtifactStamp>,
     ) -> Option<crate::task_check::TaskCheckReceipt> {
-        let receipt = self
-            .state
-            .lock()
+        self.finish_task_check_observed(call_id, exit_code, completed, after, None)
             .await
-            .task_check_ledger
-            .finish(call_id, exit_code, completed, after);
+    }
+
+    pub(crate) async fn finish_task_check_observed(
+        &self,
+        call_id: &str,
+        exit_code: i32,
+        completed: bool,
+        after: Vec<crate::task_check::TaskArtifactStamp>,
+        observation: Option<crate::task_check::TaskCheckObservation>,
+    ) -> Option<crate::task_check::TaskCheckReceipt> {
+        let receipt = self.state.lock().await.task_check_ledger.finish_observed(
+            call_id,
+            exit_code,
+            completed,
+            after,
+            observation,
+        );
         if let Err(error) = self.persist_autonomous_completion_snapshot().await {
             let mut state = self.state.lock().await;
             state.rencrow_completion_paused = true;
@@ -3414,6 +3466,33 @@ impl Session {
             tracing::error!(%error, "failed to persist task verification result; autonomous completion paused");
         }
         receipt
+    }
+
+    pub(crate) async fn observe_task_check_terminal_event(&self, call_id: &str) {
+        self.state
+            .lock()
+            .await
+            .task_check_ledger
+            .observe_terminal_event(call_id);
+    }
+
+    pub(crate) async fn task_verification_diagnostics(
+        &self,
+        root_task_id: &str,
+    ) -> serde_json::Value {
+        self.state
+            .lock()
+            .await
+            .task_check_ledger
+            .diagnostics_for_root(root_task_id)
+    }
+
+    pub(crate) async fn resolved_task_check_launch_obligation_keys(&self) -> Vec<String> {
+        self.state
+            .lock()
+            .await
+            .task_check_ledger
+            .resolved_launch_obligation_keys()
     }
 
     #[cfg(test)]

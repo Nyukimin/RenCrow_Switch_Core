@@ -1,9 +1,12 @@
+// Modified by RenCrow Switch Core, 2026-11-21: audit explicit authorized native resume.
+// Modified by RenCrow Switch Core, 2026-11-20: separate caller and host checkpoint budgets.
 //! Durable host snapshots reuse the rollout envelope, outside model-written content.
-// Modified by RenCrow Switch Core, 2026-11-16.
+// Modified by RenCrow Switch Core, 2026-11-19: retain bounded restore rejection diagnostics.
 
 use super::session::Session;
 use crate::context::AutonomousCompletionSnapshot;
 use crate::context::ContextualUserFragment;
+use crate::task_check::TaskCheckAttemptStatus;
 use crate::task_check::TaskCheckLedger;
 use crate::task_check::TaskCheckSnapshot;
 use codex_history::CodexHarnessMetadata;
@@ -21,8 +24,650 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashSet;
 
-const MAX_COMPLETION_SNAPSHOT_BYTES: usize = 256 * 1024;
+#[path = "completion_review_retry_restore.rs"]
+mod completion_review_retry_restore;
+
+#[path = "parent_handoff.rs"]
+pub(crate) mod parent_handoff;
+
+const MAX_COMPLETION_SNAPSHOT_BYTES: usize =
+    codex_history::task_context::MAX_COMPLETION_CHECKPOINT_BYTES;
 const MAX_COMPLETION_TASK_CHECKS: usize = 256;
+
+#[derive(Clone)]
+struct CanonicalTaskCheckEvent {
+    ordinal: usize,
+    thread_id: String,
+    call_id: String,
+    command: Vec<String>,
+    cwd: std::path::PathBuf,
+    status: codex_protocol::items::CommandExecutionStatus,
+    exit_code: Option<i32>,
+    stdout: Option<String>,
+    stderr: Option<String>,
+    aggregated_output: Option<String>,
+}
+
+fn canonical_task_check_events(
+    items: &[RolloutItem],
+) -> std::collections::HashMap<String, Vec<CanonicalTaskCheckEvent>> {
+    let mut events = std::collections::HashMap::<String, Vec<CanonicalTaskCheckEvent>>::new();
+    for (ordinal, item) in items.iter().enumerate() {
+        let RolloutItem::EventMsg(EventMsg::ItemCompleted(event)) = item else {
+            continue;
+        };
+        let codex_protocol::items::TurnItem::CommandExecution(command) = &event.item else {
+            continue;
+        };
+        events
+            .entry(command.id.clone())
+            .or_default()
+            .push(CanonicalTaskCheckEvent {
+                ordinal,
+                thread_id: event.thread_id.to_string(),
+                call_id: command.id.clone(),
+                command: command.command.clone(),
+                cwd: command.cwd.to_path_buf(),
+                status: command.status,
+                exit_code: command.exit_code,
+                stdout: command.stdout.clone(),
+                stderr: command.stderr.clone(),
+                aggregated_output: command.aggregated_output.clone(),
+            });
+    }
+    events
+}
+
+fn event_observation_for_receipt(
+    event: &CanonicalTaskCheckEvent,
+    thread_id: &str,
+    receipt: &crate::task_check::TaskCheckReceipt,
+    source: bool,
+) -> Option<crate::task_check::TaskCheckObservation> {
+    let expected_status = if source {
+        codex_protocol::items::CommandExecutionStatus::Failed
+    } else {
+        codex_protocol::items::CommandExecutionStatus::Completed
+    };
+    let expected_exit = if source { receipt.exit_code } else { 0 };
+    let output = event.aggregated_output.as_deref()?;
+    if event.thread_id != thread_id
+        || event.call_id != receipt.call_id
+        || event.status != expected_status
+        || event.exit_code != Some(expected_exit)
+        || receipt.workspace_root != std::fs::canonicalize(&event.cwd).ok()?
+        || event.stdout.as_deref() != Some(output)
+        || event.stderr.as_deref() != Some("")
+        || (source && (receipt.succeeded || !receipt.completed || receipt.exit_code == -1))
+        || (!source && (!receipt.succeeded || !receipt.completed))
+    {
+        return None;
+    }
+    let observation = crate::task_check::TaskCheckObservation::from_execution(
+        &event.call_id,
+        &event.command,
+        &event.cwd,
+        output,
+        expected_exit,
+        true,
+        false,
+    );
+    Some(observation)
+}
+
+fn task_check_observations_match(
+    stored: &crate::task_check::TaskCheckObservation,
+    event: &crate::task_check::TaskCheckObservation,
+) -> bool {
+    stored.command == event.command
+        && stored.cwd == event.cwd
+        && stored.diagnostic_excerpt == event.diagnostic_excerpt
+        && stored.diagnostic_sha256 == event.diagnostic_sha256
+        && stored.diagnostic_complete == event.diagnostic_complete
+        && stored.diagnostic_truncated == event.diagnostic_truncated
+        && stored.output_ref == event.output_ref
+        && stored.launch_failure == event.launch_failure
+}
+
+fn correction_matches_retained_events(
+    source: &TaskCheckSnapshot,
+    target: &TaskCheckSnapshot,
+    events: &std::collections::HashMap<String, Vec<CanonicalTaskCheckEvent>>,
+    thread_id: &str,
+    latest_snapshot_ordinal: usize,
+) -> bool {
+    let Some(correction) = source.attempt.launch_correction.as_ref() else {
+        return true;
+    };
+    let (
+        crate::task_check::TaskCheckAttemptStatus::Finished(source_receipt),
+        crate::task_check::TaskCheckAttemptStatus::Finished(target_receipt),
+    ) = (&source.attempt.status, &target.attempt.status)
+    else {
+        return false;
+    };
+    if source.attempt.resolved_by.as_deref() != Some(target.attempt.call_id.as_str())
+        || correction.target_call_id != target.attempt.call_id
+        || correction.proof_ref != source.attempt.call_id
+        || correction.target_cwd != target_receipt.workspace_root
+        || source.attempt.call_id == target.attempt.call_id
+    {
+        return false;
+    }
+    let Some(source_event_list) = events.get(&source.attempt.call_id) else {
+        return false;
+    };
+    let Some(target_event_list) = events.get(&target.attempt.call_id) else {
+        return false;
+    };
+    if source_event_list.len() != 1 || target_event_list.len() != 1 {
+        return false;
+    }
+    let source_event = &source_event_list[0];
+    let target_event = &target_event_list[0];
+    let Some(source_observation) = source_receipt.observation.as_ref() else {
+        return false;
+    };
+    let Some(observed_source) =
+        event_observation_for_receipt(source_event, thread_id, source_receipt, true)
+    else {
+        return false;
+    };
+    if !task_check_observations_match(source_observation, &observed_source) {
+        return false;
+    }
+    let Some(observed_target) =
+        event_observation_for_receipt(target_event, thread_id, target_receipt, false)
+    else {
+        return false;
+    };
+    if observed_target.diagnostic_truncated
+        || !observed_target.diagnostic_complete
+        || observed_target.command != correction.target_command
+        || observed_target.cwd != correction.target_cwd
+        || observed_target.diagnostic_sha256 != correction.target_output_sha256
+        || observed_target.output_ref != correction.target_output_ref
+    {
+        return false;
+    }
+    source_event.ordinal < target_event.ordinal && target_event.ordinal < latest_snapshot_ordinal
+}
+
+fn task_check_snapshot_without_latest(snapshot: &TaskCheckSnapshot) -> Option<Value> {
+    let mut snapshot = snapshot.clone();
+    snapshot.latest = false;
+    serde_json::to_value(snapshot).ok()
+}
+
+fn unique_imported_check<'a>(
+    imported: &'a [TaskCheckSnapshot],
+    call_id: &str,
+) -> Option<&'a TaskCheckSnapshot> {
+    let mut matches = imported
+        .iter()
+        .filter(|snapshot| snapshot.attempt.call_id == call_id);
+    let first = matches.next()?;
+    matches.next().is_none().then_some(first)
+}
+
+fn imported_resolved_launch_pair_matches(
+    source: &TaskCheckSnapshot,
+    target: &TaskCheckSnapshot,
+    imported: &[TaskCheckSnapshot],
+) -> bool {
+    let Some(correction) = source.attempt.launch_correction.as_ref() else {
+        return false;
+    };
+    if source.attempt.resolved_by.as_deref() != Some(correction.target_call_id.as_str())
+        || correction.target_call_id != target.attempt.call_id
+        || correction.proof_ref != source.attempt.call_id
+    {
+        return false;
+    }
+    let Some(imported_source) = unique_imported_check(imported, &source.attempt.call_id) else {
+        return false;
+    };
+    let Some(imported_target) = unique_imported_check(imported, &target.attempt.call_id) else {
+        return false;
+    };
+    let Some(imported_correction) = imported_source.attempt.launch_correction.as_ref() else {
+        return false;
+    };
+    imported_source.attempt.resolved_by.as_deref()
+        == Some(imported_correction.target_call_id.as_str())
+        && imported_correction.target_call_id == imported_target.attempt.call_id
+        && imported_correction.proof_ref == imported_source.attempt.call_id
+        && task_check_snapshot_without_latest(source)
+            == task_check_snapshot_without_latest(imported_source)
+        && task_check_snapshot_without_latest(target)
+            == task_check_snapshot_without_latest(imported_target)
+}
+
+fn imported_unresolved_launch_source_matches(
+    source: &TaskCheckSnapshot,
+    imported: &[TaskCheckSnapshot],
+) -> bool {
+    if source.attempt.resolved_by.is_some() || source.attempt.launch_correction.is_some() {
+        return false;
+    }
+    let Some(imported_source) = unique_imported_check(imported, &source.attempt.call_id) else {
+        return false;
+    };
+    if imported_source.attempt.resolved_by.is_some()
+        || imported_source.attempt.launch_correction.is_some()
+    {
+        return false;
+    }
+    imported_launch_source_facts_match(source, imported_source)
+}
+
+fn imported_launch_source_facts_match(
+    source: &TaskCheckSnapshot,
+    imported_source: &TaskCheckSnapshot,
+) -> bool {
+    let (
+        TaskCheckAttemptStatus::Finished(source_receipt),
+        TaskCheckAttemptStatus::Finished(imported_receipt),
+    ) = (&source.attempt.status, &imported_source.attempt.status)
+    else {
+        return false;
+    };
+    source.task_id == imported_source.task_id
+        && source.task_revision == imported_source.task_revision
+        && source.attempt.call_id == imported_source.attempt.call_id
+        && !source_receipt.succeeded
+        && source_receipt.completed
+        && source_receipt.exit_code != 0
+        && source_receipt.exit_code != -1
+        && source_receipt
+            .observation
+            .as_ref()
+            .is_some_and(|observation| {
+                observation.diagnostic_complete
+                    && !observation.diagnostic_truncated
+                    && observation.launch_failure.is_some()
+            })
+        && serde_json::to_value(source_receipt).ok() == serde_json::to_value(imported_receipt).ok()
+        && serde_json::to_value(&source.obligation).ok()
+            == serde_json::to_value(&imported_source.obligation).ok()
+}
+
+#[derive(Clone, Copy)]
+struct ImportedTaskCheckProjection<'a> {
+    sha256: &'a str,
+    snapshot_ordinal: usize,
+    checks: &'a [TaskCheckSnapshot],
+}
+
+#[derive(Default)]
+struct TaskCheckLaunchReconcileSeed {
+    terminal_event_orders: Vec<(String, u64)>,
+    imported_preflight_failures: Vec<(String, String)>,
+}
+
+fn imported_source_local_target_correction_matches(
+    source: &TaskCheckSnapshot,
+    target: &TaskCheckSnapshot,
+    imported: &ImportedTaskCheckProjection<'_>,
+    events: &std::collections::HashMap<String, Vec<CanonicalTaskCheckEvent>>,
+    thread_id: &str,
+    latest_snapshot_ordinal: usize,
+) -> bool {
+    let Some(correction) = source.attempt.launch_correction.as_ref() else {
+        return false;
+    };
+    if correction.source_handoff_projection_sha256.as_deref() != Some(imported.sha256)
+        || correction.source_event_ordinal.is_some()
+        || correction.target_event_ordinal.is_some()
+        || source.attempt.resolved_by.as_deref() != Some(target.attempt.call_id.as_str())
+        || correction.target_call_id != target.attempt.call_id
+        || correction.proof_ref != source.attempt.call_id
+        || events.contains_key(&source.attempt.call_id)
+    {
+        return false;
+    }
+    let Some(imported_source) = unique_imported_check(imported.checks, &source.attempt.call_id)
+    else {
+        return false;
+    };
+    if imported_source.attempt.resolved_by.is_some()
+        || imported_source.attempt.launch_correction.is_some()
+        || !imported_unresolved_launch_source_matches(imported_source, imported.checks)
+        || !imported_launch_source_facts_match(source, imported_source)
+    {
+        return false;
+    }
+    let Some(target_events) = events.get(&target.attempt.call_id) else {
+        return false;
+    };
+    if target_events.len() != 1 {
+        return false;
+    }
+    let event = &target_events[0];
+    if event.ordinal <= imported.snapshot_ordinal || event.ordinal >= latest_snapshot_ordinal {
+        return false;
+    }
+    let TaskCheckAttemptStatus::Finished(target_receipt) = &target.attempt.status else {
+        return false;
+    };
+    let Some(observation) = event_observation_for_receipt(event, thread_id, target_receipt, false)
+    else {
+        return false;
+    };
+    !observation.diagnostic_truncated
+        && observation.diagnostic_complete
+        && observation.command == correction.target_command
+        && observation.cwd == correction.target_cwd
+        && observation.diagnostic_sha256 == correction.target_output_sha256
+        && observation.output_ref == correction.target_output_ref
+}
+
+fn revalidate_persisted_task_check_corrections(
+    latest: &mut [TaskCheckSnapshot],
+    events: &std::collections::HashMap<String, Vec<CanonicalTaskCheckEvent>>,
+    thread_id: &str,
+    latest_snapshot_ordinal: usize,
+    imported_projection: Option<&ImportedTaskCheckProjection<'_>>,
+) {
+    let entries = latest.to_vec();
+    for source in latest.iter_mut() {
+        if source.attempt.launch_correction.is_none() {
+            continue;
+        }
+        let target_call_id = source.attempt.resolved_by.clone().unwrap_or_default();
+        let Some(target) = entries
+            .iter()
+            .find(|entry| entry.attempt.call_id == target_call_id)
+        else {
+            source.attempt.launch_correction = None;
+            source.attempt.resolved_by = None;
+            continue;
+        };
+        let local_events_valid = correction_matches_retained_events(
+            source,
+            target,
+            events,
+            thread_id,
+            latest_snapshot_ordinal,
+        );
+        let imported_pair_valid = imported_projection.is_some_and(|imported| {
+            !events.contains_key(&source.attempt.call_id)
+                && !events.contains_key(&target.attempt.call_id)
+                && imported_resolved_launch_pair_matches(source, target, imported.checks)
+        });
+        let imported_source_local_target_valid = imported_projection.is_some_and(|imported| {
+            imported_source_local_target_correction_matches(
+                source,
+                target,
+                imported,
+                events,
+                thread_id,
+                latest_snapshot_ordinal,
+            )
+        });
+        if !local_events_valid && !imported_pair_valid && !imported_source_local_target_valid {
+            source.attempt.launch_correction = None;
+            source.attempt.resolved_by = None;
+        } else if local_events_valid
+            && let Some(correction) = source.attempt.launch_correction.as_mut()
+            && let (Some(source_event), Some(target_event)) = (
+                events
+                    .get(&source.attempt.call_id)
+                    .and_then(|events| events.first()),
+                events
+                    .get(&target.attempt.call_id)
+                    .and_then(|events| events.first()),
+            )
+        {
+            correction.source_event_ordinal = Some(source_event.ordinal as u64);
+            correction.target_event_ordinal = Some(target_event.ordinal as u64);
+        }
+    }
+}
+
+fn reconcile_task_check_launch_failures(
+    latest: &mut Vec<TaskCheckSnapshot>,
+    prior_snapshots: &[(usize, Vec<TaskCheckSnapshot>)],
+    events: &std::collections::HashMap<String, Vec<CanonicalTaskCheckEvent>>,
+    thread_id: &str,
+    latest_snapshot_ordinal: usize,
+    imported_projection: Option<&ImportedTaskCheckProjection<'_>>,
+) -> TaskCheckLaunchReconcileSeed {
+    revalidate_persisted_task_check_corrections(
+        latest,
+        events,
+        thread_id,
+        latest_snapshot_ordinal,
+        imported_projection,
+    );
+    let retained_latest_call_ids = latest
+        .iter()
+        .map(|snapshot| snapshot.attempt.call_id.clone())
+        .collect::<std::collections::HashSet<_>>();
+    let mut ledger = TaskCheckLedger::default();
+    for source in latest.iter_mut() {
+        let Some(event_list) = events.get(&source.attempt.call_id) else {
+            continue;
+        };
+        if event_list.len() != 1 {
+            continue;
+        }
+        let Some(crate::task_check::TaskCheckAttemptStatus::Finished(receipt)) =
+            Some(&source.attempt.status)
+        else {
+            continue;
+        };
+        if receipt.succeeded
+            || !receipt.completed
+            || receipt.exit_code == 0
+            || receipt.exit_code == -1
+        {
+            continue;
+        }
+        let Some(observation) =
+            event_observation_for_receipt(&event_list[0], thread_id, receipt, true)
+        else {
+            continue;
+        };
+        if receipt.observation.is_none()
+            && let crate::task_check::TaskCheckAttemptStatus::Finished(receipt) =
+                &mut source.attempt.status
+        {
+            receipt.observation = Some(Box::new(observation));
+        }
+    }
+    if ledger.restore_snapshot(latest.clone()).is_err() {
+        return TaskCheckLaunchReconcileSeed::default();
+    }
+    if let Some(imported) = imported_projection {
+        let imported_sources = latest
+            .iter()
+            .filter(|source| {
+                !events.contains_key(&source.attempt.call_id)
+                    && imported.snapshot_ordinal <= latest_snapshot_ordinal
+                    && imported_unresolved_launch_source_matches(source, imported.checks)
+            })
+            .map(|source| (source.attempt.call_id.clone(), imported.sha256.to_owned()))
+            .collect();
+        ledger.seed_imported_preflight_launch_failures(imported_sources);
+    }
+    let source_attempts = latest.clone();
+    for source in source_attempts {
+        if source.attempt.resolved_by.is_some() || source.attempt.launch_correction.is_some() {
+            continue;
+        }
+        let Some(crate::task_check::TaskCheckAttemptStatus::Finished(source_receipt)) =
+            Some(&source.attempt.status)
+        else {
+            continue;
+        };
+        let Some(source_observation) = source_receipt.observation.as_ref() else {
+            continue;
+        };
+        let Some(kind) = source_observation.launch_failure.clone() else {
+            continue;
+        };
+        let local_source_ordinal = match events.get(&source.attempt.call_id) {
+            Some(source_event_list)
+                if source_event_list.len() == 1
+                    && source_event_list[0].ordinal < latest_snapshot_ordinal =>
+            {
+                let Some(event_observation) = event_observation_for_receipt(
+                    &source_event_list[0],
+                    thread_id,
+                    source_receipt,
+                    true,
+                ) else {
+                    continue;
+                };
+                if !task_check_observations_match(source_observation, &event_observation) {
+                    continue;
+                }
+                Some(source_event_list[0].ordinal)
+            }
+            Some(_) => continue,
+            None => None,
+        };
+        let imported_source = if local_source_ordinal.is_none() {
+            let Some(imported) = imported_projection else {
+                continue;
+            };
+            if imported.snapshot_ordinal > latest_snapshot_ordinal
+                || !imported_unresolved_launch_source_matches(&source, imported.checks)
+            {
+                continue;
+            }
+            Some((imported.sha256, imported.snapshot_ordinal))
+        } else {
+            None
+        };
+        let source_call_id = source.attempt.call_id.clone();
+        let source_task_id = source.task_id.clone();
+        let source_task_revision = source.task_revision;
+        let mut target_candidates = prior_snapshots
+            .iter()
+            .filter(|(snapshot_ordinal, _)| *snapshot_ordinal <= latest_snapshot_ordinal)
+            .flat_map(|(snapshot_ordinal, snapshots)| {
+                let source_task_id = source_task_id.clone();
+                snapshots
+                    .iter()
+                    .filter(move |candidate| {
+                        candidate.task_id == source_task_id
+                            && candidate.task_revision == source_task_revision
+                            && matches!(
+                                &candidate.attempt.status,
+                                crate::task_check::TaskCheckAttemptStatus::Finished(receipt)
+                                    if receipt.succeeded
+                            )
+                    })
+                    .map(move |candidate| (*snapshot_ordinal, candidate.clone()))
+            })
+            .filter_map(|(snapshot_ordinal, candidate)| {
+                let target_events = events.get(&candidate.attempt.call_id)?;
+                if target_events.len() != 1 {
+                    return None;
+                }
+                let event = &target_events[0];
+                let source_precedes_target = local_source_ordinal
+                    .is_some_and(|source_ordinal| event.ordinal > source_ordinal)
+                    || imported_source
+                        .is_some_and(|(_, projection_ordinal)| event.ordinal > projection_ordinal);
+                if !source_precedes_target
+                    || event.ordinal >= latest_snapshot_ordinal
+                    || event.status != codex_protocol::items::CommandExecutionStatus::Completed
+                {
+                    return None;
+                }
+                let crate::task_check::TaskCheckAttemptStatus::Finished(receipt) =
+                    &candidate.attempt.status
+                else {
+                    return None;
+                };
+                let observation = event_observation_for_receipt(event, thread_id, receipt, false)?;
+                if observation.diagnostic_truncated || !observation.diagnostic_complete {
+                    return None;
+                }
+                let correction = crate::task_check::TaskCheckLaunchCorrection {
+                    kind: kind.clone(),
+                    target_call_id: candidate.attempt.call_id.clone(),
+                    source_event_ordinal: local_source_ordinal.map(|ordinal| ordinal as u64),
+                    target_event_ordinal: local_source_ordinal.map(|_| event.ordinal as u64),
+                    source_handoff_projection_sha256: imported_source
+                        .map(|(projection_sha256, _)| projection_sha256.to_owned()),
+                    proof_ref: source_call_id.clone(),
+                    target_command: observation.command,
+                    target_cwd: observation.cwd,
+                    target_output_sha256: observation.diagnostic_sha256,
+                    target_output_ref: observation.output_ref,
+                };
+                Some((event.ordinal, snapshot_ordinal, candidate, correction))
+            })
+            .collect::<Vec<_>>();
+        target_candidates.sort_by_key(|(event, snapshot, candidate, _)| {
+            (*event, *snapshot, candidate.attempt.call_id.clone())
+        });
+        for (_, _, target, correction) in target_candidates {
+            if ledger.apply_launch_correction(&source_call_id, target, correction) {
+                break;
+            }
+        }
+    }
+    *latest = ledger.snapshot_with_references(&retained_latest_call_ids);
+    let local_event_orders = latest
+        .iter()
+        .filter_map(|source| {
+            if source.attempt.resolved_by.is_some() || source.attempt.launch_correction.is_some() {
+                return None;
+            }
+            let crate::task_check::TaskCheckAttemptStatus::Finished(receipt) =
+                &source.attempt.status
+            else {
+                return None;
+            };
+            if receipt.succeeded
+                || !receipt.completed
+                || receipt.exit_code == 0
+                || receipt.exit_code == -1
+            {
+                return None;
+            }
+            let observation = receipt.observation.as_ref()?;
+            observation.launch_failure.as_ref()?;
+            let source_events = events.get(&source.attempt.call_id)?;
+            if source_events.len() != 1 || source_events[0].ordinal >= latest_snapshot_ordinal {
+                return None;
+            }
+            let event_observation =
+                event_observation_for_receipt(&source_events[0], thread_id, receipt, true)?;
+            task_check_observations_match(observation, &event_observation).then(|| {
+                (
+                    source.attempt.call_id.clone(),
+                    source_events[0].ordinal as u64,
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    let imported_launch_failures = imported_projection
+        .into_iter()
+        .flat_map(|imported| {
+            latest.iter().filter_map(move |source| {
+                if source.attempt.resolved_by.is_some()
+                    || source.attempt.launch_correction.is_some()
+                    || events.contains_key(&source.attempt.call_id)
+                    || imported.snapshot_ordinal > latest_snapshot_ordinal
+                    || !imported_unresolved_launch_source_matches(source, imported.checks)
+                {
+                    return None;
+                }
+                Some((source.attempt.call_id.clone(), imported.sha256.to_owned()))
+            })
+        })
+        .collect::<Vec<_>>();
+    TaskCheckLaunchReconcileSeed {
+        terminal_event_orders: local_event_orders,
+        imported_preflight_failures: imported_launch_failures,
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -36,16 +681,42 @@ pub struct MaintenanceRepairEvidenceDigest {
 #[serde(deny_unknown_fields)]
 pub struct MaintenanceRepairReceipt {
     pub version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<MaintenanceRepairReason>,
     pub thread_id: String,
     pub root_task_id: String,
     pub request_sha256: String,
     pub snapshot_before_sha256: String,
-    pub shutdown_before_snapshot_sha256: String,
-    pub shutdown_paused_snapshot_sha256: String,
-    pub legacy_scope_mismatch_snapshot_sha256: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shutdown_before_snapshot_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shutdown_paused_snapshot_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_scope_mismatch_snapshot_sha256: Option<Vec<String>>,
     pub evidence: Vec<MaintenanceRepairEvidenceDigest>,
     pub resume_generation_before: u64,
     pub resume_generation_after: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization_issuer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_tip_before: Option<MaintenanceRepairHistoryTip>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MaintenanceRepairReason {
+    ExplicitAuthorizedResume,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MaintenanceRepairHistoryTip {
+    pub ordinal: u64,
+    pub sha256: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -141,29 +812,49 @@ fn validate_repair_receipt(
     ];
     let unique_hashes = receipt
         .legacy_scope_mismatch_snapshot_sha256
-        .iter()
+        .as_ref()
+        .into_iter()
+        .flatten()
         .collect::<BTreeSet<_>>();
     let unique_kinds = receipt
         .evidence
         .iter()
         .map(|evidence| evidence.kind.as_str())
         .collect::<BTreeSet<_>>();
-    if receipt.version != 1
-        || receipt.thread_id != expected_thread_id
+    let common_invalid = receipt.thread_id != expected_thread_id
         || receipt.thread_id != snapshot.thread_id
         || receipt.root_task_id != snapshot.root_task_id
         || receipt.request_sha256.is_empty()
         || !is_sha256(&receipt.request_sha256)
         || !is_sha256(&receipt.snapshot_before_sha256)
-        || !is_sha256(&receipt.shutdown_before_snapshot_sha256)
-        || !is_sha256(&receipt.shutdown_paused_snapshot_sha256)
-        || receipt.legacy_scope_mismatch_snapshot_sha256.is_empty()
-        || receipt.legacy_scope_mismatch_snapshot_sha256.len() > 32
-        || unique_hashes.len() != receipt.legacy_scope_mismatch_snapshot_sha256.len()
+        || receipt.resume_generation_before.checked_add(1) != Some(receipt.resume_generation_after)
+        || receipt.resume_generation_after != snapshot.resume_generation
+        || snapshot.state.paused;
+    let shutdown_invalid = receipt.reason.is_some()
+        || receipt.authorization_issuer.is_some()
+        || receipt.authorization_ref.is_some()
+        || receipt.authorization_sha256.is_some()
+        || receipt.history_tip_before.is_some()
+        || !receipt
+            .shutdown_before_snapshot_sha256
+            .as_deref()
+            .is_some_and(is_sha256)
+        || !receipt
+            .shutdown_paused_snapshot_sha256
+            .as_deref()
+            .is_some_and(is_sha256)
         || receipt
             .legacy_scope_mismatch_snapshot_sha256
-            .iter()
-            .any(|hash| !is_sha256(hash))
+            .as_ref()
+            .is_none_or(Vec::is_empty)
+        || receipt
+            .legacy_scope_mismatch_snapshot_sha256
+            .as_ref()
+            .is_some_and(|hashes| {
+                hashes.len() > 32
+                    || unique_hashes.len() != hashes.len()
+                    || hashes.iter().any(|hash| !is_sha256(hash))
+            })
         || receipt.evidence.len() != allowed_kinds.len()
         || unique_kinds.len() != allowed_kinds.len()
         || receipt.evidence.iter().any(|evidence| {
@@ -171,11 +862,35 @@ fn validate_repair_receipt(
                 || evidence.path.trim().is_empty()
                 || evidence.sha256.is_empty()
                 || !is_sha256(&evidence.sha256)
-        })
-        || receipt.resume_generation_before.checked_add(1) != Some(receipt.resume_generation_after)
-        || receipt.resume_generation_after != snapshot.resume_generation
-        || snapshot.state.paused
-    {
+        });
+    let authorized_resume_invalid = receipt.reason
+        != Some(MaintenanceRepairReason::ExplicitAuthorizedResume)
+        || receipt.shutdown_before_snapshot_sha256.is_some()
+        || receipt.shutdown_paused_snapshot_sha256.is_some()
+        || receipt.legacy_scope_mismatch_snapshot_sha256.is_some()
+        || !receipt.evidence.is_empty()
+        || receipt
+            .authorization_issuer
+            .as_deref()
+            .is_none_or(|issuer| issuer.trim().is_empty())
+        || receipt
+            .authorization_ref
+            .as_deref()
+            .is_none_or(|reference| reference.trim().is_empty())
+        || !receipt
+            .authorization_sha256
+            .as_deref()
+            .is_some_and(is_sha256)
+        || receipt
+            .history_tip_before
+            .as_ref()
+            .is_none_or(|tip| !is_sha256(&tip.sha256));
+    let variant_invalid = match receipt.version {
+        1 => shutdown_invalid,
+        2 => authorized_resume_invalid,
+        _ => true,
+    };
+    if common_invalid || variant_invalid {
         return Err("maintenance repair receipt is invalid".into());
     }
     Ok(())
@@ -221,13 +936,14 @@ fn validate_snapshot_payload(
                     .is_some_and(|scope| scope.same_execution(&attempt.scope))
                 || attempt.paths.len() > 16
         })
-        || codex_history::task_context::validate_completion_state_snapshot(
-            Some(&snapshot.state),
-            receipts,
-        )
-        .is_err()
     {
         return Err("completion snapshot payload is invalid".into());
+    }
+    if let Err(error) = codex_history::task_context::validate_completion_state_snapshot(
+        Some(&snapshot.state),
+        receipts,
+    ) {
+        return Err(format!("completion state validation failed: {error}"));
     }
     let mut ledger = TaskCheckLedger::default();
     ledger.restore_snapshot(snapshot.task_checks.clone())?;
@@ -969,6 +1685,29 @@ pub fn build_maintenance_repair_snapshot(
     current_value: &Value,
     receipt: MaintenanceRepairReceipt,
 ) -> Result<Value, String> {
+    if receipt.version != 1 || receipt.reason.is_some() {
+        return Err("shutdown maintenance repair requires its version 1 receipt".into());
+    }
+    build_resume_snapshot(current_value, receipt)
+}
+
+/// Build a generation-bumped resume authorized by an explicit host user continuation.
+pub fn build_explicit_authorized_resume_snapshot(
+    current_value: &Value,
+    receipt: MaintenanceRepairReceipt,
+) -> Result<Value, String> {
+    if receipt.version != 2
+        || receipt.reason != Some(MaintenanceRepairReason::ExplicitAuthorizedResume)
+    {
+        return Err("explicit authorized resume requires its version 2 receipt".into());
+    }
+    build_resume_snapshot(current_value, receipt)
+}
+
+fn build_resume_snapshot(
+    current_value: &Value,
+    receipt: MaintenanceRepairReceipt,
+) -> Result<Value, String> {
     let mut snapshot = serde_json::from_value::<Snapshot>(current_value.clone())
         .map_err(|error| format!("current completion snapshot is malformed: {error}"))?;
     let current_sha256 = maintenance_snapshot_digest(current_value)?;
@@ -1005,49 +1744,79 @@ fn maintenance_receipt_matches_history(
     repair_value: &Value,
     host_snapshots: &BTreeMap<String, Value>,
 ) -> bool {
-    let Some(shutdown_before) = host_snapshots.get(&receipt.shutdown_before_snapshot_sha256) else {
-        return false;
-    };
-    let Some(shutdown_paused) = host_snapshots.get(&receipt.shutdown_paused_snapshot_sha256) else {
-        return false;
-    };
     let Some(paused_current) = host_snapshots.get(&receipt.snapshot_before_sha256) else {
         return false;
     };
-    let Ok(before_snapshot) = serde_json::from_value::<Snapshot>(shutdown_before.clone()) else {
-        return false;
-    };
-    let Ok(paused_snapshot) = serde_json::from_value::<Snapshot>(shutdown_paused.clone()) else {
+    let Ok(paused_snapshot) = serde_json::from_value::<Snapshot>(paused_current.clone()) else {
         return false;
     };
     let Ok(repair_snapshot) = serde_json::from_value::<Snapshot>(repair_value.clone()) else {
         return false;
     };
-    if before_snapshot.state.paused
-        || !paused_snapshot.state.paused
-        || before_snapshot.thread_id != paused_snapshot.thread_id
-        || before_snapshot.root_task_id != paused_snapshot.root_task_id
-        || before_snapshot.state.contract_revision != paused_snapshot.state.contract_revision
-        || before_snapshot.resume_generation != paused_snapshot.resume_generation
-        || receipt.thread_id != before_snapshot.thread_id
-        || receipt.root_task_id != before_snapshot.root_task_id
+    if !paused_snapshot.state.paused
+        || repair_snapshot.state.paused
+        || receipt.thread_id != paused_snapshot.thread_id
+        || receipt.root_task_id != paused_snapshot.root_task_id
+        || receipt.resume_generation_before != paused_snapshot.resume_generation
+        || receipt.resume_generation_after != repair_snapshot.resume_generation
     {
         return false;
     }
-    let mut expected_paused = shutdown_before.clone();
-    let Some(paused_flag) = expected_paused
-        .get_mut("state")
-        .and_then(Value::as_object_mut)
-        .and_then(|state| state.get_mut("paused"))
-    else {
-        return false;
+    let expected_repair = match receipt.version {
+        1 => {
+            let Some(shutdown_before_hash) = receipt.shutdown_before_snapshot_sha256.as_deref()
+            else {
+                return false;
+            };
+            let Some(shutdown_paused_hash) = receipt.shutdown_paused_snapshot_sha256.as_deref()
+            else {
+                return false;
+            };
+            let Some(shutdown_before) = host_snapshots.get(shutdown_before_hash) else {
+                return false;
+            };
+            let Some(shutdown_paused) = host_snapshots.get(shutdown_paused_hash) else {
+                return false;
+            };
+            let Ok(before_snapshot) = serde_json::from_value::<Snapshot>(shutdown_before.clone())
+            else {
+                return false;
+            };
+            let Ok(shutdown_paused_snapshot) =
+                serde_json::from_value::<Snapshot>(shutdown_paused.clone())
+            else {
+                return false;
+            };
+            if before_snapshot.state.paused
+                || !shutdown_paused_snapshot.state.paused
+                || before_snapshot.thread_id != shutdown_paused_snapshot.thread_id
+                || before_snapshot.root_task_id != shutdown_paused_snapshot.root_task_id
+                || before_snapshot.state.contract_revision
+                    != shutdown_paused_snapshot.state.contract_revision
+                || before_snapshot.resume_generation != shutdown_paused_snapshot.resume_generation
+                || receipt.thread_id != before_snapshot.thread_id
+                || receipt.root_task_id != before_snapshot.root_task_id
+            {
+                return false;
+            }
+            let mut expected_paused = shutdown_before.clone();
+            let Some(paused_flag) = expected_paused
+                .get_mut("state")
+                .and_then(Value::as_object_mut)
+                .and_then(|state| state.get_mut("paused"))
+            else {
+                return false;
+            };
+            *paused_flag = Value::Bool(true);
+            if expected_paused != *shutdown_paused {
+                return false;
+            }
+            build_maintenance_repair_snapshot(paused_current, receipt.clone())
+        }
+        2 => build_explicit_authorized_resume_snapshot(paused_current, receipt.clone()),
+        _ => return false,
     };
-    *paused_flag = Value::Bool(true);
-    if expected_paused != *shutdown_paused {
-        return false;
-    }
-    let Ok(expected_repair) = build_maintenance_repair_snapshot(paused_current, receipt.clone())
-    else {
+    let Ok(expected_repair) = expected_repair else {
         return false;
     };
     expected_repair == *repair_value
@@ -1055,7 +1824,7 @@ fn maintenance_receipt_matches_history(
         && repair_snapshot.resume_generation == paused_snapshot.resume_generation.saturating_add(1)
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Snapshot {
     version: u32,
@@ -1870,11 +2639,29 @@ impl Session {
                 ));
             }
         };
-        self.state
-            .lock()
-            .await
-            .history
-            .record_annotated_items(&[item], TruncationPolicy::Tokens(1024));
+        {
+            let mut state = self.state.lock().await;
+            let task = crate::compact::latest_task_state_in_history(
+                state.history.annotated_items(),
+                &self.thread_id().to_string(),
+            )
+            .ok()
+            .flatten();
+            let mut proofs = parent_handoff::proof_closure(
+                &serde_json::to_value(&snapshot).map_err(|e| e.to_string())?,
+                &state.rencrow_completion_handoff_proofs,
+                task.as_ref(),
+            )
+            .unwrap_or_default();
+            proofs.insert(
+                snapshot_sha256.clone(),
+                serde_json::to_value(&snapshot).map_err(|e| e.to_string())?,
+            );
+            state.rencrow_completion_handoff_proofs = proofs;
+            state
+                .history
+                .record_annotated_items(&[item], TruncationPolicy::Tokens(1024));
+        }
         if !durable_snapshot_written {
             return Ok(());
         }
@@ -1933,6 +2720,9 @@ impl Session {
     pub(crate) async fn restore_autonomous_completion_snapshot(&self, items: &[RolloutItem]) {
         let mut restored: Option<(String, CompletionState)> = None;
         let mut restored_checks = None;
+        let mut restored_task_check_event_orders = Vec::new();
+        let mut restored_imported_preflight_launch_failures = Vec::new();
+        let mut validated_task_check_snapshots = Vec::<(usize, Vec<TaskCheckSnapshot>)>::new();
         let mut restored_scope = None;
         let mut restored_patches = Vec::new();
         let mut restored_children = Vec::new();
@@ -1962,7 +2752,12 @@ impl Session {
                 let snapshot = serde_json::from_value::<Snapshot>(value.clone()).ok()?;
                 let receipt = snapshot.maintenance_repair_receipt.as_ref()?;
                 validate_repair_receipt(receipt, &snapshot, &self.thread_id().to_string()).ok()?;
-                Some(receipt.legacy_scope_mismatch_snapshot_sha256.clone())
+                Some(
+                    receipt
+                        .legacy_scope_mismatch_snapshot_sha256
+                        .clone()
+                        .unwrap_or_default(),
+                )
             })
             .flatten()
             .collect::<HashSet<_>>();
@@ -1984,15 +2779,43 @@ impl Session {
                 }
                 let snapshot = serde_json::from_value::<Snapshot>(value.clone()).ok()?;
                 let receipt = snapshot.maintenance_repair_receipt?;
-                Some(receipt.shutdown_paused_snapshot_sha256)
+                receipt.shutdown_paused_snapshot_sha256
             })
             .collect::<HashSet<_>>();
         let mut observed_legacy_scope_mismatch_hashes = HashSet::new();
         let mut last_valid_snapshot_sha256 = None;
         let mut host_snapshot_values = BTreeMap::<String, Value>::new();
+        let mut imported_task_check_projection: Option<(String, Vec<TaskCheckSnapshot>)> = None;
+        let mut imported_projection_snapshot_ordinal = None;
+        match parent_handoff::runtime::restore_seed(items, self.thread_id()) {
+            Ok(Some(seed)) => {
+                host_snapshot_values = seed.prior_snapshots;
+                match (
+                    maintenance_snapshot_digest(&seed.snapshot),
+                    serde_json::from_value::<Snapshot>(seed.snapshot),
+                ) {
+                    (Ok(snapshot_sha256), Ok(snapshot))
+                        if snapshot.thread_id == self.thread_id().to_string() =>
+                    {
+                        imported_task_check_projection =
+                            Some((snapshot_sha256, snapshot.task_checks));
+                    }
+                    _ => fail_closed = true,
+                }
+                match crate::rencrow_execution_guard::GuardState::from_parent_handoff(&seed.guard) {
+                    Ok(guard) => self.state.lock().await.rencrow_inherited_guard = Some(guard),
+                    Err(_) => fail_closed = true,
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(%error, "parent handoff restore proof rejected");
+                fail_closed = true;
+            }
+        }
         let mut shutdown_pair_seen = false;
         let mut interrupted_after_shutdown_pair = false;
-        for item in items {
+        for (restore_item_ordinal, item) in items.iter().enumerate() {
             // Validate each snapshot against receipts already committed at that position,
             // never against a future revision which may legitimately supersede its evidence.
             let checkpoint_changed = match item {
@@ -2017,7 +2840,16 @@ impl Session {
                     &self.thread_id().to_string(),
                 ) {
                     Ok(task_state) => accepted_receipts = task_state,
-                    Err(_) => fail_closed = true,
+                    Err(error) => {
+                        tracing::warn!(
+                            thread_id = %self.thread_id(),
+                            restore_item_ordinal,
+                            reason = "compaction_checkpoint_task_state_invalid",
+                            error = %error,
+                            "autonomous completion restore rejected history checkpoint"
+                        );
+                        fail_closed = true;
+                    }
                 }
             }
             match item {
@@ -2037,13 +2869,23 @@ impl Session {
                     if !is_host {
                         continue;
                     }
-                    let parsed = serde_json::from_value::<Snapshot>(value.clone());
-                    let Ok(snapshot) = parsed else {
-                        fail_closed = true;
-                        continue;
-                    };
                     let snapshot_sha256 =
                         codex_history::compaction_candidate::digest(value).unwrap_or_default();
+                    let snapshot = match serde_json::from_value::<Snapshot>(value.clone()) {
+                        Ok(snapshot) => snapshot,
+                        Err(error) => {
+                            tracing::warn!(
+                                thread_id = %self.thread_id(),
+                                restore_item_ordinal,
+                                snapshot_sha256,
+                                reason = "completion_snapshot_deserialization_failed",
+                                error = %error,
+                                "autonomous completion restore rejected snapshot"
+                            );
+                            fail_closed = true;
+                            continue;
+                        }
+                    };
                     host_snapshot_values.insert(snapshot_sha256.clone(), value.clone());
                     if declared_shutdown_paused_hashes.contains(&snapshot_sha256) {
                         shutdown_pair_seen = true;
@@ -2053,44 +2895,83 @@ impl Session {
                         .units
                         .iter()
                         .any(|unit| unit.review_state.is_some());
-                    if !matches!(snapshot.version, 1 | 2)
-                        || (snapshot.version == 1 && has_review_state)
+                    let snapshot_rejection_reason = if !matches!(snapshot.version, 1 | 2) {
+                        Some("unsupported_completion_snapshot_version")
+                    } else if (snapshot.version == 1 && has_review_state)
                         || (snapshot.version == 2 && !has_review_state)
-                        || !review_snapshot_references_resolve(
-                            &snapshot,
-                            &snapshot_sha256,
-                            &host_snapshot_values,
-                        )
-                        || snapshot.thread_id != self.thread_id().to_string()
-                        || snapshot.root_task_id.trim().is_empty()
+                    {
+                        Some("completion_snapshot_version_review_state_mismatch")
+                    } else if !review_snapshot_references_resolve(
+                        &snapshot,
+                        &snapshot_sha256,
+                        &host_snapshot_values,
+                    ) {
+                        Some("completion_review_snapshot_reference_unresolved")
+                    } else if snapshot.thread_id != self.thread_id().to_string() {
+                        Some("completion_snapshot_thread_mismatch")
+                    } else if snapshot.root_task_id.trim().is_empty()
                         || snapshot.root_task_id.len() > 4096
-                        || snapshot.state.contract_revision == 0
-                        || snapshot.task_checks.len() > MAX_COMPLETION_TASK_CHECKS
-                        || snapshot.uncollected_children.len() > 256
+                    {
+                        Some("completion_snapshot_root_invalid")
+                    } else if snapshot.state.contract_revision == 0 {
+                        Some("completion_snapshot_revision_invalid")
+                    } else if snapshot.task_checks.len() > MAX_COMPLETION_TASK_CHECKS {
+                        Some("completion_snapshot_task_check_limit_exceeded")
+                    } else if snapshot.uncollected_children.len() > 256
                         || snapshot
                             .uncollected_children
                             .iter()
                             .any(|id| codex_protocol::ThreadId::try_from(id.as_str()).is_err())
-                        || !serde_json::to_vec(&snapshot)
-                            .is_ok_and(|bytes| bytes.len() <= MAX_COMPLETION_SNAPSHOT_BYTES)
                     {
+                        Some("completion_snapshot_uncollected_child_invalid")
+                    } else if !serde_json::to_vec(&snapshot)
+                        .is_ok_and(|bytes| bytes.len() <= MAX_COMPLETION_SNAPSHOT_BYTES)
+                    {
+                        Some("completion_snapshot_size_or_serialization_invalid")
+                    } else {
+                        None
+                    };
+                    if let Some(reason) = snapshot_rejection_reason {
+                        tracing::warn!(
+                            thread_id = %self.thread_id(),
+                            restore_item_ordinal,
+                            snapshot_sha256,
+                            root_task_id = %snapshot.root_task_id,
+                            reason,
+                            "autonomous completion restore rejected snapshot"
+                        );
                         fail_closed = true;
                         continue;
                     }
-                    if snapshot.active_scope.as_ref().is_some_and(|scope| {
-                        scope.task_id.trim().is_empty()
-                            || scope.task_revision == 0
-                            || scope.begin_call_id.trim().is_empty()
-                    }) || snapshot.patch_attempts.len() > 256
-                        || snapshot.patch_attempts.iter().any(|(call, attempt)| {
-                            call.trim().is_empty()
-                                || !snapshot
-                                    .active_scope
-                                    .as_ref()
-                                    .is_some_and(|scope| scope.same_execution(&attempt.scope))
-                                || attempt.paths.len() > 16
-                        })
-                    {
+                    let active_scope_invalid =
+                        snapshot.active_scope.as_ref().is_some_and(|scope| {
+                            scope.task_id.trim().is_empty()
+                                || scope.task_revision == 0
+                                || scope.begin_call_id.trim().is_empty()
+                        });
+                    let patch_attempt_invalid = !active_scope_invalid
+                        && (snapshot.patch_attempts.len() > 256
+                            || snapshot.patch_attempts.iter().any(|(call, attempt)| {
+                                call.trim().is_empty()
+                                    || !snapshot
+                                        .active_scope
+                                        .as_ref()
+                                        .is_some_and(|scope| scope.same_execution(&attempt.scope))
+                                    || attempt.paths.len() > 16
+                            }));
+                    if active_scope_invalid || patch_attempt_invalid {
+                        tracing::warn!(
+                            thread_id = %self.thread_id(),
+                            restore_item_ordinal,
+                            snapshot_sha256,
+                            root_task_id = %snapshot.root_task_id,
+                            reason = if active_scope_invalid {
+                                "completion_snapshot_active_scope_invalid"
+                            } else {
+                                "completion_snapshot_patch_attempt_invalid"
+                            },
+                            "autonomous completion restore rejected snapshot"
+                        );
                         fail_closed = true;
                         continue;
                     }
@@ -2102,14 +2983,32 @@ impl Session {
                             previous.paused,
                         )
                     });
-                    if validate_snapshot_sequence_transition(previous_snapshot, &snapshot).is_err()
+                    if let Err(error) =
+                        validate_snapshot_sequence_transition(previous_snapshot, &snapshot)
                     {
+                        tracing::warn!(
+                            thread_id = %self.thread_id(),
+                            restore_item_ordinal,
+                            snapshot_sha256,
+                            root_task_id = %snapshot.root_task_id,
+                            reason = "completion_snapshot_sequence_invalid",
+                            error = %error,
+                            "autonomous completion restore rejected snapshot"
+                        );
                         fail_closed = true;
                         continue;
                     }
                     if accepted_receipts.as_ref().is_some_and(|task_state| {
                         task_state.boundary.root_task_id != snapshot.root_task_id
                     }) {
+                        tracing::warn!(
+                            thread_id = %self.thread_id(),
+                            restore_item_ordinal,
+                            snapshot_sha256,
+                            root_task_id = %snapshot.root_task_id,
+                            reason = "completion_snapshot_accepted_receipt_root_mismatch",
+                            "autonomous completion restore rejected snapshot"
+                        );
                         fail_closed = true;
                         continue;
                     }
@@ -2124,55 +3023,250 @@ impl Session {
                         .is_some_and(|scope| scope.root_task_id != snapshot.root_task_id);
                     if scope_root_mismatch {
                         observed_legacy_scope_mismatch_hashes.insert(snapshot_sha256.clone());
-                        if authorized_legacy_scope_mismatch_hashes.contains(&snapshot_sha256)
-                            && validate_snapshot_payload(
+                        if authorized_legacy_scope_mismatch_hashes.contains(&snapshot_sha256) {
+                            match validate_snapshot_payload(
                                 &snapshot,
                                 &self.thread_id().to_string(),
                                 &receipts,
-                            )
-                            .is_ok()
-                        {
-                            continue;
+                            ) {
+                                Ok(()) => continue,
+                                Err(error) => {
+                                    tracing::warn!(
+                                        thread_id = %self.thread_id(),
+                                        restore_item_ordinal,
+                                        snapshot_sha256,
+                                        root_task_id = %snapshot.root_task_id,
+                                        reason = "authorized_legacy_scope_mismatch_payload_invalid",
+                                        error = %error,
+                                        "autonomous completion restore rejected legacy scope snapshot"
+                                    );
+                                }
+                            }
+                        } else {
+                            tracing::warn!(
+                                thread_id = %self.thread_id(),
+                                restore_item_ordinal,
+                                snapshot_sha256,
+                                root_task_id = %snapshot.root_task_id,
+                                reason = "legacy_scope_mismatch_not_authorized",
+                                "autonomous completion restore rejected snapshot"
+                            );
                         }
                         fail_closed = true;
                         continue;
                     }
-                    if validate_snapshot_payload(
+                    if let Err(error) = validate_snapshot_payload(
                         &snapshot,
                         &self.thread_id().to_string(),
                         &receipts,
-                    )
-                    .is_err()
-                    {
-                        fail_closed = true;
+                    ) {
+                        let legacy_terminal_transition_verified =
+                            if error
+                                == completion_review_retry_restore::RETRY_ROLLBACK_WITHOUT_RESERVED_RETRY_ERROR
+                            {
+                                items
+                                    .get(restore_item_ordinal + 1)
+                                    .and_then(|item| {
+                                        let RolloutItem::ResponseItem(envelope) = item else {
+                                            return None;
+                                        };
+                                        let metadata = envelope.metadata.as_ref()?;
+                                        let value = metadata.rencrow_completion.as_ref()?;
+                                        let is_host = matches!(&envelope.item, ResponseItem::Message {
+                                            role, internal_chat_message_metadata_passthrough: Some(kind), ..
+                                        } if role == "developer" && kind.content_item_kinds.as_ref().is_some_and(|kinds| {
+                                            kinds.len() == 1 && kinds[0].0 == "rencrow.completion_snapshot"
+                                        })) && !metadata.client_authored;
+                                        is_host.then_some(value)
+                                    })
+                                    .and_then(|value| {
+                                        let next_snapshot =
+                                            serde_json::from_value::<Snapshot>(value.clone()).ok()?;
+                                        let (previous_root, previous_state) = restored.as_ref()?;
+                                        let previous_generation = restored_generation.unwrap_or_default();
+                                        let previous_revision = restored_revision.unwrap_or_default();
+                                        let previous_snapshot = Some((
+                                            previous_root.as_str(),
+                                            previous_revision,
+                                            previous_generation,
+                                            previous_state.paused,
+                                        ));
+                                        let same_snapshot_envelope = |left: &Snapshot, right: &Snapshot| {
+                                            let Ok(mut left_value) = serde_json::to_value(left) else {
+                                                return false;
+                                            };
+                                            let Ok(mut right_value) = serde_json::to_value(right) else {
+                                                return false;
+                                            };
+                                            let Some(left_object) = left_value.as_object_mut() else {
+                                                return false;
+                                            };
+                                            let Some(right_object) = right_value.as_object_mut() else {
+                                                return false;
+                                            };
+                                            left_object.remove("state");
+                                            right_object.remove("state");
+                                            left_value == right_value
+                                        };
+                                        let mut terminal_without_retry_backup = snapshot.clone();
+                                        let mut removed_backup_count = 0;
+                                        for unit in &mut terminal_without_retry_backup.state.units {
+                                            let Some(review) = unit.review_state.as_mut() else {
+                                                continue;
+                                            };
+                                            if review
+                                                .retry_reservation_prior_historical_failure
+                                                .is_some()
+                                            {
+                                                if !review.active_attempt.as_ref().is_some_and(|attempt| {
+                                                    attempt.status
+                                                        == codex_history::task_context::CompletionReviewAttemptStatus::Failed
+                                                }) {
+                                                    return None;
+                                                }
+                                                review.retry_reservation_prior_historical_failure = None;
+                                                removed_backup_count += 1;
+                                            }
+                                        }
+                                        if removed_backup_count != 1
+                                            || previous_root != &snapshot.root_task_id
+                                            || previous_revision
+                                                != snapshot.state.contract_revision
+                                            || previous_generation != snapshot.resume_generation
+                                            || next_snapshot.thread_id != snapshot.thread_id
+                                            || next_snapshot.root_task_id != snapshot.root_task_id
+                                            || next_snapshot.version != snapshot.version
+                                            || next_snapshot.resume_generation != snapshot.resume_generation
+                                            || snapshot.maintenance_repair_receipt.is_some()
+                                            || !same_snapshot_envelope(&snapshot, &next_snapshot)
+                                            || last_valid_snapshot_sha256.is_none()
+                                            || accepted_receipts.as_ref().is_some_and(|task_state| {
+                                                task_state.boundary.root_task_id
+                                                    != next_snapshot.root_task_id
+                                            })
+                                            || validate_snapshot_sequence_transition(
+                                                previous_snapshot,
+                                                &next_snapshot,
+                                            )
+                                            .is_err()
+                                            || validate_snapshot_payload(
+                                                &terminal_without_retry_backup,
+                                                &self.thread_id().to_string(),
+                                                &receipts,
+                                            )
+                                            .is_err()
+                                            || validate_snapshot_payload(
+                                                &next_snapshot,
+                                                &self.thread_id().to_string(),
+                                                &receipts,
+                                            )
+                                            .is_err()
+                                        {
+                                            return None;
+                                        }
+                                        let successor_sha256 =
+                                            codex_history::compaction_candidate::digest(value)
+                                                .ok()?;
+                                        let mut successor_host_snapshot_values =
+                                            host_snapshot_values.clone();
+                                        successor_host_snapshot_values.insert(
+                                            successor_sha256.clone(),
+                                            value.clone(),
+                                        );
+                                        if !review_snapshot_references_resolve(
+                                            &next_snapshot,
+                                            &successor_sha256,
+                                            &successor_host_snapshot_values,
+                                        ) {
+                                            return None;
+                                        }
+                                        completion_review_retry_restore::legacy_retry_terminal_collection_matches(
+                                            previous_state,
+                                            &snapshot.state,
+                                            &next_snapshot.state,
+                                            &self.thread_id().to_string(),
+                                        )
+                                        .then_some(())
+                                    })
+                                    .is_some()
+                            } else {
+                                false
+                            };
+                        if legacy_terminal_transition_verified {
+                            tracing::warn!(
+                                thread_id = %self.thread_id(),
+                                restore_item_ordinal,
+                                snapshot_sha256,
+                                root_task_id = %snapshot.root_task_id,
+                                reason = "legacy_retry_terminal_snapshot_superseded_by_collected_successor",
+                                "autonomous completion restore skipped a validated legacy intermediate snapshot"
+                            );
+                        } else {
+                            tracing::warn!(
+                                thread_id = %self.thread_id(),
+                                restore_item_ordinal,
+                                snapshot_sha256,
+                                root_task_id = %snapshot.root_task_id,
+                                reason = "completion_snapshot_payload_validation_failed",
+                                error = %error,
+                                "autonomous completion restore rejected snapshot"
+                            );
+                            fail_closed = true;
+                        }
                         continue;
                     }
-                    if let Some(receipt) = &snapshot.maintenance_repair_receipt
-                        && (validate_repair_receipt(
+                    if let Some(receipt) = &snapshot.maintenance_repair_receipt {
+                        let validator_error = validate_repair_receipt(
                             receipt,
                             &snapshot,
                             &self.thread_id().to_string(),
                         )
-                        .is_err()
-                            || last_valid_snapshot_sha256.as_deref()
-                                != Some(receipt.snapshot_before_sha256.as_str())
-                            || receipt.resume_generation_before
-                                != restored_generation.unwrap_or_default()
-                            || receipt
+                        .err();
+                        let maintenance_rejection_reason = if validator_error.is_some() {
+                            Some("maintenance_repair_receipt_invalid")
+                        } else if last_valid_snapshot_sha256.as_deref()
+                            != Some(receipt.snapshot_before_sha256.as_str())
+                        {
+                            Some("maintenance_repair_previous_snapshot_mismatch")
+                        } else if receipt.resume_generation_before
+                            != restored_generation.unwrap_or_default()
+                        {
+                            Some("maintenance_repair_generation_mismatch")
+                        } else if receipt.version == 1
+                            && receipt
                                 .legacy_scope_mismatch_snapshot_sha256
-                                .iter()
+                                .as_ref()
                                 .cloned()
+                                .unwrap_or_default()
+                                .into_iter()
                                 .collect::<HashSet<_>>()
                                 != observed_legacy_scope_mismatch_hashes
-                            || interrupted_after_shutdown_pair
-                            || !maintenance_receipt_matches_history(
-                                receipt,
-                                value,
-                                &host_snapshot_values,
-                            ))
-                    {
-                        fail_closed = true;
-                        continue;
+                        {
+                            Some("maintenance_repair_scope_evidence_mismatch")
+                        } else if receipt.version == 1 && interrupted_after_shutdown_pair {
+                            Some("maintenance_repair_interrupted_after_shutdown")
+                        } else if !maintenance_receipt_matches_history(
+                            receipt,
+                            value,
+                            &host_snapshot_values,
+                        ) {
+                            Some("maintenance_repair_history_evidence_mismatch")
+                        } else {
+                            None
+                        };
+                        if let Some(reason) = maintenance_rejection_reason {
+                            tracing::warn!(
+                                thread_id = %self.thread_id(),
+                                restore_item_ordinal,
+                                snapshot_sha256,
+                                root_task_id = %snapshot.root_task_id,
+                                reason,
+                                error = validator_error.as_deref().unwrap_or(""),
+                                "autonomous completion restore rejected maintenance receipt"
+                            );
+                            fail_closed = true;
+                            continue;
+                        }
                     }
                     if restored_generation != Some(snapshot.resume_generation) {
                         restored_paused = snapshot.state.paused;
@@ -2182,6 +3276,14 @@ impl Session {
                     restored_revision = Some(snapshot.state.contract_revision);
                     restored_generation = Some(snapshot.resume_generation);
                     restored_snapshot_version = Some(snapshot.version);
+                    if imported_task_check_projection
+                        .as_ref()
+                        .is_some_and(|(imported_hash, _)| imported_hash == &snapshot_sha256)
+                    {
+                        imported_projection_snapshot_ordinal = Some(restore_item_ordinal);
+                    }
+                    validated_task_check_snapshots
+                        .push((restore_item_ordinal, snapshot.task_checks.clone()));
                     restored_checks = Some(snapshot.task_checks);
                     restored_scope = snapshot.active_scope;
                     restored_patches = snapshot.patch_attempts;
@@ -2205,11 +3307,40 @@ impl Session {
                 _ => {}
             }
         }
+        if let Some(latest_checks) = restored_checks.as_mut()
+            && let Some((latest_snapshot_ordinal, _)) = validated_task_check_snapshots.last()
+        {
+            let events = canonical_task_check_events(items);
+            let imported_projection = imported_task_check_projection
+                .as_ref()
+                .zip(imported_projection_snapshot_ordinal)
+                .map(|((sha256, checks), ordinal)| ImportedTaskCheckProjection {
+                    sha256: sha256.as_str(),
+                    snapshot_ordinal: ordinal,
+                    checks: checks.as_slice(),
+                });
+            let reconciliation = reconcile_task_check_launch_failures(
+                latest_checks,
+                &validated_task_check_snapshots,
+                &events,
+                &self.thread_id().to_string(),
+                *latest_snapshot_ordinal,
+                imported_projection.as_ref(),
+            );
+            restored_task_check_event_orders = reconciliation.terminal_event_orders;
+            restored_imported_preflight_launch_failures =
+                reconciliation.imported_preflight_failures;
+        }
         if let Some((root, mut contract)) = restored {
-            let paused = {
+            let (paused, current_paused, current_is_newer_or_same, current_generation) = {
                 let mut current = self.state.lock().await;
                 let current_generation = current.rencrow_completion_resume_generation;
                 let snapshot_generation = restored_generation.unwrap_or_default();
+                let current_paused = current.rencrow_completion_paused
+                    || current
+                        .rencrow_completion_state
+                        .as_ref()
+                        .is_some_and(|(_, existing)| existing.paused);
                 if current_generation > snapshot_generation {
                     if fail_closed {
                         current.rencrow_completion_paused = true;
@@ -2217,30 +3348,73 @@ impl Session {
                             existing.paused = true;
                         }
                     }
+                    if fail_closed || current_paused {
+                        tracing::warn!(
+                            thread_id = %self.thread_id(),
+                            root_task_id = %root,
+                            fail_closed,
+                            restored_paused,
+                            current_paused,
+                            current_is_newer_or_same = true,
+                            restored_generation = ?restored_generation,
+                            current_generation,
+                            final_paused = fail_closed || current_paused,
+                            "autonomous completion restore left contract paused"
+                        );
+                    }
                     return;
                 }
-                let current_paused = current.rencrow_completion_paused
-                    || current
-                        .rencrow_completion_state
-                        .as_ref()
-                        .is_some_and(|(_, existing)| existing.paused);
                 let current_is_newer_or_same =
                     restored_generation.is_some_and(|generation| current_generation >= generation);
-                fail_closed || restored_paused || (current_is_newer_or_same && current_paused)
+                (
+                    fail_closed || restored_paused || (current_is_newer_or_same && current_paused),
+                    current_paused,
+                    current_is_newer_or_same,
+                    current_generation,
+                )
             };
             contract.paused = paused;
             {
                 let mut state = self.state.lock().await;
-                if let Some(task_checks) = restored_checks
-                    && state
-                        .task_check_ledger
-                        .restore_snapshot(task_checks)
-                        .is_err()
-                {
-                    let _ = state.task_check_ledger.restore_snapshot(Vec::new());
-                    contract.paused = true;
+                if let Some(task_checks) = restored_checks {
+                    match state.task_check_ledger.restore_snapshot(task_checks) {
+                        Ok(()) => state
+                            .task_check_ledger
+                            .seed_terminal_event_orders(restored_task_check_event_orders),
+                        Err(error) => {
+                            tracing::warn!(
+                                thread_id = %self.thread_id(),
+                                root_task_id = %root,
+                                reason = "completion_task_check_ledger_restore_failed",
+                                error = %error,
+                                "autonomous completion restore rejected task-check ledger"
+                            );
+                            let _ = state.task_check_ledger.restore_snapshot(Vec::new());
+                            contract.paused = true;
+                        }
+                    }
                 }
+                state
+                    .task_check_ledger
+                    .seed_imported_preflight_launch_failures(
+                        restored_imported_preflight_launch_failures,
+                    );
                 state.rencrow_completion_paused = contract.paused;
+                if let Some(value) = last_valid_snapshot_sha256
+                    .as_ref()
+                    .and_then(|hash| host_snapshot_values.get(hash))
+                {
+                    let mut proofs = parent_handoff::proof_closure(
+                        value,
+                        &host_snapshot_values,
+                        accepted_receipts.as_ref(),
+                    )
+                    .unwrap_or_default();
+                    if let Some(hash) = &last_valid_snapshot_sha256 {
+                        proofs.insert(hash.clone(), value.clone());
+                    }
+                    state.rencrow_completion_handoff_proofs = proofs;
+                }
                 state.rencrow_completion_resume_generation =
                     restored_generation.unwrap_or_default();
                 state.rencrow_completion_uncollected_children =
@@ -2307,11 +3481,43 @@ impl Session {
                             legacy_review_bindings,
                         }
                     });
+                if contract.paused {
+                    tracing::warn!(
+                        thread_id = %self.thread_id(),
+                        root_task_id = %root,
+                        fail_closed,
+                        restored_paused,
+                        current_paused,
+                        current_is_newer_or_same,
+                        restored_generation = ?restored_generation,
+                        current_generation,
+                        final_paused = contract.paused,
+                        "autonomous completion restore left contract paused"
+                    );
+                }
                 state.rencrow_completion_state = Some((root, contract));
             }
             self.revalidate_collected_completion_reviews().await;
         } else if fail_closed {
-            self.state.lock().await.rencrow_completion_paused = true;
+            let mut state = self.state.lock().await;
+            let current_paused = state.rencrow_completion_paused
+                || state
+                    .rencrow_completion_state
+                    .as_ref()
+                    .is_some_and(|(_, contract)| contract.paused);
+            state.rencrow_completion_paused = true;
+            tracing::warn!(
+                thread_id = %self.thread_id(),
+                fail_closed,
+                restored_paused,
+                current_paused,
+                current_is_newer_or_same = false,
+                restored_generation = ?restored_generation,
+                current_generation = state.rencrow_completion_resume_generation,
+                final_paused = true,
+                reason = "restore_failed_closed_without_valid_snapshot",
+                "autonomous completion restore left contract paused"
+            );
         }
     }
 
@@ -2339,6 +3545,12 @@ mod tests {
     use pretty_assertions::assert_eq;
     use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
+
+    #[path = "completion_checkpoint_budget_persistence_tests.rs"]
+    mod completion_checkpoint_budget_persistence_tests;
+
+    #[path = "../../parent_handoff_tests.rs"]
+    mod parent_handoff_tests;
 
     struct PendingBoundaryTask;
 
@@ -2618,18 +3830,19 @@ mod tests {
         let current_paused_hash = maintenance_snapshot_digest(&current_paused).unwrap();
         let receipt = MaintenanceRepairReceipt {
             version: 1,
+            reason: None,
             thread_id: thread_id.into(),
             root_task_id: "root".into(),
             request_sha256: "1111111111111111111111111111111111111111111111111111111111111111"
                 .into(),
             snapshot_before_sha256: current_paused_hash,
-            shutdown_before_snapshot_sha256: if fake_shutdown_pair {
+            shutdown_before_snapshot_sha256: Some(if fake_shutdown_pair {
                 "2222222222222222222222222222222222222222222222222222222222222222".into()
             } else {
                 shutdown_before_hash.clone()
-            },
-            shutdown_paused_snapshot_sha256: paused_hash.clone(),
-            legacy_scope_mismatch_snapshot_sha256: vec![shutdown_before_hash, paused_hash],
+            }),
+            shutdown_paused_snapshot_sha256: Some(paused_hash.clone()),
+            legacy_scope_mismatch_snapshot_sha256: Some(vec![shutdown_before_hash, paused_hash]),
             evidence: [
                 "deployment_result",
                 "deployment_preflight",
@@ -2648,6 +3861,10 @@ mod tests {
             .collect(),
             resume_generation_before: 0,
             resume_generation_after: 1,
+            authorization_issuer: None,
+            authorization_ref: None,
+            authorization_sha256: None,
+            history_tip_before: None,
         };
         let repair = build_maintenance_repair_snapshot(&current_paused, receipt).unwrap();
         let mut items = vec![snapshot_item(shutdown_before), snapshot_item(paused)];
@@ -2664,6 +3881,68 @@ mod tests {
         }
         items.push(snapshot_item(current_paused));
         items.push(snapshot_item(repair));
+        items
+    }
+
+    fn explicit_authorized_resume_receipt(
+        thread_id: &str,
+        paused_hash: String,
+    ) -> MaintenanceRepairReceipt {
+        MaintenanceRepairReceipt {
+            version: 2,
+            reason: Some(MaintenanceRepairReason::ExplicitAuthorizedResume),
+            thread_id: thread_id.into(),
+            root_task_id: "root".into(),
+            request_sha256: "1111111111111111111111111111111111111111111111111111111111111111"
+                .into(),
+            snapshot_before_sha256: paused_hash,
+            shutdown_before_snapshot_sha256: None,
+            shutdown_paused_snapshot_sha256: None,
+            legacy_scope_mismatch_snapshot_sha256: None,
+            evidence: vec![],
+            resume_generation_before: 4,
+            resume_generation_after: 5,
+            authorization_issuer: Some("user in current official Codex conversation".into()),
+            authorization_ref: Some("/tmp/authorization-state.json".into()),
+            authorization_sha256: Some("2".repeat(64)),
+            history_tip_before: Some(MaintenanceRepairHistoryTip {
+                ordinal: 17,
+                sha256: "3".repeat(64),
+            }),
+        }
+    }
+
+    fn explicit_authorized_resume_history(
+        thread_id: &str,
+        include_interrupted_before_resume: bool,
+    ) -> Vec<RolloutItem> {
+        let paused = serde_json::json!({
+            "version": 1,
+            "thread_id": thread_id,
+            "root_task_id": "root",
+            "resume_generation": 4,
+            "state": open_state(true),
+            "task_checks": [],
+            "active_scope": null,
+            "patch_attempts": [],
+            "uncollected_children": []
+        });
+        let paused_hash = maintenance_snapshot_digest(&paused).unwrap();
+        let receipt = explicit_authorized_resume_receipt(thread_id, paused_hash);
+        let resumed = build_explicit_authorized_resume_snapshot(&paused, receipt).unwrap();
+        let mut items = vec![snapshot_item(paused)];
+        if include_interrupted_before_resume {
+            items.push(RolloutItem::EventMsg(EventMsg::TurnAborted(
+                codex_protocol::protocol::TurnAbortedEvent {
+                    turn_id: Some("newer-stop".into()),
+                    reason: TurnAbortReason::Interrupted,
+                    started_at: None,
+                    completed_at: None,
+                    duration_ms: None,
+                },
+            )));
+        }
+        items.push(snapshot_item(resumed));
         items
     }
 
@@ -3219,6 +4498,129 @@ mod tests {
                 .rencrow_completion_resume_generation,
             1
         );
+    }
+
+    #[tokio::test]
+    async fn explicit_authorized_resume_restores_generation_and_preserves_snapshot_state() {
+        let (session, _) = make_session_and_context().await;
+        let thread_id = session.thread_id().to_string();
+        let items = explicit_authorized_resume_history(&thread_id, false);
+        let paused = match &items[0] {
+            RolloutItem::ResponseItem(envelope) => envelope
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.rencrow_completion.clone())
+                .expect("paused host snapshot"),
+            _ => panic!("expected paused host snapshot"),
+        };
+        let resumed = match items.last().expect("resume snapshot") {
+            RolloutItem::ResponseItem(envelope) => envelope
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.rencrow_completion.clone())
+                .expect("resumed host snapshot"),
+            _ => panic!("expected resumed host snapshot"),
+        };
+        let receipt: MaintenanceRepairReceipt =
+            serde_json::from_value(resumed["maintenance_repair_receipt"].clone())
+                .expect("explicit authorization receipt");
+        let expected = build_explicit_authorized_resume_snapshot(&paused, receipt).unwrap();
+        assert_eq!(resumed, expected);
+        assert_eq!(resumed["state"]["paused"], false);
+        assert_eq!(resumed["resume_generation"], 5);
+        let mut unchanged_fields = resumed.clone();
+        unchanged_fields["state"]["paused"] = Value::Bool(true);
+        unchanged_fields["resume_generation"] = Value::from(4);
+        unchanged_fields
+            .as_object_mut()
+            .unwrap()
+            .remove("maintenance_repair_receipt");
+        assert_eq!(unchanged_fields, paused);
+        assert_eq!(
+            resumed["state"]["conditions"],
+            paused["state"]["conditions"]
+        );
+        assert_eq!(resumed["state"]["units"], paused["state"]["units"]);
+        assert_eq!(resumed["active_scope"], paused["active_scope"]);
+        assert_eq!(resumed["task_checks"], paused["task_checks"]);
+        assert_eq!(
+            resumed["uncollected_children"],
+            paused["uncollected_children"]
+        );
+
+        session.restore_autonomous_completion_snapshot(&items).await;
+        assert!(!session.autonomous_completion_paused().await);
+        assert_eq!(
+            session
+                .state
+                .lock()
+                .await
+                .rencrow_completion_resume_generation,
+            5
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_authorized_resume_receipt_rejects_a_newer_interruption() {
+        let (session, _) = make_session_and_context().await;
+        let mut items = explicit_authorized_resume_history(&session.thread_id().to_string(), false);
+        items.push(RolloutItem::EventMsg(EventMsg::TurnAborted(
+            codex_protocol::protocol::TurnAbortedEvent {
+                turn_id: Some("stop-after-resume".into()),
+                reason: TurnAbortReason::Interrupted,
+                started_at: None,
+                completed_at: None,
+                duration_ms: None,
+            },
+        )));
+        session.restore_autonomous_completion_snapshot(&items).await;
+        assert!(session.autonomous_completion_paused().await);
+        assert_eq!(
+            session
+                .state
+                .lock()
+                .await
+                .rencrow_completion_resume_generation,
+            5
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_authorized_resume_accepts_stop_preceding_authorization_tip() {
+        let (session, _) = make_session_and_context().await;
+        let items = explicit_authorized_resume_history(&session.thread_id().to_string(), true);
+        session.restore_autonomous_completion_snapshot(&items).await;
+        assert!(!session.autonomous_completion_paused().await);
+        assert_eq!(
+            session
+                .state
+                .lock()
+                .await
+                .rencrow_completion_resume_generation,
+            5
+        );
+    }
+
+    #[test]
+    fn shutdown_repair_v1_receipt_keeps_its_existing_wire_fields() {
+        let items = maintenance_repair_history("thread", false, false);
+        let RolloutItem::ResponseItem(envelope) = items.last().unwrap() else {
+            panic!("expected shutdown repair snapshot")
+        };
+        let value = envelope
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.rencrow_completion.as_ref())
+            .expect("completion snapshot");
+        let receipt = &value["maintenance_repair_receipt"];
+        assert_eq!(receipt["version"], 1);
+        assert!(receipt.get("reason").is_none());
+        assert!(receipt.get("authorization_ref").is_none());
+        assert!(receipt.get("authorization_sha256").is_none());
+        assert!(receipt.get("history_tip_before").is_none());
+        assert!(receipt["shutdown_before_snapshot_sha256"].is_string());
+        assert!(receipt["shutdown_paused_snapshot_sha256"].is_string());
+        assert!(receipt["legacy_scope_mismatch_snapshot_sha256"].is_array());
     }
 
     #[tokio::test]
