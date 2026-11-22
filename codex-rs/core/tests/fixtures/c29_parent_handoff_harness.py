@@ -311,6 +311,49 @@ def main(config_path):
         if host.child is None or host.child.poll() is not None:
             raise RuntimeError('native successor exited before rollout evidence was copied')
         successor_rollout = Path(host.successor_rollout())
+        cold_config = dict(config, child_pid=host.child.pid,
+                           successor_rollout=str(successor_rollout),
+                           cold_expected_hashes={
+                               'ledger': hashlib.sha256(
+                                   (base / 'escalation-ledger.json').read_bytes()).hexdigest(),
+                               'settings': hashlib.sha256(
+                                   (base / 'settings.json').read_bytes()).hexdigest(),
+                               'record': hashlib.sha256(
+                                   Path(config['record_file']).read_bytes()).hexdigest(),
+                               'rollout': hashlib.sha256(
+                                   successor_rollout.read_bytes()).hexdigest(),
+                           })
+        cold_config_path = base / 'cold-owner-input.json'
+        cold_config_path.write_text(json.dumps(cold_config, ensure_ascii=False))
+        cold_env = {
+            'PATH': os.environ.get('PATH', '/usr/bin:/bin'),
+            'HOME': str(host.HOME),
+            'PYTHONDONTWRITEBYTECODE': '1',
+            'RENCROW_TOOLS_ROOT': os.environ['RENCROW_TOOLS_ROOT'],
+            'RENCROW_TOOLS_COMMIT': os.environ['RENCROW_TOOLS_COMMIT'],
+            'RENCROW_PARENT_HANDOFF_SHA256': os.environ['RENCROW_PARENT_HANDOFF_SHA256'],
+        }
+        cold_process = subprocess.run(
+            [sys.executable, __file__, str(cold_config_path), '--cold-owner'],
+            cwd=config['cwd'], env=cold_env, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20, check=False)
+        if host.child.poll() is not None:
+            raise RuntimeError('native successor exited during cold owner observation')
+        if cold_process.returncode != 0:
+            raise RuntimeError(
+                'cold owner subprocess failed: '
+                + cold_process.stderr.decode('utf-8', errors='replace'))
+        cold_result = json.loads((base / 'cold-owner-result.json').read_text())
+        if (cold_result.get('status') != 'parent_handoff_continuing'
+                or cold_result.get('send_count') != 0
+                or cold_result.get('command_count') != 0
+                or cold_result.get('child_pid') != host.child.pid
+                or cold_result.get('owner_pid') == os.getpid()
+                or cold_result.get('same_ledger_bytes_after_observation') is not True
+                or cold_result.get('same_settings_record_rollout_bytes_after_observation') is not True
+                or cold_result.get('ledger_identity_sha256_after')
+                != cold_config['cold_expected_hashes']['ledger']):
+            raise RuntimeError(f'cold owner result violated read-only restore: {cold_result}')
         rollout_bytes = successor_rollout.read_bytes()
         rollout_copy = base / 'native-successor-rollout.jsonl'
         rollout_copy.write_bytes(rollout_bytes)
@@ -334,6 +377,13 @@ def main(config_path):
             'child_returncode_before_cleanup': host.child.poll() if host.child else None,
             'source_exit_keys': host.exit_keys,
             'child_log': str(base / 'native-child.log'),
+            'cold_owner_result': str(base / 'cold-owner-result.json'),
+            'cold_owner_pid': cold_result['owner_pid'],
+            'cold_owner_status': cold_result['status'],
+            'cold_owner_reason': cold_result['reason'],
+            'cold_owner_send_count': cold_result['send_count'],
+            'cold_owner_ledger_sha256': cold_result['ledger_identity_sha256_after'],
+            'real_supervisor_restart_tested': False,
         }
     finally:
         returncode = host.close()
@@ -342,6 +392,94 @@ def main(config_path):
     if returncode != 0:
         raise RuntimeError(f'native child test exited with {returncode}; see {result["child_log"]}')
     (base / 'result.json').write_text(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+class ColdOwnerHost:
+    """Read-only host observation for a new owner process restoring the ledger."""
+    def __init__(self, config):
+        self.ROOT = Path(config['cwd'])
+        self.BASE = Path(config['base'])
+        self.send_count = 0
+        self.command_count = 0
+
+    def require_host_action_enabled(self):
+        if (self.BASE / 'PAUSED').exists():
+            raise RuntimeError('test-owned host paused during cold owner observation')
+
+    def send(self, message):
+        self.send_count += 1
+        raise RuntimeError('cold owner adapter forbids sends')
+
+    def command(self, args):
+        self.command_count += 1
+        raise RuntimeError('cold owner adapter forbids commands')
+
+    def save(self, path, value):
+        raise RuntimeError('cold owner adapter forbids persistence writes')
+
+
+def cold_owner(config_path):
+    config = json.loads(Path(config_path).read_text())
+    base = Path(config['base'])
+    ledger_path = base / 'escalation-ledger.json'
+    settings_path = base / 'settings.json'
+    record_path = Path(config['record_file'])
+    rollout_path = Path(config['successor_rollout'])
+
+    def identities():
+        return {
+            'ledger': hashlib.sha256(ledger_path.read_bytes()).hexdigest(),
+            'settings': hashlib.sha256(settings_path.read_bytes()).hexdigest(),
+            'record': hashlib.sha256(record_path.read_bytes()).hexdigest(),
+            'rollout': hashlib.sha256(rollout_path.read_bytes()).hexdigest(),
+        }
+
+    before = identities()
+    if before != config['cold_expected_hashes']:
+        raise RuntimeError('cold owner did not receive the original test-owned file identities')
+    ledger, _ = parent_handoff.read_json(ledger_path)
+    settings, _ = parent_handoff.read_json(settings_path)
+    if settings.get('thread') != config['successor_thread']:
+        raise RuntimeError('cold owner settings do not bind the reserved successor')
+    entries = ledger.get('parent_handoffs', {}).get('attempts', {}).values()
+    matching = [entry for entry in entries
+                if entry.get('successor_thread_id') == config['successor_thread']]
+    if len(matching) != 1 or matching[0].get('phase') != 'continuing':
+        raise RuntimeError('cold owner did not restore exactly one continuing ledger entry')
+    entry = matching[0]
+    if (Path(entry.get('record_file', '')).resolve() != record_path.resolve()
+            or entry.get('capsule_sha256') != config['record_id']
+            or Path(entry.get('successor_rollout', '')).resolve() != rollout_path.resolve()):
+        raise RuntimeError('cold owner ledger does not bind the exact record and successor rollout')
+    host = ColdOwnerHost(config)
+    result = parent_handoff.run_parent_handoff(host, {
+        'thread': settings['thread'], 'rollout': str(rollout_path),
+        'turn_observation': {'active': False}, 'pending_children': [],
+    }, settings)
+    after = identities()
+    if not result or result.get('status') != 'parent_handoff_continuing':
+        raise RuntimeError(f'cold owner did not restore continuing: {result!r}')
+    if before != after:
+        raise RuntimeError('cold owner observation changed ledger/settings/record/rollout bytes')
+    if host.send_count != 0 or host.command_count != 0:
+        raise RuntimeError('cold owner attempted a duplicate send or command')
+    proof = {
+        'owner_pid': os.getpid(), 'child_pid': config['child_pid'],
+        'status': result['status'], 'reason': result.get('reason'),
+        'send_count': host.send_count, 'command_count': host.command_count,
+        'launch_count': 0, 'continuation_count': 0,
+        'ledger_identity_sha256_before': before['ledger'],
+        'ledger_identity_sha256_after': after['ledger'],
+        'settings_sha256': after['settings'], 'record_sha256': after['record'],
+        'rollout_sha256': after['rollout'],
+        'same_ledger_bytes_after_observation': True,
+        'same_settings_record_rollout_bytes_after_observation': True,
+        'old_owner_stopped': False, 'real_supervisor_restart_tested': False,
+        'real_tui_or_model_turn_tested': False,
+    }
+    (base / 'cold-owner-result.json').write_text(
+        json.dumps(proof, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -364,4 +502,6 @@ def successor_rollout_header(codex_home, successor_thread):
 
 
 if __name__ == '__main__':
+    if len(sys.argv) == 3 and sys.argv[2] == '--cold-owner':
+        raise SystemExit(cold_owner(sys.argv[1]))
     raise SystemExit(main(sys.argv[1]))

@@ -732,6 +732,12 @@ async fn run_c29_python_owner_harness(
             && result["successor_rollout_copy_bytes_equal"] == true
             && result["successor_rollout_sha256"].as_str().is_some()
             && result["cold_resume_tested"] == false
+            && result["cold_owner_status"] == "parent_handoff_continuing"
+            && result["cold_owner_pid"].as_u64().is_some()
+            && result["cold_owner_pid"] != result["child_pid"]
+            && result["cold_owner_send_count"] == 0
+            && result["cold_owner_ledger_sha256"].as_str().is_some()
+            && result["real_supervisor_restart_tested"] == false
             && result["parent_handoff_source_sha256"] == parent_handoff_sha256
             && result["tools_commit"] == tools_commit,
         "C29 bridge result did not preserve the one-record/one-child contract: {result}"
@@ -779,6 +785,10 @@ fn preserve_c29_evidence(
         (
             "python-owner-result.json",
             run_directory.join("result.json"),
+        ),
+        (
+            "cold-owner-result.json",
+            run_directory.join("cold-owner-result.json"),
         ),
         (
             "native-child-proof.json",

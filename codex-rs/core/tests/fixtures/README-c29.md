@@ -21,6 +21,15 @@ just test --cargo-profile dev-small -p codex-core --lib --retries 0 --test-threa
 
 The fixture owns its dummy source process and native child. The Python host
 adapter stubs the TUI and continuation delivery; it does not verify a live
-launcher, an actual model turn, or a Supervisor cold restart. Without
+launcher, an actual model turn, or a restart of the original Supervisor owner.
+After the owner persists `continuing`, the fixture starts a separate Python
+process that imports the same pinned `parent_handoff.py`, reads the same
+test-owned settings, ledger, record, and successor rollout, and calls
+`run_parent_handoff` in read-only mode. It must recover `continuing`, preserve
+the ledger/settings/record/rollout hashes, and make zero sends or commands
+while the original test-owned native child remains alive. The original owner
+process is not stopped; this proves cross-process durable-state reread only,
+not a full Supervisor restart, TUI session adoption, or model turn. The
+`cold-owner-result.json` artifact records this limited result. Without
 `RENCROW_C29_HARNESS`, the regular native test still runs and does not claim
 the cross-process bridge was exercised.
