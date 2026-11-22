@@ -1201,6 +1201,7 @@ async fn planned_review_runs_through_host_spawn_wait_same_child_followup_and_ado
                 "task_context_boundary".into(),
                 "multi_agent_v1::send_input".into(),
                 "multi_agent_v1::wait_agent".into(),
+                "multi_agent_v1::close_agent".into(),
             ]);
             config.features.enable(Feature::Collab).unwrap();
             let model_provider_id = config.model_provider_id.clone();
@@ -1237,6 +1238,11 @@ async fn planned_review_runs_through_host_spawn_wait_same_child_followup_and_ado
         "review-artifact.txt",
     )?;
     let relative_artifact = artifact
+        .strip_prefix(fixture.cwd_path())?
+        .to_string_lossy()
+        .to_string();
+    let test_artifact = fixture.cwd_path().join("tests/test_review_artifact.py");
+    let relative_test_artifact = test_artifact
         .strip_prefix(fixture.cwd_path())?
         .to_string_lossy()
         .to_string();
@@ -1625,6 +1631,16 @@ async fn planned_review_runs_through_host_spawn_wait_same_child_followup_and_ado
         &server,
         &parent_thread_id,
         vec![
+            sse(vec![
+                ev_response_created("review-close-a-parent"),
+                ev_function_call_with_namespace(
+                    "review-close-a",
+                    "multi_agent_v1",
+                    "close_agent",
+                    &json!({"target":reviewer_thread_id}).to_string(),
+                ),
+                ev_completed("review-close-a-parent"),
+            ]),
             function_response("review-adopt-a", "task_context_boundary", &json!({"action":"adopt_review","unit_id":"review-a","reason":"The follow-up reviewer confirmed the accepted artifact still meets AC-1."})),
             sse(vec![ev_response_created("review-adopted"), ev_assistant_message("review-adopted-message", "Review A adopted; continue with task B."), ev_completed("review-adopted")]),
         ],
@@ -1636,6 +1652,179 @@ async fn planned_review_runs_through_host_spawn_wait_same_child_followup_and_ado
     let adoption_output =
         tool_output_debug(&rollout_path, "review-adopt-a")?.expect("adopt_review tool output");
     assert!(!adoption_output.is_empty(), "adopt action returned output");
+    let close_output =
+        tool_output_debug(&rollout_path, "review-close-a")?.expect("close_agent tool output");
+    assert!(
+        !close_output.is_empty(),
+        "terminal reviewer child was closed"
+    );
+    let after_review_adoption = latest_host_completion_snapshot(&rollout_path)?;
+    assert_eq!(after_review_adoption["uncollected_children"], json!([]));
+    let adopted_review_a = completion_unit(&after_review_adoption, "review-a");
+    assert_eq!(adopted_review_a["status"], "done");
+    assert_eq!(
+        adopted_review_a["review_evidence"]["reviewer_thread_id"],
+        reviewer_thread_id
+    );
+    assert_eq!(
+        adopted_review_a["review_evidence"]["reviewer_turn_id"],
+        followup_turn_id
+    );
+    assert!(adopted_review_a["review_evidence"]["wait_result_ref"].is_string());
+
+    let parent_thread_id_for_task_b = parent_thread_id.clone();
+    let task_b_responses = mount_sse_sequence_match(
+        &server,
+        move |request: &wiremock::Request| {
+            request
+                .body_json::<Value>()
+                .ok()
+                .and_then(|body| {
+                    body["client_metadata"]["thread_id"]
+                        .as_str()
+                        .map(str::to_string)
+                })
+                .as_deref()
+                == Some(parent_thread_id_for_task_b.as_str())
+        },
+        vec![
+            function_response(
+                "guidance-begin-task-b",
+                "task_context_boundary",
+                &json!({"action":"begin","root_task_id":"root","task_id":"task-b","task_revision":1}),
+            ),
+            function_response(
+                "guidance-update-shared-artifact",
+                "exec_command",
+                &json!({
+                    "cmd":"python3 -B - <<'PY'\nfrom pathlib import Path\nPath(\"review-artifact.txt\").write_text(\"updated by task B\\n\")\nPath(\"tests/test_review_artifact.py\").write_text('''import unittest\nfrom pathlib import Path\n\nclass ArtifactContent(unittest.TestCase):\n    def test_accepted_artifact_content(self):\n        self.assertEqual(Path(\"review-artifact.txt\").read_text(), \"updated by task B\\\\n\")\n''')\nPY"
+                }),
+            ),
+            function_response(
+                "guidance-check-task-b",
+                "exec_command",
+                &json!({
+                    "cmd":"python3 -B -m unittest discover -s tests -p test_review_artifact.py -v",
+                    "task_evidence":{"task_id":"task-b","task_revision":1,"artifact_paths":[relative_artifact, relative_test_artifact],"check_kind":"verification"}
+                }),
+            ),
+            function_response(
+                "guidance-accept-task-b",
+                "task_context_boundary",
+                &json!({"action":"accept","result":"Task B verified the updated shared artifact","satisfied_conditions":["AC-1"]}),
+            ),
+            function_response(
+                "guidance-status-task-b",
+                "task_context_boundary",
+                &json!({"action":"status","root_task_id":"root"}),
+            ),
+            sse(vec![
+                ev_response_created("guidance-task-b-finished"),
+                ev_assistant_message(
+                    "guidance-task-b-finished-message",
+                    "Task B is accepted; the remaining reviews stay on the plan.",
+                ),
+                ev_completed("guidance-task-b-finished"),
+            ]),
+            sse(vec![
+                ev_response_created("guidance-after-continuation"),
+                ev_assistant_message(
+                    "guidance-after-continuation-message",
+                    "I reconciled the host review status and saved action.",
+                ),
+                ev_completed("guidance-after-continuation"),
+            ]),
+        ],
+    )
+    .await;
+    fixture
+        .submit_turn("Verify and accept task B after updating the shared reviewed artifact.")
+        .await?;
+    let task_b_begin_output =
+        tool_output_debug(&rollout_path, "guidance-begin-task-b")?.expect("task B begin output");
+    let task_b_update_output = tool_output_debug(&rollout_path, "guidance-update-shared-artifact")?
+        .expect("shared artifact update output");
+    let task_b_check_output =
+        tool_output_debug(&rollout_path, "guidance-check-task-b")?.expect("task B check output");
+    let task_b_accept_output =
+        tool_output_debug(&rollout_path, "guidance-accept-task-b")?.expect("task B accept output");
+    let task_b_status_output =
+        tool_output_text(&rollout_path, "guidance-status-task-b")?.expect("task B host status");
+    assert!(task_b_begin_output.contains("Task scope begun"));
+    assert!(!task_b_update_output.is_empty());
+    assert!(
+        task_b_check_output.contains("Process exited with code 0")
+            && task_b_check_output.contains("Ran 1 test")
+            && task_b_check_output.contains("OK"),
+        "task B check failed: {task_b_check_output}"
+    );
+    assert!(
+        task_b_accept_output.contains("Task boundary prepared"),
+        "task B host receipt was not accepted: {task_b_accept_output}"
+    );
+    let task_b_status: Value = serde_json::from_str(&task_b_status_output)?;
+    let task_b_verification = task_b_status["verification_obligations"]["attempts"]
+        .as_array()
+        .and_then(|attempts| {
+            attempts
+                .iter()
+                .find(|attempt| attempt["call_id"] == "guidance-check-task-b")
+        })
+        .expect("host status retains the task B check receipt");
+    assert_eq!(task_b_verification["status"], "finished");
+    assert_eq!(task_b_verification["exit_code"], 0);
+    assert_eq!(task_b_verification["succeeded"], true);
+    assert_eq!(
+        task_b_verification["artifact_paths"],
+        json!([relative_artifact, relative_test_artifact])
+    );
+    assert_eq!(fs::read_to_string(&artifact)?, "updated by task B\n");
+    assert!(fs::read_to_string(&test_artifact)?.contains("updated by task B\\n"));
+    let task_b_requests = task_b_responses.requests();
+    assert_eq!(
+        task_b_requests.len(),
+        7,
+        "turn-end continuation is followed by a new model sampling request"
+    );
+    let continuation_request = &task_b_requests[6];
+    assert!(
+        continuation_request
+            .body_contains_text("Continue unfinished conditions, units, or child collection")
+    );
+    assert!(continuation_request.body_contains_text("Current host review status: Review review-a remains historical for the current accepted artifact or condition definitions"));
+    assert!(continuation_request.body_contains_text("Saved next action: Begin task A."));
+    assert!(continuation_request.body_contains_text("review dependency readiness"));
+    assert!(
+        continuation_request.body_contains_text(
+            "carry forward existing accepted task execution evidence unchanged"
+        )
+    );
+    let latest_after_task_b = latest_host_completion_snapshot(&rollout_path)?;
+    assert_eq!(latest_after_task_b["state"]["next_action"], "Begin task A");
+    assert_eq!(
+        completion_unit(&latest_after_task_b, "review-a")["status"],
+        "done"
+    );
+    assert_eq!(
+        completion_unit(&latest_after_task_b, "task-b")["status"],
+        "done"
+    );
+    let task_b_unit = completion_unit(&latest_after_task_b, "task-b");
+    assert!(["evidence", "task_refs"].iter().any(|field| {
+        task_b_unit[*field].as_array().is_some_and(|refs| {
+            refs.iter().any(|reference| {
+                reference["task_id"] == "task-b" && reference["task_revision"] == 1
+            })
+        })
+    }));
+    assert_eq!(
+        completion_unit(&latest_after_task_b, "review-b")["status"],
+        "planned"
+    );
+    assert_eq!(
+        completion_unit(&latest_after_task_b, "review-b")["review_target"],
+        json!({"task_id":"task-b","task_revision":1})
+    );
 
     let snapshots =
         host_completion_snapshots(&fixture.codex.rollout_path().expect("rollout path"))?;

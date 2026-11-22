@@ -141,6 +141,29 @@ use tracing::warn;
 
 const POST_SAMPLING_TOKEN_ESTIMATE_TARGET: &str = "codex_core::post_sampling_token_estimate";
 
+fn turn_end_autonomous_completion_action(
+    plan_review_previous_plan: Option<&str>,
+    current_review_scope_reason: Option<&str>,
+    recorded_next_action: Option<&str>,
+) -> String {
+    if let Some(previous_plan) = plan_review_previous_plan {
+        format!(
+            "Review why acceptance conditions remain open. Call task_context_boundary plan_review with previous_plan exactly `{previous_plan}`, a distinct revised_plan, and an evidence-based reason. Do not reset product progress."
+        )
+    } else if let Some(reason) = current_review_scope_reason {
+        let recorded_next_action = recorded_next_action.unwrap_or("No next action is recorded");
+        format!(
+            "Current host review status: {reason} Saved next action: {recorded_next_action}. Reconcile current host status, review dependency readiness, and accepted execution receipts before choosing the next step. If an Update is needed, carry forward existing accepted task execution evidence unchanged."
+        )
+    } else {
+        recorded_next_action
+            .unwrap_or(
+                "recover terminal child results, select the next ready unit, or review the plan",
+            )
+            .into()
+    }
+}
+
 /// Explicit MCP startup requirements retained across restarts within one user turn.
 #[derive(Default)]
 pub(crate) struct McpStartupRequirements {
@@ -843,6 +866,12 @@ pub(crate) async fn run_turn(
                                 .unwrap_or(0);
                             let plan_review_due =
                                 sess.autonomous_completion_plan_review_due().await;
+                            let current_review_scope_reason = if plan_review_due {
+                                None
+                            } else {
+                                sess.autonomous_completion_current_review_scope_reason()
+                                    .await
+                            };
                             let event_key = if plan_review_due {
                                 format!(
                                     "plan-review:{}:{}:{}:{}:{}",
@@ -866,19 +895,15 @@ pub(crate) async fn run_turn(
                                 )
                                 .await
                             {
-                                let action = if plan_review_due {
-                                    let previous_plan = contract
-                                        .next_action
-                                        .as_deref()
-                                        .unwrap_or("No plan recorded");
-                                    format!(
-                                        "Review why acceptance conditions remain open. Call task_context_boundary plan_review with previous_plan exactly `{previous_plan}`, a distinct revised_plan, and an evidence-based reason. Do not reset product progress."
-                                    )
-                                } else {
-                                    contract.next_action.clone().unwrap_or_else(||
-                                        "recover terminal child results, select the next ready unit, or review the plan".into(),
-                                    )
-                                };
+                                let previous_plan = contract
+                                    .next_action
+                                    .as_deref()
+                                    .unwrap_or("No plan recorded");
+                                let action = turn_end_autonomous_completion_action(
+                                    plan_review_due.then_some(previous_plan),
+                                    current_review_scope_reason.as_deref(),
+                                    contract.next_action.as_deref(),
+                                );
                                 let item = crate::context::ContextualUserFragment::into_boxed_response_item(
                                     Box::new(crate::context::AutonomousCompletionContinue {
                                         next_action: action,

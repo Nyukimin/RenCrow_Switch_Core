@@ -109,3 +109,39 @@ fn realtime_user_verification_notice_excludes_request_payload() {
         )),
     );
 }
+
+#[test]
+fn turn_end_completion_action_includes_review_status_and_saved_action() {
+    let current_review_reason =
+        "Review review-a remains historical; add a linked revalidation through Update.";
+    let recorded_action = "Start the already completed task-b";
+
+    let current_review_action = turn_end_autonomous_completion_action(
+        None,
+        Some(current_review_reason),
+        Some(recorded_action),
+    );
+    assert!(current_review_action.contains(current_review_reason));
+    assert!(current_review_action.contains(recorded_action));
+    assert!(
+        current_review_action
+            .contains("carry forward existing accepted task execution evidence unchanged")
+    );
+
+    let plan_review_action = turn_end_autonomous_completion_action(
+        Some("Keep the existing plan"),
+        Some(current_review_reason),
+        Some(recorded_action),
+    );
+    assert!(plan_review_action.contains("previous_plan exactly `Keep the existing plan`"));
+    assert!(!plan_review_action.contains(current_review_reason));
+
+    assert_eq!(
+        turn_end_autonomous_completion_action(None, None, Some(recorded_action)),
+        recorded_action
+    );
+    assert_eq!(
+        turn_end_autonomous_completion_action(None, None, None),
+        "recover terminal child results, select the next ready unit, or review the plan"
+    );
+}
