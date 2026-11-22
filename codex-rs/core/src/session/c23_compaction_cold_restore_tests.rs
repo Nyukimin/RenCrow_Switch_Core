@@ -1,18 +1,17 @@
+// Modified by RenCrow Switch Core: test evidence across compaction and cold restore.
 use super::*;
 use crate::compact::InitialContextInjection;
 use crate::session::step_context::StepContext;
 use crate::state::ActiveTurn;
 use crate::state::RunningTask;
 use crate::state::TaskKind;
-use crate::task_check::TaskCheckExecution;
-use crate::task_check::TaskCheckKind;
-use crate::task_check::TaskCheckObservation;
-use crate::task_check::TaskEvidenceRequest;
 use crate::tools::context::ToolCallSource;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::handlers::task_context_boundary::TaskContextBoundaryHandler;
 use crate::tools::handlers::task_context_boundary_spec::TASK_CONTEXT_BOUNDARY_TOOL_NAME;
+use crate::tools::handlers::unified_exec::ExecCommandHandler;
+use crate::tools::handlers::unified_exec::ExecCommandHandlerOptions;
 use crate::turn_diff_tracker::TurnDiffTracker;
 use codex_history::ResponseItemEnvelope;
 use codex_history::task_context::AcceptedTaskEvidenceReceipt;
@@ -22,7 +21,6 @@ use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_tools::ToolName;
 use core_test_support::responses;
 use pretty_assertions::assert_eq;
-use std::process::Command;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -128,7 +126,7 @@ async fn accept_revision(
     workspace: &std::path::Path,
     revision: u64,
 ) {
-    let handler = TaskContextBoundaryHandler::new(true);
+    let boundary_handler = TaskContextBoundaryHandler::new(true);
     let workspace_cwd = workspace.canonicalize().expect("canonical isolated cwd");
     let begin_id = format!("begin-{revision}");
     let begin_args = if revision == 1 {
@@ -152,7 +150,7 @@ async fn accept_revision(
         serde_json::json!({"action":"begin", "root_task_id":"root", "task_id":"task-a", "task_revision":revision})
     };
     let begin_args_text = begin_args.to_string();
-    handler
+    boundary_handler
         .handle(invocation(
             Arc::clone(session),
             Arc::clone(turn),
@@ -164,72 +162,10 @@ async fn accept_revision(
     record_boundary_call(session, turn, &begin_id, &begin_args_text).await;
     record_boundary_output(session, turn, &begin_id).await;
 
-    let request = TaskEvidenceRequest {
-        task_id: "task-a".into(),
-        task_revision: revision,
-        artifact_paths: vec![std::path::PathBuf::from("artifact.txt")],
-        check_kind: TaskCheckKind::Verification,
-    };
-    let execution = TaskCheckExecution::new(request.clone(), workspace).expect("hash artifact");
     let verify_id = format!("verify-{revision}");
-    session
-        .begin_task_check(
-            verify_id.clone(),
-            request,
-            execution.workspace_root.clone(),
-            execution.before.clone(),
-        )
-        .await;
-    let command = vec![
-        "python3".to_string(),
-        "-B".to_string(),
-        "-c".to_string(),
-        "from pathlib import Path; assert Path(\"artifact.txt\").is_file()".to_string(),
-    ];
-    let output = Command::new(&command[0])
-        .args(&command[1..])
-        .current_dir(&workspace_cwd)
-        .output()
-        .expect("run isolated artifact verification command");
-    let exit_code = output.status.code().unwrap_or(-1);
-    let completed = output.status.code().is_some();
-    let diagnostic = format!(
-        "stdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let observation = TaskCheckObservation::from_execution(
-        &verify_id,
-        &command,
-        &workspace_cwd,
-        &diagnostic,
-        exit_code,
-        completed,
-        false,
-    );
-    session
-        .finish_task_check_observed(
-            &verify_id,
-            exit_code,
-            completed,
-            execution.hash_artifacts().expect("hash verified artifact"),
-            Some(observation),
-        )
-        .await
-        .expect("verification receipt succeeds");
-    assert!(
-        output.status.success(),
-        "isolated verification command failed"
-    );
-    let command_text = format!(
-        "{} {} {} '{}'",
-        command[0], command[1], command[2], command[3]
-    );
-    // Unified exec accepts absolute native workdir values and resolves them against the URI cwd.
-    let workdir = workspace_cwd.to_string_lossy().into_owned();
     let command_args = serde_json::json!({
-        "cmd":command_text,
-        "workdir":workdir,
+        "cmd":"python3 -B -m unittest -v test_artifact",
+        "workdir":workspace_cwd.to_string_lossy(),
         "task_evidence": {
             "task_id":"task-a",
             "task_revision":revision,
@@ -237,12 +173,60 @@ async fn accept_revision(
             "check_kind":"verification"
         }
     });
-    let command_args = command_args.to_string();
-    let _: crate::tools::handlers::unified_exec::ExecCommandArgs =
-        serde_json::from_str(&command_args)
-            .expect("exec call uses the declared command and task-evidence schema");
-    record_named_call(session, turn, &verify_id, "exec_command", &command_args).await;
-    record_named_output(session, turn, &verify_id, "exec_command", &diagnostic).await;
+    let command_args_text = command_args.to_string();
+    let payload = ToolPayload::Function {
+        arguments: command_args_text.clone(),
+    };
+    let exec_handler = ExecCommandHandler::new(ExecCommandHandlerOptions {
+        allow_login_shell: false,
+        allow_tty: true,
+        exec_permission_approvals_enabled: false,
+        include_environment_id: false,
+        include_task_evidence: true,
+        include_shell_parameter: true,
+        include_windows_shell_guidance: cfg!(windows),
+    });
+    let mut command_invocation = invocation(
+        Arc::clone(session),
+        Arc::clone(turn),
+        &verify_id,
+        command_args,
+    );
+    command_invocation.tool_name = ToolName::plain("exec_command");
+    record_named_call(
+        session,
+        turn,
+        &verify_id,
+        "exec_command",
+        &command_args_text,
+    )
+    .await;
+    let output = exec_handler
+        .handle(command_invocation)
+        .await
+        .expect("native exec handler runs the isolated verification");
+    let result = output.code_mode_result(&payload);
+    assert_eq!(
+        result["exit_code"], 0,
+        "native verification result: {result}"
+    );
+    assert!(result["session_id"].is_null());
+    let receipt = session
+        .task_check_receipt(&verify_id)
+        .await
+        .expect("native exec records the terminal verification receipt");
+    assert!(receipt.succeeded);
+    assert_eq!(receipt.task_id, "task-a");
+    assert_eq!(receipt.task_revision, revision);
+    assert_eq!(receipt.workspace_root, workspace_cwd);
+    record_named_output(
+        session,
+        turn,
+        &verify_id,
+        "exec_command",
+        &output.log_output(),
+    )
+    .await;
 
     let accept_id = format!("accept-{revision}");
     let accept_args = serde_json::json!({
@@ -251,7 +235,7 @@ async fn accept_revision(
     });
     let args_text = accept_args.to_string();
     record_boundary_call(session, turn, &accept_id, &args_text).await;
-    handler
+    boundary_handler
         .handle(invocation(
             Arc::clone(session),
             Arc::clone(turn),
@@ -325,6 +309,21 @@ async fn verification_snapshots(session: &Session) -> Vec<serde_json::Value> {
 #[tokio::test]
 async fn accepted_revision_receipts_survive_real_compaction_and_cold_restore() {
     let server = responses::start_mock_server().await;
+    let workspace = tempfile::tempdir().expect("isolated OS temporary workspace");
+    std::fs::write(
+        workspace.path().join("test_artifact.py"),
+        "import unittest\nfrom pathlib import Path\n\nclass ArtifactEvidence(unittest.TestCase):\n    def test_artifact(self):\n        self.assertIn('verified artifact revision ', Path('artifact.txt').read_text())\n",
+    )
+    .expect("write isolated standard verification fixture");
+    let workspace_path = codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(
+        workspace
+            .path()
+            .canonicalize()
+            .expect("canonical workspace"),
+    )
+    .expect("absolute isolated workspace");
+    let initial_workspace = workspace_path.clone();
+    let cold_workspace = workspace_path;
     let provider = codex_model_provider_info::ModelProviderInfo::create_openai_provider(Some(
         format!("{}/v1", server.uri()),
     ));
@@ -333,6 +332,11 @@ async fn accepted_revision_receipts_survive_real_compaction_and_cold_restore() {
         codex_login::CodexAuth::create_dummy_chatgpt_auth_for_testing(),
         Vec::new(),
         move |config| {
+            config.cwd = initial_workspace;
+            let sandbox_policy = config.legacy_sandbox_policy();
+            config
+                .set_legacy_sandbox_policy(sandbox_policy)
+                .expect("synchronize the initial workspace roots");
             config.model = Some("gpt-5.2".to_string());
             config.model_provider = provider;
             config.model_provider.supports_websockets = false;
@@ -349,7 +353,6 @@ async fn accepted_revision_receipts_survive_real_compaction_and_cold_restore() {
         attach_thread_persistence(Arc::get_mut(&mut session).expect("unique session")).await;
     install_active_turn(&session, Arc::clone(&turn)).await;
 
-    let workspace = tempfile::tempdir().expect("isolated OS temporary workspace");
     let mut expected_evidence = Vec::new();
     let mut prior_receipts = Vec::new();
     for revision in 1..=3 {
@@ -503,6 +506,11 @@ async fn accepted_revision_receipts_survive_real_compaction_and_cold_restore() {
         codex_login::CodexAuth::create_dummy_chatgpt_auth_for_testing(),
         Vec::new(),
         move |config| {
+            config.cwd = cold_workspace;
+            let sandbox_policy = config.legacy_sandbox_policy();
+            config
+                .set_legacy_sandbox_policy(sandbox_policy)
+                .expect("synchronize the resumed workspace roots");
             config.model = Some("gpt-5.2".to_string());
             config.model_provider = cold_provider;
             config.model_provider.supports_websockets = false;

@@ -509,6 +509,23 @@ async fn actual_capacity_compaction_failure_seals_and_cold_restores_parent_hando
         assert!(!restored.rencrow_completion_paused);
     }
 
+    if std::env::var_os("RENCROW_C29_HARNESS").is_some() {
+        run_c29_python_owner_harness(&fixture, &path, &record, &capsule).await?;
+        let server_requests = server.received_requests().await.unwrap_or_default();
+        anyhow::ensure!(
+            !server_requests.iter().any(|request| {
+                request.method == wiremock::http::Method::POST
+                    && request.url.path().ends_with("/responses")
+            }),
+            "isolated C29 bridge must not send a model request"
+        );
+        fixture
+            .session
+            .abort_all_tasks(TurnAbortReason::Interrupted)
+            .await;
+        return Ok(());
+    }
+
     let manager_home = tempfile::tempdir()?;
     let mut owner_config = fixture.turn.config.as_ref().clone();
     owner_config.codex_home =
@@ -599,6 +616,340 @@ async fn actual_capacity_compaction_failure_seals_and_cold_restores_parent_hando
         .session
         .abort_all_tasks(TurnAbortReason::Interrupted)
         .await;
+    Ok(())
+}
+
+async fn run_c29_python_owner_harness(
+    fixture: &ActiveHandoffFixture,
+    record_path: &std::path::Path,
+    record: &runtime::HandoffRecord,
+    capsule: &ParentHandoffCapsule,
+) -> anyhow::Result<()> {
+    use std::io::Write;
+
+    let harness = std::env::var_os("RENCROW_C29_HARNESS")
+        .ok_or_else(|| anyhow::anyhow!("RENCROW_C29_HARNESS is required"))?;
+    let tools_root = std::env::var_os("RENCROW_TOOLS_ROOT")
+        .ok_or_else(|| anyhow::anyhow!("RENCROW_TOOLS_ROOT archive is required"))?;
+    let tools_commit = std::env::var("RENCROW_TOOLS_COMMIT")?;
+    let parent_handoff_sha256 = std::env::var("RENCROW_PARENT_HANDOFF_SHA256")?;
+    let workspace = fixture.turn.config.cwd.to_path_buf();
+    let codex_home = fixture.turn.config.codex_home.to_path_buf();
+    let source_rollout = capsule.source_rollout.clone();
+    anyhow::ensure!(
+        source_rollout.starts_with(codex_home.join("sessions")),
+        "native source rollout is outside its isolated Codex HOME sessions directory: {}",
+        source_rollout.display()
+    );
+    let provider_url = fixture
+        .turn
+        .config
+        .model_provider
+        .base_url
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("capacity fixture must use its local mock provider"))?;
+    let base = fixture.directory.path().join("c29-python-owner");
+    std::fs::create_dir_all(&base)?;
+    let record_bytes = std::fs::read(record_path)?;
+    let record_sha256 =
+        codex_history::archive_reference::content_sha256(std::str::from_utf8(&record_bytes)?);
+    let config_path = base.join("harness-input.json");
+    let config = serde_json::json!({
+        "base": base,
+        "home": codex_home,
+        "cwd": workspace,
+        "record_file": record_path,
+        "record_sha256": record_sha256,
+        "record_id": record.capsule_sha256,
+        "source_thread": record.source_thread_id.to_string(),
+        "successor_thread": record.successor_thread_id.to_string(),
+        "source_turn": record.source_turn_id,
+        "root_task_id": capsule.original_snapshot["root_task_id"],
+        "source_rollout": source_rollout,
+        "rollout_mtime": std::fs::metadata(&source_rollout)?.modified()?.elapsed()?.as_secs(),
+        "handoff_directory": record_path.parent().and_then(std::path::Path::parent)
+            .ok_or_else(|| anyhow::anyhow!("handoff directory is missing"))?,
+        "provider_url": provider_url,
+        "test_binary": std::env::current_exe()?,
+    });
+    let mut config_file = std::fs::File::create(&config_path)?;
+    config_file.write_all(&serde_json::to_vec_pretty(&config)?)?;
+    config_file.sync_all()?;
+
+    let python = std::env::var_os("PYTHON").unwrap_or_else(|| "python3".into());
+    let mut command = std::process::Command::new(python);
+    command
+        .arg(harness)
+        .arg(&config_path)
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", &codex_home)
+        .env("TMPDIR", base.join("tmp"))
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .env("RENCROW_TOOLS_ROOT", tools_root)
+        .env("RENCROW_TOOLS_COMMIT", &tools_commit)
+        .env("RENCROW_PARENT_HANDOFF_SHA256", &parent_handoff_sha256);
+    if let Some(value) = std::env::var_os("RUST_MIN_STACK") {
+        command.env("RUST_MIN_STACK", value);
+    }
+    std::fs::create_dir_all(base.join("tmp"))?;
+    if let Some(value) = std::env::var_os("DYLD_LIBRARY_PATH") {
+        command.env("DYLD_LIBRARY_PATH", value);
+    }
+    let output = command.output()?;
+    let child_log_path = base.join("native-child.log");
+    let child_log_diagnostic = match std::fs::read_to_string(&child_log_path) {
+        Ok(contents) => format!(
+            "native-child.log ({}):\n{contents}",
+            child_log_path.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            format!("native-child.log is absent: {}", child_log_path.display())
+        }
+        Err(error) => format!(
+            "native-child.log could not be read at {}: {error}",
+            child_log_path.display()
+        ),
+    };
+    anyhow::ensure!(
+        output.status.success(),
+        "test-owned Python Supervisor bridge failed (status {}): {}\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+        child_log_diagnostic
+    );
+    let result_path = base.join("result.json");
+    let result: serde_json::Value = serde_json::from_slice(&std::fs::read(&result_path)?)?;
+    anyhow::ensure!(
+        result["record_file"] == record_path.to_string_lossy().as_ref()
+            && result["record_id"] == record.capsule_sha256
+            && result["record_sha256"] == record_sha256
+            && result["source_thread"] == record.source_thread_id.to_string()
+            && result["successor_thread"] == record.successor_thread_id.to_string()
+            && result["launch_count"] == 1
+            && result["continuation_count"] == 1
+            && result["child_returncode_after_cleanup"] == 0
+            && result["successor_rollout_copy_bytes_equal"] == true
+            && result["successor_rollout_sha256"].as_str().is_some()
+            && result["cold_resume_tested"] == false
+            && result["parent_handoff_source_sha256"] == parent_handoff_sha256
+            && result["tools_commit"] == tools_commit,
+        "C29 bridge result did not preserve the one-record/one-child contract: {result}"
+    );
+    if let Some(evidence_root) = std::env::var_os("RENCROW_C29_EVIDENCE_DIR") {
+        preserve_c29_evidence(
+            std::path::Path::new(&evidence_root),
+            &base,
+            record_path,
+            &record.capsule_file,
+            &capsule.source_rollout,
+            record,
+        )?;
+    }
+    Ok(())
+}
+
+fn preserve_c29_evidence(
+    evidence_root: &std::path::Path,
+    run_directory: &std::path::Path,
+    record_path: &std::path::Path,
+    capsule_path: &std::path::Path,
+    source_rollout: &std::path::Path,
+    record: &runtime::HandoffRecord,
+) -> anyhow::Result<()> {
+    let destination = evidence_root.join(format!("c29-{}", record.successor_thread_id));
+    anyhow::ensure!(
+        !destination.exists(),
+        "refusing to overwrite existing C29 evidence directory: {}",
+        destination.display()
+    );
+    std::fs::create_dir_all(&destination)?;
+    let artifacts = [
+        ("sealed-handoff.json", record_path.to_path_buf()),
+        ("handoff-capsule.json", capsule_path.to_path_buf()),
+        ("source-rollout.jsonl", source_rollout.to_path_buf()),
+        (
+            "native-successor-rollout.jsonl",
+            run_directory.join("native-successor-rollout.jsonl"),
+        ),
+        (
+            "harness-input.json",
+            run_directory.join("harness-input.json"),
+        ),
+        (
+            "python-owner-result.json",
+            run_directory.join("result.json"),
+        ),
+        (
+            "native-child-proof.json",
+            run_directory.join("child-ready.json"),
+        ),
+        (
+            "native-child-done.json",
+            run_directory.join("child-done.json"),
+        ),
+        ("native-child.log", run_directory.join("native-child.log")),
+        (
+            "supervisor-ledger.json",
+            run_directory.join("escalation-ledger.json"),
+        ),
+        ("settings.json", run_directory.join("settings.json")),
+        (
+            "completion-contract.json",
+            run_directory.join("completion-contract.json"),
+        ),
+        (
+            "executor-policy.json",
+            run_directory.join("executor-policy.json"),
+        ),
+    ];
+    let mut hashes = serde_json::Map::new();
+    for (name, source) in artifacts {
+        let bytes = std::fs::read(&source)
+            .map_err(|error| anyhow::anyhow!("read C29 evidence {}: {error}", source.display()))?;
+        let copied_path = destination.join(name);
+        std::fs::copy(&source, &copied_path)?;
+        let copied = std::fs::read(&copied_path)?;
+        anyhow::ensure!(
+            bytes == copied,
+            "C29 evidence copy changed bytes for {name}"
+        );
+        let text = std::str::from_utf8(&copied)
+            .map_err(|error| anyhow::anyhow!("C29 evidence {name} is not UTF-8: {error}"))?;
+        hashes.insert(
+            name.to_string(),
+            serde_json::Value::String(codex_history::archive_reference::content_sha256(text)),
+        );
+    }
+    std::fs::write(
+        destination.join("artifact-hashes.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "record_id": record.capsule_sha256,
+            "source_thread": record.source_thread_id.to_string(),
+            "successor_thread": record.successor_thread_id.to_string(),
+            "tools_scope": "git archive HEAD; commit and source hash pinned in python-owner-result.json",
+            "artifacts": hashes,
+        }))?,
+    )?;
+    Ok(())
+}
+
+/// Explicit subprocess-only native import helper. The parent test supplies a real sealed record.
+#[tokio::test]
+#[ignore = "spawned only by the isolated C29 Python owner harness"]
+async fn parent_handoff_os_child_imports_same_record() -> anyhow::Result<()> {
+    let record_path = std::path::PathBuf::from(std::env::var("C29_HANDOFF_PATH")?);
+    let workspace = std::path::PathBuf::from(std::env::var("C29_WORKSPACE")?);
+    let provider_url = std::env::var("C29_PROVIDER_URL")?;
+    let codex_home = std::path::PathBuf::from(std::env::var("C29_CODEX_HOME")?);
+    let ready_file = std::path::PathBuf::from(std::env::var("C29_READY_FILE")?);
+    let release_file = std::path::PathBuf::from(std::env::var("C29_RELEASE_FILE")?);
+    let done_file = std::path::PathBuf::from(std::env::var("C29_DONE_FILE")?);
+    let (record, capsule, _) = runtime::load_verified(&record_path).map_err(anyhow::Error::msg)?;
+    let source_generation = capsule.original_snapshot["resume_generation"]
+        .as_u64()
+        .ok_or_else(|| anyhow::anyhow!("sealed source snapshot omits resume_generation"))?;
+    let expected_successor_generation = source_generation
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("sealed source resume_generation overflowed"))?;
+    let handoff_directory = record_path
+        .parent()
+        .and_then(std::path::Path::parent)
+        .ok_or_else(|| anyhow::anyhow!("handoff directory is missing"))?;
+    let workspace_path =
+        codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(&workspace)?;
+    let handoff_path =
+        codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(handoff_directory)?;
+    let (_source_session, source_turn, _) =
+        crate::session::tests::make_session_and_context_with_auth_and_config_and_rx(
+            codex_login::CodexAuth::from_api_key("test"),
+            Vec::new(),
+            move |config| {
+                config.cwd = workspace_path;
+                let sandbox_policy = config.legacy_sandbox_policy();
+                config
+                    .set_legacy_sandbox_policy(sandbox_policy)
+                    .expect("sync workspace roots with the isolated cwd");
+                config.rencrow_compaction = true;
+                config.rencrow_autonomous_completion = true;
+                config.rencrow_parent_handoff_dir = Some(handoff_path);
+                config.model_auto_compact_token_limit = Some(1);
+                config.model_auto_compact_token_limit_scope =
+                    codex_protocol::config_types::AutoCompactTokenLimitScope::Total;
+                config.model_provider.base_url = Some(provider_url);
+                config.model_providers.insert(
+                    config.model_provider_id.clone(),
+                    config.model_provider.clone(),
+                );
+            },
+        )
+        .await;
+    let mut owner_config = source_turn.config.as_ref().clone();
+    owner_config.codex_home =
+        codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(&codex_home)?;
+    owner_config.rencrow_parent_handoff_file =
+        Some(codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(&record_path)?);
+    let manager = crate::ThreadManager::with_models_provider_and_home_for_tests(
+        codex_login::CodexAuth::from_api_key("test"),
+        owner_config.model_provider.clone(),
+        owner_config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    );
+    let mut successor_options = crate::StartThreadOptions::new(owner_config.clone());
+    successor_options.session_source = Some(codex_protocol::protocol::SessionSource::Cli);
+    let successor = manager.start_thread(successor_options).await?;
+    anyhow::ensure!(successor.thread_id == record.successor_thread_id);
+    runtime::claim(&record_path, record.successor_thread_id)
+        .expect_err("successor process must not claim the imported record twice");
+    let mut duplicate_options = crate::StartThreadOptions::new(owner_config);
+    duplicate_options.session_source = Some(codex_protocol::protocol::SessionSource::Cli);
+    anyhow::ensure!(
+        manager.start_thread(duplicate_options).await.is_err(),
+        "successor process started the same handoff record twice"
+    );
+    {
+        let state = successor.thread.session.state.lock().await;
+        let (root, restored) = state
+            .rencrow_completion_state
+            .as_ref()
+            .expect("native successor restores the task state");
+        anyhow::ensure!(root == "root" && *restored == open_state(false));
+        anyhow::ensure!(
+            state.rencrow_completion_resume_generation == expected_successor_generation
+        );
+        anyhow::ensure!(!state.rencrow_completion_paused);
+    }
+    let imported = successor.thread.conversation_history_snapshot().await;
+    anyhow::ensure!(imported.items().any(|item| match item {
+        codex_protocol::models::ResponseItem::Message { role, content, .. } => {
+            role == "user"
+                && content.iter().any(|item| {
+                    matches!(item, codex_protocol::models::ContentItem::InputText { text }
+                        if text == "Preserve this user constraint.")
+                })
+        }
+        _ => false,
+    }));
+    let proof = serde_json::json!({
+        "record_file": record_path,
+        "record_id": record.capsule_sha256,
+        "source_thread": record.source_thread_id.to_string(),
+        "successor_thread": record.successor_thread_id.to_string(),
+        "generation": expected_successor_generation,
+        "duplicate_claim_rejected": true,
+        "duplicate_start_rejected": true,
+    });
+    std::fs::write(&ready_file, serde_json::to_vec(&proof)?)?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(25);
+    while !release_file.exists() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    anyhow::ensure!(
+        release_file.exists(),
+        "native child release signal was not received"
+    );
+    successor.thread.shutdown_and_wait().await?;
+    std::fs::write(&done_file, serde_json::to_vec(&proof)?)?;
     Ok(())
 }
 

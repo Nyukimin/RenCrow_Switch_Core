@@ -531,6 +531,183 @@ async fn repeated_read_is_rejected_without_external_hooks() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeated_reads_do_not_reject_a_valid_status_in_the_same_sampling() -> Result<()> {
+    let server = start_mock_server().await;
+    let repeated_read = |id: &str| {
+        ev_function_call(
+            id,
+            "exec_command",
+            &json!({"cmd":"cat guard-read-fixture.txt"}).to_string(),
+        )
+    };
+    let begin_root = json!({
+        "action":"begin",
+        "root_task_id":"root-a",
+        "task_id":"root-a",
+        "task_revision":1,
+        "completion_state":{
+            "contract_revision":1,
+            "conditions":[{
+                "id":"AC-1",
+                "revision":1,
+                "result":"A verified feature is available",
+                "scope":"CLI feature",
+                "verification":"Verify the output artifact",
+                "acceptance_criteria":"The artifact contains the expected result",
+                "status":"open",
+                "evidence":[],
+                "unmet_reason":null
+            }],
+            "units":[{
+                "id":"unit-a",
+                "purpose":"Implement and verify the feature",
+                "status":"ready",
+                "condition_refs":["AC-1"],
+                "depends_on":[],
+                "evidence":[],
+                "task_refs":[]
+            }],
+            "current_unit":"unit-a",
+            "failed_approaches":[],
+            "blocker":null,
+            "next_action":"Start the implementation task",
+            "product_progress_at":null,
+            "runtime_recovery_at":null,
+            "activity_at":null
+        }
+    });
+    let requests = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("guard-status-register-root"),
+                ev_function_call(
+                    "guard-status-register-root-call",
+                    "task_context_boundary",
+                    &begin_root.to_string(),
+                ),
+                ev_completed("guard-status-register-root"),
+            ]),
+            sse(vec![
+                ev_response_created("guard-status-first-read"),
+                repeated_read("guard-status-first-read-call"),
+                ev_completed("guard-status-first-read"),
+            ]),
+            sse(vec![
+                ev_response_created("guard-status-mixed-sampling"),
+                repeated_read("guard-status-repeat-a"),
+                repeated_read("guard-status-repeat-b"),
+                repeated_read("guard-status-repeat-c"),
+                ev_function_call(
+                    "guard-status-root-a",
+                    "task_context_boundary",
+                    &json!({"action":"status","root_task_id":"root-a"}).to_string(),
+                ),
+                ev_completed("guard-status-mixed-sampling"),
+            ]),
+            sse(vec![
+                ev_response_created("guard-status-mixed-sampling-finished"),
+                ev_assistant_message(
+                    "guard-status-mixed-sampling-message",
+                    "The repeated read was refused and the registered task status was retrieved; continue the open task.",
+                ),
+                ev_completed("guard-status-mixed-sampling-finished"),
+            ]),
+            sse(vec![
+                ev_response_created("guard-status-autonomous-continuation"),
+                ev_assistant_message(
+                    "guard-status-autonomous-continuation-message",
+                    "The registered status was retrieved and the authorized continuation was reviewed.",
+                ),
+                ev_completed("guard-status-autonomous-continuation"),
+            ]),
+        ],
+    )
+    .await;
+    let test = test_codex()
+        .with_config(|config| {
+            config.rencrow_compaction = true;
+            config.rencrow_autonomous_completion = true;
+            config.rencrow_tool_allowlist =
+                Some(vec!["exec_command".into(), "task_context_boundary".into()]);
+            config.rencrow_execution_guard = Some(RencrowExecutionGuard {
+                max_repeated_reads: NonZeroU16::new(1).unwrap(),
+                ..Default::default()
+            });
+        })
+        .build_with_auto_env(&server)
+        .await?;
+    std::fs::write(
+        test.cwd_path().join("guard-read-fixture.txt"),
+        "isolated read\n",
+    )?;
+
+    test.codex
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
+                text: "Register the task, inspect the fixture, and retrieve task status".into(),
+                text_elements: vec![],
+            }])
+            .with_thread_settings(
+                codex_protocol::protocol::ThreadSettingsOverrides {
+                    approval_policy: Some(codex_protocol::protocol::AskForApproval::Never),
+                    permission_profile: Some(
+                        codex_protocol::models::PermissionProfile::workspace_write(),
+                    ),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await?;
+
+    let event = wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    let EventMsg::TurnComplete(done) = event else {
+        unreachable!()
+    };
+    assert_eq!(done.error, None);
+    assert_eq!(
+        done.last_agent_message.as_deref(),
+        Some("The registered status was retrieved and the authorized continuation was reviewed.")
+    );
+    let calls = requests.requests();
+    assert_eq!(calls.len(), 5);
+    for call_id in [
+        "guard-status-repeat-a",
+        "guard-status-repeat-b",
+        "guard-status-repeat-c",
+    ] {
+        let output = calls[3].function_call_output(call_id).to_string();
+        assert!(
+            output.contains("RENCROW_READ_BUDGET_EXCEEDED"),
+            "repeated read {call_id} should be refused by the guard: {output}"
+        );
+    }
+    let status = calls[3]
+        .function_call_output("guard-status-root-a")
+        .to_string();
+    assert!(
+        !status.contains("RENCROW_READ_BUDGET_EXCEEDED"),
+        "registered root status was refused by the guard: {status}"
+    );
+    assert!(
+        status.contains("AC-1"),
+        "status omitted the registered condition: {status}"
+    );
+    assert!(
+        status.contains("Start the implementation task"),
+        "status omitted the registered next action: {status}"
+    );
+    assert!(calls[4].body_contains_text(
+        "Continue unfinished conditions, units, or child collection"
+    ));
+    assert!(calls[4].body_contains_text("Next recorded action: Start the implementation task."));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn distinct_orchestrator_reads_can_exceed_legacy_total_limit() -> Result<()> {
     let server = start_mock_server().await;
     let mut responses = Vec::new();
