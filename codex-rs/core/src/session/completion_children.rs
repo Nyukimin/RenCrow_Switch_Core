@@ -98,6 +98,47 @@ fn status_matches_review_generation(
     })
 }
 
+fn legacy_review_failure_receipt_can_be_recorded(
+    unit: &CompletionUnit,
+    review: &CompletionReviewEvidence,
+    expected_binding: &str,
+    exact_generation: bool,
+    status: &AgentStatus,
+) -> bool {
+    if unit.review_state.is_some()
+        || !exact_generation
+        || !matches!(unit.status, UnitStatus::Running | UnitStatus::Failed)
+    {
+        return false;
+    }
+    let Some(current) = unit.review_evidence.as_ref() else {
+        return false;
+    };
+    if current.reviewer_thread_id != review.reviewer_thread_id
+        || current.reviewer_turn_id != expected_binding
+        || current.spawn_call_id != review.spawn_call_id
+        || current.wait_result_ref.is_some()
+        || current.wait_call_id.is_some()
+    {
+        return false;
+    }
+    let review_ended_fingerprint =
+        super::completion_review_deadline::review_ended_durable_fingerprint(expected_binding);
+    if current.deadline_safety_fingerprint.as_deref() == Some(review_ended_fingerprint.as_str())
+        && !matches!(status, AgentStatus::Errored(reason) if reason == "ReviewEnded")
+    {
+        return false;
+    }
+    matches!(
+        (unit.status, current.terminal_status),
+        (UnitStatus::Running, None)
+            | (
+                UnitStatus::Failed,
+                None | Some(CompletionReviewTerminalStatus::Failed)
+            )
+    )
+}
+
 fn completion_review_needs_spawn(unit: &CompletionUnit) -> bool {
     match unit.review_state.as_ref() {
         Some(review) => match review.active_attempt.as_ref() {
@@ -1574,6 +1615,7 @@ impl Session {
                 continue;
             };
             let expected_binding = review.reviewer_turn_id.clone();
+            let exact_generation = !review.reviewer_turn_id.starts_with("pending-");
             if let Some(turn_id) = status.1.as_ref()
                 && pending_after.is_some()
             {
@@ -1650,7 +1692,17 @@ impl Session {
                                             source.status == CompletionReviewTerminalStatus::Failed
                                         })
                                 });
-                        if (unit.status != UnitStatus::Running && !exact_failure_already_recorded)
+                        let legacy_failure_receipt_can_be_recorded =
+                            legacy_review_failure_receipt_can_be_recorded(
+                                unit,
+                                &review,
+                                &expected_binding,
+                                exact_generation,
+                                &status.2,
+                            );
+                        if (unit.status != UnitStatus::Running
+                            && !exact_failure_already_recorded
+                            && !legacy_failure_receipt_can_be_recorded)
                             || unit.review_evidence.as_ref().is_none_or(|current| {
                                 current.reviewer_thread_id != review.reviewer_thread_id
                                     || current.reviewer_turn_id != expected_binding
@@ -1671,6 +1723,15 @@ impl Session {
                                 .is_some_and(|source| {
                                     source.status != CompletionReviewTerminalStatus::Failed
                                 })
+                            || (unit.review_state.is_none()
+                                && unit
+                                    .review_evidence
+                                    .as_ref()
+                                    .and_then(|evidence| evidence.terminal_status)
+                                    .is_some_and(|terminal| {
+                                        terminal != CompletionReviewTerminalStatus::Failed
+                                            || unit.status != UnitStatus::Failed
+                                    }))
                         {
                             false
                         } else {
@@ -1737,6 +1798,14 @@ impl Session {
                                         Some(_) => {}
                                     }
                                 }
+                            } else if legacy_failure_receipt_can_be_recorded {
+                                let Some(current) = unit.review_evidence.as_mut() else {
+                                    continue;
+                                };
+                                current.wait_result_ref = Some(failure_ref.clone());
+                                current.wait_call_id = Some(wait_call_id.to_string());
+                                current.terminal_status =
+                                    Some(CompletionReviewTerminalStatus::Failed);
                             }
                             // A late receipt for an older child records its historical
                             // failure without changing the status of a newer active attempt.
@@ -2807,6 +2876,265 @@ mod tests {
             product_progress_at: None,
             runtime_recovery_at: None,
             activity_at: None,
+        }
+    }
+
+    fn failed_legacy_review_state(child_id: &str, turn_id: &str) -> CompletionState {
+        let mut contract = pending_review_state(child_id, turn_id);
+        contract.units[0].status = UnitStatus::Failed;
+        let evidence = contract.units[0]
+            .review_evidence
+            .as_mut()
+            .expect("legacy review evidence exists");
+        evidence.deadline_unix_ms = Some(1);
+        evidence.deadline_escalation = Some("reviewer exceeded the host SLA".into());
+        evidence.deadline_safety_fingerprint = Some(
+            super::super::completion_review_deadline::review_ended_durable_fingerprint(turn_id),
+        );
+        evidence.wait_result_ref = None;
+        evidence.terminal_status = Some(CompletionReviewTerminalStatus::Failed);
+        evidence.wait_call_id = None;
+        contract
+            .failed_approaches
+            .push(codex_history::task_context::FailedApproach {
+                summary: "review unit review-1 failed".into(),
+                cause: "reviewer exceeded the host SLA".into(),
+                next_action: "Do not resubmit the same generation".into(),
+                recorded_at: 1,
+            });
+        contract
+    }
+
+    #[tokio::test]
+    async fn legacy_failed_review_collects_exact_native_wait_once_and_preserves_deadline_proof() {
+        let (mut session, _) = make_session_and_context().await;
+        attach_thread_persistence(&mut session).await;
+        let child =
+            ThreadId::try_from("01a1c606-48b8-7cf3-bb78-77b47f6b8c2f").expect("valid reviewer ID");
+        let turn_id = "review-turn-deadline";
+        let before = failed_legacy_review_state(&child.to_string(), turn_id);
+        let original_evidence = before.units[0]
+            .review_evidence
+            .as_ref()
+            .expect("legacy review evidence exists")
+            .clone();
+        session.state.lock().await.rencrow_completion_state = Some(("root".into(), before));
+
+        let terminal_status = AgentStatus::Errored("ReviewEnded".into());
+        session
+            .collect_completion_review_results(
+                "legacy-review-wait-once",
+                &[(child, Some(turn_id.into()), terminal_status.clone())],
+            )
+            .await;
+        let collected = session
+            .rencrow_completion_state("root")
+            .await
+            .expect("native wait receipt should persist on the legacy failure");
+        let unit = &collected.units[0];
+        assert_eq!(unit.status, UnitStatus::Failed);
+        assert!(unit.review_state.is_none());
+        let evidence = unit
+            .review_evidence
+            .as_ref()
+            .expect("legacy evidence remains the compatibility record");
+        assert_eq!(
+            evidence.reviewer_thread_id,
+            original_evidence.reviewer_thread_id
+        );
+        assert_eq!(evidence.reviewer_turn_id, turn_id);
+        assert_eq!(evidence.spawn_call_id, original_evidence.spawn_call_id);
+        assert!(evidence.wait_result_ref.is_some());
+        assert_eq!(
+            evidence.wait_call_id.as_deref(),
+            Some("legacy-review-wait-once")
+        );
+        assert_eq!(
+            evidence.terminal_status,
+            Some(CompletionReviewTerminalStatus::Failed)
+        );
+        assert_eq!(
+            evidence.deadline_escalation,
+            original_evidence.deadline_escalation
+        );
+        assert_eq!(
+            evidence.deadline_safety_fingerprint,
+            original_evidence.deadline_safety_fingerprint
+        );
+        assert_eq!(collected.failed_approaches.len(), 2);
+
+        session
+            .collect_completion_review_results(
+                "legacy-review-wait-duplicate",
+                &[(child, Some(turn_id.into()), terminal_status)],
+            )
+            .await;
+        assert_eq!(
+            session.rencrow_completion_state("root").await,
+            Some(collected),
+            "an already collected failed generation must not add another wait receipt"
+        );
+
+        let mut running = pending_review_state(&child.to_string(), turn_id);
+        let running_evidence = running.units[0]
+            .review_evidence
+            .as_mut()
+            .expect("legacy evidence exists");
+        running_evidence.wait_result_ref = None;
+        running_evidence.terminal_status = None;
+        running_evidence.wait_call_id = None;
+        session.state.lock().await.rencrow_completion_state = Some(("root".into(), running));
+        session
+            .collect_completion_review_results(
+                "legacy-running-review-wait",
+                &[(
+                    child,
+                    Some(turn_id.into()),
+                    AgentStatus::Errored("reviewer failed".into()),
+                )],
+            )
+            .await;
+        let collected_running = session.rencrow_completion_state("root").await.unwrap();
+        assert_eq!(collected_running.units[0].status, UnitStatus::Failed);
+        let running_result = collected_running.units[0]
+            .review_evidence
+            .as_ref()
+            .expect("legacy evidence remains present");
+        assert!(running_result.wait_result_ref.is_some());
+        assert_eq!(
+            running_result.wait_call_id.as_deref(),
+            Some("legacy-running-review-wait")
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_failed_review_rejects_unbound_and_conflicting_wait_generations() {
+        let (mut session, _) = make_session_and_context().await;
+        attach_thread_persistence(&mut session).await;
+        let child =
+            ThreadId::try_from("01a1c606-48b8-7cf3-bb78-77b47f6b8c2f").expect("valid reviewer ID");
+        let turn_id = "review-turn-deadline";
+        let before = failed_legacy_review_state(&child.to_string(), turn_id);
+        session.state.lock().await.rencrow_completion_state = Some(("root".into(), before));
+
+        session
+            .collect_completion_review_results(
+                "legacy-review-wrong-generation",
+                &[(
+                    child,
+                    Some("different-review-turn".into()),
+                    AgentStatus::Errored("ReviewEnded".into()),
+                )],
+            )
+            .await;
+        let after_wrong_generation = session.rencrow_completion_state("root").await.unwrap();
+        let evidence = after_wrong_generation.units[0]
+            .review_evidence
+            .as_ref()
+            .expect("legacy evidence remains present");
+        assert!(evidence.wait_result_ref.is_none());
+        assert!(evidence.wait_call_id.is_none());
+
+        let mut contradictory = pending_review_state(&child.to_string(), turn_id);
+        let contradictory_evidence = contradictory.units[0]
+            .review_evidence
+            .as_mut()
+            .expect("legacy evidence exists");
+        contradictory_evidence.wait_result_ref = None;
+        contradictory_evidence.wait_call_id = None;
+        contradictory_evidence.terminal_status = Some(CompletionReviewTerminalStatus::Completed);
+        let contradictory = ("root".into(), contradictory);
+        session.state.lock().await.rencrow_completion_state = Some(contradictory.clone());
+        session
+            .collect_completion_review_results(
+                "legacy-review-contradictory-terminal",
+                &[(
+                    child,
+                    Some(turn_id.into()),
+                    AgentStatus::Errored("ReviewEnded".into()),
+                )],
+            )
+            .await;
+        assert_eq!(
+            session.rencrow_completion_state("root").await,
+            Some(contradictory.1),
+            "a failed native status cannot overwrite an existing successful terminal fact"
+        );
+
+        let mut inconsistent = pending_review_state(&child.to_string(), turn_id);
+        let inconsistent_evidence = inconsistent.units[0]
+            .review_evidence
+            .as_mut()
+            .expect("legacy evidence exists");
+        inconsistent_evidence.wait_result_ref = None;
+        inconsistent_evidence.wait_call_id = None;
+        inconsistent_evidence.terminal_status = Some(CompletionReviewTerminalStatus::Failed);
+        let inconsistent = ("root".into(), inconsistent);
+        session.state.lock().await.rencrow_completion_state = Some(inconsistent.clone());
+        session
+            .collect_completion_review_results(
+                "legacy-review-inconsistent-status",
+                &[(
+                    child,
+                    Some(turn_id.into()),
+                    AgentStatus::Errored("ReviewEnded".into()),
+                )],
+            )
+            .await;
+        assert_eq!(
+            session.rencrow_completion_state("root").await,
+            Some(inconsistent.1),
+            "a terminal failure fact cannot coexist with a Running legacy unit"
+        );
+
+        let mut pending_after = failed_legacy_review_state(&child.to_string(), turn_id);
+        pending_after.units[0]
+            .review_evidence
+            .as_mut()
+            .unwrap()
+            .reviewer_turn_id = format!("pending-after:{turn_id}");
+        let pending_after = ("root".into(), pending_after);
+        session.state.lock().await.rencrow_completion_state = Some(pending_after.clone());
+        session
+            .collect_completion_review_results(
+                "legacy-review-pending-after",
+                &[(
+                    child,
+                    Some("follow-up-turn".into()),
+                    AgentStatus::Errored("follow-up failed".into()),
+                )],
+            )
+            .await;
+        assert_eq!(
+            session.rencrow_completion_state("root").await,
+            Some(pending_after.1),
+            "pending-after does not bind a receipt to the previous spawn attempt"
+        );
+
+        for (wait_call_id, conflicting_status) in [
+            (
+                "legacy-review-wrong-error-reason",
+                AgentStatus::Errored("different failure".into()),
+            ),
+            (
+                "legacy-review-shutdown-after-review-ended",
+                AgentStatus::Shutdown,
+            ),
+        ] {
+            let before = failed_legacy_review_state(&child.to_string(), turn_id);
+            session.state.lock().await.rencrow_completion_state =
+                Some(("root".into(), before.clone()));
+            session
+                .collect_completion_review_results(
+                    wait_call_id,
+                    &[(child, Some(turn_id.into()), conflicting_status)],
+                )
+                .await;
+            assert_eq!(
+                session.rencrow_completion_state("root").await,
+                Some(before),
+                "a persisted ReviewEnded fingerprint only accepts its matching wait status"
+            );
         }
     }
 

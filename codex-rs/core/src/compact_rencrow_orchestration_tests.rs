@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-21: initialize accepted revision history fixtures.
 //! Integration regressions for the V2 original-loop connection.
 //!
 //! These cases target the pure `compact_rencrow_summary` boundary, not the model/session
@@ -143,6 +144,7 @@ fn stored_task_state_fixture() -> serde_json::Value {
     let state = StoredTaskState {
         boundary,
         completed,
+        accepted_history: vec![],
         parent_review_ref: "review:a".into(),
         previous_revision: None,
         previous_state_hash: None,

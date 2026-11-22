@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-21: initialize accepted revision history fixtures.
 use super::*;
 use crate::compact::SUMMARY_PREFIX;
 use crate::context_manager::ContextManager;
@@ -104,6 +105,7 @@ fn stored_task_state() -> Value {
     let state = StoredTaskState {
         boundary,
         completed,
+        accepted_history: vec![],
         parent_review_ref: "review:a".into(),
         previous_revision: None,
         previous_state_hash: None,

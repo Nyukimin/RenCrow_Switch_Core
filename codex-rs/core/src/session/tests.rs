@@ -1,6 +1,9 @@
+// Modified by RenCrow Switch Core, 2026-11-21: initialize accepted revision history fixtures.
 // Modified by RenCrow Switch Core, 2026-09-22: handle durable compaction markers.
 #[path = "autonomous_completion_tests.rs"]
 mod autonomous_completion_tests;
+#[path = "c23_compaction_cold_restore_tests.rs"]
+mod c23_compaction_cold_restore_tests;
 #[path = "completion_recovery_tests.rs"]
 mod completion_recovery_tests;
 #[path = "completion_review_async_tests.rs"]
@@ -6791,6 +6794,7 @@ pub(crate) fn accepted_task_boundary_item(thread_id: &str, artifact_ref: &str) -
                 verification_ref: artifact_ref.into(),
             },
         )]),
+        accepted_history: vec![],
         parent_review_ref: "review:task-a".into(),
         previous_revision: None,
         previous_state_hash: None,

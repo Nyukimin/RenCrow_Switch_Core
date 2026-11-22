@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-21: retain exact accepted task-revision evidence history.
 // Modified by RenCrow Switch Core, 2026-11-20: separate caller and host checkpoint budgets.
 //! Typed, host-verified task-boundary state and deterministic derived context.
 
@@ -6,6 +7,14 @@ use serde::Deserialize;
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+
+#[path = "task_context/accepted_evidence.rs"]
+mod accepted_evidence;
+pub use accepted_evidence::AcceptedTaskEvidenceReceipt;
+pub use accepted_evidence::AcceptedTaskEvidenceResolution;
+pub use accepted_evidence::resolve_accepted_task_evidence;
+use accepted_evidence::retain_referenced_task_evidence;
+use accepted_evidence::validate_accepted_history;
 
 const MAX_BOUNDARY_BYTES: usize = 32 * 1024;
 const MAX_TEXT_BYTES: usize = 4096;
@@ -617,6 +626,8 @@ pub struct HostBoundaryFacts {
     pub parent_review_matches: bool,
     pub unresolved_effects: Vec<String>,
     pub accepted_completed: BTreeMap<String, AcceptedTaskReceipt>,
+    /// Prior exact receipt identities copied only from a validated host checkpoint.
+    pub accepted_history: Vec<AcceptedTaskEvidenceReceipt>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -656,6 +667,7 @@ pub struct ValidatedBoundary {
     candidate: BoundaryCandidate,
     parent_review_ref: String,
     completed: BTreeMap<String, AcceptedTaskReceipt>,
+    accepted_history: Vec<AcceptedTaskEvidenceReceipt>,
     current_result: String,
 }
 
@@ -666,6 +678,9 @@ pub struct ValidatedBoundary {
 pub struct StoredTaskState {
     pub boundary: BoundaryCandidate,
     pub completed: BTreeMap<String, AcceptedTaskReceipt>,
+    /// Bounded identities for accepted receipts retained by completion evidence history.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accepted_history: Vec<AcceptedTaskEvidenceReceipt>,
     pub parent_review_ref: String,
     pub previous_revision: Option<u64>,
     pub previous_state_hash: Option<String>,
@@ -693,21 +708,35 @@ impl ValidatedBoundary {
         previous_state_hash: Option<String>,
         boundary_nonce: String,
     ) -> Result<StoredTaskState, String> {
+        let current_receipt = AcceptedTaskReceipt {
+            // The completion receipt is scoped to the closed task, not the board snapshot.
+            revision: self.candidate.closed_task_revision,
+            result: self.current_result,
+            artifact_ref: self.candidate.artifact_ref.clone(),
+            verification_ref: self.candidate.verification_ref.clone(),
+        };
+        let current_task_id = self.candidate.closed_task_id.clone();
+        let mut history_sources = self.accepted_history;
+        history_sources.extend(self.completed.iter().map(|(task_id, receipt)| {
+            AcceptedTaskEvidenceReceipt {
+                task_id: task_id.clone(),
+                task_revision: receipt.revision,
+                artifact_ref: receipt.artifact_ref.clone(),
+                verification_ref: receipt.verification_ref.clone(),
+            }
+        }));
         let mut completed = self.completed;
-        completed.insert(
-            self.candidate.closed_task_id.clone(),
-            AcceptedTaskReceipt {
-                // The completion receipt is scoped to the closed task, not the board snapshot.
-                revision: self.candidate.closed_task_revision,
-                result: self.current_result,
-                artifact_ref: self.candidate.artifact_ref.clone(),
-                verification_ref: self.candidate.verification_ref.clone(),
-            },
-        );
+        completed.insert(current_task_id, current_receipt);
+        let accepted_history = retain_referenced_task_evidence(
+            self.candidate.completion_state.as_ref(),
+            &completed,
+            history_sources,
+        )?;
         let candidate_hash = candidate_hash(&self.candidate)?;
         let state = StoredTaskState {
             boundary: self.candidate,
             completed,
+            accepted_history,
             parent_review_ref: self.parent_review_ref,
             previous_revision,
             previous_state_hash,
@@ -766,8 +795,12 @@ impl StoredTaskState {
         }
         validate_tasks(&self.boundary)
             .map_err(|error| format!("invalid stored task state: {error:?}"))?;
-        validate_completion_state(self.boundary.completion_state.as_ref(), &self.completed)
-            .map_err(|error| format!("invalid stored completion state: {error}"))?;
+        validate_completion_state_with_history(
+            self.boundary.completion_state.as_ref(),
+            &self.completed,
+            &self.accepted_history,
+        )
+        .map_err(|error| format!("invalid stored completion state: {error}"))?;
         for task in self
             .boundary
             .tasks
@@ -798,6 +831,11 @@ impl StoredTaskState {
         }) {
             return Err("stored task state has an unbound completion receipt".into());
         }
+        validate_accepted_history(
+            self.boundary.completion_state.as_ref(),
+            &self.completed,
+            &self.accepted_history,
+        )?;
         Ok(())
     }
 
@@ -809,6 +847,7 @@ impl StoredTaskState {
             candidate: self.boundary.clone(),
             parent_review_ref: self.parent_review_ref.clone(),
             completed,
+            accepted_history: self.accepted_history.clone(),
             current_result: self.completed[&self.boundary.closed_task_id].result.clone(),
         };
         Ok(render_task_context(&validated))
@@ -948,12 +987,26 @@ fn validate_boundary_with_size(
             verification_ref: verification.to_owned(),
         },
     );
-    validate_completion_state(candidate.completion_state.as_ref(), &receipts)
-        .map_err(|_| BoundaryError::InvalidCompletionState)?;
+    let mut accepted_history = facts.accepted_history.clone();
+    accepted_history.extend(facts.accepted_completed.iter().map(|(task_id, receipt)| {
+        AcceptedTaskEvidenceReceipt {
+            task_id: task_id.clone(),
+            task_revision: receipt.revision,
+            artifact_ref: receipt.artifact_ref.clone(),
+            verification_ref: receipt.verification_ref.clone(),
+        }
+    }));
+    validate_completion_state_with_history(
+        candidate.completion_state.as_ref(),
+        &receipts,
+        &accepted_history,
+    )
+    .map_err(|_| BoundaryError::InvalidCompletionState)?;
     Ok(ValidatedBoundary {
         candidate,
         parent_review_ref: review,
         completed: facts.accepted_completed.clone(),
+        accepted_history: facts.accepted_history.clone(),
         current_result,
     })
 }
@@ -1482,7 +1535,16 @@ pub fn validate_completion_state(
     state: Option<&CompletionState>,
     receipts: &BTreeMap<String, AcceptedTaskReceipt>,
 ) -> Result<(), String> {
-    validate_completion_state_inner(state, receipts, true)
+    validate_completion_state_with_history(state, receipts, &[])
+}
+
+/// Validate current proof against latest receipts and unit history against exact prior receipts.
+pub fn validate_completion_state_with_history(
+    state: Option<&CompletionState>,
+    receipts: &BTreeMap<String, AcceptedTaskReceipt>,
+    history: &[AcceptedTaskEvidenceReceipt],
+) -> Result<(), String> {
+    validate_completion_state_inner(state, receipts, history, true)
 }
 
 /// Validate an immutable host-authored snapshot without comparing its historical evidence
@@ -1491,12 +1553,13 @@ pub fn validate_completion_state_snapshot(
     state: Option<&CompletionState>,
     receipts: &BTreeMap<String, AcceptedTaskReceipt>,
 ) -> Result<(), String> {
-    validate_completion_state_inner(state, receipts, false)
+    validate_completion_state_inner(state, receipts, &[], false)
 }
 
 fn validate_completion_state_inner(
     state: Option<&CompletionState>,
     receipts: &BTreeMap<String, AcceptedTaskReceipt>,
+    history: &[AcceptedTaskEvidenceReceipt],
     enforce_current_evidence_receipts: bool,
 ) -> Result<(), String> {
     let Some(state) = state else {
@@ -1544,7 +1607,11 @@ fn validate_completion_state_inner(
             return Err("satisfied condition has no canonical evidence".into());
         }
         for evidence in &condition.evidence {
-            validate_completion_evidence(evidence, receipts, enforce_current_evidence_receipts)?;
+            if enforce_current_evidence_receipts {
+                validate_current_completion_evidence(evidence, receipts)?;
+            } else {
+                validate_completion_evidence(evidence, receipts, history, false)?;
+            }
         }
         if condition
             .unmet_reason
@@ -1714,7 +1781,12 @@ fn validate_completion_state_inner(
             }
         }
         for evidence in unit.evidence.iter().chain(&unit.task_refs) {
-            validate_completion_evidence(evidence, receipts, enforce_current_evidence_receipts)?;
+            validate_completion_evidence(
+                evidence,
+                receipts,
+                history,
+                enforce_current_evidence_receipts,
+            )?;
         }
         if unit.kind == CompletionUnitKind::Execution
             && unit.status == UnitStatus::Done
@@ -1957,8 +2029,11 @@ fn validate_completion_state_inner(
             return Err("review-owned blocker does not match its active host attempt".into());
         }
         if blocker.evidence.iter().any(|evidence| {
-            validate_completion_evidence(evidence, receipts, enforce_current_evidence_receipts)
-                .is_err()
+            if enforce_current_evidence_receipts {
+                validate_current_completion_evidence(evidence, receipts).is_err()
+            } else {
+                validate_completion_evidence(evidence, receipts, history, false).is_err()
+            }
         }) {
             return Err("completion blocker evidence is invalid".into());
         }
@@ -2006,6 +2081,7 @@ fn validate_completion_state_inner(
 fn validate_completion_evidence(
     evidence: &CompletionEvidenceRef,
     receipts: &BTreeMap<String, AcceptedTaskReceipt>,
+    history: &[AcceptedTaskEvidenceReceipt],
     enforce_current_receipt: bool,
 ) -> Result<(), String> {
     if evidence.task_id.trim().is_empty()
@@ -2018,16 +2094,35 @@ fn validate_completion_evidence(
     if !enforce_current_receipt {
         return Ok(());
     }
-    let Some(receipt) = receipts.get(&evidence.task_id) else {
-        return Err("completion evidence has no host receipt".into());
-    };
-    if receipt.revision != evidence.task_revision
-        || receipt.artifact_ref != evidence.artifact_ref
-        || receipt.verification_ref != evidence.verification_ref
-    {
-        return Err("completion evidence is stale or does not match its host receipt".into());
+    match resolve_accepted_task_evidence(evidence, receipts, history) {
+        Some(
+            AcceptedTaskEvidenceResolution::Current(_)
+            | AcceptedTaskEvidenceResolution::Historical(_),
+        ) => Ok(()),
+        Some(AcceptedTaskEvidenceResolution::CurrentRevision(_)) | None => {
+            Err("completion evidence is stale or does not match an accepted host receipt".into())
+        }
     }
-    Ok(())
+}
+
+fn validate_current_completion_evidence(
+    evidence: &CompletionEvidenceRef,
+    receipts: &BTreeMap<String, AcceptedTaskReceipt>,
+) -> Result<(), String> {
+    if evidence.task_id.trim().is_empty()
+        || evidence.task_revision == 0
+        || evidence.artifact_ref.trim().is_empty()
+        || evidence.verification_ref.trim().is_empty()
+    {
+        return Err("completion evidence identity is invalid".into());
+    }
+    if matches!(
+        resolve_accepted_task_evidence(evidence, receipts, &[]),
+        Some(AcceptedTaskEvidenceResolution::Current(_))
+    ) {
+        return Ok(());
+    }
+    Err("completion evidence is stale or does not match the current accepted host receipt".into())
 }
 
 fn validate_size_and_text(candidate: &BoundaryCandidate) -> Result<(), BoundaryError> {

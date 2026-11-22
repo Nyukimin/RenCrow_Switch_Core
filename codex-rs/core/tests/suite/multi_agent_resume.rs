@@ -3,7 +3,6 @@ use codex_core::TurnInputRequest;
 use codex_core::config::AgentRoleConfig;
 use codex_features::Feature;
 use codex_protocol::models::PermissionProfile;
-use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
@@ -142,6 +141,10 @@ fn configure_multi_agent_v2_with_role(
     config: &mut codex_core::config::Config,
     model_provider_base_url: &str,
 ) {
+    let loopback_openai_provider = config.model_provider.clone();
+    config
+        .model_providers
+        .insert(ROLE_MODEL_PROVIDER_ID.to_string(), loopback_openai_provider);
     config
         .features
         .enable(Feature::Collab)
@@ -504,6 +507,7 @@ model_reasoning_effort = "high"
 developer_instructions = "{ROLE_DEVELOPER_INSTRUCTIONS}"
 model_provider = "{ROLE_MODEL_PROVIDER_ID}"
 openai_base_url = "{redirected_base_url}"
+rencrow_read_only = true
 "#
         ),
     )?;
@@ -749,9 +753,7 @@ async fn v1_registered_provider_role_uses_its_own_manager_and_endpoint() -> Resu
     let openai_base_url = format!("{}/v1", openai_server.uri());
     let spawn_args = json!({
         "message": CROSS_PROVIDER_TASK,
-        "task_name": "analyst",
         "agent_type": "analyst",
-        "fork_turns": "none",
     })
     .to_string();
     let parent_spawn = mount_sse_once_match(
@@ -789,7 +791,7 @@ async fn v1_registered_provider_role_uses_its_own_manager_and_endpoint() -> Resu
         &openai_server,
         |request: &wiremock::Request| {
             request_has_model(request, CROSS_PROVIDER_ANALYST_MODEL)
-                && request_has_input_type(request, "agent_message")
+                && request_has_input_type(request, "message")
                 && body_contains(request, CROSS_PROVIDER_TASK)
         },
         sse(vec![
@@ -843,22 +845,44 @@ async fn v1_registered_provider_role_uses_its_own_manager_and_endpoint() -> Resu
                 AgentRoleConfig {
                     enabled: None,
                     description: Some("Registered OpenAI analyst".to_string()),
-                    config_file: Some(role_path),
+                    config_file: Some(role_path.to_path_buf()),
                     nickname_candidates: None,
                 },
             );
         });
     let fixture = builder.build(&local_parent_server).await?;
     fixture.submit_turn(CROSS_PROVIDER_PROMPT).await?;
-    wait_for_event(&fixture.codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
 
     let parent_spawn_request = parent_spawn.single_request();
     let parent_followup_request = parent_followup.single_request();
-    assert_eq!(parent_spawn_request.body_json()["model"], LOCAL_PARENT_MODEL);
-    assert_eq!(parent_followup_request.body_json()["model"], LOCAL_PARENT_MODEL);
+    assert_eq!(
+        parent_spawn_request.body_json()["model"],
+        LOCAL_PARENT_MODEL
+    );
+    assert_eq!(
+        parent_followup_request.body_json()["model"],
+        LOCAL_PARENT_MODEL
+    );
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while analyst_response.requests().is_empty() {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("timed out waiting for the spawned analyst's Responses API request");
 
     let analyst_request = analyst_response.single_request();
-    assert_eq!(analyst_request.body_json()["model"], CROSS_PROVIDER_ANALYST_MODEL);
+    assert!(
+        analyst_request
+            .message_input_texts("user")
+            .iter()
+            .any(|message| message == CROSS_PROVIDER_TASK)
+    );
+    assert_eq!(
+        analyst_request.body_json()["model"],
+        CROSS_PROVIDER_ANALYST_MODEL
+    );
     assert_eq!(analyst_request.body_json()["reasoning"]["effort"], "high");
     assert!(analyst_request.body_contains_text("<permission_profile type=\"managed\">"));
 
@@ -871,21 +895,41 @@ async fn v1_registered_provider_role_uses_its_own_manager_and_endpoint() -> Resu
         .find(|thread_id| *thread_id != root_thread_id)
         .expect("analyst child thread should be registered");
     let child_thread = fixture.thread_manager.get_thread(child_thread_id).await?;
+    wait_for_event(child_thread.as_ref(), |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
     let child_config = child_thread.config_snapshot().await;
     assert_eq!(child_config.model_provider_id, "openai");
     assert_eq!(child_config.model, CROSS_PROVIDER_ANALYST_MODEL);
     assert_eq!(child_config.reasoning_effort, Some(ReasoningEffort::High));
-    assert_eq!(child_config.permission_profile, PermissionProfile::read_only());
+    assert_eq!(
+        child_config.permission_profile,
+        PermissionProfile::read_only()
+    );
 
-    assert!(local_parent_server
+    assert!(
+        local_parent_server
+            .received_requests()
+            .await
+            .expect("local parent mock should record requests")
+            .iter()
+            .all(|request| request_has_model(request, LOCAL_PARENT_MODEL))
+    );
+    let analyst_dispatches = openai_server
         .received_requests()
-        .await?
-        .iter()
-        .all(|request| request_has_model(request, LOCAL_PARENT_MODEL)));
-    assert!(openai_server
-        .received_requests()
-        .await?
-        .iter()
-        .any(|request| request_has_model(request, CROSS_PROVIDER_ANALYST_MODEL)));
+        .await
+        .expect("OpenAI mock should record requests")
+        .into_iter()
+        .filter(|request| {
+            request_has_model(request, CROSS_PROVIDER_ANALYST_MODEL)
+                && request_has_input_type(request, "message")
+                && body_contains(request, CROSS_PROVIDER_TASK)
+        })
+        .count();
+    assert_eq!(
+        analyst_dispatches, 1,
+        "analyst task must dispatch exactly once"
+    );
     Ok(())
 }

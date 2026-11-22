@@ -69,6 +69,51 @@ pub(crate) async fn apply_role_to_config(
         })
 }
 
+/// Applies only the model and reasoning effort from an inherited parent role.
+///
+/// Full-history forks already inherit the parent's effective runtime and security config. This
+/// helper keeps C16 model precedence independent without replaying provider, prompt, or permission
+/// settings from the role file onto that live config.
+pub(crate) async fn apply_role_model_and_effort(
+    config: &mut Config,
+    role_name: &str,
+) -> Result<bool, String> {
+    let role = resolve_role_config(config, role_name)
+        .cloned()
+        .ok_or_else(|| format!("unknown agent_type '{role_name}'"))?;
+    let Some(config_file) = role.config_file.as_ref() else {
+        return Ok(false);
+    };
+    let is_built_in = !config.agent_roles.contains_key(role_name);
+    let role_layer_toml = load_role_layer_toml(config, config_file, is_built_in, role_name)
+        .await
+        .map_err(|err| {
+            tracing::warn!("failed to read model settings for inherited role: {err}");
+            AGENT_TYPE_UNAVAILABLE_ERROR.to_string()
+        })?;
+    let role_config = deserialize_config_toml_with_base(role_layer_toml, &config.codex_home)
+        .map_err(|err| {
+            tracing::warn!("failed to read model settings for inherited role: {err}");
+            AGENT_TYPE_UNAVAILABLE_ERROR.to_string()
+        })?;
+
+    let model_changed = role_config
+        .model
+        .as_ref()
+        .is_some_and(|model| config.model.as_ref() != Some(model));
+    let effort_changed = role_config
+        .model_reasoning_effort
+        .as_ref()
+        .is_some_and(|effort| config.model_reasoning_effort.as_ref() != Some(effort));
+    if let Some(model) = role_config.model {
+        config.model = Some(model);
+    }
+    if let Some(reasoning_effort) = role_config.model_reasoning_effort {
+        config.model_reasoning_effort = Some(reasoning_effort);
+    }
+    Ok(model_changed || effort_changed)
+}
+
 pub(crate) fn ensure_agent_role_enabled(
     config: &Config,
     role_name: Option<&str>,
@@ -401,16 +446,16 @@ pub(crate) mod spawn_tool_spec {
                         .and_then(TomlValue::as_str);
                     match (model, reasoning_effort) {
                         (Some(model), Some(reasoning_effort)) => format!(
-                            "\n- This role's model is set to `{model}` and its reasoning effort is set to `{reasoning_effort}`. These settings cannot be changed."
+                            "\n- This role defaults to model `{model}` and reasoning effort `{reasoning_effort}`. When provided, explicit spawn arguments take precedence for either setting."
                         ),
                         (Some(model), None) => {
                             format!(
-                                "\n- This role's model is set to `{model}` and cannot be changed."
+                                "\n- This role defaults to model `{model}`. An explicit spawn model takes precedence when provided."
                             )
                         }
                         (None, Some(reasoning_effort)) => {
                             format!(
-                                "\n- This role's reasoning effort is set to `{reasoning_effort}` and cannot be changed."
+                                "\n- This role defaults to reasoning effort `{reasoning_effort}`. An explicit spawn reasoning effort takes precedence when provided."
                             )
                         }
                         (None, None) => String::new(),

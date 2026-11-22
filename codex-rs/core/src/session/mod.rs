@@ -1663,14 +1663,44 @@ impl Session {
                 let turn_context = self.new_default_turn().await;
                 let same_thread_resume = resumed_history.conversation_id == self.thread_id();
                 let rollout_items = resumed_history.history;
-                if matches!(
-                    rollout_items.iter().rev().find_map(|item| match item {
-                        RolloutItem::EventMsg(event) => agent_status_from_event(event),
-                        _ => None,
-                    }),
-                    Some(AgentStatus::Interrupted)
-                ) {
-                    self.agent_status.send_replace(AgentStatus::Interrupted);
+                let last_status_event = rollout_items.iter().rev().find_map(|item| match item {
+                    RolloutItem::EventMsg(event) if agent_status_from_event(event).is_some() => {
+                        Some(event)
+                    }
+                    _ => None,
+                });
+                let restored_status = last_status_event.and_then(|event| {
+                    let status = agent_status_from_event(event)?;
+                    if matches!(&status, AgentStatus::Interrupted) {
+                        return Some(status);
+                    }
+
+                    let EventMsg::TurnAborted(aborted) = event else {
+                        return None;
+                    };
+                    if !same_thread_resume
+                        || !is_subagent
+                        || aborted.reason != codex_protocol::protocol::TurnAbortReason::ReviewEnded
+                    {
+                        return None;
+                    }
+
+                    let latest_started_turn_id =
+                        rollout_items.iter().rev().find_map(|item| match item {
+                            RolloutItem::EventMsg(EventMsg::TurnStarted(started)) => {
+                                Some(started.turn_id.as_str())
+                            }
+                            _ => None,
+                        });
+                    matches!(
+                        (aborted.turn_id.as_deref(), latest_started_turn_id),
+                        (Some(aborted_turn_id), Some(started_turn_id))
+                            if aborted_turn_id == started_turn_id
+                    )
+                    .then_some(status)
+                });
+                if let Some(status) = restored_status {
+                    self.agent_status.send_replace(status);
                 }
                 let previous_turn_settings = self
                     .apply_rollout_reconstruction(&turn_context, &rollout_items)
@@ -5515,6 +5545,10 @@ async fn build_hooks_config(
 #[cfg(test)]
 #[path = "elicitation_holders_tests.rs"]
 mod elicitation_holders_tests;
+
+#[cfg(test)]
+#[path = "review_status_resume_tests.rs"]
+mod review_status_resume_tests;
 
 #[cfg(test)]
 pub(crate) mod tests;

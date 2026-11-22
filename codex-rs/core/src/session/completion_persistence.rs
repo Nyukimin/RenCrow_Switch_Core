@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-21: validate accepted revision history in restored task state.
 // Modified by RenCrow Switch Core, 2026-11-21: audit explicit authorized native resume.
 // Modified by RenCrow Switch Core, 2026-11-20: separate caller and host checkpoint budgets.
 //! Durable host snapshots reuse the rollout envelope, outside model-written content.
@@ -3639,6 +3640,7 @@ mod tests {
                     verification_ref: artifact_ref.into(),
                 },
             )]),
+            accepted_history: vec![],
             parent_review_ref: "review:task-a".into(),
             previous_revision: None,
             previous_state_hash: None,
@@ -4298,9 +4300,10 @@ mod tests {
         .expect("accepted task boundary must be in the disk rollout");
         let parsed_snapshot: Snapshot =
             serde_json::from_value(snapshot.clone()).expect("parse persisted deadline snapshot");
-        let state_validation = codex_history::task_context::validate_completion_state(
+        let state_validation = codex_history::task_context::validate_completion_state_with_history(
             Some(&parsed_snapshot.state),
             &accepted_task_state.completed,
+            &accepted_task_state.accepted_history,
         );
         assert!(
             state_validation.is_ok(),

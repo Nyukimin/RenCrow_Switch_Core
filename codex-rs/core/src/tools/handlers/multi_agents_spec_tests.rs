@@ -83,10 +83,11 @@ fn spawn_agent_tool_v2_requires_task_name_and_lists_visible_models() {
     assert!(description.contains("Spawns an agent to work on the specified task."));
     assert!(description.contains("The spawned agent will have the same tools as you"));
     assert!(!description.contains("max_concurrent_threads_per_session"));
-    assert!(description.contains(SPAWN_AGENT_INHERITED_MODEL_GUIDANCE));
+    assert!(description.contains(SPAWN_AGENT_MODEL_EFFORT_DEFAULT_GUIDANCE));
     assert!(
-        description
-            .contains("Available model overrides (optional; inherited parent model is preferred):")
+        description.contains(
+            "Available model overrides (applied after global and selected role defaults):"
+        )
     );
     assert!(description.contains(
         "- `visible-model`: visible description Reasoning efforts: medium (default). Service tiers: priority."
@@ -117,7 +118,7 @@ fn spawn_agent_tool_v2_requires_task_name_and_lists_visible_models() {
         properties
             .get("reasoning_effort")
             .and_then(|schema| schema.description.as_deref()),
-        Some("Reasoning effort override for the new agent. Omit to inherit the parent effort.")
+        Some(SPAWN_AGENT_REASONING_EFFORT_OVERRIDE_DESCRIPTION)
     );
     assert!(!properties.contains_key("service_tier"));
     assert_eq!(
@@ -159,7 +160,7 @@ fn spawn_agent_catalog_description_preserves_generated_context() {
     assert!(
         configured_tool
             .description
-            .contains(SPAWN_AGENT_INHERITED_MODEL_GUIDANCE)
+            .contains(SPAWN_AGENT_MODEL_EFFORT_DEFAULT_GUIDANCE)
     );
     assert!(configured_tool.description.ends_with("Local usage hint."));
     assert!(
@@ -187,8 +188,11 @@ fn spawn_agent_tool_v1_keeps_legacy_fork_context_field() {
         panic!("spawn_agent v1 should be a namespace tool");
     };
     assert_eq!(namespace.name, MULTI_AGENT_V1_NAMESPACE);
-    let Some(ResponsesApiNamespaceTool::Function(ResponsesApiTool { parameters, .. })) =
-        namespace.tools.first()
+    let Some(ResponsesApiNamespaceTool::Function(ResponsesApiTool {
+        description,
+        parameters,
+        ..
+    })) = namespace.tools.first()
     else {
         panic!("spawn_agent should be a namespace function tool");
     };
@@ -196,6 +200,8 @@ fn spawn_agent_tool_v1_keeps_legacy_fork_context_field() {
         parameters.schema_type.clone(),
         Some(JsonSchemaType::Single(JsonSchemaPrimitiveType::Object))
     );
+    assert!(description.contains(SPAWN_AGENT_MODEL_EFFORT_DEFAULT_GUIDANCE));
+    assert!(description.contains("No picker-visible model overrides are currently loaded."));
     let properties = parameters
         .properties
         .as_ref()
@@ -240,6 +246,12 @@ fn spawn_agent_tool_v1_keeps_legacy_fork_context_field() {
             .get("model")
             .and_then(|schema| schema.description.as_deref()),
         Some(SPAWN_AGENT_MODEL_OVERRIDE_DESCRIPTION)
+    );
+    assert_eq!(
+        properties
+            .get("reasoning_effort")
+            .and_then(|schema| schema.description.as_deref()),
+        Some(SPAWN_AGENT_REASONING_EFFORT_OVERRIDE_DESCRIPTION)
     );
     assert!(!properties.contains_key("service_tier"));
 }
@@ -294,7 +306,7 @@ fn spawn_agent_tool_caps_reasoning_effort_value_length() {
     assert_eq!(
         spawn_agent_models_description(&[model], MultiAgentVersion::V2),
         format!(
-            "Available model overrides (optional; inherited parent model is preferred):\n- `visible-model`: visible description Reasoning efforts: {} (default). Service tiers: priority.",
+            "Available model overrides (applied after global and selected role defaults):\n- `visible-model`: visible description Reasoning efforts: {} (default). Service tiers: priority.",
             "é".repeat(MAX_REASONING_EFFORT_CHARS_IN_SPAWN_AGENT_DESCRIPTION)
         )
     );
@@ -332,7 +344,7 @@ fn spawn_agent_tool_keeps_model_controls_when_spawn_metadata_is_hidden() {
     assert!(properties.contains_key("model"));
     assert!(properties.contains_key("reasoning_effort"));
     assert!(!properties.contains_key("service_tier"));
-    assert!(!description.contains(SPAWN_AGENT_INHERITED_MODEL_GUIDANCE));
+    assert!(!description.contains(SPAWN_AGENT_MODEL_EFFORT_DEFAULT_GUIDANCE));
     assert!(description.contains("Available model overrides"));
 }
 
@@ -367,7 +379,7 @@ fn spawn_agent_tool_hides_model_controls_without_override_exposure() {
     for property in ["agent_type", "model", "reasoning_effort", "service_tier"] {
         assert!(!properties.contains_key(property));
     }
-    assert!(!description.contains(SPAWN_AGENT_INHERITED_MODEL_GUIDANCE));
+    assert!(!description.contains(SPAWN_AGENT_MODEL_EFFORT_DEFAULT_GUIDANCE));
     assert!(!description.contains("Available model overrides"));
 }
 

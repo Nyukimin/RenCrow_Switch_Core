@@ -1104,7 +1104,7 @@ fn spawn_tool_spec_lists_user_defined_roles_before_built_ins() {
 }
 
 #[test]
-fn spawn_tool_spec_marks_role_locked_model_and_reasoning_effort() {
+fn spawn_tool_spec_describes_role_model_and_reasoning_effort_defaults() {
     let tempdir = TempDir::new().expect("create temp dir");
     let role_path = tempdir.path().join("researcher.toml");
     fs::write(
@@ -1125,12 +1125,12 @@ fn spawn_tool_spec_marks_role_locked_model_and_reasoning_effort() {
     let spec = spawn_tool_spec::build(&user_defined_roles);
 
     assert!(spec.contains(
-            "Research carefully.\n- This role's model is set to `gpt-5` and its reasoning effort is set to `high`. These settings cannot be changed."
+            "Research carefully.\n- This role defaults to model `gpt-5` and reasoning effort `high`. When provided, explicit spawn arguments take precedence for either setting."
         ));
 }
 
 #[test]
-fn spawn_tool_spec_marks_role_locked_reasoning_effort_only() {
+fn spawn_tool_spec_describes_role_reasoning_effort_default() {
     let tempdir = TempDir::new().expect("create temp dir");
     let role_path = tempdir.path().join("reviewer.toml");
     fs::write(
@@ -1151,8 +1151,34 @@ fn spawn_tool_spec_marks_role_locked_reasoning_effort_only() {
     let spec = spawn_tool_spec::build(&user_defined_roles);
 
     assert!(spec.contains(
-            "Review carefully.\n- This role's reasoning effort is set to `medium` and cannot be changed."
+            "Review carefully.\n- This role defaults to reasoning effort `medium`. An explicit spawn reasoning effort takes precedence when provided."
         ));
+}
+
+#[test]
+fn spawn_tool_spec_describes_role_model_default() {
+    let tempdir = TempDir::new().expect("create temp dir");
+    let role_path = tempdir.path().join("worker.toml");
+    fs::write(
+        &role_path,
+        "developer_instructions = \"Work carefully\"\nmodel = \"gpt-5\"\n",
+    )
+    .expect("write role config");
+    let user_defined_roles = BTreeMap::from([(
+        "worker".to_string(),
+        AgentRoleConfig {
+            enabled: None,
+            description: Some("Work carefully.".to_string()),
+            config_file: Some(role_path),
+            nickname_candidates: None,
+        },
+    )]);
+
+    let spec = spawn_tool_spec::build(&user_defined_roles);
+
+    assert!(spec.contains(
+        "Work carefully.\n- This role defaults to model `gpt-5`. An explicit spawn model takes precedence when provided."
+    ));
 }
 
 #[test]

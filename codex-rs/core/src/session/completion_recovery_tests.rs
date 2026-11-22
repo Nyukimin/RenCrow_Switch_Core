@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-21: initialize accepted revision history fixtures.
 // Modified by RenCrow Switch Core, 2026-11-21: exercise paginated handoff recovery.
 use super::make_session_and_context;
 use crate::agent::completion_recovery::SUPPORTED_RECHECK_CONDITION;
@@ -550,6 +551,7 @@ fn accepted_task_boundary_item(thread_id: &str, evidence_ref: &str) -> RolloutIt
                 verification_ref: evidence_ref.into(),
             },
         )]),
+        accepted_history: vec![],
         parent_review_ref: "review:unit-1".into(),
         previous_revision: None,
         previous_state_hash: None,

@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-21: preserve exact accepted revision evidence during acceptance.
 // Modified by RenCrow Switch Core, 2026-11-21: expose bounded host verification diagnostics in status.
 // Modified by RenCrow Switch Core, 2026-11-20: separate caller and host checkpoint budgets.
 // Modified by RenCrow Switch Core, 2026-11-16.
@@ -1286,12 +1287,31 @@ impl ToolExecutor<ToolInvocation> for TaskContextBoundaryHandler {
                                 verification_ref: evidence_ref.clone(),
                             },
                         );
+                        let mut accepted_history = latest_state
+                            .as_ref()
+                            .map(|latest| latest.accepted_history.clone())
+                            .unwrap_or_default();
+                        accepted_history.extend(
+                            latest_state
+                                .as_ref()
+                                .into_iter()
+                                .flat_map(|latest| latest.completed.iter())
+                                .map(|(task_id, receipt)| {
+                                    codex_history::task_context::AcceptedTaskEvidenceReceipt {
+                                        task_id: task_id.clone(),
+                                        task_revision: receipt.revision,
+                                        artifact_ref: receipt.artifact_ref.clone(),
+                                        verification_ref: receipt.verification_ref.clone(),
+                                    }
+                                }),
+                        );
                         let mut state_value = serde_json::to_value(&*state).map_err(|error| {
                             FunctionCallError::RespondToModel(error.to_string())
                         })?;
                         crate::session::session::canonicalize_completion_state_evidence(
                             &mut state_value,
                             &receipts,
+                            &accepted_history,
                         )
                         .map_err(FunctionCallError::RespondToModel)?;
                         *state = serde_json::from_value(state_value).map_err(|error| {
@@ -1357,6 +1377,10 @@ impl ToolExecutor<ToolInvocation> for TaskContextBoundaryHandler {
                         accepted_completed: latest_state
                             .as_ref()
                             .map(|state| state.completed.clone())
+                            .unwrap_or_default(),
+                        accepted_history: latest_state
+                            .as_ref()
+                            .map(|state| state.accepted_history.clone())
                             .unwrap_or_default(),
                     };
                     let validated =

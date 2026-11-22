@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-21: initialize accepted revision history fixtures.
 // Modified by RenCrow Switch Core, 2026-09-22.
 use super::*;
 use crate::session::tests::make_session_and_context;
@@ -49,6 +50,7 @@ fn stored_task_state(thread_id: &str) -> StoredTaskState {
                 verification_ref: "check:a".into(),
             },
         )]),
+        accepted_history: vec![],
         parent_review_ref: "review:a".into(),
         previous_revision: None,
         previous_state_hash: None,

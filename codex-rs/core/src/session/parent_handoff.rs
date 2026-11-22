@@ -100,7 +100,7 @@ fn review_reference_hashes(value: &Value, hashes: &mut BTreeSet<String>) -> Resu
                 && fields.contains_key("version")
                 && fields.contains_key("sha256") =>
         {
-            if fields["version"].as_u64() != Some(1) {
+            if !matches!(fields["version"].as_u64(), Some(1 | 2)) {
                 return Err("unsupported review snapshot reference in parent handoff".into());
             }
             let hash = fields["sha256"]
@@ -390,5 +390,33 @@ impl ParentHandoffCapsule {
             accepted_task_state: task_state,
             guard: self.guard.clone(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::review_reference_hashes;
+    use serde_json::json;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn parent_handoff_review_reference_walker_accepts_only_valid_v1_v2_refs() {
+        // Captured from the actual v2 previous_attempt_ref that caused the runtime warning.
+        let captured_v2_sha = "20b9cbe1774e14df8626033a215f72e6b6303dad056138c9734b2f07c7574622";
+        for (version, sha) in [(1, "a".repeat(64)), (2, captured_v2_sha.to_owned())] {
+            let value = json!({"previous_attempt_ref":{"version":version,"sha256":sha.clone()}});
+            let mut hashes = BTreeSet::new();
+            review_reference_hashes(&value, &mut hashes).expect("supported review ref");
+            assert_eq!(hashes, [sha].into_iter().collect());
+        }
+
+        for value in [
+            json!({"previous_attempt_ref":{"version":3,"sha256":"a".repeat(64)}}),
+            json!({"previous_attempt_ref":{"version":2,"sha256":"not-a-sha256"}}),
+        ] {
+            let mut hashes = BTreeSet::new();
+            assert!(review_reference_hashes(&value, &mut hashes).is_err());
+            assert!(hashes.is_empty());
+        }
     }
 }

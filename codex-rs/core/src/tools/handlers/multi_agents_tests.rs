@@ -419,6 +419,11 @@ async fn spawn_agent_explicit_model_and_effort_override_role_defaults() {
         "model = \"gpt-5.4\"\nmodel_reasoning_effort = \"high\"\n",
     )
     .expect("update test role reasoning effort");
+    update_turn_settings_for_test(&mut turn, |settings| {
+        update_selected_settings_for_test(settings, |selected| {
+            selected.collaboration_mode.settings.reasoning_effort = Some(ReasoningEffort::High);
+        });
+    });
     let manager = thread_manager();
     let root = manager
         .start_thread(StartThreadOptions::new((*turn.config).clone()))
@@ -504,8 +509,8 @@ async fn spawn_agent_explicit_model_and_effort_override_role_defaults() {
 
     let default_output = SpawnAgentHandler::default()
         .handle(invocation(
-            session,
-            turn,
+            session.clone(),
+            turn.clone(),
             "spawn_agent",
             function_payload(json!({
                 "message": "use role defaults",
@@ -531,6 +536,38 @@ async fn spawn_agent_explicit_model_and_effort_override_role_defaults() {
     assert_eq!(default_snapshot.model, "gpt-5.4");
     assert_eq!(
         default_snapshot.reasoning_effort,
+        Some(ReasoningEffort::High)
+    );
+
+    let model_only_output = SpawnAgentHandler::default()
+        .handle(invocation(
+            session,
+            turn,
+            "spawn_agent",
+            function_payload(json!({
+                "message": "explicit model inherits parent effective effort",
+                "model": "gpt-5.5",
+                "fork_context": false
+            })),
+        ))
+        .await
+        .expect("spawn_agent should retain the parent effective effort");
+    let (content, _) = expect_text_output(model_only_output);
+    let model_only_result: serde_json::Value =
+        serde_json::from_str(&content).expect("spawn_agent result should be json");
+    let model_only_snapshot = manager
+        .get_thread(parse_agent_id(
+            model_only_result["agent_id"]
+                .as_str()
+                .expect("spawn result should contain an agent id"),
+        ))
+        .await
+        .expect("model-only child should exist")
+        .config_snapshot()
+        .await;
+    assert_eq!(model_only_snapshot.model, "gpt-5.5");
+    assert_eq!(
+        model_only_snapshot.reasoning_effort,
         Some(ReasoningEffort::High)
     );
 }
@@ -569,6 +606,123 @@ async fn multi_agent_v2_spawn_fork_turns_all_applies_agent_type_override() {
         ))
         .await
         .expect("fork_turns=all should apply agent_type overrides");
+}
+
+#[tokio::test]
+async fn multi_agent_v2_fresh_spawn_keeps_independent_role_and_explicit_overrides() {
+    let (mut session, mut turn) = make_session_and_context().await;
+    let role_name = install_role_with_model_override(&mut turn).await;
+    let role_path = turn.config.agent_roles[&role_name]
+        .config_file
+        .as_ref()
+        .expect("test role should have a config file");
+    std::fs::write(
+        role_path,
+        "model = \"gpt-5.4\"\nmodel_reasoning_effort = \"low\"\nrencrow_read_only = true\nrencrow_tool_allowlist = [\"exec_command\"]\n",
+    )
+    .expect("write V2 fresh-spawn role config");
+
+    update_turn_settings_for_test(&mut turn, |settings| {
+        update_selected_settings_for_test(settings, |selected| {
+            selected.collaboration_mode.settings.reasoning_effort = Some(ReasoningEffort::High);
+        });
+    });
+    let mut config = (*turn.config).clone();
+    config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("test config should allow feature update");
+    let mut turn = turn;
+    turn.config = Arc::new(config);
+    turn.multi_agent_version = codex_protocol::protocol::MultiAgentVersion::V2;
+    let expected_cwd = turn
+        .initial_environments
+        .primary()
+        .and_then(|environment| environment.cwd().to_abs_path().ok())
+        .expect("fixture should have a selected environment cwd");
+
+    let manager = thread_manager();
+    let root = manager
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .await
+        .expect("root thread should start");
+    session.services.agent_control = manager.agent_control();
+    session.thread_id = root.thread_id;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+
+    for (task_name, args, expected_model, expected_effort) in [
+        (
+            "explicit_model",
+            json!({
+                "message": "explicit model keeps role effort",
+                "task_name": "explicit_model",
+                "agent_type": role_name.clone(),
+                "fork_turns": "none",
+                "model": "gpt-5.5",
+            }),
+            "gpt-5.5",
+            ReasoningEffort::Low,
+        ),
+        (
+            "explicit_effort",
+            json!({
+                "message": "explicit effort keeps role model",
+                "task_name": "explicit_effort",
+                "agent_type": role_name.clone(),
+                "fork_turns": "none",
+                "reasoning_effort": "high",
+            }),
+            "gpt-5.4",
+            ReasoningEffort::High,
+        ),
+        (
+            "global_effort",
+            json!({
+                "message": "explicit model keeps parent effective effort",
+                "task_name": "global_effort",
+                "fork_turns": "none",
+                "model": "gpt-5.5",
+            }),
+            "gpt-5.5",
+            ReasoningEffort::High,
+        ),
+    ] {
+        let output = SpawnAgentHandlerV2::default()
+            .handle(invocation(
+                session.clone(),
+                turn.clone(),
+                "spawn_agent",
+                function_payload(args),
+            ))
+            .await
+            .expect("fresh V2 spawn should accept the final model and effort");
+        let _ = expect_text_output(output);
+        let child_id = session
+            .services
+            .agent_control
+            .resolve_agent_reference(session.thread_id, &turn.session_source, task_name)
+            .await
+            .expect("named V2 child should resolve");
+        let child_thread = manager
+            .get_thread(child_id)
+            .await
+            .expect("spawned child should exist");
+        let snapshot = child_thread.config_snapshot().await;
+        let child_config = child_thread.config().await;
+
+        assert_eq!(snapshot.model, expected_model);
+        assert_eq!(snapshot.reasoning_effort, Some(expected_effort));
+        assert_eq!(snapshot.cwd().as_path(), expected_cwd.as_path());
+        if task_name != "global_effort" {
+            assert!(!snapshot.full_access);
+            assert!(child_config.rencrow_read_only);
+            assert_eq!(
+                child_config.rencrow_tool_allowlist,
+                Some(vec!["exec_command".to_string()])
+            );
+        }
+    }
 }
 
 fn service_tier_test_catalog() -> codex_protocol::openai_models::ModelsResponse {
@@ -984,7 +1138,12 @@ async fn multi_agent_v2_spawn_partial_fork_turns_allows_agent_type_override() {
     let mut turn = turn;
     turn.config = Arc::new(config);
     turn.multi_agent_version = codex_protocol::protocol::MultiAgentVersion::V2;
-    let parent_provider_id = turn.config.model_provider_id.clone();
+    let expected_role_provider = turn
+        .config
+        .model_providers
+        .get("ollama")
+        .expect("role provider should be registered")
+        .clone();
 
     let output = SpawnAgentHandlerV2::default()
         .handle(invocation(
@@ -1010,16 +1169,130 @@ async fn multi_agent_v2_spawn_partial_fork_turns_allows_agent_type_override() {
         .map(|(thread_id, _)| thread_id)
         .find(|thread_id| *thread_id != root.thread_id)
         .expect("spawned agent should receive an op");
-    let snapshot = manager
+    let child_thread = manager
         .get_thread(agent_id)
         .await
-        .expect("spawned agent thread should exist")
-        .config_snapshot()
-        .await;
+        .expect("spawned agent thread should exist");
+    let snapshot = child_thread.config_snapshot().await;
+    let child_config = child_thread.config().await;
 
     assert_eq!(snapshot.model, "gpt-5-role-override");
-    assert_eq!(snapshot.model_provider_id, parent_provider_id);
+    assert_eq!(snapshot.model_provider_id, "ollama");
+    assert_eq!(child_config.model_provider, expected_role_provider);
     assert_eq!(snapshot.reasoning_effort, Some(ReasoningEffort::Minimal));
+}
+
+#[tokio::test]
+async fn multi_agent_v2_partial_fork_keeps_independent_role_and_explicit_overrides() {
+    let (mut session, mut turn) = make_session_and_context().await;
+    let role_name = install_role_with_model_override(&mut turn).await;
+    let role_path = turn.config.agent_roles[&role_name]
+        .config_file
+        .as_ref()
+        .expect("test role should have a config file");
+    std::fs::write(
+        role_path,
+        "model = \"gpt-5.4\"\nmodel_reasoning_effort = \"low\"\nrencrow_read_only = true\nrencrow_tool_allowlist = [\"exec_command\"]\n",
+    )
+    .expect("write V2 partial-fork role config");
+
+    let mut config = (*turn.config).clone();
+    config.agent_default_subagent_model = Some("gpt-5.5".to_string());
+    config.agent_default_subagent_reasoning_effort = Some(ReasoningEffort::High);
+    config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("test config should allow feature update");
+    turn.config = Arc::new(config);
+    turn.multi_agent_version = codex_protocol::protocol::MultiAgentVersion::V2;
+    let expected_cwd = turn
+        .initial_environments
+        .primary()
+        .and_then(|environment| environment.cwd().to_abs_path().ok())
+        .expect("fixture should have a selected environment cwd");
+    let parent_provider_id = turn.config.model_provider_id.clone();
+
+    let manager = thread_manager();
+    let root = manager
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .await
+        .expect("root thread should start");
+    session.services.agent_control = manager.agent_control();
+    session.thread_id = root.thread_id;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+
+    for (task_name, args, expected_model, expected_effort) in [
+        (
+            "role_defaults",
+            json!({
+                "message": "partial fork keeps role defaults",
+                "task_name": "role_defaults",
+                "agent_type": role_name.clone(),
+                "fork_turns": "1",
+            }),
+            "gpt-5.4",
+            ReasoningEffort::Low,
+        ),
+        (
+            "explicit_model",
+            json!({
+                "message": "partial fork explicit model keeps role effort",
+                "task_name": "explicit_model",
+                "agent_type": role_name.clone(),
+                "fork_turns": "1",
+                "model": "gpt-5.6-sol",
+            }),
+            "gpt-5.6-sol",
+            ReasoningEffort::Low,
+        ),
+        (
+            "explicit_effort",
+            json!({
+                "message": "partial fork explicit effort keeps role model",
+                "task_name": "explicit_effort",
+                "agent_type": role_name.clone(),
+                "fork_turns": "1",
+                "reasoning_effort": "medium",
+            }),
+            "gpt-5.4",
+            ReasoningEffort::Medium,
+        ),
+    ] {
+        let output = SpawnAgentHandlerV2::default()
+            .handle(invocation(
+                session.clone(),
+                turn.clone(),
+                "spawn_agent",
+                function_payload(args),
+            ))
+            .await
+            .expect("V2 partial fork should keep field-wise precedence");
+        let _ = expect_text_output(output);
+        let child_id = session
+            .services
+            .agent_control
+            .resolve_agent_reference(session.thread_id, &turn.session_source, task_name)
+            .await
+            .expect("named V2 partial-fork child should resolve");
+        let child_thread = manager
+            .get_thread(child_id)
+            .await
+            .expect("spawned partial-fork child should exist");
+        let snapshot = child_thread.config_snapshot().await;
+        let child_config = child_thread.config().await;
+
+        assert_eq!(snapshot.model, expected_model);
+        assert_eq!(snapshot.reasoning_effort, Some(expected_effort));
+        assert_eq!(snapshot.model_provider_id, parent_provider_id);
+        assert_eq!(snapshot.cwd().as_path(), expected_cwd.as_path());
+        assert!(!snapshot.full_access);
+        assert!(child_config.rencrow_read_only);
+        assert_eq!(
+            child_config.rencrow_tool_allowlist,
+            Some(vec!["exec_command".to_string()])
+        );
+    }
 }
 
 #[tokio::test]

@@ -597,6 +597,7 @@ async fn repeated_read_budget_refusals_stop_the_turn_without_another_request() -
             call("read-2"),
             call("read-3"),
             call("read-4"),
+            call("read-5"),
         ],
     )
     .await;
@@ -625,12 +626,37 @@ async fn repeated_read_budget_refusals_stop_the_turn_without_another_request() -
     let error = done
         .error
         .expect("repeated guard refusals must stop the turn");
+    let error_kind = if error
+        .message
+        .starts_with("RENCROW_READ_BUDGET_EXCEEDED: repeated host refusals stopped the turn;")
+    {
+        "repeated-read-budget-fatal"
+    } else if error.message.starts_with("RENCROW_READ_BUDGET_EXCEEDED:") {
+        "read-budget-refusal"
+    } else if error.message.starts_with("RENCROW_PATCH_RETRY_EXCEEDED:") {
+        "patch-retry-fatal"
+    } else {
+        "other"
+    };
+    let request_count = requests.requests().len();
+    let server_response_request_count = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|request| {
+            request.method == wiremock::http::Method::POST
+                && request.url.path().ends_with("/responses")
+        })
+        .count();
     assert!(
         error
             .message
-            .contains("repeated host refusals stopped the turn")
+            .contains("repeated host refusals stopped the turn"),
+        "unexpected turn error classification {error_kind}; matched response request count {request_count}; server response POST count {server_response_request_count}"
     );
-    assert_eq!(requests.requests().len(), 4);
+    assert_eq!(request_count, 5);
+    assert_eq!(server_response_request_count, 5);
     Ok(())
 }
 

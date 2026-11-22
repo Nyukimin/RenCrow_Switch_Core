@@ -5,6 +5,7 @@
 //! inheritance, and validation messages remain the same for each multi-agent version.
 
 use crate::agent::role::DEFAULT_ROLE_NAME;
+use crate::agent::role::apply_role_model_and_effort;
 use crate::agent::role::apply_role_to_config;
 use crate::agent::role::ensure_agent_role_enabled;
 use crate::config::Config;
@@ -61,29 +62,39 @@ pub(crate) async fn prepare_agent_spawn_config(
     let turn = step_context.turn.as_ref();
     let mut config =
         build_agent_spawn_config(&session.get_base_instructions().await, step_context)?;
+    let inherited_v1_full_history_role = if options.version == SpawnConfigVersion::V1
+        && options.full_history_fork
+        && options.role_name.is_none()
+    {
+        turn.session_source.get_agent_role()
+    } else {
+        None
+    };
+    let selected_role_name = options
+        .role_name
+        .or(inherited_v1_full_history_role.as_deref());
     ensure_agent_role_enabled(&config, options.role_name)?;
+    if let Some(inherited_role_name) = inherited_v1_full_history_role.as_deref() {
+        ensure_agent_role_enabled(&config, Some(inherited_role_name))?;
+    }
     if options.version == SpawnConfigVersion::V1 && options.full_history_fork {
         reject_full_fork_agent_type_override(options.role_name)?;
     }
-    let role_applied_v1 = options.version == SpawnConfigVersion::V1 && !options.full_history_fork;
-    let (initial_model, initial_reasoning_effort) = if role_applied_v1 {
-        (None, None)
-    } else {
-        (options.model, options.reasoning_effort.clone())
-    };
-    apply_requested_spawn_agent_model_overrides(
-        session,
-        step_context,
-        &mut config,
-        initial_model,
-        initial_reasoning_effort,
-        /*include_configured_defaults*/ true,
-    )
-    .await?;
-    if !options.full_history_fork
-        || (options.version == SpawnConfigVersion::V2 && options.role_name.is_some())
-    {
-        apply_spawn_agent_role(session, &mut config, options.role_name, turn).await?;
+    let role_applied = !options.full_history_fork
+        || (options.version == SpawnConfigVersion::V2 && options.role_name.is_some());
+    // Keep configured defaults as unresolved candidates until the role and explicit arguments
+    // have selected the final model. This avoids rejecting a lower-precedence model that is
+    // replaced before it would be used, and resolves the winner against the final provider.
+    let configured_model = turn.config.agent_default_subagent_model.as_deref();
+    let configured_reasoning_effort = turn.config.agent_default_subagent_reasoning_effort.clone();
+    if let Some(model) = configured_model {
+        config.model = Some(model.to_owned());
+    }
+    if let Some(reasoning_effort) = configured_reasoning_effort.clone() {
+        config.model_reasoning_effort = Some(reasoning_effort);
+    }
+    let role_changed_model_settings = if role_applied {
+        let changed = apply_spawn_agent_role(&mut config, options.role_name).await?;
         if options.version == SpawnConfigVersion::V2
             && options.full_history_fork
             && config.developer_instructions.is_none()
@@ -92,17 +103,48 @@ pub(crate) async fn prepare_agent_spawn_config(
                 .developer_instructions
                 .clone_from(&turn.developer_instructions);
         }
+        changed
+    } else if let Some(role_name) = inherited_v1_full_history_role.as_deref() {
+        // The parent config already carries the role's runtime and security policy. Reapply the
+        // role's model and effort after global defaults, without reapplying its other settings.
+        apply_role_model_and_effort(&mut config, role_name).await?
+    } else {
+        false
+    };
+    // Explicit tool arguments outrank the role for both spawn versions. Each field is
+    // independent: an explicit model does not discard the role's selected effort.
+    let configured_model_survived_role =
+        configured_model.filter(|model| config.model.as_deref() == Some(*model));
+    let requested_model = options.model.or(configured_model_survived_role);
+    apply_requested_spawn_agent_model_overrides(
+        session,
+        step_context,
+        &mut config,
+        requested_model,
+        options.reasoning_effort.clone(),
+        /*include_configured_defaults*/ false,
+    )
+    .await?;
+    if requested_model.is_some()
+        && configured_reasoning_effort.is_none()
+        && options.reasoning_effort.is_none()
+        && config.model_reasoning_effort.is_none()
+        && !role_changed_model_settings
+    {
+        apply_selected_model_default_reasoning_effort(session, &mut config, turn).await;
     }
-    // V1's explicit tool arguments outrank the selected role. Apply them after role
-    // configuration, while leaving configured subagent defaults below the role layer.
-    if role_applied_v1 {
-        apply_requested_spawn_agent_model_overrides(
+    if role_changed_model_settings
+        || options.model.is_some()
+        || options.reasoning_effort.is_some()
+        || requested_model.is_some()
+        || configured_reasoning_effort.is_some()
+    {
+        validate_final_spawn_agent_reasoning_effort(
             session,
-            step_context,
-            &mut config,
-            options.model,
-            options.reasoning_effort,
-            /*include_configured_defaults*/ false,
+            &config,
+            turn,
+            options.reasoning_effort.is_some()
+                || (configured_reasoning_effort.is_some() && !role_changed_model_settings),
         )
         .await?;
     }
@@ -120,8 +162,7 @@ pub(crate) async fn prepare_agent_spawn_config(
     }
 
     // Remember an applied configured default so cold reload reapplies its restrictions.
-    let role_name = options
-        .role_name
+    let role_name = selected_role_name
         .or_else(|| {
             (!options.full_history_fork
                 && config
@@ -258,38 +299,21 @@ async fn apply_requested_spawn_agent_model_overrides(
             requested_model,
             turn.multi_agent_version,
         )?;
-        let selected_model_info = models_manager
-            .get_model_info(&selected_model_name, &config.to_models_manager_config())
-            .await;
-
-        config.model = Some(selected_model_name.clone());
+        config.model = Some(selected_model_name);
         if let Some(reasoning_effort) = requested_reasoning_effort {
-            validate_spawn_agent_reasoning_effort(
-                &selected_model_name,
-                &selected_model_info.supported_reasoning_levels,
-                &reasoning_effort,
-            )?;
             config.model_reasoning_effort = Some(reasoning_effort);
-        } else {
-            config.model_reasoning_effort = selected_model_info.default_reasoning_level;
         }
 
         return Ok(());
     }
 
     if let Some(reasoning_effort) = requested_reasoning_effort {
-        let model = config.model.as_deref().ok_or_else(|| {
-            "spawn_agent could not resolve the child model for reasoning effort validation"
-                .to_string()
-        })?;
-        let model_info = models_manager
-            .get_model_info(model, &config.to_models_manager_config())
-            .await;
-        validate_spawn_agent_reasoning_effort(
-            model,
-            &model_info.supported_reasoning_levels,
-            &reasoning_effort,
-        )?;
+        if config.model.is_none() {
+            return Err(
+                "spawn_agent could not resolve the child model for reasoning effort validation"
+                    .to_string(),
+            );
+        }
         config.model_reasoning_effort = Some(reasoning_effort);
     }
 
@@ -346,40 +370,56 @@ pub(crate) async fn apply_spawn_agent_service_tier(
 }
 
 async fn apply_spawn_agent_role(
-    session: &Session,
     config: &mut Config,
     role_name: Option<&str>,
-    turn: &TurnContext,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let previous_model = config.model.clone();
     let previous_reasoning_effort = config.model_reasoning_effort.clone();
     let previous_models_manager_binding = ModelsManagerBinding::from_config(config);
     apply_role_to_config(config, role_name).await?;
-    if config.model == previous_model
-        && config.model_reasoning_effort == previous_reasoning_effort
-        && ModelsManagerBinding::from_config(config) == previous_models_manager_binding
-    {
-        return Ok(());
-    }
+    Ok(config.model != previous_model
+        || config.model_reasoning_effort != previous_reasoning_effort
+        || ModelsManagerBinding::from_config(config) != previous_models_manager_binding)
+}
 
-    let Some(reasoning_effort) = config.model_reasoning_effort.clone() else {
+async fn apply_selected_model_default_reasoning_effort(
+    session: &Session,
+    config: &mut Config,
+    turn: &TurnContext,
+) {
+    let Some(model) = config.model.as_deref() else {
+        return;
+    };
+    let models_manager = models_manager_for_spawn_config(session, config, turn);
+    let model_info = models_manager
+        .get_model_info(model, &config.to_models_manager_config())
+        .await;
+    config.model_reasoning_effort = model_info.default_reasoning_level;
+}
+
+async fn validate_final_spawn_agent_reasoning_effort(
+    session: &Session,
+    config: &Config,
+    turn: &TurnContext,
+    strict_when_metadata_is_unavailable: bool,
+) -> Result<(), String> {
+    let Some(reasoning_effort) = config.model_reasoning_effort.as_ref() else {
         return Ok(());
     };
-    let model = config.model.clone().ok_or_else(|| {
+    let model = config.model.as_deref().ok_or_else(|| {
         "spawn_agent could not resolve the child model for reasoning effort validation".to_string()
     })?;
     let models_manager = models_manager_for_spawn_config(session, config, turn);
     let model_info = models_manager
-        .get_model_info(&model, &config.to_models_manager_config())
+        .get_model_info(model, &config.to_models_manager_config())
         .await;
-    if model_info.used_fallback_model_metadata {
+    if model_info.used_fallback_model_metadata && !strict_when_metadata_is_unavailable {
         return Ok(());
     }
-
     validate_spawn_agent_reasoning_effort(
-        &model,
+        model,
         &model_info.supported_reasoning_levels,
-        &reasoning_effort,
+        reasoning_effort,
     )
 }
 

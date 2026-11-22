@@ -472,6 +472,20 @@ impl LocalAgentControl {
                 .map_err(|err| {
                     CodexErr::InvalidRequest(format!("permission_profile is invalid: {err}"))
                 })?;
+            if config.rencrow_read_only {
+                let read_only_profile = crate::agent::rencrow_read_only::read_only_profile(
+                    config.permissions.permission_profile(),
+                )
+                .map_err(|err| {
+                    CodexErr::InvalidRequest(format!("read-only agent role is invalid: {err}"))
+                })?;
+                config
+                    .permissions
+                    .set_permission_profile(read_only_profile)
+                    .map_err(|err| {
+                        CodexErr::InvalidRequest(format!("permission_profile is invalid: {err}"))
+                    })?;
+            }
         }
         config.service_tier = self.root_service_tier();
         if let Some(model) = stored_model {

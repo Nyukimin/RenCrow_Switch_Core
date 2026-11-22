@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-21: resolve exact accepted revision evidence across update and restore.
 // Modified by RenCrow Switch Core, 2026-11-20: separate caller and host checkpoint budgets.
 // Modified by RenCrow Switch Core, 2026-09-22: handle durable compaction markers; 2026-09-28: role tool allowlist.
 // Modified 2026-11-19: validate retry bindings against the host plan-review history.
@@ -649,6 +650,7 @@ fn canonicalize_completion_evidence(
         String,
         codex_history::task_context::AcceptedTaskReceipt,
     >,
+    accepted_history: &[codex_history::task_context::AcceptedTaskEvidenceReceipt],
 ) -> Result<(), String> {
     match value {
         serde_json::Value::Object(object) => {
@@ -663,25 +665,59 @@ fn canonicalize_completion_evidence(
                     .ok_or_else(|| {
                         "completion evidence task_revision must be a positive integer".to_string()
                     })?;
-                let receipt = completed.get(task_id)
-                    .filter(|receipt| receipt.revision == revision)
-                    .ok_or_else(|| format!("no accepted host receipt matches completion evidence {task_id}@{revision}"))?;
-                object.insert(
-                    "artifact_ref".into(),
-                    serde_json::Value::String(receipt.artifact_ref.clone()),
-                );
-                object.insert(
-                    "verification_ref".into(),
-                    serde_json::Value::String(receipt.verification_ref.clone()),
-                );
+                let artifact_ref = object
+                    .get("artifact_ref")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                let verification_ref = object
+                    .get("verification_ref")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                let evidence = codex_history::task_context::CompletionEvidenceRef {
+                    task_id: task_id.to_owned(),
+                    task_revision: revision,
+                    artifact_ref: artifact_ref.to_owned(),
+                    verification_ref: verification_ref.to_owned(),
+                };
+                match codex_history::task_context::resolve_accepted_task_evidence(
+                    &evidence,
+                    completed,
+                    accepted_history,
+                ) {
+                    Some(
+                        codex_history::task_context::AcceptedTaskEvidenceResolution::Current(_)
+                        | codex_history::task_context::AcceptedTaskEvidenceResolution::Historical(
+                            _,
+                        ),
+                    ) => {}
+                    Some(
+                        codex_history::task_context::AcceptedTaskEvidenceResolution::CurrentRevision(
+                            receipt,
+                        ),
+                    ) => {
+                        object.insert(
+                            "artifact_ref".into(),
+                            serde_json::Value::String(receipt.artifact_ref.clone()),
+                        );
+                        object.insert(
+                            "verification_ref".into(),
+                            serde_json::Value::String(receipt.verification_ref.clone()),
+                        );
+                    }
+                    None => {
+                        return Err(format!(
+                            "no accepted host receipt matches completion evidence {task_id}@{revision}"
+                        ));
+                    }
+                }
             }
             for child in object.values_mut() {
-                canonicalize_completion_evidence(child, completed)?;
+                canonicalize_completion_evidence(child, completed, accepted_history)?;
             }
         }
         serde_json::Value::Array(values) => {
             for child in values {
-                canonicalize_completion_evidence(child, completed)?;
+                canonicalize_completion_evidence(child, completed, accepted_history)?;
             }
         }
         _ => {}
@@ -695,6 +731,7 @@ pub(crate) fn canonicalize_completion_state_evidence(
         String,
         codex_history::task_context::AcceptedTaskReceipt,
     >,
+    accepted_history: &[codex_history::task_context::AcceptedTaskEvidenceReceipt],
 ) -> Result<(), String> {
     let object = value
         .as_object_mut()
@@ -705,7 +742,7 @@ pub(crate) fn canonicalize_completion_state_evidence(
     {
         for condition in conditions {
             if let Some(evidence) = condition.get_mut("evidence") {
-                canonicalize_completion_evidence(evidence, completed)?;
+                canonicalize_completion_evidence(evidence, completed, accepted_history)?;
             }
         }
     }
@@ -716,7 +753,7 @@ pub(crate) fn canonicalize_completion_state_evidence(
         for unit in units {
             for field in ["evidence", "task_refs"] {
                 if let Some(evidence) = unit.get_mut(field) {
-                    canonicalize_completion_evidence(evidence, completed)?;
+                    canonicalize_completion_evidence(evidence, completed, accepted_history)?;
                 }
             }
         }
@@ -724,7 +761,7 @@ pub(crate) fn canonicalize_completion_state_evidence(
     if let Some(blocker) = object.get_mut("blocker")
         && let Some(evidence) = blocker.get_mut("evidence")
     {
-        canonicalize_completion_evidence(evidence, completed)?;
+        canonicalize_completion_evidence(evidence, completed, accepted_history)?;
     }
     Ok(())
 }
@@ -1237,7 +1274,15 @@ impl Session {
             .as_ref()
             .map(|state| state.completed.clone())
             .unwrap_or_default();
-        canonicalize_completion_state_evidence(&mut completion_state, &completed)?;
+        let accepted_history = latest
+            .as_ref()
+            .map(|state| state.accepted_history.clone())
+            .unwrap_or_default();
+        canonicalize_completion_state_evidence(
+            &mut completion_state,
+            &completed,
+            &accepted_history,
+        )?;
         if !invalidated_conditions.is_empty()
             && let Some(conditions) = completion_state
                 .get_mut("conditions")
@@ -1310,7 +1355,11 @@ impl Session {
         // The stale-proof fallback above may restore the prior evidence after the incoming
         // proposal was canonicalized. Keep that fallback aligned with the same accepted host
         // receipts before the existing exact task-check and physical-artifact validation.
-        canonicalize_completion_state_evidence(&mut completion_state, &completed)?;
+        canonicalize_completion_state_evidence(
+            &mut completion_state,
+            &completed,
+            &accepted_history,
+        )?;
         let mut evidence_refs = Vec::new();
         collect_fresh_completion_evidence(
             &completion_state,
@@ -1712,9 +1761,10 @@ impl Session {
             .as_ref()
             .map(|previous| previous.plan_reviews.clone())
             .unwrap_or_default();
-        codex_history::task_context::validate_completion_state(
+        codex_history::task_context::validate_completion_state_with_history(
             Some(&completion_state),
             &completed,
+            &accepted_history,
         )?;
         if completion_state.conditions.iter().any(|condition| {
             condition.status == codex_history::task_context::AcceptanceStatus::Waived

@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-21: cover accepted revision evidence history.
 // Modified by RenCrow Switch Core, 2026-11-20: separate caller and host checkpoint budgets.
 // Modified by RenCrow Switch Core, 2026-11-16.
 use super::*;
@@ -923,6 +924,7 @@ fn facts() -> HostBoundaryFacts {
         parent_review_matches: true,
         unresolved_effects: vec![],
         accepted_completed: Default::default(),
+        accepted_history: vec![],
     }
 }
 
@@ -946,9 +948,140 @@ fn validated_boundary_round_trips_as_host_stored_state_and_renders_after_reload(
     let value = serde_json::to_value(&stored).unwrap();
     assert_eq!(value["boundary_nonce"], "nonce-1");
     assert!(value.get("authorized_parent").is_none());
+    assert!(value.get("accepted_history").is_none());
     let restored = StoredTaskState::parse_and_validate(value, "th1").unwrap();
     assert_eq!(restored.render_context().unwrap(), expected);
     assert_eq!(restored.state_hash().unwrap().len(), 64);
+}
+
+#[test]
+fn stored_task_state_retains_only_exact_referenced_accepted_revision_history() {
+    let old_receipt = AcceptedTaskReceipt {
+        revision: 1,
+        result: "first accepted revision".into(),
+        artifact_ref: "artifact:rev1".into(),
+        verification_ref: "check:rev1".into(),
+    };
+    let current_receipt = AcceptedTaskReceipt {
+        revision: 2,
+        result: "second accepted revision".into(),
+        artifact_ref: "artifact:sha".into(),
+        verification_ref: "test:42".into(),
+    };
+    let mut facts = facts();
+    facts.artifact_result = Some(current_receipt.result.clone());
+    facts
+        .accepted_completed
+        .insert("a".into(), old_receipt.clone());
+    let mut candidate = candidate();
+    let mut state = CompletionState {
+        contract_revision: 1,
+        units_completed_since_review: 0,
+        plan_review_at: None,
+        plan_reviews: vec![],
+        paused: false,
+        consumed_host_events: vec![],
+        conditions: vec![AcceptanceCondition {
+            id: "AC-1".into(),
+            revision: 1,
+            result: "Feature works".into(),
+            scope: "CLI".into(),
+            verification: "Run the check".into(),
+            acceptance_criteria: "Checks pass".into(),
+            status: AcceptanceStatus::Satisfied,
+            evidence: vec![CompletionEvidenceRef {
+                task_id: "a".into(),
+                task_revision: 2,
+                artifact_ref: "artifact:sha".into(),
+                verification_ref: "test:42".into(),
+            }],
+            unmet_reason: None,
+        }],
+        units: vec![CompletionUnit {
+            id: "unit-a".into(),
+            purpose: "implement".into(),
+            status: UnitStatus::Done,
+            kind: CompletionUnitKind::Execution,
+            condition_refs: vec!["AC-1".into()],
+            depends_on: vec![],
+            evidence: vec![
+                CompletionEvidenceRef {
+                    task_id: "a".into(),
+                    task_revision: 1,
+                    artifact_ref: old_receipt.artifact_ref.clone(),
+                    verification_ref: old_receipt.verification_ref.clone(),
+                },
+                CompletionEvidenceRef {
+                    task_id: "a".into(),
+                    task_revision: 2,
+                    artifact_ref: current_receipt.artifact_ref.clone(),
+                    verification_ref: current_receipt.verification_ref.clone(),
+                },
+            ],
+            task_refs: vec![],
+            review_target: None,
+            review_evidence: None,
+            review_launch: None,
+            review_decision_reason: None,
+            review_state: None,
+            review_revalidation_of: None,
+        }],
+        current_unit: None,
+        failed_approaches: vec![],
+        blocker: None,
+        next_action: None,
+        product_progress_at: None,
+        runtime_recovery_at: None,
+        activity_at: None,
+    };
+    candidate.completion_state = Some(state.clone());
+    let stored = validate_host_boundary_checkpoint(candidate, &facts)
+        .unwrap()
+        .into_stored_state(None, None, "nonce-revision-2".into())
+        .unwrap();
+    assert_eq!(stored.completed["a"], current_receipt);
+    assert_eq!(
+        stored.accepted_history,
+        vec![AcceptedTaskEvidenceReceipt {
+            task_id: "a".into(),
+            task_revision: 1,
+            artifact_ref: old_receipt.artifact_ref.clone(),
+            verification_ref: old_receipt.verification_ref.clone(),
+        }]
+    );
+    let value = serde_json::to_value(&stored).unwrap();
+    let restored = StoredTaskState::parse_and_validate(value.clone(), "th1").unwrap();
+    assert_eq!(restored.accepted_history, stored.accepted_history);
+
+    let mut missing_history = value.clone();
+    missing_history
+        .as_object_mut()
+        .unwrap()
+        .remove("accepted_history");
+    assert!(StoredTaskState::parse_and_validate(missing_history, "th1").is_err());
+
+    let mut forged_history = value.clone();
+    forged_history["accepted_history"][0]["artifact_ref"] = "artifact:forged".into();
+    assert!(StoredTaskState::parse_and_validate(forged_history, "th1").is_err());
+
+    let mut wrong_task_history = value;
+    wrong_task_history["accepted_history"][0]["task_id"] = "other-task".into();
+    assert!(StoredTaskState::parse_and_validate(wrong_task_history, "th1").is_err());
+
+    state.conditions[0].evidence[0] = CompletionEvidenceRef {
+        task_id: "a".into(),
+        task_revision: 1,
+        artifact_ref: old_receipt.artifact_ref,
+        verification_ref: old_receipt.verification_ref,
+    };
+    assert!(
+        validate_completion_state_with_history(
+            Some(&state),
+            &BTreeMap::from([("a".into(), current_receipt)]),
+            &stored.accepted_history,
+        )
+        .is_err()
+    );
 }
 
 #[test]

@@ -228,13 +228,14 @@ async fn spawn_agent_description_lists_visible_models_and_reasoning_efforts() ->
         "expected visible model summary in spawn_agent description: {description:?}"
     );
     assert!(
-        description
-            .contains("Available model overrides (optional; inherited parent model is preferred):"),
+        description.contains(
+            "Available model overrides (applied after global and selected role defaults):"
+        ),
         "expected model choices to be framed as overrides in spawn_agent description: {description:?}"
     );
     assert!(
         description.contains(
-            "Spawned agents inherit your current model by default. Omit `model` to use that preferred default; set `model` only when an explicit override is needed."
+            "Model and reasoning effort are resolved independently: apply the global default when configured, then the selected role default when configured, then an explicit spawn value when provided. If none applies, use the parent's effective value."
         ),
         "expected inherited-model guidance in spawn_agent description: {description:?}"
     );

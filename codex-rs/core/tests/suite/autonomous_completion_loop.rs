@@ -2,11 +2,17 @@
 //! Autonomous completion claims bind to real accepted task receipts and reopen when stale.
 use anyhow::Result;
 use codex_config::RencrowExecutionGuard;
+use codex_core::TurnInputRequest;
 use codex_core::config::AgentRoleConfig;
+use codex_core::config::Config;
 use codex_features::Feature;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AgentStatus;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::TurnAbortReason;
+use codex_protocol::turn_input::TurnInputSubmission;
+use codex_protocol::user_input::UserInput;
 use codex_rollout::RolloutItem;
 use core_test_support::responses::ev_apply_patch_custom_tool_call;
 use core_test_support::responses::ev_assistant_message;
@@ -19,12 +25,17 @@ use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::mount_sse_sequence_match;
 use core_test_support::responses::sse;
 use core_test_support::responses::sse_failed;
+use core_test_support::responses::sse_response;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::test_codex;
 use serde_json::Value;
 use serde_json::json;
 use std::fs;
+use std::sync::Arc;
+use std::time::Duration;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 const REVIEW_MODEL: &str = "gpt-5.6-sol";
 const REVIEW_ROLE: &str = "reviewer";
@@ -141,6 +152,69 @@ fn is_completion_reviewer_request(request: &wiremock::Request, parent_thread_id:
         && body["client_metadata"]["x-codex-parent-thread-id"].as_str() == Some(parent_thread_id)
 }
 
+async fn completion_reviewer_request_diagnostics(
+    server: &wiremock::MockServer,
+    parent_thread_id: &str,
+    child_thread_id: &str,
+) -> String {
+    let requests = server.received_requests().await.unwrap_or_default();
+    let mut summaries = Vec::new();
+    for (index, request) in requests.iter().enumerate() {
+        if request.method != wiremock::http::Method::POST
+            || !request.url.path().ends_with("/responses")
+        {
+            continue;
+        }
+        let body = if request
+            .headers
+            .get("content-encoding")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value
+                    .split(',')
+                    .any(|encoding| encoding.trim().eq_ignore_ascii_case("zstd"))
+            }) {
+            zstd::stream::decode_all(std::io::Cursor::new(&request.body)).ok()
+        } else {
+            Some(request.body.clone())
+        };
+        let parsed = body
+            .as_deref()
+            .and_then(|body| serde_json::from_slice::<Value>(body).ok());
+        let Some(body) = parsed else {
+            summaries.push(format!("request[{index}] json_decoded=false"));
+            continue;
+        };
+        let has_review_prompt = body["input"].as_array().is_some_and(|items| {
+            items.iter().any(|item| {
+                item["type"] == "message"
+                    && item["role"] == "user"
+                    && item["content"].as_array().is_some_and(|content| {
+                        content.iter().any(|part| {
+                            part["type"] == "input_text"
+                                && part["text"].as_str().is_some_and(|text| {
+                                    text.contains("Host-assigned read-only review")
+                                })
+                        })
+                    })
+            })
+        });
+        summaries.push(format!(
+            "request[{index}] model_matches={} child_thread_matches={} parent_thread_matches={} review_prompt_present={}",
+            body["model"] == REVIEW_MODEL,
+            body["client_metadata"]["thread_id"].as_str() == Some(child_thread_id),
+            body["client_metadata"]["x-codex-parent-thread-id"].as_str()
+                == Some(parent_thread_id),
+            has_review_prompt,
+        ));
+    }
+    format!(
+        "server_response_requests={} [{}]",
+        summaries.len(),
+        summaries.join("; ")
+    )
+}
+
 fn open_contract() -> Value {
     json!({
         "contract_revision": 1,
@@ -219,6 +293,139 @@ fn write_artifact_content_test(
         ),
     )?;
     Ok(())
+}
+
+fn configure_completion_review_test(config: &mut Config, provider_url: &str) {
+    config.rencrow_compaction = true;
+    config.rencrow_autonomous_completion = true;
+    config.rencrow_tool_allowlist = Some(vec![
+        "exec_command".into(),
+        "task_context_boundary".into(),
+        "multi_agent_v1::wait_agent".into(),
+        "multi_agent_v1::resume_agent".into(),
+    ]);
+    config
+        .features
+        .enable(Feature::Collab)
+        .expect("enable collaboration for the isolated reviewer test");
+    let model_provider_id = config.model_provider_id.clone();
+    config.model_provider.stream_idle_timeout_ms = Some(12 * 60 * 1000);
+    config
+        .model_providers
+        .insert(model_provider_id.clone(), config.model_provider.clone());
+    let role_path = config.codex_home.join("completion-reviewer.toml");
+    // The role selects the test's injected `openai` route above; role TOML may only add a
+    // separate custom provider because built-in provider IDs are reserved in config files.
+    fs::write(
+        &role_path,
+        format!(
+            "model = \"{REVIEW_MODEL}\"\nrencrow_read_only = true\nmodel_provider = \"{model_provider_id}\"\n\n[rencrow_execution_guard]\ntask_kind = \"read_only\"\n\n[model_providers.mock]\nname = \"mock\"\nbase_url = \"{provider_url}\"\nenv_key = \"PATH\"\nwire_api = \"responses\"\n"
+        ),
+    )
+    .expect("write isolated read-only completion reviewer role");
+    config.agent_roles.insert(
+        REVIEW_ROLE.into(),
+        AgentRoleConfig {
+            enabled: None,
+            description: Some("Read-only completion reviewer".into()),
+            config_file: Some(role_path.as_path().to_path_buf()),
+            nickname_candidates: None,
+        },
+    );
+}
+
+async fn mount_delayed_completion_reviewer_response(
+    server: &wiremock::MockServer,
+    parent_thread_id: String,
+    delay: Duration,
+) {
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path_regex(".*/responses$"))
+        .and(move |request: &wiremock::Request| {
+            is_completion_reviewer_request(request, &parent_thread_id)
+        })
+        .respond_with(
+            sse_response(sse(vec![
+                ev_response_created("delayed-completion-reviewer-response"),
+                ev_assistant_message(
+                    "delayed-completion-reviewer-message",
+                    "This mock response must arrive only after the host review deadline.",
+                ),
+                ev_completed("delayed-completion-reviewer-response"),
+            ]))
+            .set_delay(delay),
+        )
+        .up_to_n_times(1)
+        .mount(server)
+        .await;
+}
+
+async fn completion_reviewer_requests(
+    server: &wiremock::MockServer,
+    parent_thread_id: &str,
+) -> Result<Vec<wiremock::Request>> {
+    let requests = server
+        .received_requests()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("loopback mock server did not return captured requests"))?;
+    Ok(requests
+        .into_iter()
+        .filter(|request| is_completion_reviewer_request(request, parent_thread_id))
+        .collect())
+}
+
+async fn wait_for_completion_reviewer_requests(
+    server: &wiremock::MockServer,
+    parent_thread_id: &str,
+) -> Vec<wiremock::Request> {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let requests = completion_reviewer_requests(server, parent_thread_id)
+                .await
+                .expect("read loopback completion reviewer requests");
+            if !requests.is_empty() {
+                return requests;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("timed out waiting for the real completion reviewer request")
+}
+
+async fn persisted_review_ended_event_count(
+    codex_home: &std::path::Path,
+    reviewer_thread_id: &str,
+    reviewer_turn_id: &str,
+) -> Result<usize> {
+    let path = codex_core::find_thread_path_by_id_str(
+        codex_home,
+        reviewer_thread_id,
+        /*state_db_ctx*/ None,
+    )
+    .await?
+    .ok_or_else(|| anyhow::anyhow!("reviewer rollout is missing for {reviewer_thread_id}"))?;
+    Ok(fs::read_to_string(path)?
+        .lines()
+        .filter_map(|line| codex_rollout::parse_rollout_line(line).ok())
+        .filter(|entry| {
+            matches!(
+                &entry.item,
+                RolloutItem::EventMsg(codex_protocol::protocol::EventMsg::TurnAborted(event))
+                    if event.turn_id.as_deref() == Some(reviewer_turn_id)
+                        && event.reason == TurnAbortReason::ReviewEnded
+            )
+        })
+        .count())
+}
+
+fn unix_time_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after the Unix epoch")
+        .as_millis()
+        .try_into()
+        .expect("current Unix timestamp should fit in i64 milliseconds")
 }
 
 fn host_completion_snapshots(path: &std::path::Path) -> Result<Vec<Value>> {
@@ -997,6 +1204,10 @@ async fn planned_review_runs_through_host_spawn_wait_same_child_followup_and_ado
             ]);
             config.features.enable(Feature::Collab).unwrap();
             let model_provider_id = config.model_provider_id.clone();
+            config.model_providers.insert(
+                model_provider_id.clone(),
+                config.model_provider.clone(),
+            );
             let role_path = config.codex_home.join("completion-reviewer.toml");
             fs::write(
                 &role_path,
@@ -1161,10 +1372,23 @@ async fn planned_review_runs_through_host_spawn_wait_same_child_followup_and_ado
         .filter(|request| request.body_json()["client_metadata"]["thread_id"] == reviewer_thread_id)
         .map(core_test_support::responses::ResponsesRequest::body_json)
         .collect::<Vec<_>>();
+    let dispatch_diagnostics = if reviewer_requests.len() != 1 {
+        Some(
+            completion_reviewer_request_diagnostics(
+                &server,
+                &parent_thread_id,
+                &reviewer_thread_id,
+            )
+            .await,
+        )
+    } else {
+        None
+    };
     assert_eq!(
         reviewer_requests.len(),
         1,
-        "review launches exactly the host-returned child thread {reviewer_thread_id}; tool output: {review_output}"
+        "review launches exactly the host-returned child thread {reviewer_thread_id}; tool_output_present={}; request diagnostics: {dispatch_diagnostics:?}",
+        !review_output.is_empty()
     );
     assert_eq!(reviewer_requests[0]["model"], REVIEW_MODEL);
     let reviewer_turn_id = reviewer_requests
@@ -1463,6 +1687,471 @@ async fn planned_review_runs_through_host_spawn_wait_same_child_followup_and_ado
     Ok(())
 }
 
+/// Requires a dedicated nextest timeout greater than the existing 10-minute reviewer SLA.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_reviewer_deadline_stops_collects_and_cold_resumes_the_same_generation() -> Result<()>
+{
+    skip_if_no_network!(Ok(()));
+    const REVIEWER_SLA_MS: i64 = 10 * 60 * 1000;
+    const PARENT_WAIT_TIMEOUT_MS: i64 = 11 * 60 * 1000;
+
+    let server = start_mock_server().await;
+    let provider_url = format!("{}/v1", server.uri());
+    let provider_url_for_config = provider_url.clone();
+    let fixture = test_codex()
+        .with_config(move |config| {
+            configure_completion_review_test(config, &provider_url_for_config);
+        })
+        .build(&server)
+        .await?;
+    let parent_thread_id = fixture.session_configured.thread_id.to_string();
+    let artifact = fixture.cwd_path().join("deadline-review-artifact.txt");
+    fs::write(&artifact, "accepted artifact\n")?;
+    write_artifact_content_test(
+        fixture.cwd_path(),
+        "test_deadline_review_artifact.py",
+        "deadline-review-artifact.txt",
+    )?;
+    let relative_artifact = artifact
+        .strip_prefix(fixture.cwd_path())?
+        .to_string_lossy()
+        .to_string();
+
+    let review_contract = json!({
+        "contract_revision":1,
+        "conditions":[{
+            "id":"AC-1", "revision":1, "result":"Task A is correct", "scope":"CLI",
+            "verification":"Inspect the accepted artifact", "acceptance_criteria":"Expected content is present",
+            "status":"open", "evidence":[], "unmet_reason":null
+        }],
+        "units":[
+            {"id":"task-a", "purpose":"Create the reviewed artifact", "status":"ready", "condition_refs":["AC-1"], "depends_on":[], "evidence":[], "task_refs":[]},
+            {"id":"review-a", "purpose":"Review task A against AC-1", "status":"planned", "kind":"review", "condition_refs":["AC-1"], "depends_on":["task-a"], "evidence":[], "task_refs":[], "review_target":{"task_id":"task-a","task_revision":1}},
+            {"id":"task-b", "purpose":"Continue after review A", "status":"planned", "condition_refs":["AC-1"], "depends_on":["review-a"], "evidence":[], "task_refs":[]}
+        ],
+        "current_unit":"task-a", "failed_approaches":[], "blocker":null,
+        "next_action":"Begin task A", "product_progress_at":null,
+        "runtime_recovery_at":null, "activity_at":null
+    });
+    mount_parent_sse_sequence(
+        &server,
+        &parent_thread_id,
+        vec![
+            function_response(
+                "deadline-review-begin-root",
+                "task_context_boundary",
+                &json!({"action":"begin","root_task_id":"root","task_id":"root","task_revision":1,"completion_state":review_contract}),
+            ),
+            sse(vec![
+                ev_response_created("deadline-review-root-begun"),
+                ev_assistant_message("deadline-review-root-begun-message", "Review plan registered."),
+                ev_completed("deadline-review-root-begun"),
+            ]),
+        ],
+    )
+    .await;
+    fixture
+        .submit_turn("Register task A, its required review, and the following task.")
+        .await?;
+
+    mount_parent_sse_sequence(
+        &server,
+        &parent_thread_id,
+        vec![
+            function_response(
+                "deadline-review-begin-task-a",
+                "task_context_boundary",
+                &json!({"action":"begin","root_task_id":"root","task_id":"task-a","task_revision":1}),
+            ),
+            function_response(
+                "deadline-review-verify-task-a",
+                "exec_command",
+                &json!({"cmd":"python3 -B -m unittest discover -s tests -p test_deadline_review_artifact.py -v","task_evidence":{"task_id":"task-a","task_revision":1,"artifact_paths":[relative_artifact],"check_kind":"verification"}}),
+            ),
+            function_response(
+                "deadline-review-accept-task-a",
+                "task_context_boundary",
+                &json!({"action":"accept","result":"Task A artifact verified","satisfied_conditions":["AC-1"]}),
+            ),
+            sse(vec![
+                ev_response_created("deadline-review-task-a-accepted"),
+                ev_assistant_message("deadline-review-task-a-message", "Task A is accepted; review A remains required."),
+                ev_completed("deadline-review-task-a-accepted"),
+            ]),
+        ],
+    )
+    .await;
+    fixture
+        .submit_turn("Verify and accept task A before its required review.")
+        .await?;
+    let rollout_path = fixture.codex.rollout_path().expect("parent rollout path");
+    let task_a_begin_output = tool_output_debug(&rollout_path, "deadline-review-begin-task-a")?
+        .expect("task A begin output");
+    let task_a_verification_output =
+        tool_output_debug(&rollout_path, "deadline-review-verify-task-a")?
+            .expect("task A verification output");
+    let task_a_accept_output = tool_output_debug(&rollout_path, "deadline-review-accept-task-a")?
+        .expect("task A acceptance output");
+    assert!(!task_a_begin_output.is_empty());
+    assert!(
+        task_a_verification_output.contains("OK"),
+        "task A verification failed before reviewer launch: {task_a_verification_output}"
+    );
+    assert!(
+        task_a_accept_output.contains("Task boundary prepared"),
+        "task A acceptance failed before reviewer launch: {task_a_accept_output}"
+    );
+    let accepted = latest_host_completion_snapshot(&rollout_path)?;
+    let accepted_task_a = completion_unit(&accepted, "task-a");
+    let accepted_review_a = completion_unit(&accepted, "review-a");
+    assert_eq!(accepted["state"]["conditions"][0]["status"], "satisfied");
+    assert_eq!(accepted_task_a["status"], "done");
+    assert_eq!(accepted_review_a["status"], "planned");
+
+    mount_delayed_completion_reviewer_response(
+        &server,
+        parent_thread_id.clone(),
+        Duration::from_secs(12 * 60),
+    )
+    .await;
+    mount_parent_sse_sequence(
+        &server,
+        &parent_thread_id,
+        vec![
+            sse(vec![
+                ev_response_created("deadline-review-action-parent"),
+                ev_function_call(
+                    "deadline-review-action",
+                    "task_context_boundary",
+                    &json!({"action":"review","target_task_id":"task-a"}).to_string(),
+                ),
+                ev_completed("deadline-review-action-parent"),
+            ]),
+            sse(vec![
+                ev_response_created("deadline-review-action-finished"),
+                ev_assistant_message(
+                    "deadline-review-action-message",
+                    "Review launched; wait on that reviewer.",
+                ),
+                ev_completed("deadline-review-action-finished"),
+            ]),
+        ],
+    )
+    .await;
+    fixture
+        .submit_turn("Launch the planned read-only review for task A.")
+        .await?;
+
+    let review_action_output =
+        tool_output_debug(&rollout_path, "deadline-review-action")?.expect("review action output");
+    assert!(
+        !review_action_output.is_empty(),
+        "review action returned no host output; accepted snapshot: {accepted}"
+    );
+    let launched = latest_host_completion_snapshot(&rollout_path)?;
+    let launched_review = completion_unit(&launched, "review-a");
+    let reviewer_thread_id = launched_review["review_evidence"]["reviewer_thread_id"]
+        .as_str()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "review action did not bind a reviewer thread; output={review_action_output}; task-a-status={}; review-a-status={}; review-a-evidence={}; review-a-state={}",
+                accepted_task_a["status"],
+                launched_review["status"],
+                launched_review["review_evidence"],
+                launched_review["review_state"]
+            )
+        })?
+        .to_string();
+    let reviewer_turn_id = launched_review["review_evidence"]["reviewer_turn_id"]
+        .as_str()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "review action bound no reviewer generation; output={review_action_output}; review-a-state={}",
+                launched_review["review_state"]
+            )
+        })?
+        .to_string();
+    let deadline_unix_ms = launched_review["review_evidence"]["deadline_unix_ms"]
+        .as_i64()
+        .expect("host-assigned reviewer deadline");
+    let reviewer_requests = wait_for_completion_reviewer_requests(&server, &parent_thread_id).await;
+    assert_eq!(
+        reviewer_requests.len(),
+        1,
+        "one host-bound reviewer request must be dispatched"
+    );
+    let reviewer_request_body: Value = reviewer_requests[0].body_json()?;
+    assert_eq!(
+        reviewer_request_body["client_metadata"]["thread_id"],
+        reviewer_thread_id
+    );
+    assert_eq!(
+        reviewer_request_body["client_metadata"]["turn_id"],
+        reviewer_turn_id
+    );
+    assert_eq!(reviewer_request_body["model"], REVIEW_MODEL);
+    let remaining_before_wait_ms = deadline_unix_ms.saturating_sub(unix_time_ms());
+    assert!(
+        (REVIEWER_SLA_MS - 60_000..=REVIEWER_SLA_MS).contains(&remaining_before_wait_ms),
+        "reviewer request reached the loopback gateway with about the full host SLA remaining: {remaining_before_wait_ms}ms"
+    );
+    assert!(matches!(
+        fixture
+            .thread_manager
+            .get_thread(codex_protocol::ThreadId::try_from(
+                reviewer_thread_id.as_str()
+            )?)
+            .await?
+            .agent_status()
+            .await,
+        AgentStatus::Running
+    ));
+
+    mount_parent_sse_sequence(
+        &server,
+        &parent_thread_id,
+        vec![
+            sse(vec![
+                ev_response_created("deadline-wait-parent"),
+                ev_function_call_with_namespace(
+                    "deadline-wait-call",
+                    "multi_agent_v1",
+                    "wait_agent",
+                    &json!({
+                        "targets":[reviewer_thread_id],
+                        "timeout_ms":PARENT_WAIT_TIMEOUT_MS
+                    })
+                    .to_string(),
+                ),
+                ev_completed("deadline-wait-parent"),
+            ]),
+            sse(vec![
+                ev_response_created("deadline-wait-finished"),
+                ev_assistant_message(
+                    "deadline-wait-finished-message",
+                    "The host deadline result was collected.",
+                ),
+                ev_completed("deadline-wait-finished"),
+            ]),
+        ],
+    )
+    .await;
+    let wait_submission = fixture
+        .codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "Wait for the exact reviewer generation and collect its host deadline result."
+                .into(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    let wait_turn_id = match wait_submission {
+        TurnInputSubmission::Started { turn_id } => turn_id,
+        submission => anyhow::bail!("deadline wait turn did not start: {submission:?}"),
+    };
+    let wait_started = tokio::time::Instant::now();
+    let wait_event_deadline = wait_started
+        + Duration::from_millis(remaining_before_wait_ms as u64)
+        + Duration::from_secs(120);
+    loop {
+        let event =
+            tokio::time::timeout_at(wait_event_deadline, fixture.codex.next_event()).await??;
+        if matches!(
+            event.msg,
+            EventMsg::TurnComplete(turn_complete) if turn_complete.turn_id == wait_turn_id
+        ) {
+            break;
+        }
+    }
+    let wait_elapsed = wait_started.elapsed();
+    assert!(
+        wait_elapsed + Duration::from_secs(2)
+            >= Duration::from_millis(remaining_before_wait_ms as u64),
+        "native wait returned before the saved reviewer deadline: elapsed={wait_elapsed:?}, remaining={remaining_before_wait_ms}ms"
+    );
+    assert!(
+        wait_elapsed
+            <= Duration::from_millis(remaining_before_wait_ms as u64) + Duration::from_secs(120),
+        "native wait exceeded the saved deadline by more than its bounded recovery margin: elapsed={wait_elapsed:?}, remaining={remaining_before_wait_ms}ms"
+    );
+
+    let wait_output = tool_output_debug(&rollout_path, "deadline-wait-call")?
+        .expect("native deadline wait output");
+    assert!(
+        wait_output.contains("ReviewEnded"),
+        "native wait collected the exact ReviewEnded status: {wait_output}"
+    );
+    let after_wait = latest_host_completion_snapshot(&rollout_path)?;
+    let failed_review = completion_unit(&after_wait, "review-a");
+    let failed_evidence = &failed_review["review_evidence"];
+    assert_eq!(failed_review["status"], "failed");
+    assert_eq!(failed_evidence["reviewer_thread_id"], reviewer_thread_id);
+    assert_eq!(failed_evidence["reviewer_turn_id"], reviewer_turn_id);
+    assert_eq!(failed_evidence["deadline_unix_ms"], deadline_unix_ms);
+    assert_eq!(failed_evidence["terminal_status"], "failed");
+    assert!(
+        failed_evidence["deadline_escalation"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("ReviewEnded terminal status"))
+    );
+    let original_wait_result_ref = failed_evidence["wait_result_ref"]
+        .as_str()
+        .expect("deadline generation native wait receipt")
+        .to_string();
+    assert_eq!(failed_evidence["wait_call_id"], "deadline-wait-call");
+    assert_eq!(
+        persisted_review_ended_event_count(
+            fixture.codex_home_path(),
+            &reviewer_thread_id,
+            &reviewer_turn_id,
+        )
+        .await?,
+        1,
+        "one durable ReviewEnded event belongs to the exact reviewer generation"
+    );
+    let reviewer_thread = fixture
+        .thread_manager
+        .get_thread(codex_protocol::ThreadId::try_from(
+            reviewer_thread_id.as_str(),
+        )?)
+        .await?;
+    assert_eq!(
+        reviewer_thread.agent_status().await,
+        AgentStatus::Errored("ReviewEnded".into())
+    );
+    assert_eq!(
+        completion_reviewer_requests(&server, &parent_thread_id)
+            .await?
+            .len(),
+        1,
+        "deadline handling must not spawn or resubmit another reviewer request"
+    );
+
+    reviewer_thread.flush_rollout().await?;
+    fixture.codex.flush_rollout().await?;
+    let codex_home = Arc::clone(&fixture.home);
+    let cwd = Arc::clone(&fixture.cwd);
+    reviewer_thread.shutdown_and_wait().await?;
+    fixture.codex.shutdown_and_wait().await?;
+    drop(reviewer_thread);
+    drop(fixture);
+    assert!(cwd.path().join("deadline-review-artifact.txt").is_file());
+
+    let resume_provider_url = provider_url.clone();
+    let mut resume_builder = test_codex().with_config(move |config| {
+        configure_completion_review_test(config, &resume_provider_url);
+    });
+    let resumed = resume_builder
+        .resume(&server, codex_home, rollout_path.clone())
+        .await?;
+    assert_eq!(
+        resumed.session_configured.thread_id.to_string(),
+        parent_thread_id
+    );
+
+    mount_parent_sse_sequence(
+        &server,
+        &parent_thread_id,
+        vec![
+            sse(vec![
+                ev_response_created("deadline-cold-resume-parent"),
+                ev_function_call_with_namespace(
+                    "deadline-resume-agent-call",
+                    "multi_agent_v1",
+                    "resume_agent",
+                    &json!({"id":reviewer_thread_id}).to_string(),
+                ),
+                ev_completed("deadline-cold-resume-parent"),
+            ]),
+            sse(vec![
+                ev_response_created("deadline-cold-resume-wait-parent"),
+                ev_function_call_with_namespace(
+                    "deadline-cold-resume-wait-call",
+                    "multi_agent_v1",
+                    "wait_agent",
+                    &json!({"targets":[reviewer_thread_id],"timeout_ms":30_000}).to_string(),
+                ),
+                ev_completed("deadline-cold-resume-wait-parent"),
+            ]),
+            function_response(
+                "deadline-cold-resume-status-call",
+                "task_context_boundary",
+                &json!({"action":"status","root_task_id":"root"}),
+            ),
+            sse(vec![
+                ev_response_created("deadline-cold-resume-finished"),
+                ev_assistant_message(
+                    "deadline-cold-resume-message",
+                    "Saved review state remains failed and collected.",
+                ),
+                ev_completed("deadline-cold-resume-finished"),
+            ]),
+        ],
+    )
+    .await;
+    resumed
+        .submit_turn("Restore the saved reviewer, wait for its terminal generation, and inspect the saved completion state.")
+        .await?;
+
+    let resume_output = tool_output_debug(&rollout_path, "deadline-resume-agent-call")?
+        .expect("cold resume must restore the same reviewer thread");
+    assert!(
+        resume_output.contains("ReviewEnded"),
+        "resumed status: {resume_output}"
+    );
+    let cold_wait_output = tool_output_debug(&rollout_path, "deadline-cold-resume-wait-call")?
+        .expect("cold resume wait must observe the existing terminal reviewer");
+    assert!(
+        cold_wait_output.contains("ReviewEnded"),
+        "cold wait must return the original terminal generation: {cold_wait_output}"
+    );
+    let cold_status_output = tool_output_debug(&rollout_path, "deadline-cold-resume-status-call")?
+        .expect("cold resume status must expose the restored completion state");
+    for saved_value in [
+        reviewer_thread_id.as_str(),
+        reviewer_turn_id.as_str(),
+        original_wait_result_ref.as_str(),
+        "deadline-wait-call",
+        "ReviewEnded",
+        "failed",
+    ] {
+        assert!(
+            cold_status_output.contains(saved_value),
+            "cold-resumed status output omitted saved value {saved_value}: {cold_status_output}"
+        );
+    }
+    let resumed_reviewer = resumed
+        .thread_manager
+        .get_thread(codex_protocol::ThreadId::try_from(
+            reviewer_thread_id.as_str(),
+        )?)
+        .await?;
+    assert_eq!(
+        resumed_reviewer.agent_status().await,
+        AgentStatus::Errored("ReviewEnded".into())
+    );
+    assert_eq!(
+        persisted_review_ended_event_count(
+            resumed.codex_home_path(),
+            &reviewer_thread_id,
+            &reviewer_turn_id,
+        )
+        .await?,
+        1,
+        "cold resume must retain one terminal event for the same reviewer generation"
+    );
+    assert_eq!(
+        completion_reviewer_requests(&server, &parent_thread_id)
+            .await?
+            .len(),
+        1,
+        "cold resume and terminal wait must not dispatch a second reviewer model request"
+    );
+    resumed.codex.shutdown_and_wait().await?;
+    drop(cwd);
+    Ok(())
+}
+
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_review_close_preserves_history_and_allows_one_new_authorized_review() -> Result<()>
@@ -1482,6 +2171,10 @@ async fn failed_review_close_preserves_history_and_allows_one_new_authorized_rev
             ]);
             config.features.enable(Feature::Collab).unwrap();
             let model_provider_id = config.model_provider_id.clone();
+            config.model_providers.insert(
+                model_provider_id.clone(),
+                config.model_provider.clone(),
+            );
             let role_path = config.codex_home.join("completion-reviewer.toml");
             fs::write(
                 &role_path,
@@ -1615,10 +2308,18 @@ async fn failed_review_close_preserves_history_and_allows_one_new_authorized_rev
                 == Some(first_thread_id.as_str())
         })
         .collect::<Vec<_>>();
+    let dispatch_diagnostics = if first_child_requests.len() != 1 {
+        Some(
+            completion_reviewer_request_diagnostics(&server, &parent_thread_id, &first_thread_id)
+                .await,
+        )
+    } else {
+        None
+    };
     assert_eq!(
         first_child_requests.len(),
         1,
-        "one dispatch for the host-bound child"
+        "one dispatch for the host-bound child; request diagnostics: {dispatch_diagnostics:?}"
     );
     assert_eq!(first_child_requests[0].body_json()["model"], REVIEW_MODEL);
     assert_eq!(

@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-21: initialize accepted revision history fixtures.
 use super::*;
 use crate::compaction_checkpoint_metadata::CheckpointResponseStage;
 use crate::compaction_checkpoint_metadata::CompactionModelResponseReceipt;
@@ -61,6 +62,7 @@ fn stored_task_state() -> Value {
         parent_review_matches: true,
         unresolved_effects: vec![],
         accepted_completed: Default::default(),
+        accepted_history: vec![],
     };
     serde_json::to_value(
         validate_boundary(candidate, &facts)

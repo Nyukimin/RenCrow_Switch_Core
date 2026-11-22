@@ -93,7 +93,9 @@ const V2_DEFAULT_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::High;
 const V2_REQUESTED_MODEL: &str = "gpt-5.6-sol";
 const V2_REQUESTED_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::Low;
 const ROLE_MODEL: &str = "gpt-5.5";
+const C16_ROLE_MODEL: &str = "gpt-5.4";
 const ROLE_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::High;
+const C16_ROLE_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::Low;
 const SUBAGENT_START_CONTEXT: &str = "subagent start context reaches child";
 const SUBAGENT_STOP_CONTINUATION: &str = "continue only the child";
 const INTERNAL_SUBAGENT_PROMPT: &str = "internal subagent: review";
@@ -1443,6 +1445,12 @@ async fn grandchild_full_fork_preserves_context_baseline(
 enum FullHistoryV2ModelSelection {
     ConfiguredDefault,
     ExplicitOverride,
+    RoleWithExplicitModelOnly,
+    RoleWithExplicitEffortOnly,
+    RoleUnsupportedEffortResolvedExplicitly,
+    RoleModelWithGlobalEffort,
+    RoleEffortWithGlobalModel,
+    RoleOverridesInvalidGlobalModel,
     WorldStateIdentity,
     CurrentTimeReminders,
     MultiAgentModeInstructions,
@@ -1451,6 +1459,12 @@ enum FullHistoryV2ModelSelection {
 
 #[test_case(FullHistoryV2ModelSelection::ConfiguredDefault; "configured default with omitted fork_turns")]
 #[test_case(FullHistoryV2ModelSelection::ExplicitOverride; "explicit override with fork_turns all")]
+#[test_case(FullHistoryV2ModelSelection::RoleWithExplicitModelOnly; "role effort survives explicit model")]
+#[test_case(FullHistoryV2ModelSelection::RoleWithExplicitEffortOnly; "role model survives explicit effort")]
+#[test_case(FullHistoryV2ModelSelection::RoleUnsupportedEffortResolvedExplicitly; "final explicit effort resolves unsupported role intermediate")]
+#[test_case(FullHistoryV2ModelSelection::RoleModelWithGlobalEffort; "global effort fills role model-only")]
+#[test_case(FullHistoryV2ModelSelection::RoleEffortWithGlobalModel; "global model fills role effort-only")]
+#[test_case(FullHistoryV2ModelSelection::RoleOverridesInvalidGlobalModel; "valid role replaces unused invalid global model")]
 #[test_case(FullHistoryV2ModelSelection::WorldStateIdentity; "world state appends context window when agent identity changes")]
 #[test_case(FullHistoryV2ModelSelection::CurrentTimeReminders; "full fork drops inherited current-time reminders")]
 #[test_case(FullHistoryV2ModelSelection::MultiAgentModeInstructions; "full fork drops inherited multi-agent mode instructions")]
@@ -1495,6 +1509,69 @@ async fn spawned_full_history_v2_child_uses_model_precedence_without_dropping_co
             }),
             V2_REQUESTED_MODEL,
             V2_REQUESTED_REASONING_EFFORT,
+        ),
+        FullHistoryV2ModelSelection::RoleWithExplicitModelOnly => (
+            json!({
+                "message": CHILD_PROMPT,
+                "task_name": "worker",
+                "agent_type": "custom",
+                "fork_turns": "all",
+                "model": V2_REQUESTED_MODEL,
+            }),
+            V2_REQUESTED_MODEL,
+            C16_ROLE_REASONING_EFFORT,
+        ),
+        FullHistoryV2ModelSelection::RoleWithExplicitEffortOnly => (
+            json!({
+                "message": CHILD_PROMPT,
+                "task_name": "worker",
+                "agent_type": "custom",
+                "fork_turns": "all",
+                "reasoning_effort": ROLE_REASONING_EFFORT,
+            }),
+            C16_ROLE_MODEL,
+            ROLE_REASONING_EFFORT,
+        ),
+        FullHistoryV2ModelSelection::RoleUnsupportedEffortResolvedExplicitly => (
+            json!({
+                "message": CHILD_PROMPT,
+                "task_name": "worker",
+                "agent_type": "custom",
+                "fork_turns": "all",
+                "reasoning_effort": ROLE_REASONING_EFFORT,
+            }),
+            C16_ROLE_MODEL,
+            ROLE_REASONING_EFFORT,
+        ),
+        FullHistoryV2ModelSelection::RoleModelWithGlobalEffort => (
+            json!({
+                "message": CHILD_PROMPT,
+                "task_name": "worker",
+                "agent_type": "custom",
+                "fork_turns": "all",
+            }),
+            C16_ROLE_MODEL,
+            V2_DEFAULT_REASONING_EFFORT,
+        ),
+        FullHistoryV2ModelSelection::RoleEffortWithGlobalModel => (
+            json!({
+                "message": CHILD_PROMPT,
+                "task_name": "worker",
+                "agent_type": "custom",
+                "fork_turns": "all",
+            }),
+            V2_DEFAULT_MODEL,
+            C16_ROLE_REASONING_EFFORT,
+        ),
+        FullHistoryV2ModelSelection::RoleOverridesInvalidGlobalModel => (
+            json!({
+                "message": CHILD_PROMPT,
+                "task_name": "worker",
+                "agent_type": "custom",
+                "fork_turns": "all",
+            }),
+            C16_ROLE_MODEL,
+            C16_ROLE_REASONING_EFFORT,
         ),
     };
     let spawn_args = serde_json::to_string(&spawn_args)?;
@@ -1576,7 +1653,12 @@ async fn spawned_full_history_v2_child_uses_model_precedence_without_dropping_co
         let model_catalog = config.model_catalog.get_or_insert_with(|| {
             bundled_models_response().expect("bundled models.json should parse")
         });
-        for model in [INHERITED_MODEL, V2_DEFAULT_MODEL, V2_REQUESTED_MODEL] {
+        for model in [
+            INHERITED_MODEL,
+            V2_DEFAULT_MODEL,
+            V2_REQUESTED_MODEL,
+            C16_ROLE_MODEL,
+        ] {
             let model_info = model_catalog
                 .models
                 .iter_mut()
@@ -1654,8 +1736,113 @@ async fn spawned_full_history_v2_child_uses_model_precedence_without_dropping_co
         }
         config.model = Some(INHERITED_MODEL.to_string());
         config.model_reasoning_effort = Some(INHERITED_REASONING_EFFORT);
-        config.agent_default_subagent_model = Some(V2_DEFAULT_MODEL.to_string());
+        config.agent_default_subagent_model = Some(if matches!(
+            selection,
+            FullHistoryV2ModelSelection::RoleOverridesInvalidGlobalModel
+        ) {
+            "c16-invalid-unselected-model".to_string()
+        } else {
+            V2_DEFAULT_MODEL.to_string()
+        });
         config.agent_default_subagent_reasoning_effort = Some(V2_DEFAULT_REASONING_EFFORT);
+        match selection {
+            FullHistoryV2ModelSelection::RoleWithExplicitModelOnly
+            | FullHistoryV2ModelSelection::RoleWithExplicitEffortOnly => {
+                let role_path = config.codex_home.join("c16-combined-role.toml");
+                let role_model = if matches!(
+                    selection,
+                    FullHistoryV2ModelSelection::RoleWithExplicitEffortOnly
+                ) {
+                    C16_ROLE_MODEL
+                } else {
+                    ROLE_MODEL
+                };
+                std::fs::write(
+                    &role_path,
+                    format!(
+                        "model = \"{role_model}\"\nmodel_reasoning_effort = \"{C16_ROLE_REASONING_EFFORT}\"\nrencrow_read_only = true\nrencrow_tool_allowlist = [\"exec_command\"]\n"
+                    ),
+                )
+                .expect("write role config");
+                config.agent_roles.insert(
+                    "custom".to_string(),
+                    AgentRoleConfig {
+                        enabled: None,
+                        description: Some("C16 role".to_string()),
+                        config_file: Some(role_path.to_path_buf()),
+                        nickname_candidates: None,
+                    },
+                );
+            }
+            FullHistoryV2ModelSelection::RoleUnsupportedEffortResolvedExplicitly => {
+                let role_path = config.codex_home.join("c16-intermediate-role.toml");
+                std::fs::write(
+                    &role_path,
+                    format!("model = \"{C16_ROLE_MODEL}\"\nmodel_reasoning_effort = \"ultra\"\n"),
+                )
+                .expect("write role config");
+                config.agent_roles.insert(
+                    "custom".to_string(),
+                    AgentRoleConfig {
+                        enabled: None,
+                        description: Some("C16 intermediate role".to_string()),
+                        config_file: Some(role_path.to_path_buf()),
+                        nickname_candidates: None,
+                    },
+                );
+            }
+            FullHistoryV2ModelSelection::RoleModelWithGlobalEffort => {
+                let role_path = config.codex_home.join("c16-model-role.toml");
+                std::fs::write(&role_path, format!("model = \"{C16_ROLE_MODEL}\"\n"))
+                    .expect("write role config");
+                config.agent_roles.insert(
+                    "custom".to_string(),
+                    AgentRoleConfig {
+                        enabled: None,
+                        description: Some("C16 model role".to_string()),
+                        config_file: Some(role_path.to_path_buf()),
+                        nickname_candidates: None,
+                    },
+                );
+            }
+            FullHistoryV2ModelSelection::RoleEffortWithGlobalModel => {
+                let role_path = config.codex_home.join("c16-effort-role.toml");
+                std::fs::write(
+                    &role_path,
+                    format!("model_reasoning_effort = \"{C16_ROLE_REASONING_EFFORT}\"\n"),
+                )
+                .expect("write role config");
+                config.agent_roles.insert(
+                    "custom".to_string(),
+                    AgentRoleConfig {
+                        enabled: None,
+                        description: Some("C16 effort role".to_string()),
+                        config_file: Some(role_path.to_path_buf()),
+                        nickname_candidates: None,
+                    },
+                );
+            }
+            FullHistoryV2ModelSelection::RoleOverridesInvalidGlobalModel => {
+                let role_path = config.codex_home.join("c16-valid-role.toml");
+                std::fs::write(
+                    &role_path,
+                    format!(
+                        "model = \"{C16_ROLE_MODEL}\"\nmodel_reasoning_effort = \"{C16_ROLE_REASONING_EFFORT}\"\n"
+                    ),
+                )
+                .expect("write role config");
+                config.agent_roles.insert(
+                    "custom".to_string(),
+                    AgentRoleConfig {
+                        enabled: None,
+                        description: Some("C16 valid role".to_string()),
+                        config_file: Some(role_path.to_path_buf()),
+                        nickname_candidates: None,
+                    },
+                );
+            }
+            _ => {}
+        }
     });
     if matches!(selection, FullHistoryV2ModelSelection::WorldStateIdentity) {
         builder = builder.with_history_mode(ThreadHistoryMode::Paginated);
@@ -1793,6 +1980,20 @@ async fn spawned_full_history_v2_child_uses_model_precedence_without_dropping_co
         message.contains(&format!("{INHERITED_MODEL} root role."))
             || message.contains(&format!("{INHERITED_MODEL} subagent role."))
     }));
+    if matches!(
+        selection,
+        FullHistoryV2ModelSelection::RoleWithExplicitModelOnly
+            | FullHistoryV2ModelSelection::RoleWithExplicitEffortOnly
+    ) {
+        let spawned_id = wait_for_spawned_thread_id(&test).await?;
+        let child_thread = test
+            .thread_manager
+            .get_thread(ThreadId::from_string(&spawned_id)?)
+            .await?;
+        let child_snapshot = child_thread.config_snapshot().await;
+        assert_eq!(child_snapshot.cwd().as_path(), test.cwd_path());
+        assert!(!child_snapshot.full_access);
+    }
     if matches!(
         selection,
         FullHistoryV2ModelSelection::MultiAgentModeInstructions
@@ -2013,7 +2214,7 @@ async fn spawn_agent_uses_configured_subagent_defaults() -> Result<()> {
     Some(REQUESTED_MODEL),
     None,
     REQUESTED_MODEL,
-    Some(ReasoningEffort::Medium);
+    Some(INHERITED_REASONING_EFFORT);
     "model only"
 )]
 #[test_case(
@@ -3326,7 +3527,7 @@ async fn spawn_agent_rejects_reasoning_effort_unsupported_by_role_model() -> Res
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn spawn_agent_tool_description_mentions_role_locked_settings() -> Result<()> {
+async fn spawn_agent_tool_description_mentions_role_defaults() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -3393,7 +3594,7 @@ async fn spawn_agent_tool_description_mentions_role_locked_settings() -> Result<
         role_block(&agent_type_description, "custom").expect("custom role description");
     assert_eq!(
         custom_role_description,
-        "custom: {\nCustom role\n- This role's model is set to `gpt-5.5` and its reasoning effort is set to `high`. These settings cannot be changed.\n}"
+        "custom: {\nCustom role\n- This role defaults to model `gpt-5.5` and reasoning effort `high`. When provided, explicit spawn arguments take precedence for either setting.\n}"
     );
 
     Ok(())

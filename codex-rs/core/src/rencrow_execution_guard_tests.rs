@@ -563,6 +563,70 @@ async fn same_sampling_batch_refusals_wait_for_model_feedback_before_fatal() {
     ));
 }
 
+#[tokio::test]
+async fn task_context_status_with_distinct_identity_survives_same_batch_refusals() {
+    let mut repeated_status = exec_guard_invocation(
+        "",
+        RencrowExecutionGuard {
+            max_repeated_reads: NonZeroU16::new(1).unwrap(),
+            ..Default::default()
+        },
+        None,
+    )
+    .await;
+    repeated_status.tool_name = codex_tools::ToolName::plain("task_context_boundary");
+    repeated_status.payload = ToolPayload::Function {
+        arguments: serde_json::json!({"action": "status", "root_task_id": "root-a"}).to_string(),
+    };
+    before_tool(&repeated_status)
+        .await
+        .expect("the first status read for root-a should be allowed");
+
+    let turn_state = {
+        let active = repeated_status.session.active_turn.lock().await;
+        std::sync::Arc::clone(&active.as_ref().expect("fixture has active turn").turn_state)
+    };
+    turn_state
+        .lock()
+        .await
+        .rencrow_execution_guard
+        .arm_fatal_on_next_budget_refusal();
+
+    let mut distinct_status = repeated_status.clone();
+    distinct_status.payload = ToolPayload::Function {
+        arguments: serde_json::json!({"action": "status", "root_task_id": "root-b"}).to_string(),
+    };
+    let batch = tokio::join!(
+        before_tool(&repeated_status),
+        before_tool(&repeated_status),
+        before_tool(&repeated_status),
+        before_tool(&distinct_status),
+    );
+    assert!(matches!(batch.0, Err(FunctionCallError::RespondToModel(_))));
+    assert!(matches!(batch.1, Err(FunctionCallError::RespondToModel(_))));
+    assert!(matches!(batch.2, Err(FunctionCallError::RespondToModel(_))));
+    assert!(
+        batch.3.is_ok(),
+        "root-b status has a distinct read identity"
+    );
+    {
+        let turn = turn_state.lock().await;
+        assert_eq!(turn.rencrow_execution_guard.budget_rejections, 3);
+        assert_eq!(turn.rencrow_execution_guard.repeated.len(), 2);
+        assert!(!turn.rencrow_execution_guard.fatal_on_next_budget_refusal);
+    }
+
+    turn_state
+        .lock()
+        .await
+        .rencrow_execution_guard
+        .arm_fatal_on_next_budget_refusal();
+    assert!(matches!(
+        before_tool(&repeated_status).await,
+        Err(FunctionCallError::Fatal(_))
+    ));
+}
+
 #[test]
 fn handoff_preserves_refusal_count_and_next_sampling_rearms_fatal() {
     let mut state = GuardState {

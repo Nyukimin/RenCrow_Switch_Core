@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-21: cover accepted task revision history through accept, update, and reload.
 // Modified by RenCrow Switch Core, 2026-11-21: cover host verification diagnostics in status and accept.
 // Modified by RenCrow Switch Core, 2026-11-20: separate caller and host checkpoint budgets.
 // Modified by RenCrow Switch Core, 2026-11-16.
@@ -1636,17 +1637,33 @@ async fn autonomous_accept_with_prior_same_revision_receipt_persists_fresh_host_
             .expect("commit fresh same-scope receipt and completion state")
     );
 
-    let current_receipt = session
+    let current_state = session
         .latest_rencrow_task_state()
         .await
         .expect("current task state parses")
-        .expect("current task state exists")
+        .expect("current task state exists");
+    let current_receipt = current_state
         .completed
         .get("sp-newAC1")
         .cloned()
         .expect("current accepted receipt exists");
     assert_ne!(current_receipt, old_receipt);
     assert_eq!(current_receipt.revision, old_receipt.revision);
+    assert_eq!(
+        current_state.accepted_history,
+        vec![codex_history::task_context::AcceptedTaskEvidenceReceipt {
+            task_id: "sp-newAC1".into(),
+            task_revision: old_receipt.revision,
+            artifact_ref: old_receipt.artifact_ref.clone(),
+            verification_ref: old_receipt.verification_ref.clone(),
+        }]
+    );
+    let reloaded = codex_history::task_context::StoredTaskState::parse_and_validate(
+        serde_json::to_value(&current_state).expect("serialize revision history checkpoint"),
+        &session.thread_id().to_string(),
+    )
+    .expect("exact accepted revision history survives checkpoint reload");
+    assert_eq!(reloaded.accepted_history, current_state.accepted_history);
     let completion = session
         .rencrow_completion_state("root")
         .await
@@ -1673,7 +1690,7 @@ async fn autonomous_accept_with_prior_same_revision_receipt_persists_fresh_host_
     assert_eq!(completion.units[0].evidence[0].task_revision, 1);
     assert_eq!(
         completion.units[0].evidence[0].artifact_ref,
-        current_receipt.artifact_ref
+        old_receipt.artifact_ref
     );
     assert_eq!(completion.units[1].status, UnitStatus::Done);
     assert_eq!(
@@ -1682,6 +1699,206 @@ async fn autonomous_accept_with_prior_same_revision_receipt_persists_fresh_host_
     );
     assert_eq!(completion.units[2].status, UnitStatus::Planned);
     assert_eq!(completion.current_unit, None);
+
+    let update = json!({
+        "action":"update",
+        "root_task_id":"root",
+        "completion_state":serde_json::to_value(&completion).expect("serialize current completion state")
+    });
+    TaskContextBoundaryHandler::new(true)
+        .handle(invocation_in_session(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            "update-after-history",
+            update,
+        ))
+        .await
+        .expect("completion update resolves exact historical unit evidence");
+    let _ = store;
+}
+
+#[tokio::test]
+async fn autonomous_accept_retains_three_accepted_revisions_across_update_and_checkpoint_reload() {
+    let (mut session, mut turn_context) = make_session_and_context().await;
+    turn_context.session_source = SessionSource::Cli;
+    Arc::make_mut(&mut turn_context.config).rencrow_compaction = true;
+    Arc::make_mut(&mut turn_context.config).rencrow_autonomous_completion = true;
+    let turn = Arc::new(turn_context);
+    let store = attach_boundary_owner(&mut session, Arc::clone(&turn)).await;
+    let session = Arc::new(session);
+    let workspace = tempfile::tempdir().expect("workspace");
+    std::fs::write(
+        workspace.path().join("artifact.txt"),
+        "same verified artifact",
+    )
+    .expect("create artifact");
+
+    let completion_contract = json!({
+        "contract_revision": 1,
+        "conditions": [{
+            "id": "AC-1", "revision": 1, "result": "Deliver task-a", "scope": "task-a",
+            "verification": "Run task-a check", "acceptance_criteria": "Check passes", "status": "open"
+        }],
+        "units": [{
+            "id": "task-a", "purpose": "Complete task-a", "status": "running",
+            "kind": "execution", "condition_refs": ["AC-1"], "depends_on": [], "task_refs": []
+        }],
+        "current_unit": "task-a"
+    });
+    let handler = TaskContextBoundaryHandler::new(true);
+    handler
+        .handle(invocation_in_session(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            "begin-revision-1",
+            json!({
+                "action":"begin", "root_task_id":"root", "task_id":"task-a",
+                "task_revision":1, "completion_state":completion_contract
+            }),
+        ))
+        .await
+        .expect("begin revision one with completion contract");
+    record_call(
+        &session,
+        &turn,
+        "begin-revision-1",
+        TASK_CONTEXT_BOUNDARY_TOOL_NAME,
+    )
+    .await;
+    record_output(
+        &session,
+        &turn,
+        "begin-revision-1",
+        TASK_CONTEXT_BOUNDARY_TOOL_NAME,
+    )
+    .await;
+
+    for revision in 1..=3 {
+        if revision > 1 {
+            let call_id = format!("begin-revision-{revision}");
+            handler
+                .handle(invocation_in_session(
+                    Arc::clone(&session),
+                    Arc::clone(&turn),
+                    &call_id,
+                    begin("root", "task-a", revision),
+                ))
+                .await
+                .expect("begin next revision for the same task");
+            record_call(&session, &turn, &call_id, TASK_CONTEXT_BOUNDARY_TOOL_NAME).await;
+            record_output(&session, &turn, &call_id, TASK_CONTEXT_BOUNDARY_TOOL_NAME).await;
+        }
+
+        let verify_call_id = format!("verify-revision-{revision}");
+        record_successful_verification(
+            &session,
+            &turn,
+            workspace.path(),
+            "task-a",
+            revision,
+            &verify_call_id,
+        )
+        .await;
+
+        let accept_call_id = format!("accept-revision-{revision}");
+        let accept_args = json!({
+            "action":"accept",
+            "result":format!("accepted revision {revision}"),
+            "satisfied_conditions":["AC-1"]
+        });
+        record_call_with_arguments(
+            &session,
+            &turn,
+            &accept_call_id,
+            TASK_CONTEXT_BOUNDARY_TOOL_NAME,
+            &accept_args.to_string(),
+        )
+        .await;
+        handler
+            .handle(invocation_in_session(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                &accept_call_id,
+                accept_args,
+            ))
+            .await
+            .expect("accept current revision while retaining older unit evidence");
+        record_output(
+            &session,
+            &turn,
+            &accept_call_id,
+            TASK_CONTEXT_BOUNDARY_TOOL_NAME,
+        )
+        .await;
+        assert!(
+            session
+                .commit_prepared_task_boundary(&turn, &tokio_util::sync::CancellationToken::new())
+                .await
+                .expect("commit accepted revision")
+        );
+
+        let stored = session
+            .latest_rencrow_task_state()
+            .await
+            .expect("latest boundary is valid")
+            .expect("latest boundary exists");
+        assert_eq!(stored.completed["task-a"].revision, revision);
+        assert_eq!(stored.accepted_history.len(), (revision - 1) as usize);
+        let completion = session
+            .rencrow_completion_state("root")
+            .await
+            .expect("completion state remains registered");
+        assert_eq!(completion.units[0].evidence.len(), revision as usize);
+        assert_eq!(completion.conditions[0].evidence[0].task_revision, revision);
+        for (index, evidence) in completion.units[0].evidence.iter().enumerate() {
+            assert_eq!(evidence.task_revision, (index + 1) as u64);
+        }
+        let restored = codex_history::task_context::StoredTaskState::parse_and_validate(
+            serde_json::to_value(&stored).expect("serialize accepted revision checkpoint"),
+            &session.thread_id().to_string(),
+        )
+        .expect("persisted revision history survives cold-style parse and validation");
+        assert_eq!(restored.accepted_history, stored.accepted_history);
+
+        if revision == 2 {
+            let status_id = "status-after-revision-2";
+            handler
+                .handle(invocation_in_session(
+                    Arc::clone(&session),
+                    Arc::clone(&turn),
+                    status_id,
+                    json!({"action":"status", "root_task_id":"root"}),
+                ))
+                .await
+                .expect("status reads completion state with retained history");
+            record_call(&session, &turn, status_id, TASK_CONTEXT_BOUNDARY_TOOL_NAME).await;
+            record_output(&session, &turn, status_id, TASK_CONTEXT_BOUNDARY_TOOL_NAME).await;
+
+            let update_id = "update-after-revision-2";
+            let update_args = json!({
+                "action":"update", "root_task_id":"root",
+                "completion_state":serde_json::to_value(&completion).expect("serialize update")
+            });
+            record_call_with_arguments(
+                &session,
+                &turn,
+                update_id,
+                TASK_CONTEXT_BOUNDARY_TOOL_NAME,
+                &update_args.to_string(),
+            )
+            .await;
+            handler
+                .handle(invocation_in_session(
+                    Arc::clone(&session),
+                    Arc::clone(&turn),
+                    update_id,
+                    update_args,
+                ))
+                .await
+                .expect("update validates current condition and exact older unit evidence");
+            record_output(&session, &turn, update_id, TASK_CONTEXT_BOUNDARY_TOOL_NAME).await;
+        }
+    }
     let _ = store;
 }
 
