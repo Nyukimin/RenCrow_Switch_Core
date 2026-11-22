@@ -1,4 +1,5 @@
 // Modified by RenCrow Switch Core, 2026-11-21: explicit authorized native resume.
+// Modified by RenCrow Switch Core, 2026-11-21: profile-aware offline store loading.
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::ensure;
@@ -10,6 +11,9 @@ use codex_core::MaintenanceRepairReason;
 use codex_core::MaintenanceRepairReceipt;
 use codex_core::build_explicit_authorized_resume_snapshot;
 use codex_core::build_maintenance_repair_snapshot;
+use codex_core::config::ConfigBuilder;
+use codex_core::config::LoaderOverrides;
+use codex_core::config::resolve_profile_v2_config_path;
 use codex_core::inspect_maintenance_repair_snapshot;
 use codex_core::maintenance_snapshot_digest;
 use codex_history::CodexHarnessMetadata;
@@ -29,6 +33,7 @@ use codex_thread_store::ReadThreadParams;
 use codex_thread_store::ResumeThreadParams;
 use codex_thread_store::ThreadPersistenceMetadata;
 use codex_thread_store::ThreadStore;
+use codex_utils_cli::ProfileV2Name;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
@@ -920,6 +925,7 @@ async fn run_explicit_authorized_resume(
     codex_home: PathBuf,
     thread: String,
     request_path: PathBuf,
+    profile: Option<&ProfileV2Name>,
     apply: bool,
 ) -> Result<()> {
     let home = codex_home
@@ -934,14 +940,11 @@ async fn run_explicit_authorized_resume(
     let rollout_path = super::thread_rollout(&thread, Some(home.clone())).await?;
     let (request, request_sha256, authorization_sha256, authorization_issuer) =
         load_authorized_resume_request(&request_path, &thread)?;
+    let config = offline_store_config(&home, profile).await?;
     let initial_items = super::thread_rollout_items(&rollout_path, &thread_id).await?;
     let mut store: Option<Arc<LocalThreadStore>> = None;
     let mut live: Option<LiveThread> = None;
     if apply {
-        let config = codex_core::config::ConfigBuilder::default()
-            .codex_home(home.clone())
-            .build()
-            .await?;
         let state_db = codex_rollout::state_db::try_init(&config).await?;
         let local_store = Arc::new(LocalThreadStore::new(
             LocalThreadStoreConfig::from_config(&config),
@@ -1199,6 +1202,16 @@ pub(super) async fn run(
     request_path: PathBuf,
     apply: bool,
 ) -> Result<()> {
+    run_with_profile(codex_home, thread, request_path, None, apply).await
+}
+
+pub(super) async fn run_with_profile(
+    codex_home: PathBuf,
+    thread: String,
+    request_path: PathBuf,
+    profile: Option<ProfileV2Name>,
+    apply: bool,
+) -> Result<()> {
     if request_path.is_absolute() {
         let canonical = request_path
             .canonicalize()
@@ -1207,7 +1220,14 @@ pub(super) async fn run(
         let value: Value =
             serde_json::from_slice(&bytes).context("maintenance request is invalid JSON")?;
         if value["version"].as_u64() == Some(2) {
-            return run_explicit_authorized_resume(codex_home, thread, canonical, apply).await;
+            return run_explicit_authorized_resume(
+                codex_home,
+                thread,
+                canonical,
+                profile.as_ref(),
+                apply,
+            )
+            .await;
         }
     }
     let home = codex_home
@@ -1230,14 +1250,11 @@ pub(super) async fn run(
         !request.root_task_id.trim().is_empty(),
         "request root task id is empty"
     );
+    let config = offline_store_config(&home, profile.as_ref()).await?;
     let initial_items = super::thread_rollout_items(&rollout_path, &thread_id).await?;
     let mut store: Option<Arc<LocalThreadStore>> = None;
     let mut live: Option<LiveThread> = None;
     if apply {
-        let config = codex_core::config::ConfigBuilder::default()
-            .codex_home(home.clone())
-            .build()
-            .await?;
         let state_db = codex_rollout::state_db::try_init(&config).await?;
         let local_store = Arc::new(LocalThreadStore::new(
             LocalThreadStoreConfig::from_config(&config),
@@ -1597,6 +1614,39 @@ pub(super) async fn run(
             }
         }
     }
+}
+
+async fn offline_store_config(
+    codex_home: &Path,
+    profile: Option<&ProfileV2Name>,
+) -> Result<codex_core::config::Config> {
+    let builder = ConfigBuilder::default().codex_home(codex_home.to_path_buf());
+    let (builder, context) = match profile {
+        Some(profile) => {
+            let profile_path = resolve_profile_v2_config_path(codex_home, profile);
+            let context = format!(
+                "load offline thread-store config for CODEX_HOME {} with profile `{profile}` at {}",
+                codex_home.display(),
+                profile_path.display()
+            );
+            (
+                builder.loader_overrides(LoaderOverrides {
+                    user_config_path: Some(profile_path),
+                    user_config_profile: Some(profile.clone()),
+                    ..LoaderOverrides::default()
+                }),
+                context,
+            )
+        }
+        None => (
+            builder,
+            format!(
+                "load offline thread-store config for CODEX_HOME {} from base config",
+                codex_home.display()
+            ),
+        ),
+    };
+    builder.build().await.context(context)
 }
 
 #[cfg(test)]

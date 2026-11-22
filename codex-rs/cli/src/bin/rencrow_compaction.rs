@@ -1,4 +1,5 @@
 // Modified by RenCrow Switch Core, 2026-09-22; V2 range retrieval and inventory 2026-09-24.
+// Modified by RenCrow Switch Core, 2026-11-21: explicit profile for offline repair.
 //! Separate candidate builder. Never opens a live Codex session for writing.
 use anyhow::Context;
 use anyhow::Result;
@@ -168,6 +169,9 @@ enum Command {
     RepairMaintenancePause {
         #[arg(long, required = true)]
         codex_home: PathBuf,
+        /// Explicit runtime configuration profile used to open the offline thread store.
+        #[arg(long)]
+        profile: Option<codex_utils_cli::ProfileV2Name>,
         #[arg(long, required = true)]
         thread: String,
         #[arg(long, required = true)]
@@ -585,11 +589,24 @@ async fn run(args: Args) -> Result<()> {
         }
         Command::RepairMaintenancePause {
             codex_home,
+            profile,
             thread,
             request,
             apply,
         } => {
-            maintenance_repair::run(codex_home, thread, request, apply).await?;
+            match profile {
+                Some(profile) => {
+                    maintenance_repair::run_with_profile(
+                        codex_home,
+                        thread,
+                        request,
+                        Some(profile),
+                        apply,
+                    )
+                    .await?;
+                }
+                None => maintenance_repair::run(codex_home, thread, request, apply).await?,
+            }
             return Ok(());
         }
         Command::TaskCheckpoint {

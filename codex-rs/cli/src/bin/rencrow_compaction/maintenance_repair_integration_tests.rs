@@ -1,4 +1,4 @@
-// Modified by RenCrow Switch Core, 2026-11-21: explicit authorized resume regressions.
+// Modified by RenCrow Switch Core, 2026-11-21: authorized resume and profile regressions.
 use super::*;
 use codex_history::RolloutItem;
 use codex_protocol::protocol::EventMsg;
@@ -25,6 +25,26 @@ const PREDEPLOY_AT: &str = "2026-11-11T05:06:30.815682+00:00";
 const BEFORE_AT: &str = "2026-11-11T05:02:26.703000+00:00";
 const PAUSED_AT: &str = "2026-11-11T05:06:31.299000+00:00";
 const CURRENT_AT: &str = "2026-11-11T05:06:32.000000+00:00";
+
+fn write_env_only_base_and_profile_mcp_config(home: &Path) -> codex_utils_cli::ProfileV2Name {
+    std::fs::create_dir_all(home).expect("create isolated CODEX_HOME");
+    std::fs::write(
+        home.join("config.toml"),
+        r#"[mcp_servers.rencrow_advisor.env]
+RENCROW_ADVISOR_EXECUTOR_POLICY_FILE = "/tmp/fixture-policy.json"
+"#,
+    )
+    .expect("write base env-only MCP fragment");
+    std::fs::write(
+        home.join("rencrow.config.toml"),
+        r#"[mcp_servers.rencrow_advisor]
+command = "fixture-advisor"
+args = []
+"#,
+    )
+    .expect("write external profile MCP transport");
+    "rencrow".parse().expect("valid runtime profile name")
+}
 
 fn completion_state(paused: bool) -> Value {
     serde_json::json!({
@@ -352,18 +372,31 @@ async fn write_authorized_resume_fixture() -> (TempDir, PathBuf, PathBuf, PathBu
 async fn maintenance_repair_full_run_is_dry_then_applied_and_idempotent() {
     let (_root, home, rollout, request, _, _) =
         write_repair_fixture(SOURCE_COPY, HISTORICAL_SOURCE_FIXTURE).await;
+    let profile = write_env_only_base_and_profile_mcp_config(&home);
     let before_dry_run = std::fs::read(&rollout).expect("read initial rollout");
-    run(home.clone(), THREAD.into(), request.clone(), false)
-        .await
-        .expect("dry-run maintenance repair");
+    run_with_profile(
+        home.clone(),
+        THREAD.into(),
+        request.clone(),
+        Some(profile.clone()),
+        false,
+    )
+    .await
+    .expect("dry-run maintenance repair");
     assert_eq!(
         std::fs::read(&rollout).expect("read after dry-run"),
         before_dry_run
     );
 
-    run(home.clone(), THREAD.into(), request.clone(), true)
-        .await
-        .expect("apply maintenance repair");
+    run_with_profile(
+        home.clone(),
+        THREAD.into(),
+        request.clone(),
+        Some(profile.clone()),
+        true,
+    )
+    .await
+    .expect("apply maintenance repair");
     let after_apply = std::fs::read(&rollout).expect("read applied rollout");
     let thread_id = ThreadId::from_string(THREAD).unwrap();
     let items = super::super::thread_rollout_items(&rollout, &thread_id)
@@ -383,17 +416,21 @@ async fn maintenance_repair_full_run_is_dry_then_applied_and_idempotent() {
     assert_eq!(repaired["resume_generation"], 1);
     assert!(repaired["maintenance_repair_receipt"].is_object());
 
-    run(home.clone(), THREAD.into(), request, true)
-        .await
-        .expect("idempotent apply retry");
+    run_with_profile(
+        home.clone(),
+        THREAD.into(),
+        request,
+        Some(profile.clone()),
+        true,
+    )
+    .await
+    .expect("idempotent apply retry");
     assert_eq!(
         std::fs::read(&rollout).expect("read after retry"),
         after_apply
     );
 
-    let config = codex_core::config::ConfigBuilder::default()
-        .codex_home(home.clone())
-        .build()
+    let config = super::offline_store_config(&home, Some(&profile))
         .await
         .expect("build isolated config");
     let state_db = codex_rollout::state_db::try_init(&config)
@@ -422,14 +459,27 @@ async fn maintenance_repair_full_run_is_dry_then_applied_and_idempotent() {
 #[tokio::test]
 async fn explicit_authorized_resume_is_dry_then_applied_and_idempotent() {
     let (_root, home, rollout, request, _) = write_authorized_resume_fixture().await;
+    let profile = write_env_only_base_and_profile_mcp_config(&home);
     let before = std::fs::read(&rollout).expect("read initial rollout");
-    run(home.clone(), THREAD.into(), request.clone(), false)
-        .await
-        .expect("dry-run explicit authorized resume");
+    run_with_profile(
+        home.clone(),
+        THREAD.into(),
+        request.clone(),
+        Some(profile.clone()),
+        false,
+    )
+    .await
+    .expect("dry-run explicit authorized resume");
     assert_eq!(std::fs::read(&rollout).expect("read after dry-run"), before);
-    run(home.clone(), THREAD.into(), request.clone(), true)
-        .await
-        .expect("apply explicit authorized resume");
+    run_with_profile(
+        home.clone(),
+        THREAD.into(),
+        request.clone(),
+        Some(profile.clone()),
+        true,
+    )
+    .await
+    .expect("apply explicit authorized resume");
     let after_apply = std::fs::read(&rollout).expect("read applied rollout");
     let thread_id = ThreadId::from_string(THREAD).unwrap();
     let items = super::super::thread_rollout_items(&rollout, &thread_id)
@@ -453,9 +503,103 @@ async fn explicit_authorized_resume_is_dry_then_applied_and_idempotent() {
             .get("legacy_scope_mismatch_snapshot_sha256")
             .is_none()
     );
-    run(home, THREAD.into(), request, true)
+    run_with_profile(home, THREAD.into(), request, Some(profile), true)
         .await
         .expect("idempotent resume retry");
+    assert_eq!(
+        std::fs::read(&rollout).expect("read after retry"),
+        after_apply
+    );
+}
+
+#[tokio::test]
+async fn explicit_authorized_resume_rejects_missing_profile_without_modifying_history() {
+    let (_root, home, rollout, request, _) = write_authorized_resume_fixture().await;
+    write_env_only_base_and_profile_mcp_config(&home);
+    let before = std::fs::read(&rollout).expect("read initial rollout");
+
+    let no_profile = run_with_profile(home.clone(), THREAD.into(), request.clone(), None, false)
+        .await
+        .expect_err("env-only base MCP config must fail without its runtime profile");
+    let no_profile_chain = format!("{no_profile:#}");
+    assert!(no_profile_chain.contains("from base config"));
+    assert!(no_profile_chain.contains("invalid transport"));
+    assert_eq!(
+        std::fs::read(&rollout).expect("read rollout after base config rejection"),
+        before
+    );
+
+    let missing_profile: codex_utils_cli::ProfileV2Name =
+        "missing".parse().expect("valid profile name");
+    let missing_profile_error = run_with_profile(
+        home.clone(),
+        THREAD.into(),
+        request,
+        Some(missing_profile),
+        false,
+    )
+    .await
+    .expect_err("an unavailable explicit profile must fail closed");
+    let missing_profile_chain = format!("{missing_profile_error:#}");
+    assert!(missing_profile_chain.contains("profile `missing`"));
+    assert!(missing_profile_chain.contains("missing.config.toml"));
+    assert_eq!(
+        std::fs::read(&rollout).expect("read rollout after profile rejection"),
+        before
+    );
+}
+
+#[tokio::test]
+async fn maintenance_repair_without_profile_is_dry_then_applied_and_idempotent() {
+    let (_root, home, rollout, request, _, _) =
+        write_repair_fixture(SOURCE_COPY, HISTORICAL_SOURCE_FIXTURE).await;
+    let before_dry_run = std::fs::read(&rollout).expect("read initial rollout");
+
+    run(home.clone(), THREAD.into(), request.clone(), false)
+        .await
+        .expect("dry-run maintenance repair without profile");
+    assert_eq!(
+        std::fs::read(&rollout).expect("read after dry-run"),
+        before_dry_run
+    );
+
+    run(home.clone(), THREAD.into(), request.clone(), true)
+        .await
+        .expect("apply maintenance repair without profile");
+    let after_apply = std::fs::read(&rollout).expect("read applied rollout");
+    assert_ne!(after_apply, before_dry_run);
+
+    run(home, THREAD.into(), request, true)
+        .await
+        .expect("idempotent maintenance repair without profile");
+    assert_eq!(
+        std::fs::read(&rollout).expect("read after retry"),
+        after_apply
+    );
+}
+
+#[tokio::test]
+async fn explicit_authorized_resume_without_profile_is_dry_then_applied_and_idempotent() {
+    let (_root, home, rollout, request, _) = write_authorized_resume_fixture().await;
+    let before_dry_run = std::fs::read(&rollout).expect("read initial rollout");
+
+    run(home.clone(), THREAD.into(), request.clone(), false)
+        .await
+        .expect("dry-run explicit authorized resume without profile");
+    assert_eq!(
+        std::fs::read(&rollout).expect("read after dry-run"),
+        before_dry_run
+    );
+
+    run(home.clone(), THREAD.into(), request.clone(), true)
+        .await
+        .expect("apply explicit authorized resume without profile");
+    let after_apply = std::fs::read(&rollout).expect("read applied rollout");
+    assert_ne!(after_apply, before_dry_run);
+
+    run(home, THREAD.into(), request, true)
+        .await
+        .expect("idempotent explicit authorized resume without profile");
     assert_eq!(
         std::fs::read(&rollout).expect("read after retry"),
         after_apply
