@@ -2565,8 +2565,15 @@ async fn failed_review_close_preserves_history_and_allows_one_new_authorized_rev
     let retry_launch = latest_host_completion_snapshot(&rollout_path)?;
     let retry_unit = completion_unit(&retry_launch, "review-a");
     let active_attempt = &retry_unit["review_state"]["active_attempt"];
-    let active_attempt_id = active_attempt["attempt_id"].as_str().unwrap_or("<missing>");
+    let active_attempt_id = active_attempt["attempt_id"]
+        .as_str()
+        .expect("retry must record a new attempt id");
     let active_attempt_status = active_attempt["status"].as_str().unwrap_or("<missing>");
+    assert_ne!(
+        active_attempt_id,
+        failed_attempt_id.as_str(),
+        "an authorized retry must create a new attempt instead of reusing the failed attempt"
+    );
     let retry_thread_id = retry_unit["review_evidence"]["reviewer_thread_id"]
         .as_str()
         .unwrap_or("<missing>")
@@ -2651,6 +2658,10 @@ async fn failed_review_close_preserves_history_and_allows_one_new_authorized_rev
     let final_state = latest_host_completion_snapshot(&rollout_path)?;
     let adopted = completion_unit(&final_state, "review-a");
     assert_eq!(adopted["status"], "done");
+    assert_eq!(
+        adopted["review_state"]["active_attempt"]["attempt_id"], active_attempt_id,
+        "adoption must retain the new successful attempt identity"
+    );
     assert_eq!(adopted["review_evidence"]["reviewer_role"], REVIEW_ROLE);
     assert_eq!(
         adopted["review_evidence"]["reviewer_thread_id"],
