@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core on 2026-11-22: record the source of ephemeral structured threads.
 //! Run isolated structured requests through existing app-server methods.
 
 use codex_app_server_client::AppServerRequestHandle;
@@ -60,6 +61,7 @@ pub(crate) async fn start_temporary_thread(
         active_permission_profile,
         mcp_server_names,
     } = options;
+    let thread_source_for_log = thread_source.clone();
     let custom_permission_profile =
         active_permission_profile.filter(|profile| !profile.starts_with(':'));
     let mut config = std::collections::HashMap::from([
@@ -162,6 +164,12 @@ pub(crate) async fn start_temporary_thread(
     })
     .await
     .map_err(|_| eyre!("temporary structured thread start timed out"))??;
+
+    tracing::info!(
+        thread_id = %response.thread.id,
+        thread_source = ?thread_source_for_log,
+        "started temporary structured thread"
+    );
 
     if let Some(expected_profile) = custom_permission_profile {
         if response
