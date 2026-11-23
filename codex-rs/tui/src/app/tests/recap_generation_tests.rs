@@ -443,9 +443,11 @@ async fn recap_generation_uses_remote_workspace_cwd() -> Result<()> {
 async fn temporary_recap_threads_disable_memories_and_remote_mcp_servers() -> Result<()> {
     let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
     let codex_home = tempdir()?;
+    app.config.rencrow_compaction = true;
+    app.config.rencrow_autonomous_completion = true;
     std::fs::write(
         codex_home.path().join("config.toml"),
-        "features.context_management.experimental_mode = true\n[mcp_servers.filesystem]\ncommand = 'true'\n",
+        "rencrow_compaction = true\nrencrow_autonomous_completion = true\nfeatures.context_management.experimental_mode = true\n[mcp_servers.filesystem]\ncommand = 'true'\n",
     )?;
     app.config.codex_home = codex_home.path().to_path_buf().abs();
     app.config.sqlite = codex_state::SqliteConfig::new_for_testing(codex_home.path().abs());
@@ -474,6 +476,13 @@ async fn temporary_recap_threads_disable_memories_and_remote_mcp_servers() -> Re
     assert_eq!(starts[0]["sandbox"], "read-only");
     assert_eq!(starts[0]["permissions"], serde_json::Value::Null);
     assert_eq!(starts[0]["config"]["default_permissions"], ":read-only");
+    assert_eq!(starts[0]["config"]["rencrow_compaction"], false);
+    assert_eq!(starts[0]["config"]["rencrow_autonomous_completion"], false);
+    assert_eq!(starts[0]["config"]["features.sleep_tool"], false);
+    assert_eq!(
+        starts[0]["config"]["features.send_message_to_user_async"],
+        false
+    );
     assert_eq!(starts[0]["config"]["features.memories"], false);
     assert_eq!(starts[0]["config"]["features.context_management"], false);
     assert!(starts[0]["config"].get("features.memory_tool").is_none());

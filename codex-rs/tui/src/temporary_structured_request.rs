@@ -80,15 +80,22 @@ pub(crate) async fn start_temporary_thread(
         ("features.multi_agent_v2".to_string(), false.into()),
         ("features.plugins".to_string(), false.into()),
         (
+            "features.send_message_to_user_async".to_string(),
+            false.into(),
+        ),
+        (
             "features.request_permissions_tool".to_string(),
             false.into(),
         ),
         ("features.shell_snapshot".to_string(), false.into()),
         ("features.shell_tool".to_string(), false.into()),
+        ("features.sleep_tool".to_string(), false.into()),
         ("features.standalone_web_search".to_string(), false.into()),
         ("features.token_budget".to_string(), false.into()),
         ("features.tool_suggest".to_string(), false.into()),
         ("features.unified_exec".to_string(), false.into()),
+        ("rencrow_autonomous_completion".to_string(), false.into()),
+        ("rencrow_compaction".to_string(), false.into()),
         ("features.view_image".to_string(), false.into()),
         ("cloud.skills.enabled".to_string(), false.into()),
         ("skills.include_instructions".to_string(), false.into()),
@@ -284,7 +291,7 @@ pub(crate) async fn unsubscribe_temporary_thread(
     }
 }
 
-/// Run a bounded structured turn, interrupt it on cancellation, and detach the temporary thread.
+/// Run a bounded structured turn, best-effort interrupt it on timeout/cancellation, then detach.
 pub(crate) async fn run_temporary_structured_turn(
     request_handle: AppServerRequestHandle,
     thread_id: String,
@@ -294,13 +301,54 @@ pub(crate) async fn run_temporary_structured_turn(
     notifications: UnboundedReceiver<ServerNotification>,
     cancellation: CancellationToken,
 ) -> color_eyre::Result<String> {
+    run_temporary_structured_turn_with_timeout(
+        TemporaryStructuredTurnRequest {
+            request_handle,
+            thread_id,
+            prompt,
+            output_schema,
+            effort,
+            notifications,
+            cancellation,
+        },
+        STRUCTURED_TURN_TIMEOUT,
+    )
+    .await
+}
+
+struct TemporaryStructuredTurnRequest {
+    request_handle: AppServerRequestHandle,
+    thread_id: String,
+    prompt: String,
+    output_schema: Value,
+    effort: Option<ReasoningEffort>,
+    notifications: UnboundedReceiver<ServerNotification>,
+    cancellation: CancellationToken,
+}
+
+async fn run_temporary_structured_turn_with_timeout(
+    request: TemporaryStructuredTurnRequest,
+    turn_timeout: Duration,
+) -> color_eyre::Result<String> {
+    let TemporaryStructuredTurnRequest {
+        request_handle,
+        thread_id,
+        prompt,
+        output_schema,
+        effort,
+        notifications,
+        cancellation,
+    } = request;
     let mut turn_id = None;
-    let result = tokio::time::timeout(STRUCTURED_TURN_TIMEOUT, async {
+    let mut start_attempted = false;
+    let mut timed_out = false;
+    let result = match tokio::time::timeout(turn_timeout, async {
         if cancellation.is_cancelled() {
             return Err(eyre!("temporary structured turn cancelled"));
         }
-        // Wait for turn/start to return its ID before interrupting, even if cancellation
-        // arrives during startup. Dropping that request could leave an orphaned turn.
+        start_attempted = true;
+        // Keep the turn/start request alive until it returns an ID or the outer deadline
+        // expires. If the deadline wins first, delivery and stop status are unknown.
         let turn = start_structured_turn(
             &request_handle,
             thread_id.clone(),
@@ -318,13 +366,18 @@ pub(crate) async fn run_temporary_structured_turn(
         }
     })
     .await
-    .unwrap_or_else(|_| Err(eyre!("temporary structured turn timed out")));
+    {
+        Ok(result) => result,
+        Err(_) => {
+            timed_out = true;
+            Err(eyre!("temporary structured turn timed out"))
+        }
+    };
 
     // Give interruption its own deadline so cancellation near the response timeout
     // still gets a chance to stop the hidden turn.
-    if cancellation.is_cancelled()
-        && let Some(turn_id) = turn_id
-    {
+    let should_interrupt = timed_out || cancellation.is_cancelled();
+    if should_interrupt && let Some(turn_id) = turn_id {
         let interrupt =
             request_handle.request_typed::<TurnInterruptResponse>(ClientRequest::TurnInterrupt {
                 request_id: RequestId::String(format!(
@@ -343,6 +396,12 @@ pub(crate) async fn run_temporary_structured_turn(
             }
             Err(_) => tracing::debug!("temporary structured turn interrupt timed out"),
         }
+    } else if should_interrupt && start_attempted {
+        tracing::debug!(
+            thread_id,
+            timed_out,
+            "temporary structured turn ended before its ID was available; stop status is unknown"
+        );
     }
     unsubscribe_temporary_thread(&request_handle, thread_id).await;
 
