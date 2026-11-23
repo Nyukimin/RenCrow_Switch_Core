@@ -1876,6 +1876,287 @@ async fn planned_review_runs_through_host_spawn_wait_same_child_followup_and_ado
     Ok(())
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cold_resume_reuses_running_uncollected_typed_review_launch() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let provider_url = format!("{}/v1", server.uri());
+    let provider_url_for_config = provider_url.clone();
+    let fixture = test_codex()
+        .with_config(move |config| {
+            configure_completion_review_test(config, &provider_url_for_config);
+        })
+        .build(&server)
+        .await?;
+    let parent_thread_id = fixture.session_configured.thread_id.to_string();
+    let artifact = fixture.cwd_path().join("cold-resume-review-artifact.txt");
+    fs::write(&artifact, "accepted artifact\n")?;
+    write_artifact_content_test(
+        fixture.cwd_path(),
+        "test_cold_resume_review_artifact.py",
+        "cold-resume-review-artifact.txt",
+    )?;
+    let relative_artifact = artifact
+        .strip_prefix(fixture.cwd_path())?
+        .to_string_lossy()
+        .to_string();
+    let review_contract = json!({
+        "contract_revision": 1,
+        "conditions": [{
+            "id": "AC-1", "revision": 1, "result": "Task A is correct", "scope": "CLI",
+            "verification": "Inspect the accepted artifact", "acceptance_criteria": "Expected content is present",
+            "status": "open", "evidence": [], "unmet_reason": null
+        }],
+        "units": [
+            {"id":"task-a", "purpose":"Create the reviewed artifact", "status":"ready", "condition_refs":["AC-1"], "depends_on":[], "evidence":[], "task_refs":[]},
+            {"id":"review-a", "purpose":"Review task A against AC-1", "status":"planned", "kind":"review", "condition_refs":["AC-1"], "depends_on":["task-a"], "evidence":[], "task_refs":[], "review_target":{"task_id":"task-a","task_revision":1}}
+        ],
+        "current_unit": "task-a",
+        "failed_approaches": [],
+        "blocker": null,
+        "next_action": "Spawn the reviewer for task-a and wait for its result.",
+        "product_progress_at": null,
+        "runtime_recovery_at": null,
+        "activity_at": null
+    });
+
+    mount_parent_sse_sequence(
+        &server,
+        &parent_thread_id,
+        vec![
+            function_response(
+                "cold-review-begin-root",
+                "task_context_boundary",
+                &json!({"action":"begin","root_task_id":"root","task_id":"root","task_revision":1,"completion_state":review_contract}),
+            ),
+            sse(vec![
+                ev_response_created("cold-review-root-finished"),
+                ev_assistant_message("cold-review-root-message", "Review plan registered."),
+                ev_completed("cold-review-root-finished"),
+            ]),
+        ],
+    )
+    .await;
+    fixture
+        .submit_turn("Register task A and its required review.")
+        .await?;
+    mount_parent_sse_sequence(
+        &server,
+        &parent_thread_id,
+        vec![
+            function_response(
+                "cold-review-begin-task-a",
+                "task_context_boundary",
+                &json!({"action":"begin","root_task_id":"root","task_id":"task-a","task_revision":1}),
+            ),
+            function_response(
+                "cold-review-verify-task-a",
+                "exec_command",
+                &json!({"cmd":"python3 -B -m unittest discover -s tests -p test_cold_resume_review_artifact.py -v","task_evidence":{"task_id":"task-a","task_revision":1,"artifact_paths":[relative_artifact],"check_kind":"verification"}}),
+            ),
+            function_response(
+                "cold-review-accept-task-a",
+                "task_context_boundary",
+                &json!({"action":"accept","result":"Task A artifact verified","satisfied_conditions":["AC-1"]}),
+            ),
+            sse(vec![
+                ev_response_created("cold-review-task-a-finished"),
+                ev_assistant_message("cold-review-task-a-message", "Task A is accepted; review A remains required."),
+                ev_completed("cold-review-task-a-finished"),
+            ]),
+        ],
+    )
+    .await;
+    fixture
+        .submit_turn("Verify and accept task A before its required review.")
+        .await?;
+    let rollout_path = fixture.codex.rollout_path().expect("parent rollout path");
+    let accepted = latest_host_completion_snapshot(&rollout_path)?;
+    assert_eq!(completion_unit(&accepted, "task-a")["status"], "done");
+    assert_eq!(completion_unit(&accepted, "review-a")["status"], "planned");
+
+    mount_delayed_completion_reviewer_response(
+        &server,
+        parent_thread_id.clone(),
+        Duration::from_secs(12 * 60),
+    )
+    .await;
+    mount_parent_sse_sequence(
+        &server,
+        &parent_thread_id,
+        vec![
+            sse(vec![
+                ev_response_created("cold-review-launch-parent"),
+                ev_function_call(
+                    "cold-review-launch-call",
+                    "task_context_boundary",
+                    &json!({"action":"review","target_task_id":"task-a","unit_id":"review-a"})
+                        .to_string(),
+                ),
+                ev_completed("cold-review-launch-parent"),
+            ]),
+            sse(vec![
+                ev_response_created("cold-review-launch-finished"),
+                ev_assistant_message("cold-review-launch-message", "Review launched."),
+                ev_completed("cold-review-launch-finished"),
+            ]),
+        ],
+    )
+    .await;
+    fixture
+        .submit_turn("Launch the planned read-only review for task A.")
+        .await?;
+
+    let before_resume = latest_host_completion_snapshot(&rollout_path)?;
+    let launched_unit = completion_unit(&before_resume, "review-a");
+    let reviewer_thread_id = launched_unit["review_evidence"]["reviewer_thread_id"]
+        .as_str()
+        .expect("host-bound reviewer ID")
+        .to_string();
+    let reviewer_turn_id = launched_unit["review_evidence"]["reviewer_turn_id"]
+        .as_str()
+        .expect("host-bound reviewer generation")
+        .to_string();
+    let attempt_id = launched_unit["review_state"]["active_attempt"]["attempt_id"]
+        .as_str()
+        .expect("canonical review attempt")
+        .to_string();
+    assert_eq!(launched_unit["status"], "running");
+    assert!(launched_unit["review_evidence"]["wait_result_ref"].is_null());
+    assert!(launched_unit["review_evidence"]["terminal_status"].is_null());
+    assert_eq!(
+        before_resume["state"]["next_action"],
+        "Spawn the reviewer for task-a and wait for its result."
+    );
+    assert_eq!(
+        before_resume["uncollected_children"],
+        json!([reviewer_thread_id])
+    );
+    assert_eq!(
+        wait_for_completion_reviewer_requests(&server, &parent_thread_id)
+            .await
+            .len(),
+        1
+    );
+
+    mount_function_turn(
+        &server,
+        &parent_thread_id,
+        "cold-review-premature-adopt-call",
+        "task_context_boundary",
+        &json!({"action":"adopt_review","unit_id":"review-a","reason":"Attempt adoption before collecting the reviewer."}),
+        "The host rejected premature adoption.",
+    )
+    .await;
+    fixture
+        .submit_turn("Try the host adoption action before collecting this review.")
+        .await?;
+    let premature_adopt_output =
+        tool_output_debug(&rollout_path, "cold-review-premature-adopt-call")?
+            .expect("premature adoption output");
+    assert!(
+        premature_adopt_output.contains("uncollected"),
+        "host did not reject adoption while the reviewer child was uncollected: {premature_adopt_output}"
+    );
+    let after_rejected_adoption = latest_host_completion_snapshot(&rollout_path)?;
+    let uncollected_unit = completion_unit(&after_rejected_adoption, "review-a");
+    assert_eq!(uncollected_unit["status"], "running");
+    assert!(uncollected_unit["review_decision_reason"].is_null());
+    assert!(uncollected_unit["review_state"]["active_attempt"]["adoption_reason"].is_null());
+    assert_eq!(
+        after_rejected_adoption["uncollected_children"],
+        json!([reviewer_thread_id])
+    );
+
+    fixture.codex.flush_rollout().await?;
+    let codex_home = Arc::clone(&fixture.home);
+    let cwd = Arc::clone(&fixture.cwd);
+    fixture.codex.shutdown_and_wait().await?;
+    drop(fixture);
+
+    let resume_provider_url = provider_url.clone();
+    let mut resume_builder = test_codex().with_config(move |config| {
+        configure_completion_review_test(config, &resume_provider_url);
+    });
+    let resumed = resume_builder
+        .resume(&server, codex_home, rollout_path.clone())
+        .await?;
+    assert_eq!(
+        resumed.session_configured.thread_id.to_string(),
+        parent_thread_id
+    );
+    assert!(cwd.path().join("cold-resume-review-artifact.txt").is_file());
+    let hydrated = latest_host_completion_snapshot(&rollout_path)?;
+    assert!(hydrated["state"]["paused"].as_bool().unwrap_or(false));
+    let hydrated_unit = completion_unit(&hydrated, "review-a");
+    assert_eq!(hydrated_unit["status"], "running");
+    assert_eq!(
+        hydrated_unit["review_state"]["active_attempt"]["attempt_id"],
+        attempt_id
+    );
+    assert_eq!(
+        hydrated_unit["review_evidence"]["reviewer_thread_id"],
+        reviewer_thread_id
+    );
+    assert_eq!(
+        hydrated_unit["review_evidence"]["reviewer_turn_id"],
+        reviewer_turn_id
+    );
+    assert!(hydrated_unit["review_evidence"]["wait_result_ref"].is_null());
+    assert!(hydrated_unit["review_evidence"]["terminal_status"].is_null());
+    assert!(hydrated_unit["review_decision_reason"].is_null());
+    assert_eq!(
+        hydrated["uncollected_children"],
+        json!([reviewer_thread_id])
+    );
+
+    mount_function_turn(
+        &server,
+        &parent_thread_id,
+        "cold-review-repeat-call",
+        "task_context_boundary",
+        &json!({"action":"review","target_task_id":"task-a","unit_id":"review-a"}),
+        "The existing typed review remains unresolved.",
+    )
+    .await;
+    resumed
+        .submit_turn("Re-request the typed review for task-a using the current host state.")
+        .await?;
+    let repeated_output = tool_output_debug(&rollout_path, "cold-review-repeat-call")?
+        .expect("repeated typed review action output");
+    assert!(
+        repeated_output.contains(&reviewer_thread_id),
+        "existing reviewer was not returned: {repeated_output}"
+    );
+    assert_eq!(
+        completion_reviewer_requests(&server, &parent_thread_id)
+            .await?
+            .len(),
+        1
+    );
+    let after_repeat = latest_host_completion_snapshot(&rollout_path)?;
+    let repeated_unit = completion_unit(&after_repeat, "review-a");
+    assert_eq!(repeated_unit["status"], "running");
+    assert_eq!(
+        repeated_unit["review_state"]["active_attempt"]["attempt_id"],
+        attempt_id
+    );
+    assert!(repeated_unit["review_evidence"]["wait_result_ref"].is_null());
+    assert!(repeated_unit["review_evidence"]["terminal_status"].is_null());
+    assert!(repeated_unit["review_decision_reason"].is_null());
+    assert!(repeated_unit["review_state"]["active_attempt"]["adoption_reason"].is_null());
+    assert_eq!(
+        after_repeat["uncollected_children"],
+        json!([reviewer_thread_id])
+    );
+
+    resumed.codex.shutdown_and_wait().await?;
+    drop(cwd);
+    Ok(())
+}
+
 /// Requires a dedicated nextest timeout greater than the existing 10-minute reviewer SLA.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
