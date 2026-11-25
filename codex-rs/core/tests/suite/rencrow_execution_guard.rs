@@ -1,4 +1,5 @@
 // Modified by RenCrow: exercise native enforcement through the real Responses/tool loop.
+// Modified by RenCrow, 2026-11-25: verify bounded CLI orchestrator completion recovery.
 use anyhow::Result;
 use codex_config::RencrowExecutionGuard;
 use codex_config::RencrowTaskKind;
@@ -1370,6 +1371,68 @@ async fn prose_only_implementation_finishes_as_error_not_completed() -> Result<(
         AgentStatus::Errored(_)
     ));
     assert_eq!(done.last_agent_message, None);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_orchestrator_recovers_once_and_still_requires_a_passing_check() -> Result<()> {
+    for passes_check in [true, false] {
+        let server = start_mock_server().await;
+        let mut responses = vec![sse(vec![
+            ev_assistant_message("premature", "I will investigate next."),
+            ev_completed("premature"),
+        ])];
+        if passes_check {
+            responses.push(sse(vec![
+                ev_function_call(
+                    "check",
+                    "exec_command",
+                    &json!({"cmd":"node --check valid.js"}).to_string(),
+                ),
+                ev_completed("check"),
+            ]));
+        }
+        responses.push(sse(vec![
+            ev_assistant_message("done", "Investigation result."),
+            ev_completed("done"),
+        ]));
+        let requests = mount_sse_sequence(&server, responses).await;
+        let test = test_codex()
+            .with_config(|config| {
+                config.rencrow_execution_guard = Some(RencrowExecutionGuard {
+                    require_check: true,
+                    task_kind: Some(RencrowTaskKind::Orchestrate),
+                    ..Default::default()
+                });
+            })
+            .build_with_auto_env(&server)
+            .await?;
+        std::fs::write(test.cwd_path().join("valid.js"), "const valid = true;\n")?;
+        let parent = test
+            .thread_manager
+            .start_thread(StartThreadOptions {
+                session_source: Some(SessionSource::Cli),
+                environments: Some(test.codex.environment_selections().await),
+                ..StartThreadOptions::new(test.config.clone())
+            })
+            .await?
+            .thread;
+        parent
+            .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+                text: "Investigate and verify".into(),
+                text_elements: vec![],
+            }]))
+            .await?;
+        let event =
+            wait_for_event(&parent, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+        let EventMsg::TurnComplete(done) = event else {
+            unreachable!()
+        };
+        assert_eq!(done.error.is_none(), passes_check);
+        let calls = requests.requests();
+        assert!(calls[1].body_contains_text("RENCROW_EXECUTION_RECOVERY 1/1"));
+        assert_eq!(calls.len(), if passes_check { 3 } else { 2 });
+    }
     Ok(())
 }
 

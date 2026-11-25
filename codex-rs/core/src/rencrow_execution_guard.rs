@@ -1,5 +1,6 @@
 // Modified by RenCrow: host-observed progress, bounded reads and completion contracts.
 //! No prompt inference, external hooks, permissions changes, or new persistent store.
+// Modified by RenCrow, 2026-11-25: allow the CLI orchestrator to recover once before completion rejection.
 use crate::function_tool::FunctionCallError;
 use crate::memory_usage::shell_script_for_invocation;
 use crate::session::session::Session;
@@ -1450,10 +1451,11 @@ pub(crate) async fn completion_recovery_prompt(
     if (!policy.requires_edit()
         && !policy.requires_check()
         && policy.task_kind != Some(RencrowTaskKind::Orchestrate))
-        || !matches!(
+        || !(matches!(
             turn.session_source,
             SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. })
-        )
+        ) || (matches!(turn.session_source, SessionSource::Cli)
+            && policy.task_kind == Some(RencrowTaskKind::Orchestrate)))
     {
         return None;
     }
