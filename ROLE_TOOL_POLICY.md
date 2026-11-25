@@ -27,6 +27,13 @@ LLMの自制に頼らず、役割に要らないtoolをmodelへ見せず、呼�
 - 親から引き継いだ権限より狭めることだけができる。`false`や未指定は親の権限をそのまま引き継ぐ。
   読み取り専用では、workspaceと`/tmp`への書込み、localhostを含む通信ができない。
 
+### 再開時のnative V1選択（2026-11-24改変）
+
+`features.multi_agent = true`を明示すると、保存済みの無効状態から同じthreadをV1で再開できる。
+明示した`false`は無効を選び、未指定なら保存済みのmodeを保持する。
+既存のV2明示設定の優先順位、`agents.enabled = false`、管理されたfeature制限は維持する。
+この選択は子の役割・許可tool・sandbox・taskの作業権限を拡大しない。
+
 ## 強制点
 
 新しい仕組みは作らず、上流の`ToolPolicy.allowed_tools`（guardian reviewerも使うsessionのtool制限）へ流し込む。

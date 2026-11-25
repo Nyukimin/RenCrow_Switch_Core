@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-24: verify explicit V1 selection and narrower controls on resume.
 use crate::config::edit::ConfigEdit;
 use crate::config::edit::ConfigEditsBuilder;
 use crate::config::edit::apply_blocking;
@@ -9529,6 +9530,66 @@ job_max_runtime_seconds = 900
             ..Default::default()
         })
     );
+}
+
+#[tokio::test]
+async fn explicit_v1_feature_controls_saved_multi_agent_version() -> anyhow::Result<()> {
+    for (text, configured, saved, expected) in [
+        (
+            "",
+            None,
+            MultiAgentVersion::Disabled,
+            MultiAgentVersion::Disabled,
+        ),
+        ("", None, MultiAgentVersion::V2, MultiAgentVersion::V2),
+        (
+            "[features]\nmulti_agent = true\n",
+            Some(true),
+            MultiAgentVersion::Disabled,
+            MultiAgentVersion::V1,
+        ),
+        (
+            "[features]\nmulti_agent = false\n",
+            Some(false),
+            MultiAgentVersion::V1,
+            MultiAgentVersion::Disabled,
+        ),
+        (
+            "[features]\nmulti_agent = true\n[agents]\nenabled = false\n",
+            Some(true),
+            MultiAgentVersion::V1,
+            MultiAgentVersion::Disabled,
+        ),
+        (
+            "[features]\nmulti_agent = true\nmulti_agent_v2 = true\n",
+            Some(true),
+            MultiAgentVersion::Disabled,
+            MultiAgentVersion::V2,
+        ),
+    ] {
+        let home = TempDir::new()?;
+        let mut config = Config::load_from_base_config_with_overrides(
+            toml::from_str(text)?,
+            ConfigOverrides::default(),
+            home.abs(),
+        )
+        .await?;
+        assert_eq!(config.multi_agent_v1_configured, configured, "{text}");
+        assert_eq!(
+            config.multi_agent_version_for_model(Some(saved)),
+            expected,
+            "{text}"
+        );
+        if configured == Some(true) && expected == MultiAgentVersion::V1 {
+            config.features.disable(Feature::Collab)?;
+            assert_eq!(
+                config.multi_agent_version_for_model(Some(saved)),
+                MultiAgentVersion::Disabled,
+                "an explicit selection must still respect a narrower effective feature"
+            );
+        }
+    }
+    Ok(())
 }
 
 #[tokio::test]

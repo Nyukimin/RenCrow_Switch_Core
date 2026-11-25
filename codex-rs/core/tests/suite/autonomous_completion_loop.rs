@@ -152,6 +152,27 @@ fn is_completion_reviewer_request(request: &wiremock::Request, parent_thread_id:
         && body["client_metadata"]["x-codex-parent-thread-id"].as_str() == Some(parent_thread_id)
 }
 
+fn response_request_json(request: &wiremock::Request) -> Option<Value> {
+    if request.method != wiremock::http::Method::POST || !request.url.path().ends_with("/responses")
+    {
+        return None;
+    }
+    let body = if request
+        .headers
+        .get("content-encoding")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(',')
+                .any(|encoding| encoding.trim().eq_ignore_ascii_case("zstd"))
+        }) {
+        zstd::stream::decode_all(std::io::Cursor::new(&request.body)).ok()?
+    } else {
+        request.body.clone()
+    };
+    serde_json::from_slice(&body).ok()
+}
+
 async fn completion_reviewer_request_diagnostics(
     server: &wiremock::MockServer,
     parent_thread_id: &str,
@@ -165,23 +186,7 @@ async fn completion_reviewer_request_diagnostics(
         {
             continue;
         }
-        let body = if request
-            .headers
-            .get("content-encoding")
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| {
-                value
-                    .split(',')
-                    .any(|encoding| encoding.trim().eq_ignore_ascii_case("zstd"))
-            }) {
-            zstd::stream::decode_all(std::io::Cursor::new(&request.body)).ok()
-        } else {
-            Some(request.body.clone())
-        };
-        let parsed = body
-            .as_deref()
-            .and_then(|body| serde_json::from_slice::<Value>(body).ok());
-        let Some(body) = parsed else {
+        let Some(body) = response_request_json(request) else {
             summaries.push(format!("request[{index}] json_decoded=false"));
             continue;
         };
@@ -2079,6 +2084,11 @@ async fn cold_resume_reuses_running_uncollected_typed_review_launch() -> Result<
     let resume_provider_url = provider_url.clone();
     let mut resume_builder = test_codex().with_config(move |config| {
         configure_completion_review_test(config, &resume_provider_url);
+        config
+            .rencrow_tool_allowlist
+            .as_mut()
+            .expect("review test config has an explicit tool allowlist")
+            .push("multi_agent_v1::spawn_agent".into());
     });
     let resumed = resume_builder
         .resume(&server, codex_home, rollout_path.clone())
@@ -2150,6 +2160,189 @@ async fn cold_resume_reuses_running_uncollected_typed_review_launch() -> Result<
     assert_eq!(
         after_repeat["uncollected_children"],
         json!([reviewer_thread_id])
+    );
+
+    let typed_requests = completion_reviewer_requests(&server, &parent_thread_id).await?;
+    let typed_request_body = typed_requests[0].body_json::<Value>()?;
+    let typed_review_message = typed_request_body["input"]
+        .as_array()
+        .and_then(|items| {
+            items.iter().find_map(|item| {
+                (item["type"] == "message" && item["role"] == "user")
+                    .then(|| item["content"].as_array())
+                    .flatten()
+                    .and_then(|content| {
+                        content.iter().find_map(|part| {
+                            (part["type"] == "input_text")
+                                .then(|| part["text"].as_str())
+                                .flatten()
+                                .filter(|text| text.contains("Host-assigned read-only review"))
+                        })
+                    })
+            })
+        })
+        .map(str::to_owned)
+        .expect("typed review request should contain its review message");
+    let target_ref = repeated_unit["review_state"]["active_attempt"]["target_artifact_ref"]
+        .as_str()
+        .expect("review attempt has an accepted artifact reference");
+    assert_eq!(typed_review_message.matches(target_ref).count(), 1);
+    mount_delayed_completion_reviewer_response(
+        &server,
+        parent_thread_id.clone(),
+        Duration::from_secs(12 * 60),
+    )
+    .await;
+    mount_multi_agent_turn(
+        &server,
+        &parent_thread_id,
+        "cold-review-generic-spawn",
+        "spawn_agent",
+        &json!({
+            "message": typed_review_message,
+            "agent_type": REVIEW_ROLE
+        }),
+        "A generic reviewer child was created independently of the typed review unit.",
+    )
+    .await;
+    resumed
+        .submit_turn("Spawn a generic reviewer with the same review message and target.")
+        .await?;
+    let generic_spawn_output = tool_output_text(&rollout_path, "cold-review-generic-spawn")?
+        .expect("generic spawn_agent tool output");
+    let generic_spawn_result: Value = serde_json::from_str(&generic_spawn_output)?;
+    let generic_reviewer_thread_id = generic_spawn_result["agent_id"]
+        .as_str()
+        .expect("generic spawn_agent returns its created child id");
+    assert_ne!(generic_reviewer_thread_id, reviewer_thread_id);
+    let generic_request_body = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let requests = server.received_requests().await.unwrap_or_default();
+            if let Some(body) = requests
+                .iter()
+                .filter_map(response_request_json)
+                .find(|body| body["client_metadata"]["thread_id"] == generic_reviewer_thread_id)
+            {
+                return body;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .ok();
+    let request_diagnostics = completion_reviewer_request_diagnostics(
+        &server,
+        &parent_thread_id,
+        generic_reviewer_thread_id,
+    )
+    .await;
+    let provider_request_observed = generic_request_body.is_some();
+    let typed_filter_would_match = generic_request_body.as_ref().is_some_and(|body| {
+        let model_matches = body["model"] == REVIEW_MODEL;
+        let child_thread_matches =
+            body["client_metadata"]["thread_id"].as_str() == Some(generic_reviewer_thread_id);
+        let parent_thread_matches = body["client_metadata"]["x-codex-parent-thread-id"].as_str()
+            == Some(parent_thread_id.as_str());
+        let review_marker_present = body["input"].as_array().is_some_and(|items| {
+            items.iter().any(|item| {
+                item["type"] == "message"
+                    && item["role"] == "user"
+                    && item["content"].as_array().is_some_and(|content| {
+                        content.iter().any(|part| {
+                            part["type"] == "input_text"
+                                && part["text"].as_str().is_some_and(|text| {
+                                    text.contains("Host-assigned read-only review")
+                                })
+                        })
+                    })
+            })
+        });
+        assert!(
+            model_matches,
+            "generic provider model mismatch; {request_diagnostics}"
+        );
+        assert!(
+            child_thread_matches,
+            "generic provider child ID mismatch; {request_diagnostics}"
+        );
+        assert!(
+            parent_thread_matches,
+            "generic provider parent ID mismatch; {request_diagnostics}"
+        );
+        assert!(
+            review_marker_present,
+            "generic provider review marker missing; {request_diagnostics}"
+        );
+        assert!(
+            body["input"].as_array().is_some_and(|items| {
+                items.iter().any(|item| {
+                    item["type"] == "message"
+                        && item["role"] == "user"
+                        && item["content"].as_array().is_some_and(|content| {
+                            content.iter().any(|part| {
+                                part["type"] == "input_text"
+                                    && part["text"].as_str() == Some(typed_review_message.as_str())
+                            })
+                        })
+                })
+            }),
+            "generic provider prompt differed from the typed review prompt; {request_diagnostics}"
+        );
+        model_matches && child_thread_matches && parent_thread_matches && review_marker_present
+    });
+    eprintln!(
+        "generic spawn observation: child_id_distinct=true provider_request_observed={provider_request_observed} typed_filter_would_match={typed_filter_would_match} {request_diagnostics}"
+    );
+    assert!(
+        provider_request_observed,
+        "generic reviewer must reach the provider; {request_diagnostics}"
+    );
+    assert!(
+        typed_filter_would_match,
+        "generic reviewer must receive the same typed review prompt; {request_diagnostics}"
+    );
+
+    mount_function_turn(
+        &server,
+        &parent_thread_id,
+        "cold-review-generic-adopt-call",
+        "task_context_boundary",
+        &json!({
+            "action": "adopt_review",
+            "unit_id": "review-a",
+            "reason": "Attempt to adopt the typed review using the generic child result."
+        }),
+        "The host rejected adoption because the typed reviewer remains uncollected.",
+    )
+    .await;
+    resumed
+        .submit_turn("Try adopting the typed review after creating the generic child.")
+        .await?;
+    let generic_adoption_output =
+        tool_output_debug(&rollout_path, "cold-review-generic-adopt-call")?
+            .expect("typed review adoption output after generic spawn");
+    assert!(
+        generic_adoption_output
+            .contains("review adoption is blocked while autonomous completion is paused"),
+        "cold-resumed adoption must respect the persisted pause: {generic_adoption_output}"
+    );
+    let after_generic_spawn = latest_host_completion_snapshot(&rollout_path)?;
+    assert_eq!(after_generic_spawn["state"]["paused"], true);
+    let still_uncollected = completion_unit(&after_generic_spawn, "review-a");
+    assert_eq!(still_uncollected["status"], "running");
+    assert_eq!(
+        still_uncollected["review_evidence"]["reviewer_thread_id"],
+        reviewer_thread_id
+    );
+    assert!(still_uncollected["review_decision_reason"].is_null());
+    let uncollected: std::collections::BTreeSet<String> =
+        serde_json::from_value(after_generic_spawn["uncollected_children"].clone())?;
+    assert_eq!(
+        uncollected,
+        std::collections::BTreeSet::from([
+            reviewer_thread_id,
+            generic_reviewer_thread_id.to_string()
+        ])
     );
 
     resumed.codex.shutdown_and_wait().await?;

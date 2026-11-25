@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-24: preserve implicit saved multi-agent mode in the sample.
 // Modified by RenCrow Switch Core, 2026-09-29: initialize the fork-owned Config fields.
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -275,6 +276,7 @@ fn new_config(model: Option<String>, arg0_paths: Arg0DispatchPaths) -> anyhow::R
         project_doc_fallback_filenames: Vec::new(),
         tool_output_token_limit: None,
         agents_enabled: true,
+        multi_agent_v1_configured: None,
         agent_max_threads: Some(6),
         agent_default_subagent_model: None,
         agent_default_subagent_reasoning_effort: None,

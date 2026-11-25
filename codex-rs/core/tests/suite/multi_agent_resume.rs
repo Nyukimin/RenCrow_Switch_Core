@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-24: exercise explicit V1 activation on a cold disabled root.
 use anyhow::Result;
 use codex_core::TurnInputRequest;
 use codex_core::config::AgentRoleConfig;
@@ -5,6 +6,7 @@ use codex_features::Feature;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
@@ -751,6 +753,30 @@ async fn v1_registered_provider_role_uses_its_own_manager_and_endpoint() -> Resu
     let openai_server = start_mock_server().await;
     let local_parent_base_url = format!("{}/v1", local_parent_server.uri());
     let openai_base_url = format!("{}/v1", openai_server.uri());
+    mount_sse_once(
+        &local_parent_server,
+        sse(vec![
+            ev_response_created("disabled-root-response"),
+            ev_assistant_message("disabled-root-message", "disabled root saved"),
+            ev_completed("disabled-root-response"),
+        ]),
+    )
+    .await;
+    let mut initial_builder = test_codex()
+        .with_model(LOCAL_PARENT_MODEL)
+        .with_pre_build_hook(|home| {
+            std::fs::write(
+                home.join("config.toml"),
+                "[agents]\nenabled = false\n[features]\nmulti_agent = false\n",
+            )
+            .expect("write disabled root config");
+        });
+    let initial = initial_builder.build(&local_parent_server).await?;
+    initial.submit_turn("Save this disabled root.").await?;
+    assert_eq!(
+        initial.codex.multi_agent_version(),
+        Some(MultiAgentVersion::Disabled)
+    );
     let spawn_args = json!({
         "message": CROSS_PROVIDER_TASK,
         "agent_type": "analyst",
@@ -812,6 +838,10 @@ async fn v1_registered_provider_role_uses_its_own_manager_and_endpoint() -> Resu
     local_catalog.models = vec![local_parent_model];
     let mut builder = test_codex()
         .with_model(LOCAL_PARENT_MODEL)
+        .with_pre_build_hook(|home| {
+            std::fs::write(home.join("config.toml"), "[features]\nmulti_agent = true\n")
+                .expect("write explicit V1 resume config");
+        })
         .with_config(move |config| {
             config.features.enable(Feature::Collab).unwrap();
             config.features.disable(Feature::MultiAgentV2).unwrap();
@@ -850,7 +880,17 @@ async fn v1_registered_provider_role_uses_its_own_manager_and_endpoint() -> Resu
                 },
             );
         });
-    let fixture = builder.build(&local_parent_server).await?;
+    let fixture = builder.restart(&local_parent_server, &initial).await?;
+    assert_eq!(
+        fixture.session_configured.thread_id,
+        initial.session_configured.thread_id
+    );
+    assert_eq!(fixture.config.multi_agent_v1_configured, Some(true));
+    assert_eq!(
+        fixture.codex.multi_agent_version(),
+        Some(MultiAgentVersion::V1),
+        "explicit V1 config must override the disabled version persisted by this root"
+    );
     fixture.submit_turn(CROSS_PROVIDER_PROMPT).await?;
 
     let parent_spawn_request = parent_spawn.single_request();

@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-24: explain exact review revalidation condition scope.
 // Modified by RenCrow Switch Core, 2026-11-21: resolve exact accepted revision evidence across update and restore.
 // Modified by RenCrow Switch Core, 2026-11-20: separate caller and host checkpoint budgets.
 // Modified by RenCrow Switch Core, 2026-09-22: handle durable compaction markers; 2026-09-28: role tool allowlist.
@@ -1664,10 +1665,14 @@ impl Session {
                         && candidate.status != codex_history::task_context::UnitStatus::Cancelled
                 })
             });
+            if unit.condition_refs != source.condition_refs {
+                return Err(
+                    "review revalidation must preserve condition_refs exactly from the adopted source unit named by review_revalidation_of; copy that unit's array from status without adding or removing conditions".into(),
+                );
+            }
             if source.status != codex_history::task_context::UnitStatus::Done
                 || source.kind != codex_history::task_context::CompletionUnitKind::Review
                 || target.task_revision != accepted.revision
-                || unit.condition_refs != source.condition_refs
                 || !revalidation_dependencies.contains(&unit.id)
                 || (accepted_artifact_fingerprint == source_artifact_fingerprint
                     && condition_definitions_sha256

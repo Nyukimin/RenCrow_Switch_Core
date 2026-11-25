@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-24: explicit V1 configuration takes precedence over saved mode.
 // Modified by RenCrow Switch Core, 2026-09-22: validated compaction configuration; 2026-09-28: role tool allowlist.
 use crate::config::edit::ConfigEdit;
 use crate::config::edit::ConfigEditsBuilder;
@@ -930,6 +931,9 @@ pub struct Config {
     /// Whether multi-agent tools are enabled through `[agents]`.
     pub agents_enabled: bool,
 
+    /// Explicit `features.multi_agent` selection; omission preserves a saved thread's mode.
+    pub multi_agent_v1_configured: Option<bool>,
+
     /// User-configured maximum number of spawned agent threads per session.
     pub agent_max_threads: Option<usize>,
 
@@ -1586,7 +1590,13 @@ impl Config {
         } else if !self.agents_enabled {
             Some(MultiAgentVersion::Disabled)
         } else {
-            None
+            self.multi_agent_v1_configured.map(|enabled| {
+                if enabled && self.features.enabled(Feature::Collab) {
+                    MultiAgentVersion::V1
+                } else {
+                    MultiAgentVersion::Disabled
+                }
+            })
         }
     }
 
@@ -3842,6 +3852,10 @@ impl Config {
             .as_ref()
             .and_then(|agents| agents.enabled)
             .unwrap_or(true);
+        let multi_agent_v1_configured = cfg
+            .features
+            .as_ref()
+            .and_then(|features| features.entries().get(Feature::Collab.key()).copied());
         let agent_max_threads = cfg
             .agents
             .as_ref()
@@ -4326,6 +4340,7 @@ impl Config {
                 .collect(),
             tool_output_token_limit: cfg.tool_output_token_limit,
             agents_enabled,
+            multi_agent_v1_configured,
             agent_max_threads,
             agent_default_subagent_model,
             agent_default_subagent_reasoning_effort,

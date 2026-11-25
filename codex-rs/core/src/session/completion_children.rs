@@ -1,4 +1,5 @@
 //! Collection state follows native tool receipts, not the child's completion prose.
+// Modified by RenCrow Switch Core, 2026-11-25: avoid repeating the accepted artifact reference in review prompts.
 // Modified by RenCrow Switch Core, 2026-11-16.
 use super::session::Session;
 use codex_history::compaction_candidate::digest;
@@ -457,8 +458,8 @@ impl Session {
                 );
             }
             brief.push_str(&format!(
-                "Review purpose: {}\nAccepted task result: {}\nAccepted artifact ref: {}",
-                review_unit.purpose, accepted.result, target_artifact_ref
+                "Review purpose: {}\nAccepted task result: {}",
+                review_unit.purpose, accepted.result
             ));
             for condition_id in review_unit.condition_refs.iter().take(8) {
                 if let Some(condition) = contract.conditions.iter().find(|c| c.id == *condition_id)

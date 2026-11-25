@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-24: describe exact revalidation scope and accepted execution dependency.
 // Modified by RenCrow Switch Core, 2026-11-11: describe execution and review completion separately.
 use codex_tools::JsonSchema;
 use codex_tools::ResponsesApiTool;
@@ -163,7 +164,7 @@ pub(crate) fn create_task_context_boundary_tool(autonomous_completion: bool) -> 
                             (
                                 "review_revalidation_of".into(),
                                 JsonSchema::string(Some(
-                                    "On an explicit update, name the exact previously adopted Done review unit whose current artifact acceptance must be revalidated. The host validates the one-to-one relation; same-target reviews are independent unless this field names the source unit.".into(),
+                                    "On an explicit update, name the exact previously adopted Done review unit whose current artifact acceptance must be revalidated. Copy that source unit's condition_refs exactly, without adding or removing conditions. Set review_target to the current accepted task revision, which may belong to a different task, and include its execution unit in depends_on. The host validates the one-to-one relation; same-target reviews are independent unless this field names the source unit.".into(),
                                 )),
                             ),
                             (

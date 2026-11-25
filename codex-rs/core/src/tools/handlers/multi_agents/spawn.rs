@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-25: shorten the host-assigned review prompt.
 // Modified by RenCrow Switch Core, 2026-11-16.
 use super::*;
 use crate::agent::child_config::PreparedSpawnConfig;
@@ -123,7 +124,7 @@ pub(crate) async fn spawn_configured_completion_review(
     validate_completion_reviewer_depth(&turn.session_source, turn.config.agent_max_depth)
         .map_err(FunctionCallError::RespondToModel)?;
     let prompt = format!(
-        "Host-assigned read-only review. Inspect task `{target_task_id}` revision {target_task_revision} against accepted artifact reference `{target_ref}`.\n{review_brief}\nUse each verified artifact's exact absolute path together with its stated workspace root; do not resolve paths relative to the reviewer working directory or infer ownership from another repository. Use the stated acceptance criteria and existing host evidence only; do not edit files or rerun tests. Return findings to the parent for an explicit adoption decision."
+        "Host-assigned read-only review. Task `{target_task_id}` revision {target_task_revision}; accepted artifact `{target_ref}`.\n{review_brief}\nUse each verified absolute path with its workspace root; do not infer paths or ownership. Use only stated criteria and host evidence. Do not edit or rerun tests. Return findings to the parent for adoption."
     );
     let input_items = vec![UserInput::Text {
         text: prompt.clone(),

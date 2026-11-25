@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-24: preserve review scope on rejected cross-task revalidation.
 // Modified by RenCrow Switch Core, 2026-11-16.
 #[path = "parent_handoff_review_tests.rs"]
 mod parent_handoff_review_tests;
@@ -560,6 +561,8 @@ async fn completion_review_brief_preserves_receipt_workspace_and_artifact_paths(
 
     assert!(launch.should_spawn);
     assert!(launch.review_brief.chars().count() <= 7_000);
+    assert!(!launch.review_brief.contains(&artifact_ref));
+    assert_eq!(launch.target_artifact_ref, artifact_ref);
     assert_eq!(
         location["workspace_root"].as_str(),
         Some(workspace_root.to_string_lossy().as_ref())
@@ -3870,6 +3873,34 @@ async fn adopted_alpha_can_be_revalidated_against_a_newly_accepted_beta_task() -
         review_state: None,
         review_revalidation_of: Some(REVIEW_UNIT_ID.into()),
     });
+    let before_invalid_update = session.rencrow_completion_state(ROOT_TASK_ID).await;
+    let mut widened_scope = beta_review_plan.clone();
+    let mut additional_condition = widened_scope.conditions[0].clone();
+    additional_condition.id = "AC-2".into();
+    additional_condition.status = AcceptanceStatus::Open;
+    additional_condition.evidence.clear();
+    widened_scope
+        .units
+        .iter_mut()
+        .find(|unit| unit.id == BETA_REVIEW_UNIT_ID)
+        .expect("new Beta review exists")
+        .condition_refs
+        .push(additional_condition.id.clone());
+    widened_scope.conditions.push(additional_condition);
+    let scope_error = session
+        .set_rencrow_completion_state_with_call_id(
+            ROOT_TASK_ID.into(),
+            serde_json::to_value(widened_scope)?,
+            Some("update-reject-widened-alpha-review-scope".into()),
+        )
+        .await
+        .expect_err("revalidation cannot widen the adopted source obligation");
+    assert!(scope_error.contains("preserve condition_refs exactly"));
+    assert_eq!(
+        session.rencrow_completion_state(ROOT_TASK_ID).await,
+        before_invalid_update,
+        "rejected revalidation must not change the accepted plan or its evidence"
+    );
     session
         .set_rencrow_completion_state_with_call_id(
             ROOT_TASK_ID.into(),

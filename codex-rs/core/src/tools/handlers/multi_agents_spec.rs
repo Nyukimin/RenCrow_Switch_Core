@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-25: guide parents to provide minimal child context.
 use crate::agent::child_config::MAX_SPAWN_AGENT_MODEL_OVERRIDES;
 use crate::agent::child_config::model_supports_multi_agent_backend;
 use codex_protocol::openai_models::ModelPreset;
@@ -627,7 +628,7 @@ fn spawn_agent_common_properties_v1(agent_type_description: &str) -> BTreeMap<St
         (
             "message".to_string(),
             JsonSchema::string(Some(
-                "Initial plain-text task for the new agent. Use either message or items."
+                "One small, self-contained task: include only the goal, relevant inputs and paths, permissions, acceptance condition, and needed constraints. Omit unrelated history and duplicated instructions. Use either message or items."
                     .to_string(),
             )),
         ),
@@ -641,7 +642,7 @@ fn spawn_agent_common_properties_v1(agent_type_description: &str) -> BTreeMap<St
         (
             "fork_context".to_string(),
             JsonSchema::boolean(Some(
-                "True forks the current thread history into the new agent; false or omitted starts with only the initial prompt."
+                "False or omitted starts with only the initial prompt and avoids copying parent history. Use true only when the task requires the full history."
                     .to_string(),
             )),
         ),
@@ -665,7 +666,7 @@ fn spawn_agent_common_properties_v2(agent_type_description: &str) -> BTreeMap<St
         (
             "message".to_string(),
             JsonSchema::string(Some(
-                "Initial plain-text task for the new agent.".to_string(),
+                "One small, self-contained task: include only the goal, relevant inputs and paths, permissions, acceptance condition, and needed constraints. Omit unrelated history and duplicated instructions.".to_string(),
             ))
             .with_encrypted(),
         ),
@@ -678,7 +679,7 @@ fn spawn_agent_common_properties_v2(agent_type_description: &str) -> BTreeMap<St
         (
             "fork_turns".to_string(),
             JsonSchema::string(Some(
-                "Optional number of turns to fork. Defaults to `all`. Use `none`, `all`, or a positive integer string such as `3` to fork only the most recent turns."
+                "Optional number of turns to fork. Defaults to `all`. Use `none` unless history is needed; otherwise use `all` or a positive integer string such as `3` for only the most recent turns."
                     .to_string(),
             )),
         ),
