@@ -61,23 +61,23 @@ pub(crate) fn common_harness_tool_name_allowed(
 ) -> bool {
     match profile {
         CommonHarnessToolProfile::Legacy => {
-            !(tool_name.namespace.is_none() && tool_name.name == "workspace_read")
+            !(tool_name.is_default_namespace() && tool_name.name == "workspace_read")
         }
         CommonHarnessToolProfile::StatusOnly => {
-            tool_name.namespace.is_none() && tool_name.name == "task_context_boundary"
+            tool_name.is_default_namespace() && tool_name.name == "task_context_boundary"
         }
         CommonHarnessToolProfile::ReservedBegin => {
-            tool_name.namespace.is_none() && tool_name.name == "task_context_boundary"
+            tool_name.is_default_namespace() && tool_name.name == "task_context_boundary"
         }
         CommonHarnessToolProfile::Root => {
-            tool_name.namespace.is_none()
+            tool_name.is_default_namespace()
                 && matches!(
                     tool_name.name.as_str(),
                     "task_context_boundary" | "workspace_read" | "exec_command" | "apply_patch"
                 )
         }
         CommonHarnessToolProfile::ReviewReadOnly => {
-            tool_name.namespace.is_none()
+            tool_name.is_default_namespace()
                 && matches!(
                     tool_name.name.as_str(),
                     "task_context_boundary" | "workspace_read"
@@ -913,7 +913,7 @@ async fn common_harness_tool_boundary(
     else {
         return Ok(());
     };
-    if invocation.tool_name.namespace.is_some() {
+    if !invocation.tool_name.is_default_namespace() {
         return Err(FunctionCallError::RespondToModel(
             "common-harness v1 does not delegate tools to MCP or child namespaces".into(),
         ));

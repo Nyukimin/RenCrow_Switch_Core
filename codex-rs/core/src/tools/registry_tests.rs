@@ -1165,6 +1165,56 @@ async fn historical_terminal_common_state_is_not_reactivated_by_read_only_new_tu
 }
 
 #[tokio::test]
+async fn common_harness_router_default_namespace_preserves_builtin_policy() {
+    let (session, turn) = common_harness_policy_fixture().await;
+    for namespace in [None, Some(""), Some(DEFAULT_FUNCTION_NAMESPACE)] {
+        for name in [
+            "task_context_boundary",
+            "workspace_read",
+            "exec_command",
+            "apply_patch",
+        ] {
+            let call =
+                crate::tools::router::ToolRouter::build_tool_call(ResponseItem::FunctionCall {
+                    id: None,
+                    name: name.to_string(),
+                    namespace: namespace.map(str::to_string),
+                    arguments: "{}".to_string(),
+                    encrypted_function_args: None,
+                    call_id: "common-default-namespace".to_string(),
+                    internal_chat_message_metadata_passthrough: None,
+                })
+                .expect("valid provider tool call")
+                .expect("function call produces a routed tool");
+            assert!(common_harness_tool_name_allowed(
+                CommonHarnessToolProfile::Root,
+                &call.tool_name
+            ));
+            assert_eq!(
+                common_harness_tool_name_allowed(
+                    CommonHarnessToolProfile::ReviewReadOnly,
+                    &call.tool_name
+                ),
+                matches!(name, "task_context_boundary" | "workspace_read")
+            );
+            if matches!(name, "task_context_boundary" | "workspace_read") {
+                let invocation = test_invocation(
+                    Arc::clone(&session),
+                    Arc::clone(&turn),
+                    "common-default-namespace",
+                    call.tool_name,
+                );
+                assert!(common_harness_tool_boundary(&invocation).await.is_ok());
+            }
+        }
+    }
+    assert!(!common_harness_tool_name_allowed(
+        CommonHarnessToolProfile::Legacy,
+        &codex_tools::ToolName::plain("workspace_read").with_default_namespace()
+    ));
+}
+
+#[tokio::test]
 async fn common_harness_boundary_allows_scoped_workspace_read_but_blocks_bypass_tools() {
     let (session, turn) = common_harness_policy_fixture().await;
     for name in ["task_context_boundary", "workspace_read"] {
