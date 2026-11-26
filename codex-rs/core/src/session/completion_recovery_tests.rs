@@ -336,6 +336,7 @@ async fn changed_artifact_invalidates_satisfied_condition_during_reconcile() {
             product_progress_at: Some(100),
             runtime_recovery_at: Some(110),
             activity_at: Some(120),
+            common_harness: None,
         },
     ));
 

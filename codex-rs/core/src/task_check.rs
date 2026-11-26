@@ -1,4 +1,5 @@
 // Modified by RenCrow Switch Core, 2026-11-16: compile test helpers only for tests.
+// Modified by RenCrow Switch Core, 2026-11-26: bind expected failures to host-owned obligations.
 //! Host-owned receipts for task-scoped verification commands.
 use serde::Deserialize;
 use serde::Serialize;
@@ -8,6 +9,11 @@ use std::fs::OpenOptions;
 use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
+
+#[path = "task_check_expected_negative.rs"]
+mod expected_negative;
+pub(crate) use expected_negative::ExpectedNegativeBindingV1;
+pub(crate) use expected_negative::ExpectedNegativeResolutionV1;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -31,6 +37,17 @@ pub(crate) struct TaskCheckExecution {
     pub before: Vec<TaskArtifactStamp>,
     pub obligation: Option<TaskCheckObligation>,
     pub execution_environment_id: Option<String>,
+}
+
+/// One observed native completion, before deriving a task-check receipt.
+pub(crate) struct TaskCheckCompletion<'a> {
+    pub(crate) command: &'a [String],
+    pub(crate) cwd: &'a Path,
+    pub(crate) output: &'a str,
+    pub(crate) exit_code: i32,
+    pub(crate) completed: bool,
+    pub(crate) output_truncated: bool,
+    pub(crate) after: Vec<TaskArtifactStamp>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -284,6 +301,7 @@ pub(crate) struct TaskCheckLedger {
     attempt_obligation: HashMap<String, Option<TaskCheckObligation>>,
     latest_attempt: HashMap<(String, u64), String>,
     pending_data: HashMap<String, (TaskEvidenceRequest, PathBuf, Vec<TaskArtifactStamp>)>,
+    expected_negative: HashMap<String, expected_negative::ExpectedNegativeRecordV1>,
     terminal_event_order: HashMap<String, u64>,
     imported_launch_projection: HashMap<String, String>,
     next_terminal_event_order: u64,
@@ -318,6 +336,8 @@ pub(crate) struct TaskCheckSnapshot {
     pub(crate) latest: bool,
     #[serde(default)]
     pub(crate) obligation: Option<TaskCheckObligation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) expected_negative: Option<expected_negative::ExpectedNegativeRecordV1>,
 }
 
 fn default_snapshot_latest() -> bool {
@@ -342,10 +362,11 @@ impl TaskCheckLedger {
                     .latest_attempt
                     .get(&(task_id.clone(), *task_revision))
                     .is_some_and(|call| call == &attempt.call_id);
-                let unresolved = attempt_is_unresolved(attempt);
+                let unresolved = self.attempt_is_unresolved(attempt);
                 (latest_task
                     || unresolved
                     || attempt.launch_correction.is_some()
+                    || self.expected_negative.contains_key(&attempt.call_id)
                     || referenced_calls.contains(&attempt.call_id))
                 .then_some(attempt.call_id.clone())
             })
@@ -384,6 +405,7 @@ impl TaskCheckLedger {
                     task_revision,
                     attempt: attempt.clone(),
                     obligation,
+                    expected_negative: self.expected_negative.get(&attempt.call_id).cloned(),
                 })
             })
             .collect::<Vec<_>>();
@@ -461,8 +483,14 @@ impl TaskCheckLedger {
             restored
                 .attempt_obligation
                 .insert(call.clone(), entry.obligation);
+            if let Some(expected_negative) = entry.expected_negative {
+                restored
+                    .expected_negative
+                    .insert(call.clone(), expected_negative);
+            }
             restored.attempts.insert(call.clone(), entry.attempt);
         }
+        restored.validate_expected_negative_snapshot()?;
         for ((task_id, task_revision), call) in &restored.latest_attempt {
             if !restored.attempts.get(call).is_some_and(|attempt| {
                 match &attempt.status {
@@ -628,6 +656,10 @@ impl TaskCheckLedger {
         before: Vec<TaskArtifactStamp>,
         obligation: Option<TaskCheckObligation>,
     ) {
+        // A reserved expected-negative call has an immutable pre-launch identity and raw result.
+        if self.expected_negative.contains_key(&call_id) {
+            return;
+        }
         if request.artifact_paths.is_empty()
             || before.is_empty()
             || request.artifact_paths.len() != before.len()
@@ -847,6 +879,7 @@ impl TaskCheckLedger {
             latest: false,
             task_id,
             task_revision,
+            expected_negative: self.expected_negative.get(target_call_id).cloned(),
             attempt: target_attempt,
             obligation: Some(target_obligation),
         };
@@ -971,7 +1004,7 @@ impl TaskCheckLedger {
                 if attempt.resolved_by.is_some() || attempt.launch_correction.is_some() {
                     return None;
                 }
-                if !attempt_is_unresolved(attempt) {
+                if !self.attempt_is_unresolved(attempt) {
                     return None;
                 }
                 self.attempt_obligation
@@ -1124,7 +1157,7 @@ impl TaskCheckLedger {
             .collect::<Vec<_>>();
         let priority =
             |attempt: &TaskCheckAttempt| {
-                if attempt_is_unresolved(attempt) {
+                if self.attempt_is_unresolved(attempt) {
                     0
                 } else if attempt.launch_correction.is_some() {
                     1
@@ -1148,7 +1181,7 @@ impl TaskCheckLedger {
         let count = attempts.len();
         let unresolved_count = attempts
             .iter()
-            .filter(|(attempt, _)| attempt_is_unresolved(attempt))
+            .filter(|(attempt, _)| self.attempt_is_unresolved(attempt))
             .count();
         let mut omitted = count.saturating_sub(MAX_ATTEMPTS);
         let mut remaining_diagnostic_bytes = MAX_STATUS_DIAGNOSTIC_BYTES;
@@ -1280,7 +1313,7 @@ impl TaskCheckLedger {
             else {
                 continue;
             };
-            if obligation.scope.same_execution(scope) && attempt_is_unresolved(attempt) {
+            if obligation.scope.same_execution(scope) && self.attempt_is_unresolved(attempt) {
                 unresolved.insert(obligation.key(), obligation.clone());
             }
         }
@@ -1297,7 +1330,8 @@ impl TaskCheckLedger {
             else {
                 continue;
             };
-            if obligation.scope.root_task_id == root_task_id && attempt_is_unresolved(attempt) {
+            if obligation.scope.root_task_id == root_task_id && self.attempt_is_unresolved(attempt)
+            {
                 unresolved.insert(obligation.key(), obligation.clone());
             }
         }
@@ -1322,7 +1356,7 @@ impl TaskCheckLedger {
                             .is_some_and(|(task_id, revision)| {
                                 task_id == &scope.task_id && *revision == scope.task_revision
                             })
-                        && attempt_is_unresolved(attempt)
+                        && self.attempt_is_unresolved(attempt)
                 })
                 .count()
     }
@@ -1336,7 +1370,7 @@ impl TaskCheckLedger {
                     self.attempt_obligation
                         .get(*call)
                         .is_some_and(Option::is_none)
-                        && attempt_is_unresolved(attempt)
+                        && self.attempt_is_unresolved(attempt)
                 })
                 .count()
     }

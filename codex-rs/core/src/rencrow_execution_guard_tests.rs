@@ -1209,6 +1209,78 @@ fn orchestrator_noop_turn_still_rejects_failed_or_incomplete_checks() {
 }
 
 #[test]
+fn common_harness_expected_negative_raw_failure_does_not_charge_failure_budgets_or_credit_success()
+{
+    let mut guard = GuardState::default();
+    guard.observe_diff(None);
+    let stamp = guard.check_stamp();
+    guard.finish_host_projected_check(
+        "task-evidence:obligation:call:baseline",
+        stamp,
+        CompletedCheckObservation {
+            exit_code: 1,
+            output: "expected baseline failure",
+            output_may_be_truncated: false,
+        },
+        &["obligation:call:baseline".into()],
+    );
+    assert!(guard.failed_checks.is_empty());
+    assert!(guard.baseline_failure_reads_stamp.is_none());
+    assert!(!guard.checked);
+    assert!(guard.verified_diff_stamps.is_empty());
+    guard.finish_host_projected_check(
+        "task-evidence:obligation:call:candidate",
+        stamp,
+        CompletedCheckObservation {
+            exit_code: 1,
+            output: "candidate still fails",
+            output_may_be_truncated: false,
+        },
+        &["obligation:call:baseline".into()],
+    );
+    assert!(
+        guard
+            .failed_checks
+            .contains("task-evidence:obligation:call:candidate")
+    );
+    assert!(!guard.checked);
+}
+
+#[test]
+fn common_harness_expected_negative_settlement_cannot_clear_a_candidate_failure() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let obligation = crate::task_check::TaskCheckObligation::new(
+        scope_for_guard_test(),
+        workspace.path().to_path_buf(),
+        "go test -json -count=1 .",
+        vec![PathBuf::from("regression_test.go")],
+    )
+    .expect("obligation");
+    let baseline = task_evidence_check_key(
+        &obligation,
+        TaskEvidenceKeyScope::CommonHarnessCall("baseline"),
+    );
+    let candidate = task_evidence_check_key(
+        &obligation,
+        TaskEvidenceKeyScope::CommonHarnessCall("candidate"),
+    );
+    assert_ne!(
+        baseline, candidate,
+        "two raw results must retain distinct guard obligations"
+    );
+    let mut guard = GuardState::default();
+    guard.failed_checks.insert(baseline.clone());
+    guard.failed_checks.insert(candidate.clone());
+    guard.settle_proven_task_evidence_launches(&[format!("{}:call:baseline", obligation.key())]);
+    assert!(!guard.failed_checks.contains(&baseline));
+    assert!(guard.failed_checks.contains(&candidate));
+    assert_eq!(
+        task_evidence_check_key(&obligation, TaskEvidenceKeyScope::LegacyObligation),
+        format!("task-evidence:{}", obligation.key())
+    );
+}
+
+#[test]
 fn proven_task_evidence_settlement_removes_only_exact_keys_and_is_idempotent() {
     let mut state = GuardState::default();
     state.failed_checks.insert("task-evidence:resolved".into());
@@ -1427,10 +1499,7 @@ async fn proven_launch_correction_settles_the_guard_before_the_next_read() {
         .expect("corrected host verification is retained");
 
     assert_eq!(
-        invocation
-            .session
-            .resolved_task_check_launch_obligation_keys()
-            .await,
+        invocation.session.resolved_task_check_guard_keys().await,
         vec![
             source_guard_key
                 .trim_start_matches("task-evidence:")

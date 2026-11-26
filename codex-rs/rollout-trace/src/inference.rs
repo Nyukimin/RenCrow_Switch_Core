@@ -6,6 +6,7 @@
 
 use std::fmt::Display;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
@@ -51,6 +52,7 @@ struct EnabledInferenceTraceContext {
     codex_turn_id: CodexTurnId,
     model: String,
     provider_name: String,
+    model_settings_receipt_context: Option<JsonValue>,
 }
 
 /// One concrete upstream request attempt.
@@ -67,7 +69,7 @@ pub struct InferenceTraceAttempt {
 #[derive(Debug)]
 enum InferenceTraceAttemptState {
     Disabled,
-    Enabled(EnabledInferenceTraceAttempt),
+    Enabled(Box<EnabledInferenceTraceAttempt>),
 }
 
 #[derive(Debug)]
@@ -75,6 +77,8 @@ struct EnabledInferenceTraceAttempt {
     context: EnabledInferenceTraceContext,
     inference_call_id: InferenceCallId,
     terminal_recorded: AtomicBool,
+    model_settings_receipt: Mutex<Option<JsonValue>>,
+    verified_backend_model: Mutex<Option<String>>,
 }
 
 /// Non-delta response payload saved for completed or interrupted inference streams.
@@ -114,7 +118,30 @@ impl InferenceTraceContext {
                 codex_turn_id,
                 model,
                 provider_name,
+                model_settings_receipt_context: None,
             }),
+        }
+    }
+
+    /// Attaches host-generated settings context to this trace. Legacy traces
+    /// without Common Harness context remain unchanged.
+    pub fn with_model_settings_receipt_context(mut self, context: &impl Serialize) -> Self {
+        if let InferenceTraceContextState::Enabled(enabled) = &mut self.state
+            && let Ok(context) = serde_json::to_value(context)
+        {
+            enabled.model_settings_receipt_context = Some(context);
+        }
+        self
+    }
+
+    /// Returns the host-generated context for transport code to project against
+    /// the concrete provider request. This value is observational only.
+    pub fn model_settings_receipt_context(&self) -> Option<JsonValue> {
+        match &self.state {
+            InferenceTraceContextState::Disabled => None,
+            InferenceTraceContextState::Enabled(enabled) => {
+                enabled.model_settings_receipt_context.clone()
+            }
         }
     }
 
@@ -125,11 +152,13 @@ impl InferenceTraceContext {
         };
 
         InferenceTraceAttempt {
-            state: InferenceTraceAttemptState::Enabled(EnabledInferenceTraceAttempt {
+            state: InferenceTraceAttemptState::Enabled(Box::new(EnabledInferenceTraceAttempt {
                 context: context.clone(),
                 inference_call_id: next_inference_call_id(),
                 terminal_recorded: AtomicBool::new(false),
-            }),
+                model_settings_receipt: Mutex::new(None),
+                verified_backend_model: Mutex::new(None),
+            })),
         }
     }
 }
@@ -139,6 +168,52 @@ impl InferenceTraceAttempt {
     pub fn disabled() -> Self {
         Self {
             state: InferenceTraceAttemptState::Disabled,
+        }
+    }
+
+    /// Stores host-owned settings evidence until the attempt reaches a terminal
+    /// event, so the receipt can link to the final response/usage payload.
+    pub fn record_model_settings_receipt(&self, receipt: &impl Serialize) {
+        let InferenceTraceAttemptState::Enabled(attempt) = &self.state else {
+            return;
+        };
+        let Ok(mut receipt) = serde_json::to_value(receipt) else {
+            return;
+        };
+        let Some(object) = receipt.as_object_mut() else {
+            return;
+        };
+        object.insert(
+            "call_ref".to_string(),
+            JsonValue::String(attempt.inference_call_id.clone()),
+        );
+        object.insert("usage_ref".to_string(), JsonValue::Null);
+        if let Ok(model) = attempt.verified_backend_model.lock()
+            && let Some(model) = model.as_deref()
+        {
+            set_verified_backend_model(&mut receipt, model);
+        }
+        if let Ok(mut saved) = attempt.model_settings_receipt.lock() {
+            *saved = Some(receipt);
+        }
+    }
+
+    /// Stores only the value observed in the verified response header. No
+    /// request-side model value is reported as the physical backend identity.
+    pub fn record_verified_backend_model(&self, model: Option<&str>) {
+        let InferenceTraceAttemptState::Enabled(attempt) = &self.state else {
+            return;
+        };
+        let Some(model) = model.filter(|model| !model.is_empty()) else {
+            return;
+        };
+        if let Ok(mut verified) = attempt.verified_backend_model.lock() {
+            *verified = Some(model.to_string());
+        }
+        if let Ok(mut receipt) = attempt.model_settings_receipt.lock()
+            && let Some(receipt) = receipt.as_mut()
+        {
+            set_verified_backend_model(receipt, model);
         }
     }
 
@@ -219,8 +294,11 @@ impl InferenceTraceAttempt {
             token_usage.as_ref(),
             output_items,
         ) else {
+            append_model_settings_receipt_best_effort(attempt, None);
             return;
         };
+
+        append_model_settings_receipt_best_effort(attempt, Some(&response_payload));
 
         append_with_context_best_effort(
             &attempt.context,
@@ -254,6 +332,7 @@ impl InferenceTraceAttempt {
                 output_items,
             )
         };
+        append_model_settings_receipt_best_effort(attempt, partial_response_payload.as_ref());
         append_with_context_best_effort(
             &attempt.context,
             RawTraceEventPayload::InferenceFailed {
@@ -290,6 +369,7 @@ impl InferenceTraceAttempt {
                 output_items,
             )
         };
+        append_model_settings_receipt_best_effort(attempt, partial_response_payload.as_ref());
         append_with_context_best_effort(
             &attempt.context,
             RawTraceEventPayload::InferenceCancelled {
@@ -304,7 +384,7 @@ impl InferenceTraceAttempt {
     fn take_terminal_attempt(&self) -> Option<&EnabledInferenceTraceAttempt> {
         let attempt = match &self.state {
             InferenceTraceAttemptState::Disabled => return None,
-            InferenceTraceAttemptState::Enabled(attempt) => attempt,
+            InferenceTraceAttemptState::Enabled(attempt) => attempt.as_ref(),
         };
         if attempt.terminal_recorded.swap(true, Ordering::AcqRel) {
             return None;
@@ -385,6 +465,65 @@ fn append_with_context_best_effort(
         codex_turn_id: Some(context.codex_turn_id.clone()),
     };
     let _ = context.writer.append_with_context(event_context, payload);
+}
+
+fn set_verified_backend_model(receipt: &mut JsonValue, model: &str) {
+    let Some(physical_backend) = receipt
+        .get_mut("model_identity")
+        .and_then(|identity| identity.get_mut("physical_backend"))
+        .and_then(JsonValue::as_object_mut)
+    else {
+        return;
+    };
+    physical_backend.insert("value".to_string(), JsonValue::String(model.to_string()));
+    physical_backend.insert(
+        "source".to_string(),
+        JsonValue::String("verified_response_header".to_string()),
+    );
+    physical_backend.insert("observed".to_string(), JsonValue::Bool(true));
+}
+
+fn append_model_settings_receipt_best_effort(
+    attempt: &EnabledInferenceTraceAttempt,
+    usage_payload: Option<&crate::RawPayloadRef>,
+) {
+    let mut receipt = {
+        let Ok(mut saved) = attempt.model_settings_receipt.lock() else {
+            return;
+        };
+        let Some(receipt) = saved.take() else {
+            return;
+        };
+        receipt
+    };
+    if let Some(object) = receipt.as_object_mut() {
+        object.insert(
+            "call_ref".to_string(),
+            JsonValue::String(attempt.inference_call_id.clone()),
+        );
+        object.insert(
+            "usage_ref".to_string(),
+            usage_payload
+                .map(|payload| JsonValue::String(payload.raw_payload_id.clone()))
+                .unwrap_or(JsonValue::Null),
+        );
+    } else {
+        return;
+    }
+    let Some(receipt_payload) = write_json_payload_best_effort(
+        &attempt.context.writer,
+        RawPayloadKind::ModelSettingsReceipt,
+        &receipt,
+    ) else {
+        return;
+    };
+    append_with_context_best_effort(
+        &attempt.context,
+        RawTraceEventPayload::ModelSettingsReceipt {
+            inference_call_id: attempt.inference_call_id.clone(),
+            receipt_payload,
+        },
+    );
 }
 
 #[cfg(test)]

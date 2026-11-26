@@ -788,6 +788,25 @@ fn completion_task_check_references(state: &CompletionState) -> HashSet<String> 
     {
         collect_task_check_call_id(&reference.target_artifact_ref, &mut calls);
     }
+    if let Some(common_harness) = state.common_harness.as_ref() {
+        for operation in &common_harness.operation_refs {
+            if operation.intent.operation_kind
+                == codex_history::task_context::OperationKindV1::RunVerifier
+                && let Some(call_id) = operation
+                    .intent
+                    .operation_id
+                    .strip_prefix("verify:")
+                    .filter(|call_id| !call_id.is_empty())
+            {
+                calls.insert(call_id.to_owned());
+            }
+        }
+        for evidence in &common_harness.evidence_refs {
+            for log_ref in &evidence.log_refs {
+                collect_task_check_call_id(log_ref, &mut calls);
+            }
+        }
+    }
     calls
 }
 
@@ -2430,6 +2449,8 @@ impl Session {
         reason = "dedicated append lock serializes capture and asynchronous rollout persistence; SessionState locks are scoped separately"
     )]
     pub(crate) async fn persist_autonomous_completion_snapshot(&self) -> Result<(), String> {
+        #[cfg(test)]
+        crate::session::session::trace_native_patch_wait("snapshot:lock-acquire-begin");
         let persist_lock = self
             .state
             .lock()
@@ -2439,6 +2460,8 @@ impl Session {
         // Serialize capture and the async append together; this dedicated lock never
         // protects SessionState and prevents older snapshots overtaking newer ones.
         let _persist_guard = persist_lock.lock().await;
+        #[cfg(test)]
+        crate::session::session::trace_native_patch_wait("snapshot:lock-acquired");
         {
             let mut state = self.state.lock().await;
             let legacy_receipt = state
@@ -2615,6 +2638,8 @@ impl Session {
                 ..Default::default()
             }),
         };
+        #[cfg(test)]
+        crate::session::session::trace_native_patch_wait("snapshot:live-append-begin");
         let persist_result = match self.live_thread() {
             Some(live_thread) => live_thread
                 .append_items(&[RolloutItem::ResponseItem(item.clone())])
@@ -2640,6 +2665,8 @@ impl Session {
                 ));
             }
         };
+        #[cfg(test)]
+        crate::session::session::trace_native_patch_wait("snapshot:live-append-end");
         {
             let mut state = self.state.lock().await;
             let task = crate::compact::latest_task_state_in_history(
@@ -3522,7 +3549,7 @@ impl Session {
         }
     }
 
-    async fn mark_completion_paused_in_memory(&self) {
+    pub(super) async fn mark_completion_paused_in_memory(&self) {
         let mut state = self.state.lock().await;
         state.rencrow_completion_paused = true;
         if let Some((_, contract)) = state.rencrow_completion_state.as_mut() {
@@ -3739,7 +3766,295 @@ mod tests {
             product_progress_at: None,
             runtime_recovery_at: None,
             activity_at: None,
+            common_harness: None,
         }
+    }
+
+    fn common_harness_retention_fixture(source_call_id: &str) -> CompletionState {
+        use codex_history::task_context::CheckOutputParserV1;
+        use codex_history::task_context::CheckSpecV1;
+        use codex_history::task_context::CommonHarnessStateV1;
+        use codex_history::task_context::ConditionEvidenceV1;
+        use codex_history::task_context::ConditionKindV1;
+        use codex_history::task_context::ConditionSpecV1;
+        use codex_history::task_context::ConditionVerdictV1;
+        use codex_history::task_context::EvidenceLifecycleV1;
+        use codex_history::task_context::ExecutionOwnerV1;
+        use codex_history::task_context::ExpectedCheckOutcomeV1;
+        use codex_history::task_context::GoTestSelectionV1;
+        use codex_history::task_context::HostEventV1;
+        use codex_history::task_context::OperationClaimKindV1;
+        use codex_history::task_context::OperationClaimV1;
+        use codex_history::task_context::OperationIntentStatusV1;
+        use codex_history::task_context::OperationIntentV1;
+        use codex_history::task_context::OperationKindV1;
+        use codex_history::task_context::OperationOutcomeV1;
+        use codex_history::task_context::OperationReceiptV1;
+        use codex_history::task_context::StateFenceV1;
+        use codex_history::task_context::TaskRequestV1;
+
+        fn apply(state: &CommonHarnessStateV1, event: HostEventV1) -> CommonHarnessStateV1 {
+            state
+                .apply_host_event(
+                    StateFenceV1 {
+                        request_revision: state.request.request_revision,
+                        expected_state_version: state.run_state.state_version,
+                        owner_epoch: state.run_state.owner_epoch,
+                    },
+                    event,
+                )
+                .expect("fixture host event is valid")
+        }
+
+        fn record_successful_operation(
+            state: &CommonHarnessStateV1,
+            operation_id: &str,
+            kind: OperationKindV1,
+        ) -> CommonHarnessStateV1 {
+            let intent = OperationIntentV1 {
+                operation_id: operation_id.into(),
+                task_id: state.request.task_id.clone(),
+                request_revision: state.request.request_revision,
+                attempt_no: state.run_state.attempt_no,
+                owner_epoch: state.run_state.owner_epoch,
+                expected_state_version: state.run_state.state_version,
+                base_target_version: state.run_state.target_version.clone(),
+                operation_kind: kind,
+                normalized_arguments_ref: format!("args:{operation_id}"),
+                normalized_arguments_digest: format!("sha256:{operation_id}"),
+                permission_decision_ref: "permission:allow".into(),
+                approval_ref: None,
+                executor_ref: "executor:host".into(),
+                timeout_ms: 30_000,
+                status: OperationIntentStatusV1::Running,
+            };
+            let claim_id = format!("claim:{operation_id}");
+            let reserved = apply(
+                state,
+                HostEventV1::ReserveOperation {
+                    claim: OperationClaimV1 {
+                        claim_id: claim_id.clone(),
+                        operation_id: operation_id.into(),
+                        previous_claim_id: None,
+                        owner_epoch: intent.owner_epoch,
+                        expected_state_version: intent.expected_state_version,
+                        intent_digest: intent.content_digest().unwrap(),
+                        claimed_at_ms: 1_000,
+                        deadline_at_ms: 20_000,
+                        kind: OperationClaimKindV1::Execution,
+                        supersedes_execution_claim_id: None,
+                        native_executor_dead_proof_ref: None,
+                    },
+                    intent: intent.clone(),
+                },
+            );
+            apply(
+                &reserved,
+                HostEventV1::FinalizeOperation {
+                    receipt: OperationReceiptV1 {
+                        operation_id: operation_id.into(),
+                        task_id: intent.task_id,
+                        request_revision: intent.request_revision,
+                        attempt_no: intent.attempt_no,
+                        owner_epoch: intent.owner_epoch,
+                        execution_id: claim_id,
+                        outcome: OperationOutcomeV1::Succeeded,
+                        actual_before_version: intent.base_target_version.clone(),
+                        actual_after_version: Some(intent.base_target_version),
+                        exit_status: Some(0),
+                        result_ref: Some(format!("receipt:{operation_id}")),
+                        external_receipt_ref: None,
+                        reconciliation_ref: None,
+                    },
+                },
+            )
+        }
+
+        let task_id = "common-harness-root";
+        let target = "target:baseline";
+        let request = TaskRequestV1 {
+            task_id: task_id.into(),
+            request_revision: 1,
+            authorized_request_ref: "request:host".into(),
+            goal: "Retain verifier provenance".into(),
+            workspace_ref: "workspace:host".into(),
+            start_target_version: target.into(),
+            permission_snapshot_ref: "permission:host".into(),
+            constraints: vec!["Preserve host receipts".into()],
+            conditions: vec![ConditionSpecV1 {
+                condition_id: "AC-1".into(),
+                condition_revision: 1,
+                kind: ConditionKindV1::TestSuite,
+                comparison_scope: "selected Go tests".into(),
+                expected: "all selected tests pass".into(),
+                required: true,
+                verifier_ref: Some("codex-common-harness/go-test-json/1".into()),
+                verifier_config_revision: Some(1),
+                check: Some(CheckSpecV1 {
+                    argv: vec![
+                        "go".into(),
+                        "test".into(),
+                        "-json".into(),
+                        "-count=1".into(),
+                        "-run".into(),
+                        "^TestRegression$".into(),
+                        "./pkg".into(),
+                    ],
+                    parser: CheckOutputParserV1::GoTestJson,
+                    expected_outcome: ExpectedCheckOutcomeV1::AllSelectedTestsPass,
+                    go_test_selection: Some(GoTestSelectionV1 {
+                        selected_cases: vec!["TestRegression".into()],
+                        expected_case_count: 1,
+                    }),
+                    cwd_binding_refs: vec!["pkg".into()],
+                    allowed_environment_refs: Vec::new(),
+                    toolchain_ref: Some("toolchain:go".into()),
+                    timeout_ms: 30_000,
+                }),
+                dependency_refs: vec!["pkg/regression_test.go".into()],
+            }],
+            condition_set_revision: 1,
+            max_attempts: 3,
+            operation_limits_ref: "operation-limits:host".into(),
+            skill_refs: Vec::new(),
+            execution_owner: ExecutionOwnerV1::StandaloneSwitch,
+        };
+        let queued = CommonHarnessStateV1::queued(request, "owner:host".into(), 1)
+            .expect("registered common-harness request");
+        let mut common = apply(
+            &queued,
+            HostEventV1::StartAttempt {
+                target_version: target.into(),
+            },
+        );
+        common = record_successful_operation(
+            &common,
+            "verify:record-only-call",
+            OperationKindV1::RunVerifier,
+        );
+        common = record_successful_operation(
+            &common,
+            "patch:patch-operation",
+            OperationKindV1::ApplyPatch,
+        );
+        common = record_successful_operation(
+            &common,
+            "external:external-operation",
+            OperationKindV1::ExternalAction,
+        );
+        common = apply(
+            &common,
+            HostEventV1::BeginVerification {
+                target_version: target.into(),
+            },
+        );
+        let evidence = ConditionEvidenceV1 {
+            evidence_id: "evidence:current".into(),
+            condition_id: "AC-1".into(),
+            condition_revision: 1,
+            condition_set_revision: 1,
+            request_revision: 1,
+            target_version: target.into(),
+            comparison_scope_digest: "sha256:scope".into(),
+            execution_id: "claim:verify:record-only-call".into(),
+            operation_id: "verify:record-only-call".into(),
+            verifier_ref: "codex-common-harness/go-test-json/1".into(),
+            verifier_config_revision: 1,
+            observed: "selected tests passed".into(),
+            verdict: ConditionVerdictV1::Pass,
+            log_refs: vec![
+                format!("task-check:{source_call_id}:{}", "a".repeat(64)),
+                format!("task-check:log-only-call:{}", "b".repeat(64)),
+            ],
+            artifact_refs: vec!["pkg".into()],
+            source_evidence_ref: None,
+            comparison_proof_ref: None,
+            host_negative_proof: None,
+            lifecycle: EvidenceLifecycleV1::Current,
+        };
+        common = apply(&common, HostEventV1::RecordEvidence { evidence });
+        let mut completion = open_state(false);
+        completion.conditions[0].result = "all selected tests pass".into();
+        completion.conditions[0].scope = "selected Go tests".into();
+        completion.conditions[0].acceptance_criteria = "all selected tests pass".into();
+        completion.common_harness = Some(common);
+        codex_history::task_context::validate_completion_state_snapshot(
+            Some(&completion),
+            &BTreeMap::new(),
+        )
+        .expect("valid outer completion/common-harness bindings");
+        completion
+    }
+
+    #[test]
+    fn common_harness_candidate_logs_retain_source_task_check_snapshot() {
+        let source_call_id = "common-harness-source-call";
+        let completion = common_harness_retention_fixture(source_call_id);
+        let common = completion
+            .common_harness
+            .as_ref()
+            .expect("common-harness extension fixture");
+        assert_eq!(
+            common.evidence_refs[0].operation_id,
+            "verify:record-only-call"
+        );
+        assert!(
+            common.evidence_refs[0]
+                .log_refs
+                .iter()
+                .all(|reference| !reference.contains("record-only-call"))
+        );
+        let references = completion_task_check_references(&completion);
+        assert_eq!(
+            references,
+            HashSet::from([
+                source_call_id.to_owned(),
+                "record-only-call".to_owned(),
+                "log-only-call".to_owned(),
+            ]),
+            "candidate operation ID and both task-check log IDs are retained"
+        );
+        assert!(!references.contains("patch-operation"));
+        assert!(!references.contains("external-operation"));
+
+        let artifact_path = std::path::PathBuf::from("pkg/regression_test.go");
+        let stamp = crate::task_check::TaskArtifactStamp {
+            path: artifact_path.clone(),
+            sha256: "a".repeat(64),
+        };
+        let mut ledger = TaskCheckLedger::default();
+        for call_id in [
+            source_call_id,
+            "record-only-call",
+            "log-only-call",
+            "newer-task-check",
+        ] {
+            ledger.begin(
+                call_id.into(),
+                crate::task_check::TaskEvidenceRequest {
+                    task_id: "common-harness-root".into(),
+                    task_revision: 1,
+                    artifact_paths: vec![artifact_path.clone()],
+                    check_kind: crate::task_check::TaskCheckKind::Verification,
+                },
+                std::env::temp_dir(),
+                vec![stamp.clone()],
+            );
+            assert!(
+                ledger
+                    .finish(call_id, 0, true, vec![stamp.clone()])
+                    .is_some()
+            );
+        }
+        let retained_calls = ledger
+            .snapshot_with_references(&references)
+            .into_iter()
+            .map(|snapshot| snapshot.attempt.call_id)
+            .collect::<HashSet<_>>();
+        assert!(retained_calls.contains(source_call_id));
+        assert!(retained_calls.contains("record-only-call"));
+        assert!(retained_calls.contains("log-only-call"));
+        assert!(retained_calls.contains("newer-task-check"));
     }
 
     fn snapshot_item(value: serde_json::Value) -> RolloutItem {

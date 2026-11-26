@@ -863,7 +863,10 @@ async fn drain_to_completed(
         None
     };
     // Opt-in owner tracing also captures rejected staged proposals for diagnosis.
-    let inference_trace = if turn_context.config.rencrow_compaction {
+    let receipt_context = sess
+        .common_harness_inference_receipt_context(turn_context, &turn_context.initial_settings)
+        .await;
+    let inference_trace = if turn_context.config.rencrow_compaction || receipt_context.is_some() {
         sess.services.rollout_thread_trace.inference_trace_context(
             turn_context.sub_id.as_str(),
             turn_context.model_info().slug.as_str(),
@@ -871,6 +874,10 @@ async fn drain_to_completed(
         )
     } else {
         InferenceTraceContext::disabled()
+    };
+    let inference_trace = match receipt_context {
+        Some(context) => inference_trace.with_model_settings_receipt_context(&context),
+        None => inference_trace,
     };
     let mut stream = client_session
         .stream(

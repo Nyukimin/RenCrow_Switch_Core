@@ -9,6 +9,45 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
+#[path = "task_context/common_harness.rs"]
+mod common_harness;
+pub use common_harness::COMMON_HARNESS_CONTRACT;
+pub use common_harness::COMMON_HARNESS_VERSION;
+pub use common_harness::CheckOutputParserV1;
+pub use common_harness::CheckSpecV1;
+pub use common_harness::CommonHarnessStateV1;
+pub use common_harness::ConditionEvidenceV1;
+pub use common_harness::ConditionKindV1;
+pub use common_harness::ConditionSpecV1;
+pub use common_harness::ConditionVerdictV1;
+pub use common_harness::EvidenceLifecycleV1;
+pub use common_harness::ExecutionOwnerV1;
+pub use common_harness::ExpectedCheckOutcomeV1;
+pub use common_harness::GoTestSelectionV1;
+pub use common_harness::HostEventV1;
+pub use common_harness::HostNegativeProofV1;
+pub use common_harness::MAX_COMMON_HARNESS_ATTEMPTS;
+pub use common_harness::MAX_COMMON_HARNESS_RECORDS;
+pub use common_harness::OperationClaimKindV1;
+pub use common_harness::OperationClaimV1;
+pub use common_harness::OperationFinalizationV1;
+pub use common_harness::OperationIntentStatusV1;
+pub use common_harness::OperationIntentV1;
+pub use common_harness::OperationKindV1;
+pub use common_harness::OperationOutcomeV1;
+pub use common_harness::OperationReceiptV1;
+pub use common_harness::OperationRecordRefV1;
+pub use common_harness::OwnerTakeoverRecordV1;
+pub use common_harness::SkillRefV1;
+pub use common_harness::StateFenceV1;
+pub use common_harness::TaskRequestV1;
+pub use common_harness::TaskRunPhaseV1;
+pub use common_harness::TaskRunStateV1;
+pub use common_harness::TaskRunStatusV1;
+pub use common_harness::TransitionErrorV1;
+pub use common_harness::WaitingStateV1;
+pub use common_harness::WorkWindowV1;
+
 #[path = "task_context/accepted_evidence.rs"]
 mod accepted_evidence;
 pub use accepted_evidence::AcceptedTaskEvidenceReceipt;
@@ -94,6 +133,9 @@ pub struct CompletionState {
     pub runtime_recovery_at: Option<i64>,
     #[serde(default)]
     pub activity_at: Option<i64>,
+    /// Host-owned v1 state for a finite common-harness run. Legacy snapshots omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub common_harness: Option<CommonHarnessStateV1>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1622,6 +1664,34 @@ fn validate_completion_state_inner(
             .is_some_and(|reason| reason.trim().is_empty() || reason.len() > MAX_TEXT_BYTES)
         {
             return Err("condition unmet reason is invalid".into());
+        }
+    }
+    if let Some(common_harness) = state.common_harness.as_ref() {
+        common_harness
+            .validate(Some(&state.conditions))
+            .map_err(|error| format!("common-harness state is invalid: {error:?}"))?;
+        if common_harness.request.conditions.len() != state.conditions.len() {
+            return Err(
+                "common-harness request conditions differ from completion conditions".into(),
+            );
+        }
+        for requested in &common_harness.request.conditions {
+            let Some(condition) = conditions.get(requested.condition_id.as_str()) else {
+                return Err(format!(
+                    "common-harness condition `{}` is missing from completion conditions",
+                    requested.condition_id
+                ));
+            };
+            if condition.revision != requested.condition_revision
+                || condition.scope != requested.comparison_scope
+                || condition.result != requested.expected
+                || condition.acceptance_criteria != requested.expected
+            {
+                return Err(format!(
+                    "common-harness condition `{}` differs from its completion binding",
+                    requested.condition_id
+                ));
+            }
         }
     }
     let mut units = BTreeSet::new();

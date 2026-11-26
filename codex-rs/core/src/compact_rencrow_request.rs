@@ -99,10 +99,17 @@ async fn drain_compaction_prompt(
     let started = Instant::now();
     let responses_metadata = sess.compaction_responses_metadata(ctx, metadata).await;
     let mut client = sess.services.model_client.new_session();
+    let work_deadline = sess
+        .common_harness_inference_deadline(ctx)
+        .await
+        .map_err(CodexErr::Fatal)?;
     let response = tokio::select! {
         biased;
         _ = cancellation.cancelled() => return Err(CodexErr::TurnAborted),
-        response = drain_to_completed(sess, ctx, &mut client, &responses_metadata, &prompt, metadata.phase()) => response?,
+        response = crate::session::common_harness_deadline::within_work_window(
+            work_deadline,
+            drain_to_completed(sess, ctx, &mut client, &responses_metadata, &prompt, metadata.phase()),
+        ) => response.map_err(CodexErr::Fatal)??,
     };
     let seconds = started.elapsed().as_secs_f64();
     let rate = response

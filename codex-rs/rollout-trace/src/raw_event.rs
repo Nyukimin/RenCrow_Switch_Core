@@ -127,6 +127,13 @@ pub enum RawTraceEventPayload {
         /// Completed output items observed before cancellation, if any.
         partial_response_payload: Option<RawPayloadRef>,
     },
+    /// Host settings evidence for one existing inference call. It records
+    /// request facts and any separate verified backend observation; it does not
+    /// claim physical application when the backend observation is absent.
+    ModelSettingsReceipt {
+        inference_call_id: InferenceCallId,
+        receipt_payload: RawPayloadRef,
+    },
     ToolCallStarted {
         tool_call_id: ToolCallId,
         /// Protocol/model call ID when this runtime call came from model output.
@@ -252,6 +259,10 @@ impl RawTraceEventPayload {
             } => metadata_payload.iter().collect(),
             RawTraceEventPayload::InferenceStarted {
                 request_payload, ..
+            }
+            | RawTraceEventPayload::ModelSettingsReceipt {
+                receipt_payload: request_payload,
+                ..
             }
             | RawTraceEventPayload::InferenceCompleted {
                 response_payload: request_payload,

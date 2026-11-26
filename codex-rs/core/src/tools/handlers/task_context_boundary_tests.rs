@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-27: enable real receipt tracing in Common Begin fixtures.
 // Modified by RenCrow Switch Core, 2026-11-21: cover accepted task revision history through accept, update, and reload.
 // Modified by RenCrow Switch Core, 2026-11-21: cover host verification diagnostics in status and accept.
 // Modified by RenCrow Switch Core, 2026-11-20: separate caller and host checkpoint budgets.
@@ -6,6 +7,7 @@ use super::*;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::session::tests::make_session_and_context;
+use crate::session::tests::make_session_and_context_with_auth_and_config_and_rx;
 use crate::session::turn_context::TurnContext;
 use crate::state::ActiveTurn;
 use crate::state::RunningTask;
@@ -29,6 +31,9 @@ use tokio::sync::Mutex;
 
 #[path = "completion_checkpoint_budget_tests.rs"]
 mod completion_checkpoint_budget_tests;
+
+#[path = "common_harness_lifecycle_tests.rs"]
+mod common_harness_lifecycle_tests;
 
 static TEST_ACTIVE_TURNS: codex_diagnostics::Gauge =
     codex_diagnostics::Gauge::new("task_context_boundary_test_active_turns");
@@ -160,8 +165,372 @@ async fn attach_boundary_owner(
     store
 }
 
+fn enable_common_harness_fixture_trace(session: &mut Session, turn: &TurnContext) {
+    let trace_root = turn.config.codex_home.as_path().join("rollout-traces");
+    std::fs::create_dir_all(&trace_root).expect("common Begin trace fixture root");
+    session.services.rollout_thread_trace =
+        codex_rollout_trace::ThreadTraceContext::start_root_in_root_for_test(
+            &trace_root,
+            codex_rollout_trace::ThreadStartedTraceMetadata {
+                thread_id: session.thread_id().to_string(),
+                agent_path: "/root".into(),
+                task_name: None,
+                nickname: None,
+                agent_role: None,
+                session_source: turn.session_source.clone(),
+                cwd: turn.config.cwd.as_path().to_path_buf(),
+                rollout_path: None,
+                model: turn.model_info().slug.clone(),
+                provider_name: turn.config.model_provider_id.clone(),
+                approval_policy: turn.approval_policy().to_string(),
+                sandbox_policy: format!("{:?}", turn.sandbox_policy()),
+            },
+        )
+        .expect("enabled Common Begin fixture trace");
+    session
+        .services
+        .rollout_thread_trace
+        .record_codex_turn_started(turn.sub_id.as_str());
+}
+
 fn begin(root: &str, task: &str, revision: u64) -> serde_json::Value {
     json!({"action":"begin", "root_task_id":root, "task_id":task, "task_revision":revision})
+}
+
+#[tokio::test]
+async fn begin_accepts_and_persists_common_harness_request_while_legacy_begin_remains_accepted() {
+    let workspace = tempfile::tempdir().expect("bounded Go fixture workspace");
+    std::fs::write(
+        workspace.path().join("go.mod"),
+        "module example.test/common-harness\n\ngo 1.24\n",
+    )
+    .expect("write Go fixture module");
+    std::fs::write(
+        workspace.path().join("task_test.go"),
+        "package commonharness\nimport \"testing\"\nfunc TestBoundedFixture(t *testing.T) {}\n",
+    )
+    .expect("write Go fixture test");
+    let (session, turn_context, _events) = make_session_and_context_with_auth_and_config_and_rx(
+        codex_login::CodexAuth::from_api_key("Test API Key"),
+        Vec::new(),
+        |config| {
+            config.cwd = workspace
+                .path()
+                .to_path_buf()
+                .try_into()
+                .expect("absolute Go fixture workspace");
+        },
+    )
+    .await;
+    let mut session = Arc::try_unwrap(session)
+        .ok()
+        .expect("unique configured session for persistence setup");
+    let mut turn_context = Arc::try_unwrap(turn_context)
+        .expect("unique configured turn context for persistence setup");
+    let skill_dir = session
+        .get_config()
+        .await
+        .codex_home
+        .join("skills")
+        .join("semantic-coding");
+    std::fs::create_dir_all(&skill_dir).expect("create host skill fixture directory");
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: semantic-coding\ndescription: fixture skill\n---\n\n# Fixture\n",
+    )
+    .expect("write host skill fixture");
+    turn_context.session_source = SessionSource::Cli;
+    Arc::make_mut(&mut turn_context.config).rencrow_compaction = true;
+    Arc::make_mut(&mut turn_context.config).rencrow_autonomous_completion = true;
+    let turn = Arc::new(turn_context);
+    let _store = attach_boundary_owner(&mut session, Arc::clone(&turn)).await;
+    enable_common_harness_fixture_trace(&mut session, &turn);
+    let session = Arc::new(session);
+
+    let request = json!({
+        "contract_version": "common-harness/1.0",
+        "task_id": "task-v1",
+        "request_revision": 1,
+        "authorized_request_ref": "user-request-1",
+        "goal": "Verify a bounded task request is registered by the host",
+        "workspace_ref": "workspace-current",
+        "start_target_version": "baseline-version",
+        "permission_snapshot_ref": "permission-snapshot-current",
+        "constraints": ["Do not expand the authorized workspace"],
+        "conditions": [{
+            "condition_id": "AC-1",
+            "condition_revision": 1,
+            "kind": "test_suite",
+            "comparison_scope": "TestBoundedFixture",
+            "expected": "the single selected fixture test passes",
+            "required": true,
+            "verifier_ref": "codex-common-harness/go-test-json/1",
+            "verifier_config_revision": 1,
+            "check": {
+                "argv": ["go", "test", "-json", "-count=1", "-run", "^TestBoundedFixture$", "."],
+                "parser": "go_test_json",
+                "expected_outcome": {
+                    "test_counts": {"passed": 1, "failed": 0, "skipped": 0}
+                },
+                "go_test_selection": {
+                    "selected_cases": ["TestBoundedFixture"],
+                    "expected_case_count": 1
+                },
+                "cwd_binding_refs": ["go.mod", "task_test.go"],
+                "allowed_environment_refs": [],
+                "toolchain_ref": "go",
+                "timeout_ms": 30000
+            },
+            "dependency_refs": ["go.mod", "task_test.go"]
+        }],
+        "condition_set_revision": 1,
+        "max_attempts": 3,
+        "operation_limits_ref": "operation-limits-1",
+        "skill_refs": [{
+            "id": "semantic-coding",
+            "version_ref": "local-current",
+            "content_digest": "sha256:skill-content",
+            "source_ref": "skills/semantic-coding/SKILL.md"
+        }],
+        "execution_owner": "standalone_switch"
+    });
+    let mut omitted_host_metadata_request = request.clone();
+    for host_owned in [
+        "authorized_request_ref",
+        "workspace_ref",
+        "start_target_version",
+        "permission_snapshot_ref",
+        "operation_limits_ref",
+    ] {
+        omitted_host_metadata_request
+            .as_object_mut()
+            .expect("request object")
+            .remove(host_owned);
+    }
+    omitted_host_metadata_request["skill_refs"] = json!([{"id": "semantic-coding"}]);
+    let begin_args = json!({
+        "action": "begin",
+        "root_task_id": "root-v1",
+        "task_id": "task-v1",
+        "task_revision": 1,
+        "common_harness_request": request
+    });
+    let result = TaskContextBoundaryHandler::new(true)
+        .handle(invocation_in_session(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            "begin-common-harness-v1",
+            begin_args,
+        ))
+        .await;
+    assert!(
+        result.is_ok(),
+        "Begin should accept a common_harness_request: {:?}",
+        result.err()
+    );
+
+    assert_eq!(
+        session
+            .active_task_scope()
+            .await
+            .map(|scope| { (scope.root_task_id, scope.task_id, scope.task_revision) }),
+        Some(("root-v1".into(), "task-v1".into(), 1))
+    );
+    let stored = session
+        .rencrow_completion_state("root-v1")
+        .await
+        .expect("v1 completion state remains available after Begin persistence");
+    let stored = serde_json::to_value(stored).expect("serialize persisted completion state");
+    assert_eq!(stored["common_harness"]["contract_version"], 1);
+    assert_eq!(stored["common_harness"]["request"]["task_id"], "task-v1");
+    assert_eq!(stored["common_harness"]["request"]["request_revision"], 1);
+    assert_ne!(
+        stored["common_harness"]["request"]["authorized_request_ref"], "user-request-1",
+        "authorization provenance comes from the host session"
+    );
+    assert_ne!(
+        stored["common_harness"]["request"]["workspace_ref"], "workspace-current",
+        "workspace binding comes from the session cwd"
+    );
+    assert_ne!(
+        stored["common_harness"]["request"]["start_target_version"], "baseline-version",
+        "starting target version is captured by the host"
+    );
+    assert_eq!(
+        stored["common_harness"]["run_state"]["target_version"],
+        stored["common_harness"]["request"]["start_target_version"]
+    );
+    assert_ne!(
+        stored["common_harness"]["request"]["permission_snapshot_ref"],
+        "permission-snapshot-current",
+        "permissions are bound from the host session"
+    );
+    assert!(
+        !stored["common_harness"]["request"]["skill_refs"]
+            .to_string()
+            .contains("sha256:skill-content"),
+        "skill references are bound to host-resolved skill content"
+    );
+    assert_ne!(
+        stored["common_harness"]["request"]["conditions"][0]["check"]["toolchain_ref"], "go",
+        "the Go toolchain is resolved by the host"
+    );
+
+    let downgraded_begin = TaskContextBoundaryHandler::new(true)
+        .handle(invocation_in_session(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            "legacy-begin-cannot-downgrade-v1",
+            begin("root-v1", "task-v1", 1),
+        ))
+        .await;
+    assert!(
+        matches!(
+            downgraded_begin,
+            Err(FunctionCallError::RespondToModel(message))
+                if message.contains("common-harness v1")
+        ),
+        "a legacy Begin must fail explicitly while the active scope is v1"
+    );
+    let legacy_update = TaskContextBoundaryHandler::new(true)
+        .handle(invocation_in_session(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            "legacy-update-cannot-replace-v1",
+            json!({
+                "action": "update",
+                "root_task_id": "root-v1",
+                "completion_state": {
+                    "contract_revision": 9,
+                    "conditions": [],
+                    "units": [],
+                }
+            }),
+        ))
+        .await;
+    assert!(
+        matches!(
+            legacy_update,
+            Err(FunctionCallError::RespondToModel(message))
+                if message.contains("common-harness v1")
+        ),
+        "legacy Update must not replace or bypass host-owned v1 state"
+    );
+    let legacy_accept = TaskContextBoundaryHandler::new(true)
+        .handle(invocation_in_session(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            "legacy-accept-cannot-bypass-v1",
+            json!({"action": "accept", "result": "claimed complete"}),
+        ))
+        .await;
+    assert!(
+        matches!(
+            legacy_accept,
+            Err(FunctionCallError::RespondToModel(message))
+                if message.contains("common-harness v1")
+        ),
+        "legacy Accept must use the v1 host completion gate"
+    );
+    let after_legacy_actions = session
+        .rencrow_completion_state("root-v1")
+        .await
+        .expect("v1 state remains installed after rejected legacy actions");
+    assert_eq!(
+        serde_json::to_value(after_legacy_actions).expect("serialize unchanged completion state")["common_harness"],
+        stored["common_harness"],
+        "legacy actions cannot remove or mutate the persisted v1 state"
+    );
+
+    let (omitted_session, omitted_turn_context, _omitted_events) =
+        make_session_and_context_with_auth_and_config_and_rx(
+            codex_login::CodexAuth::from_api_key("Test API Key"),
+            Vec::new(),
+            |config| {
+                config.cwd = workspace
+                    .path()
+                    .to_path_buf()
+                    .try_into()
+                    .expect("absolute Go fixture workspace");
+            },
+        )
+        .await;
+    let mut omitted_session = Arc::try_unwrap(omitted_session)
+        .ok()
+        .expect("unique configured session for omitted-metadata persistence setup");
+    let mut omitted_turn_context = Arc::try_unwrap(omitted_turn_context)
+        .expect("unique configured turn context for omitted-metadata setup");
+    omitted_turn_context.session_source = SessionSource::Cli;
+    Arc::make_mut(&mut omitted_turn_context.config).rencrow_compaction = true;
+    Arc::make_mut(&mut omitted_turn_context.config).rencrow_autonomous_completion = true;
+    let omitted_skill_dir = omitted_session
+        .get_config()
+        .await
+        .codex_home
+        .join("skills")
+        .join("semantic-coding");
+    std::fs::create_dir_all(&omitted_skill_dir).expect("create host skill fixture directory");
+    std::fs::write(
+        omitted_skill_dir.join("SKILL.md"),
+        "---\nname: semantic-coding\ndescription: fixture skill\n---\n\n# Fixture\n",
+    )
+    .expect("write host skill fixture");
+    let omitted_turn = Arc::new(omitted_turn_context);
+    let _omitted_store =
+        attach_boundary_owner(&mut omitted_session, Arc::clone(&omitted_turn)).await;
+    enable_common_harness_fixture_trace(&mut omitted_session, &omitted_turn);
+    let omitted_session = Arc::new(omitted_session);
+    TaskContextBoundaryHandler::new(true)
+        .handle(invocation_in_session(
+            Arc::clone(&omitted_session),
+            Arc::clone(&omitted_turn),
+            "begin-common-harness-with-host-defaults",
+            json!({
+                "action": "begin",
+                "root_task_id": "root-host-defaults",
+                "task_id": "task-v1",
+                "task_revision": 1,
+                "common_harness_request": omitted_host_metadata_request,
+            }),
+        ))
+        .await
+        .expect("ordinary Begin may omit host-owned reference metadata");
+    let omitted_stored = omitted_session
+        .rencrow_completion_state("root-host-defaults")
+        .await
+        .expect("omitted-metadata Begin persisted host state");
+    assert!(
+        !omitted_stored
+            .common_harness
+            .unwrap()
+            .request
+            .workspace_ref
+            .is_empty()
+    );
+
+    let (mut legacy_session, mut legacy_turn_context) = make_session_and_context().await;
+    legacy_turn_context.session_source = SessionSource::Cli;
+    Arc::make_mut(&mut legacy_turn_context.config).rencrow_compaction = true;
+    let legacy_turn = Arc::new(legacy_turn_context);
+    let _legacy_store = attach_boundary_owner(&mut legacy_session, Arc::clone(&legacy_turn)).await;
+    let legacy_session = Arc::new(legacy_session);
+    TaskContextBoundaryHandler::new(false)
+        .handle(invocation_in_session(
+            Arc::clone(&legacy_session),
+            Arc::clone(&legacy_turn),
+            "begin-legacy-control",
+            begin("legacy-root", "legacy-task", 1),
+        ))
+        .await
+        .expect("legacy Begin without common_harness_request remains accepted");
+    assert_eq!(
+        legacy_session.active_task_scope().await.map(|scope| (
+            scope.root_task_id,
+            scope.task_id,
+            scope.task_revision
+        )),
+        Some(("legacy-root".into(), "legacy-task".into(), 1))
+    );
 }
 
 #[test]
@@ -737,7 +1106,24 @@ fn enabled_schema_action_shapes_match_argument_parser() {
     let one_of = schema["parameters"]["oneOf"]
         .as_array()
         .expect("enabled schema has action-specific oneOf");
-    let expected: [(&str, &[&str], &[&str]); 7] = [
+    let expected: [(&str, &[&str], &[&str]); 8] = [
+        (
+            "begin",
+            &[
+                "action",
+                "root_task_id",
+                "task_id",
+                "task_revision",
+                "common_harness_request",
+            ],
+            &[
+                "action",
+                "root_task_id",
+                "task_id",
+                "task_revision",
+                "common_harness_request",
+            ],
+        ),
         (
             "begin",
             &[
@@ -851,6 +1237,88 @@ fn enabled_schema_action_shapes_match_argument_parser() {
     ] {
         assert!(serde_json::from_value::<TaskContextBoundaryArgs>(invalid).is_err());
     }
+}
+
+#[test]
+fn common_harness_begin_schema_advertises_host_bound_go_verifier_inputs() {
+    let schema = serde_json::to_value(TaskContextBoundaryHandler::new(true).spec())
+        .expect("enabled schema serializes");
+    let request = &schema["parameters"]["properties"]["common_harness_request"];
+    assert_eq!(
+        request["properties"]["contract_version"]["enum"],
+        json!(["common-harness/1.0"])
+    );
+    let request_required = request["required"]
+        .as_array()
+        .expect("common harness required fields")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect::<Vec<_>>();
+    for host_owned in [
+        "authorized_request_ref",
+        "workspace_ref",
+        "start_target_version",
+        "permission_snapshot_ref",
+        "operation_limits_ref",
+    ] {
+        assert!(
+            !request_required.contains(&host_owned),
+            "Begin must not require model-invented host reference {host_owned}"
+        );
+    }
+    let condition = &request["properties"]["conditions"]["items"];
+    assert_eq!(
+        condition["properties"]["verifier_ref"]["enum"],
+        json!(["codex-common-harness/go-test-json/1"])
+    );
+    assert_eq!(
+        condition["properties"]["verifier_config_revision"]["type"],
+        "number"
+    );
+    assert!(
+        condition["properties"]["verifier_config_revision"]["description"]
+            .as_str()
+            .is_some_and(|description| description.contains('1'))
+    );
+    let check = &condition["properties"]["check"];
+    assert_eq!(
+        check["properties"]["parser"]["enum"],
+        json!(["go_test_json"])
+    );
+    let selection = &check["properties"]["go_test_selection"];
+    assert_eq!(selection["type"], "object");
+    assert_eq!(
+        selection["required"],
+        json!(["selected_cases", "expected_case_count"])
+    );
+    assert_eq!(selection["properties"]["selected_cases"]["type"], "array");
+    assert_eq!(
+        selection["properties"]["expected_case_count"]["type"],
+        "number"
+    );
+    let outcomes = check["properties"]["expected_outcome"]["oneOf"]
+        .as_array()
+        .expect("supported typed Go outcomes are advertised");
+    let outcome_tags = outcomes
+        .iter()
+        .flat_map(|variant| variant["properties"].as_object().into_iter())
+        .flat_map(|properties| properties.keys().cloned())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        outcome_tags,
+        [
+            "all_selected_tests_pass",
+            "failure_identity",
+            "specified_test_failure",
+            "test_counts",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    );
+    let skills = &request["properties"]["skill_refs"]["items"];
+    assert_eq!(skills["required"], json!(["id"]));
+    assert_eq!(skills["properties"]["id"]["type"], "string");
 }
 
 #[test]
@@ -1147,6 +1615,7 @@ async fn tool_is_registered_only_for_parent_sources_when_compaction_is_enabled()
             /*apps_enabled*/ false,
             &turn.extension_data,
             /*tool_suggest_candidates*/ None,
+            /*common_harness_tool_profile*/ None,
         )
         .expect("build tool router");
         assert_eq!(

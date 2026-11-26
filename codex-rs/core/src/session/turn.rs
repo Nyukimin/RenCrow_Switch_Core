@@ -517,6 +517,31 @@ pub(crate) async fn run_turn(
         )
         .await;
 
+        let common_harness_active = if let Some((_, common)) = sess
+            .common_harness_turn_state(&turn_context)
+            .await
+            .map_err(CodexErr::Stream)?
+        {
+            if let Some(message) =
+                super::common_harness_completion::common_harness_stop_reason(&common)
+            {
+                let model_info = turn_context.capture_current_model_info();
+                if let Some(result) = sess
+                    .emit_common_harness_terminal_result(&turn_context, model_info.as_ref())
+                    .await
+                    .map_err(CodexErr::Fatal)?
+                {
+                    last_agent_message = Some(result);
+                }
+                sess.send_event(&turn_context, EventMsg::Warning(WarningEvent { message }))
+                    .await;
+                break;
+            }
+            true
+        } else {
+            false
+        };
+
         // Capture once so context, advertised tools, and tool calls share one request view.
         let step_context = match next_step_context.take() {
             Some(step_context) if pending_input.is_empty() => step_context,
@@ -563,6 +588,7 @@ pub(crate) async fn run_turn(
             return Err(CodexErr::TurnAborted);
         }
         if turn_context.config.rencrow_autonomous_completion
+            && !common_harness_active
             && matches!(
                 &turn_context.session_source,
                 SessionSource::Cli | SessionSource::VSCode | SessionSource::Exec
@@ -743,6 +769,32 @@ pub(crate) async fn run_turn(
                 let task_boundary_committed = sess
                     .take_task_boundary_committed_turn(&turn_context.sub_id)
                     .await;
+                if let Some(result) = sess
+                    .common_harness_checkpoint_result(
+                        &turn_context,
+                        task_boundary_committed,
+                        has_pending_input,
+                    )
+                    .await
+                    .map_err(CodexErr::Fatal)?
+                {
+                    sess.record_response_item_and_emit_turn_item(
+                        &turn_context,
+                        &step_context.settings.model_info,
+                        ResponseItem::Message {
+                            id: None,
+                            role: "assistant".into(),
+                            content: vec![ContentItem::OutputText {
+                                text: result.clone(),
+                            }],
+                            phase: Some(codex_protocol::models::MessagePhase::FinalAnswer),
+                            internal_chat_message_metadata_passthrough: None,
+                        },
+                    )
+                    .await;
+                    last_agent_message = Some(result);
+                    break;
+                }
                 let should_roll_over = needs_follow_up
                     && (token_limit_reached
                         || (context_window_requested && !task_boundary_committed));
@@ -818,7 +870,48 @@ pub(crate) async fn run_turn(
                         last_agent_message = None;
                         continue;
                     }
+                    let common_harness_decision = sess
+                        .common_harness_turn_end_gate(&turn_context)
+                        .await
+                        .map_err(CodexErr::Stream)?;
+                    if matches!(
+                        &common_harness_decision,
+                        super::common_harness_completion::CommonHarnessTurnEndDecision::Stopped { .. }
+                            | super::common_harness_completion::CommonHarnessTurnEndDecision::Completed { .. }
+                    ) && let Some(result) = sess.common_harness_terminal_result(&turn_context)
+                        .await.map_err(CodexErr::Fatal)? {
+                        sess.record_response_item_and_emit_turn_item(
+                            &turn_context,
+                            &step_context.settings.model_info,
+                            ResponseItem::Message {
+                                id: None,
+                                role: "assistant".into(),
+                                content: vec![ContentItem::OutputText { text: result.clone() }],
+                                phase: Some(codex_protocol::models::MessagePhase::FinalAnswer),
+                                internal_chat_message_metadata_passthrough: None,
+                            },
+                        ).await;
+                        last_agent_message = Some(result);
+                    }
+                    let common_harness_terminal = match common_harness_decision {
+                        super::common_harness_completion::CommonHarnessTurnEndDecision::Legacy => false,
+                        super::common_harness_completion::CommonHarnessTurnEndDecision::Continue { next_action } => {
+                            let item = crate::context::ContextualUserFragment::into_boxed_response_item(
+                                Box::new(crate::context::AutonomousCompletionContinue { next_action }),
+                            );
+                            sess.record_response_item_and_emit_turn_item(&turn_context,
+                                &step_context.settings.model_info, item).await;
+                            last_agent_message = None;
+                            continue;
+                        }
+                        super::common_harness_completion::CommonHarnessTurnEndDecision::Stopped { reason, .. } => {
+                            sess.send_event(&turn_context, EventMsg::Warning(WarningEvent { message:reason })).await;
+                            break;
+                        }
+                        super::common_harness_completion::CommonHarnessTurnEndDecision::Completed { .. } => true,
+                    };
                     if turn_context.config.rencrow_autonomous_completion
+                        && !common_harness_terminal
                         && matches!(
                             &turn_context.session_source,
                             SessionSource::Cli | SessionSource::VSCode | SessionSource::Exec
@@ -833,6 +926,7 @@ pub(crate) async fn run_turn(
                         return Err(CodexErr::Stream(error));
                     }
                     if turn_context.config.rencrow_autonomous_completion
+                        && !common_harness_terminal
                         && matches!(
                             &turn_context.session_source,
                             SessionSource::Cli | SessionSource::VSCode | SessionSource::Exec
@@ -921,6 +1015,7 @@ pub(crate) async fn run_turn(
                         }
                     }
                     if turn_context.config.rencrow_autonomous_completion
+                        && !common_harness_terminal
                         && matches!(
                             &turn_context.session_source,
                             SessionSource::Cli | SessionSource::VSCode | SessionSource::Exec
@@ -1148,6 +1243,14 @@ pub(crate) async fn run_turn(
                 sess.track_turn_codex_error(turn_context.as_ref(), &e);
                 let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
                 sess.send_event(&turn_context, event).await;
+                let model_info = turn_context.capture_current_model_info();
+                if let Some(result) = sess
+                    .emit_common_harness_terminal_result(&turn_context, model_info.as_ref())
+                    .await
+                    .map_err(CodexErr::Fatal)?
+                {
+                    last_agent_message = Some(result);
+                }
                 // let the user continue the conversation
                 break;
             }
@@ -1613,12 +1716,34 @@ async fn track_turn_resolved_config_analytics(
 }
 
 #[instrument(level = "trace", skip_all)]
-async fn run_pre_sampling_compact(
+pub(crate) async fn run_pre_sampling_compact(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
     client_session: &mut ModelClientSession,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<()> {
+    if let Some((_, common)) = sess
+        .common_harness_turn_state(turn_context)
+        .await
+        .map_err(CodexErr::Fatal)?
+    {
+        if super::common_harness_completion::common_harness_stop_reason(&common).is_some() {
+            return Ok(());
+        }
+        if let Err(reason) = sess.common_harness_inference_deadline(turn_context).await {
+            // Preserve pending user input: run_turn records it after this seam, then
+            // the ordinary inference gate observes the durable stopped state.
+            if let Some((_, stopped)) = sess
+                .common_harness_turn_state(turn_context)
+                .await
+                .map_err(CodexErr::Fatal)?
+                && super::common_harness_completion::common_harness_stop_reason(&stopped).is_some()
+            {
+                return Ok(());
+            }
+            return Err(CodexErr::Fatal(reason));
+        }
+    }
     maybe_run_previous_model_inline_compact(sess, turn_context, client_session, cancellation_token)
         .await?;
     let token_status =
@@ -1969,6 +2094,12 @@ async fn run_sampling_request(
                     .for_prompt(&step_context.settings.model_info.input_modalities)
             };
             let mut prompt_input = prompt_input;
+            sess.common_harness_inference_deadline(&turn_context)
+                .await
+                .map_err(CodexErr::Fatal)?;
+            sess.append_common_harness_prompt_context(&turn_context, &mut prompt_input)
+                .await
+                .map_err(CodexErr::Fatal)?;
             sess.services
                 .executed_tool_calls
                 .attach_to_prompt(&mut prompt_input, &mut executed_tool_calls_by_output);
@@ -2008,6 +2139,16 @@ async fn run_sampling_request(
                     return Ok((output, original_input.unwrap_or(prompt.input)));
                 }
                 Err(err) => match err.details() {
+                    CodexErrorDetails::Fatal(reason) => {
+                        if reason == super::common_harness_deadline::WORK_WINDOW_EXPIRED {
+                            // try_run_sampling_request has drained started tools. Persist
+                            // expiry now, without cancelling their dispatch futures.
+                            sess.common_harness_inference_deadline(&turn_context)
+                                .await
+                                .map_err(CodexErr::Fatal)?;
+                        }
+                        return Err(err);
+                    }
                     CodexErrorDetails::ContextWindowExceeded => {
                         sess.set_total_tokens_full(&turn_context).await;
                         return Err(err);
@@ -2110,6 +2251,38 @@ pub(crate) async fn built_tools(
     step_store: &ExtensionData,
     prepared_recommendations: PreparedToolRecommendations,
 ) -> CodexResult<Arc<ToolRouter>> {
+    let common_harness_tool_profile = if let Some((root_task_id, common)) =
+        sess.common_harness_tool_state_for_turn(turn_context).await
+    {
+        let scope_matches = sess
+            .active_task_scope()
+            .await
+            .is_some_and(|scope| scope.root_task_id == root_task_id);
+        let task_is_nonterminal = !matches!(
+            common.run_state.status,
+            codex_history::task_context::TaskRunStatusV1::Completed
+                | codex_history::task_context::TaskRunStatusV1::Cancelled
+                | codex_history::task_context::TaskRunStatusV1::Exhausted
+        );
+        if !scope_matches || !task_is_nonterminal {
+            if !sess.is_read_only_review_actor_for_turn(turn_context).await
+                && sess
+                    .reserved_common_harness_execution_for_turn(turn_context)
+                    .await
+                    .is_some()
+            {
+                crate::tools::registry::CommonHarnessToolProfile::ReservedBegin
+            } else {
+                crate::tools::registry::CommonHarnessToolProfile::StatusOnly
+            }
+        } else if sess.is_read_only_review_actor_for_turn(turn_context).await {
+            crate::tools::registry::CommonHarnessToolProfile::ReviewReadOnly
+        } else {
+            crate::tools::registry::CommonHarnessToolProfile::Root
+        }
+    } else {
+        crate::tools::registry::CommonHarnessToolProfile::Legacy
+    };
     let all_mcp_tools = mcp.tools();
     let connector_snapshot = mcp.config().connector_snapshot.clone();
 
@@ -2179,6 +2352,7 @@ pub(crate) async fn built_tools(
         apps_enabled,
         step_store,
         tool_suggest_candidates.as_ref(),
+        Some(common_harness_tool_profile),
     )?))
 }
 
@@ -2863,7 +3037,18 @@ async fn try_run_sampling_request(
         },
     )
     .await;
-    let mut stream = client_session
+    let work_deadline = sess
+        .common_harness_inference_deadline(&turn_context)
+        .await
+        .map_err(CodexErr::Fatal)?;
+    let inference_trace = match sess
+        .common_harness_inference_receipt_context(turn_context.as_ref(), &step_context.settings)
+        .await
+    {
+        Some(context) => inference_trace.with_model_settings_receipt_context(&context),
+        None => inference_trace,
+    };
+    let stream_request = client_session
         .stream(
             prompt,
             &step_context.settings.model_info,
@@ -2879,8 +3064,11 @@ async fn try_run_sampling_request(
             &inference_trace,
         )
         .instrument(trace_span!("stream_request"))
-        .or_cancel(&cancellation_token)
-        .await??;
+        .or_cancel(&cancellation_token);
+    let mut stream =
+        super::common_harness_deadline::within_work_window(work_deadline, stream_request)
+            .await
+            .map_err(CodexErr::Fatal)???;
     let mut in_flight: FuturesOrdered<InFlightFuture<'static>> = FuturesOrdered::new();
     let mut deferred_output_items = Vec::new();
     let mut needs_follow_up = false;
@@ -2927,12 +3115,18 @@ async fn try_run_sampling_request(
             codex.usage.total_tokens = field::Empty,
         );
 
-        let event = match stream
+        let next_event = stream
             .next()
             .instrument(trace_span!(parent: &handle_responses, "receiving"))
-            .or_cancel(&cancellation_token)
-            .await
-        {
+            .or_cancel(&cancellation_token);
+        let event =
+            match super::common_harness_deadline::within_work_window(work_deadline, next_event)
+                .await
+            {
+                Ok(event) => event,
+                Err(reason) => break Err(CodexErr::Fatal(reason)),
+            };
+        let event = match event {
             Ok(event) => event,
             Err(codex_async_utils::CancelErr::Cancelled) => {
                 break Err(CodexErr::TurnAborted);

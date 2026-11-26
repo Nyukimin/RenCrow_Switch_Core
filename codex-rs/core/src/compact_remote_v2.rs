@@ -397,6 +397,21 @@ async fn run_remote_compaction_request_v2(
         .info()
         .stream_max_retries()
         .min(MAX_REMOTE_COMPACTION_V2_STREAM_RETRIES);
+    let receipt_context = sess
+        .common_harness_inference_receipt_context(turn_context.as_ref(), &step_context.settings)
+        .await;
+    let inference_trace = match receipt_context {
+        Some(context) => sess
+            .services
+            .rollout_thread_trace
+            .inference_trace_context(
+                turn_context.sub_id.as_str(),
+                turn_context.model_info().slug.as_str(),
+                turn_context.provider.info().name.as_str(),
+            )
+            .with_model_settings_receipt_context(&context),
+        None => InferenceTraceContext::disabled(),
+    };
     let mut retry_state = ResponsesStreamRetryState::default();
     loop {
         let result = match client_session
@@ -412,7 +427,7 @@ async fn run_remote_compaction_request_v2(
                 turn_context.reasoning_summary(),
                 step_context.settings.service_tier.clone(),
                 responses_metadata,
-                &InferenceTraceContext::disabled(),
+                &inference_trace,
             )
             .await
         {

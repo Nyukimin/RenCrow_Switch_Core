@@ -1,4 +1,5 @@
 // Modified by RenCrow Switch Core, 2026-11-21: expose explicit authorized resume receipts.
+// Modified by RenCrow Switch Core, 2026-11-26: register bounded common-harness observations.
 //! Root of the `codex-core` library.
 
 // Prevent accidental direct writes to stdout/stderr in library code. All
@@ -32,6 +33,9 @@ pub use responses_metadata::CodexResponsesMetadata;
 pub use turn_metadata::detached_memory_responses_metadata;
 mod autonomous_progress;
 mod codex_thread;
+mod common_harness_artifacts;
+mod common_harness_io;
+mod common_harness_native_patch;
 mod compact_model_fallback;
 mod compact_remote_history;
 mod compact_remote_v2;

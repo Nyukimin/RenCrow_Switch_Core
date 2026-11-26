@@ -474,6 +474,9 @@ impl TraceReducer {
             RawTraceEventPayload::Other { .. } => {
                 bail!("raw trace event has no reducer implementation");
             }
+            // Receipt evidence is registered by raw_payload_refs and does not
+            // alter the reduced conversation.
+            RawTraceEventPayload::ModelSettingsReceipt { .. } => {}
         }
 
         Ok(())

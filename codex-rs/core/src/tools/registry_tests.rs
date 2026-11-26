@@ -864,6 +864,11 @@ fn test_invocation(
     tool_name: codex_tools::ToolName,
 ) -> ToolInvocation {
     let step_context = StepContext::for_test(Arc::clone(&turn));
+    let arguments = if tool_name.name == "task_context_boundary" {
+        r#"{"action":"status"}"#.to_string()
+    } else {
+        "{}".to_string()
+    };
     ToolInvocation {
         session,
         step_context,
@@ -875,8 +880,421 @@ fn test_invocation(
         call_id: call_id.to_string(),
         tool_name,
         source: crate::tools::context::ToolCallSource::Direct,
-        payload: ToolPayload::Function {
-            arguments: "{}".to_string(),
-        },
+        payload: ToolPayload::Function { arguments },
     }
+}
+
+async fn common_harness_policy_fixture() -> (
+    Arc<crate::session::session::Session>,
+    Arc<crate::session::turn_context::TurnContext>,
+) {
+    common_harness_policy_fixture_with_scope(true).await
+}
+
+async fn common_harness_policy_fixture_with_scope(
+    bind_scope: bool,
+) -> (
+    Arc<crate::session::session::Session>,
+    Arc<crate::session::turn_context::TurnContext>,
+) {
+    use codex_history::task_context::AcceptanceCondition;
+    use codex_history::task_context::AcceptanceStatus;
+    use codex_history::task_context::CheckOutputParserV1;
+    use codex_history::task_context::CheckSpecV1;
+    use codex_history::task_context::CommonHarnessStateV1;
+    use codex_history::task_context::CompletionState;
+    use codex_history::task_context::CompletionUnit;
+    use codex_history::task_context::CompletionUnitKind;
+    use codex_history::task_context::ConditionKindV1;
+    use codex_history::task_context::ConditionSpecV1;
+    use codex_history::task_context::ExecutionOwnerV1;
+    use codex_history::task_context::ExpectedCheckOutcomeV1;
+    use codex_history::task_context::GoTestSelectionV1;
+    use codex_history::task_context::SkillRefV1;
+    use codex_history::task_context::TaskRequestV1;
+    use codex_history::task_context::UnitStatus;
+
+    let (mut session, mut turn) = crate::session::tests::make_session_and_context().await;
+    turn.session_source = codex_protocol::protocol::SessionSource::Cli;
+    let mut config = (*turn.config).clone();
+    config.rencrow_compaction = true;
+    config.rencrow_autonomous_completion = true;
+    turn.config = Arc::new(config);
+    let trace_root = turn.config.codex_home.as_path().join("rollout-traces");
+    std::fs::create_dir_all(&trace_root).expect("policy fixture trace root");
+    session.services.rollout_thread_trace =
+        codex_rollout_trace::ThreadTraceContext::start_root_in_root_for_test(
+            &trace_root,
+            codex_rollout_trace::ThreadStartedTraceMetadata {
+                thread_id: session.thread_id().to_string(),
+                agent_path: "/root".into(),
+                task_name: None,
+                nickname: None,
+                agent_role: None,
+                session_source: turn.session_source.clone(),
+                cwd: turn.config.cwd.as_path().to_path_buf(),
+                rollout_path: None,
+                model: turn.model_info().slug.clone(),
+                provider_name: turn.config.model_provider_id.clone(),
+                approval_policy: turn.approval_policy().to_string(),
+                sandbox_policy: format!("{:?}", turn.sandbox_policy()),
+            },
+        )
+        .expect("enabled policy fixture trace");
+    session
+        .services
+        .rollout_thread_trace
+        .record_codex_turn_started(turn.sub_id.as_str());
+    let request = TaskRequestV1 {
+        task_id: "policy-task".into(),
+        request_revision: 1,
+        authorized_request_ref: "host-auth".into(),
+        goal: "Verify the policy fixture".into(),
+        workspace_ref: "host-workspace".into(),
+        start_target_version: "sha256:baseline".into(),
+        permission_snapshot_ref: "sha256:permissions".into(),
+        constraints: vec![],
+        conditions: vec![ConditionSpecV1 {
+            condition_id: "AC-1".into(),
+            condition_revision: 1,
+            kind: ConditionKindV1::TestSuite,
+            comparison_scope: "TestPolicyFixture".into(),
+            expected: "selected fixture test passes".into(),
+            required: true,
+            verifier_ref: Some("codex-common-harness/go-test-json/1".into()),
+            verifier_config_revision: Some(1),
+            check: Some(CheckSpecV1 {
+                argv: vec![
+                    "go".into(),
+                    "test".into(),
+                    "-json".into(),
+                    "-count=1".into(),
+                    "./...".into(),
+                ],
+                parser: CheckOutputParserV1::GoTestJson,
+                expected_outcome: ExpectedCheckOutcomeV1::AllSelectedTestsPass,
+                go_test_selection: Some(GoTestSelectionV1 {
+                    selected_cases: vec!["TestPolicyFixture".into()],
+                    expected_case_count: 1,
+                }),
+                cwd_binding_refs: vec!["go.mod".into(), "policy_test.go".into()],
+                allowed_environment_refs: vec![],
+                toolchain_ref: Some("/host/go:go version go1.26.3".into()),
+                timeout_ms: 30_000,
+            }),
+            dependency_refs: vec!["go.mod".into(), "policy_test.go".into()],
+        }],
+        condition_set_revision: 1,
+        max_attempts: 2,
+        operation_limits_ref: "host-limits".into(),
+        skill_refs: vec![SkillRefV1 {
+            id: "semantic-coding".into(),
+            version_ref: "sha256:skill".into(),
+            content_digest: "sha256:skill".into(),
+            source_ref: "host/skill.md".into(),
+        }],
+        execution_owner: ExecutionOwnerV1::StandaloneSwitch,
+    };
+    let common = CommonHarnessStateV1::queued(
+        request,
+        crate::session::common_harness::common_harness_runtime_owner_id(
+            &session.thread_id().to_string(),
+        ),
+        1,
+    )
+    .expect("valid common-harness test state");
+    let completion = CompletionState {
+        contract_revision: 1,
+        units_completed_since_review: 0,
+        plan_review_at: None,
+        plan_reviews: vec![],
+        paused: false,
+        consumed_host_events: vec![],
+        conditions: vec![AcceptanceCondition {
+            id: "AC-1".into(),
+            revision: 1,
+            result: "selected fixture test passes".into(),
+            scope: "TestPolicyFixture".into(),
+            verification: "go test".into(),
+            acceptance_criteria: "selected fixture test passes".into(),
+            status: AcceptanceStatus::Open,
+            evidence: vec![],
+            unmet_reason: None,
+        }],
+        units: vec![CompletionUnit {
+            id: "policy-task".into(),
+            purpose: "Verify the policy fixture".into(),
+            status: UnitStatus::Ready,
+            kind: CompletionUnitKind::Execution,
+            condition_refs: vec!["AC-1".into()],
+            depends_on: vec![],
+            evidence: vec![],
+            task_refs: vec![],
+            review_target: None,
+            review_evidence: None,
+            review_launch: None,
+            review_decision_reason: None,
+            review_state: None,
+            review_revalidation_of: None,
+        }],
+        current_unit: Some("policy-task".into()),
+        failed_approaches: vec![],
+        blocker: None,
+        next_action: Some("Run the bounded verifier".into()),
+        product_progress_at: None,
+        runtime_recovery_at: None,
+        activity_at: None,
+        common_harness: Some(common),
+    };
+    session
+        .set_rencrow_completion_state(
+            "policy-root".into(),
+            serde_json::to_value(completion).unwrap(),
+        )
+        .await
+        .expect("persist v1 policy fixture");
+    if bind_scope {
+        session
+            .begin_task_scope(
+                "policy-root".into(),
+                "policy-task".into(),
+                1,
+                "policy-begin".into(),
+                false,
+            )
+            .await
+            .expect("activate v1 policy fixture scope");
+    }
+    (Arc::new(session), Arc::new(turn))
+}
+
+#[tokio::test]
+async fn common_harness_policy_survives_new_turn_without_scope_but_denies_effects() {
+    let (session, turn) = common_harness_policy_fixture_with_scope(false).await;
+    let old_sub_id = turn.sub_id.clone();
+    let mut resumed_turn = Arc::try_unwrap(turn).expect("policy fixture retains one turn context");
+    resumed_turn.sub_id = format!("resumed-after-{old_sub_id}");
+    let resumed_turn = Arc::new(resumed_turn);
+
+    let persisted = session
+        .current_common_harness_state("policy-root")
+        .await
+        .expect("nonterminal v1 request persists across a fresh turn");
+    assert_eq!(persisted.run_state.task_id, "policy-task");
+    assert!(
+        session
+            .common_harness_tool_state_for_turn(&resumed_turn)
+            .await
+            .is_some(),
+        "the new turn must retain canonical common-harness policy"
+    );
+
+    let status = test_invocation(
+        Arc::clone(&session),
+        Arc::clone(&resumed_turn),
+        "resumed-v1-status",
+        codex_tools::ToolName::plain("task_context_boundary"),
+    );
+    assert!(common_harness_tool_boundary(&status).await.is_ok());
+
+    let mut accept = test_invocation(
+        Arc::clone(&session),
+        Arc::clone(&resumed_turn),
+        "resumed-v1-unbound-accept",
+        codex_tools::ToolName::plain("task_context_boundary"),
+    );
+    if let ToolPayload::Function { arguments } = &mut accept.payload {
+        *arguments = r#"{"action":"accept","result":"done"}"#.into();
+    }
+    assert!(
+        common_harness_tool_boundary(&accept).await.is_err(),
+        "a task without its active root scope is status-only"
+    );
+
+    for name in ["workspace_read", "exec_command", "apply_patch"] {
+        let invocation = test_invocation(
+            Arc::clone(&session),
+            Arc::clone(&resumed_turn),
+            "resumed-v1-unbound-effect",
+            codex_tools::ToolName::plain(name),
+        );
+        assert!(
+            common_harness_tool_boundary(&invocation).await.is_err(),
+            "a persisted task without an active root scope cannot execute {name}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn historical_terminal_common_state_is_not_reactivated_by_read_only_new_turn() {
+    use codex_history::task_context::HostEventV1;
+
+    let (session, turn) = common_harness_policy_fixture_with_scope(false).await;
+    let started = session
+        .ensure_common_harness_attempt("policy-root")
+        .await
+        .expect("start the host-bound policy fixture attempt");
+    session
+        .apply_common_harness_host_event(
+            "policy-root",
+            codex_history::task_context::StateFenceV1 {
+                request_revision: started.request.request_revision,
+                expected_state_version: started.run_state.state_version,
+                owner_epoch: started.run_state.owner_epoch,
+            },
+            HostEventV1::RequestCancel,
+        )
+        .await
+        .expect("close the persisted task as cancelled");
+
+    let mut unrelated_review_turn =
+        Arc::try_unwrap(turn).expect("policy fixture retains one turn context");
+    unrelated_review_turn.sub_id = "unrelated-review-turn".into();
+    let mut config = (*unrelated_review_turn.config).clone();
+    config.rencrow_read_only = true;
+    unrelated_review_turn.config = Arc::new(config);
+    let unrelated_review_turn = Arc::new(unrelated_review_turn);
+
+    assert!(
+        session
+            .common_harness_tool_state_for_turn(&unrelated_review_turn)
+            .await
+            .is_none(),
+        "a historical terminal task cannot reapply v1 policy to an unrelated read-only turn"
+    );
+}
+
+#[tokio::test]
+async fn common_harness_boundary_allows_scoped_workspace_read_but_blocks_bypass_tools() {
+    let (session, turn) = common_harness_policy_fixture().await;
+    for name in ["task_context_boundary", "workspace_read"] {
+        let invocation = test_invocation(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            "v1-allowed-tool",
+            codex_tools::ToolName::plain(name),
+        );
+        assert!(
+            common_harness_tool_boundary(&invocation).await.is_ok(),
+            "v1 should retain host control and bounded structured reads through {name}"
+        );
+    }
+    for name in ["shell", "write_stdin", "spawn_agent"] {
+        let invocation = test_invocation(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            "v1-forbidden-tool",
+            codex_tools::ToolName::plain(name),
+        );
+        assert!(
+            common_harness_tool_boundary(&invocation).await.is_err(),
+            "common-harness v1 must deny generic side-effect route {name}"
+        );
+    }
+    let mcp_read = test_invocation(
+        Arc::clone(&session),
+        Arc::clone(&turn),
+        "v1-mcp-read",
+        codex_tools::ToolName::namespaced("filesystem", "read_file"),
+    );
+    assert!(
+        common_harness_tool_boundary(&mcp_read).await.is_err(),
+        "an MCP read tool cannot escape host-bounded workspace bindings"
+    );
+    drop(mcp_read);
+
+    let mut readonly_child_turn =
+        Arc::try_unwrap(turn).expect("all parent tool invocations release their turn context");
+    let mut child_config = (*readonly_child_turn.config).clone();
+    child_config.rencrow_read_only = true;
+    child_config.rencrow_tool_allowlist = Some(vec!["workspace_read".into()]);
+    readonly_child_turn.config = Arc::new(child_config);
+    let readonly_child_turn = Arc::new(readonly_child_turn);
+    for name in ["workspace_read", "apply_patch", "exec_command"] {
+        let invocation = test_invocation(
+            Arc::clone(&session),
+            Arc::clone(&readonly_child_turn),
+            "v1-reviewer-tool",
+            codex_tools::ToolName::plain(name),
+        );
+        assert_eq!(
+            common_harness_tool_boundary(&invocation).await.is_ok(),
+            name == "workspace_read",
+            "inherited read-only reviewers keep scoped reads and cannot write via {name}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn common_harness_expired_work_window_denies_bounded_workspace_read() {
+    use codex_history::task_context::HostEventV1;
+    use codex_history::task_context::StateFenceV1;
+    use codex_history::task_context::TaskRunStatusV1;
+    use codex_history::task_context::WorkWindowV1;
+
+    let (session, turn) = common_harness_policy_fixture().await;
+    let started = session
+        .ensure_common_harness_attempt("policy-root")
+        .await
+        .expect("start the registered policy attempt");
+    let now = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock after epoch")
+            .as_millis(),
+    )
+    .expect("supported test clock range");
+    session
+        .apply_common_harness_host_event(
+            "policy-root",
+            StateFenceV1 {
+                request_revision: started.request.request_revision,
+                expected_state_version: started.run_state.state_version,
+                owner_epoch: started.run_state.owner_epoch,
+            },
+            HostEventV1::BindWorkWindow {
+                window: WorkWindowV1 {
+                    window_id: "registry-expired-window".into(),
+                    attempt_no: started.run_state.attempt_no,
+                    started_at_ms: now - 1_000,
+                    deadline_at_ms: now - 1,
+                    timeout_ms: 999,
+                    policy_ref: "common-harness/test-expiry/1".into(),
+                },
+            },
+        )
+        .await
+        .expect("persist the already-expired absolute work window");
+
+    let invocation = test_invocation(
+        Arc::clone(&session),
+        Arc::clone(&turn),
+        "expired-window-bounded-read",
+        codex_tools::ToolName::plain("workspace_read"),
+    );
+    assert!(
+        common_harness_tool_boundary(&invocation).await.is_err(),
+        "the work-window boundary must deny even scoped read-only tools after expiry"
+    );
+    let state = session
+        .current_common_harness_state("policy-root")
+        .await
+        .expect("persisted blocked state after expired-window read");
+    assert_eq!(state.run_state.status, TaskRunStatusV1::Blocked);
+}
+
+#[test]
+fn common_harness_legacy_filter_matches_plain_builtin_identity_only() {
+    assert!(!common_harness_tool_name_allowed(
+        CommonHarnessToolProfile::Legacy,
+        &codex_tools::ToolName::plain("workspace_read")
+    ));
+    assert!(common_harness_tool_name_allowed(
+        CommonHarnessToolProfile::Legacy,
+        &codex_tools::ToolName::namespaced("filesystem", "workspace_read")
+    ));
+    assert!(!common_harness_tool_name_allowed(
+        CommonHarnessToolProfile::Root,
+        &codex_tools::ToolName::namespaced("filesystem", "workspace_read")
+    ));
 }

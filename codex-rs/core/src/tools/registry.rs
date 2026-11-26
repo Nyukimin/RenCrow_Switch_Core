@@ -46,6 +46,79 @@ use serde_json::Value;
 
 pub(crate) type ToolTelemetryTags = Vec<(&'static str, String)>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CommonHarnessToolProfile {
+    Legacy,
+    StatusOnly,
+    ReservedBegin,
+    Root,
+    ReviewReadOnly,
+}
+
+pub(crate) fn common_harness_tool_name_allowed(
+    profile: CommonHarnessToolProfile,
+    tool_name: &ToolName,
+) -> bool {
+    match profile {
+        CommonHarnessToolProfile::Legacy => {
+            !(tool_name.namespace.is_none() && tool_name.name == "workspace_read")
+        }
+        CommonHarnessToolProfile::StatusOnly => {
+            tool_name.namespace.is_none() && tool_name.name == "task_context_boundary"
+        }
+        CommonHarnessToolProfile::ReservedBegin => {
+            tool_name.namespace.is_none() && tool_name.name == "task_context_boundary"
+        }
+        CommonHarnessToolProfile::Root => {
+            tool_name.namespace.is_none()
+                && matches!(
+                    tool_name.name.as_str(),
+                    "task_context_boundary" | "workspace_read" | "exec_command" | "apply_patch"
+                )
+        }
+        CommonHarnessToolProfile::ReviewReadOnly => {
+            tool_name.namespace.is_none()
+                && matches!(
+                    tool_name.name.as_str(),
+                    "task_context_boundary" | "workspace_read"
+                )
+        }
+    }
+}
+
+fn common_harness_tool_allowed(
+    profile: CommonHarnessToolProfile,
+    tool_name: &ToolName,
+    payload: &ToolPayload,
+) -> bool {
+    if !common_harness_tool_name_allowed(profile, tool_name) {
+        return false;
+    }
+    if tool_name.name != "task_context_boundary" {
+        return true;
+    }
+    let action = match payload {
+        ToolPayload::Function { arguments } => serde_json::from_str::<Value>(arguments)
+            .ok()
+            .and_then(|arguments| {
+                arguments
+                    .get("action")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            }),
+        _ => None,
+    };
+    match profile {
+        CommonHarnessToolProfile::Legacy => true,
+        CommonHarnessToolProfile::StatusOnly => action.as_deref() == Some("status"),
+        CommonHarnessToolProfile::ReservedBegin => {
+            matches!(action.as_deref(), Some("status" | "begin"))
+        }
+        CommonHarnessToolProfile::Root => matches!(action.as_deref(), Some("status" | "accept")),
+        CommonHarnessToolProfile::ReviewReadOnly => action.as_deref() == Some("status"),
+    }
+}
+
 pub use codex_tools::ToolExecutor;
 pub use codex_tools::ToolExposure;
 
@@ -660,6 +733,21 @@ impl ToolRegistry {
             return Err(err);
         }
 
+        if let Err(err) = common_harness_tool_boundary(&invocation).await {
+            if tool.is_builtin_control_tool() {
+                let mut analytics = ControlToolCallGuard::new(&invocation);
+                analytics.finish(ControlToolCallStatus::Rejected);
+            }
+            dispatch_trace.record_failed(&err);
+            notify_tool_finish_if_unclaimed(
+                &invocation,
+                call_state.as_deref(),
+                ToolCallOutcome::Blocked,
+            )
+            .await;
+            return Err(err);
+        }
+
         if tool.mcp_server_name().is_none() {
             notify_tool_start(&invocation, /*mcp_tool*/ None).await;
         }
@@ -813,6 +901,150 @@ impl ToolRegistry {
             }
         }
     }
+}
+
+async fn common_harness_tool_boundary(
+    invocation: &ToolInvocation,
+) -> Result<(), FunctionCallError> {
+    let Some((root_task_id, common)) = invocation
+        .session
+        .common_harness_tool_state_for_turn(&invocation.turn)
+        .await
+    else {
+        return Ok(());
+    };
+    if invocation.tool_name.namespace.is_some() {
+        return Err(FunctionCallError::RespondToModel(
+            "common-harness v1 does not delegate tools to MCP or child namespaces".into(),
+        ));
+    }
+    let scope_matches = invocation
+        .session
+        .active_task_scope()
+        .await
+        .is_some_and(|scope| scope.root_task_id == root_task_id);
+    let task_is_nonterminal = !matches!(
+        common.run_state.status,
+        codex_history::task_context::TaskRunStatusV1::Completed
+            | codex_history::task_context::TaskRunStatusV1::Cancelled
+            | codex_history::task_context::TaskRunStatusV1::Exhausted
+    );
+    let reserved_begin = if !scope_matches && task_is_nonterminal {
+        if let ToolPayload::Function { arguments } = &invocation.payload {
+            let parsed = serde_json::from_str::<Value>(arguments)
+                .ok()
+                .filter(|arguments| arguments["action"] == "begin")
+                .and_then(|arguments| {
+                    Some((
+                        arguments.get("root_task_id")?.as_str()?.to_string(),
+                        arguments.get("task_id")?.as_str()?.to_string(),
+                        arguments.get("task_revision")?.as_u64()?,
+                        arguments
+                            .get("common_harness_request")
+                            .is_none_or(Value::is_null),
+                        arguments.get("completion_state").is_none_or(Value::is_null),
+                    ))
+                });
+            if let Some((root, task, revision, request_absent, completion_absent)) = parsed {
+                request_absent
+                    && completion_absent
+                    && invocation
+                        .session
+                        .common_harness_reserved_begin_matches(
+                            &invocation.turn,
+                            &root,
+                            &task,
+                            revision,
+                        )
+                        .await
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    let profile = if reserved_begin {
+        CommonHarnessToolProfile::ReservedBegin
+    } else if !scope_matches || !task_is_nonterminal {
+        CommonHarnessToolProfile::StatusOnly
+    } else if invocation
+        .session
+        .is_read_only_review_actor_for_turn(&invocation.turn)
+        .await
+    {
+        CommonHarnessToolProfile::ReviewReadOnly
+    } else {
+        CommonHarnessToolProfile::Root
+    };
+    if !common_harness_tool_allowed(profile, &invocation.tool_name, &invocation.payload) {
+        return Err(FunctionCallError::RespondToModel(format!(
+            "common-harness v1 {:?} tool route denies {}",
+            profile, invocation.tool_name.name
+        )));
+    }
+    if profile == CommonHarnessToolProfile::ReservedBegin
+        && invocation.tool_name.name == "task_context_boundary"
+        && let ToolPayload::Function { arguments } = &invocation.payload
+        && let Ok(arguments) = serde_json::from_str::<Value>(arguments)
+        && arguments["action"] == "begin"
+        && !invocation
+            .session
+            .common_harness_reserved_begin_matches(
+                &invocation.turn,
+                arguments
+                    .get("root_task_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                arguments
+                    .get("task_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                arguments
+                    .get("task_revision")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default(),
+            )
+            .await
+    {
+        return Err(FunctionCallError::RespondToModel(
+            "task-context Begin does not match the host-reserved Common execution unit".into(),
+        ));
+    }
+    let is_bounded_status = invocation.tool_name.name == "task_context_boundary"
+        && matches!(
+            &invocation.payload,
+            crate::tools::context::ToolPayload::Function { arguments }
+                if serde_json::from_str::<Value>(arguments)
+                    .ok()
+                    .is_some_and(|arguments| arguments["action"] == "status")
+        );
+    if !is_bounded_status {
+        let _deadline = invocation
+            .session
+            .common_harness_inference_deadline(&invocation.turn)
+            .await
+            .map_err(FunctionCallError::RespondToModel)?;
+    }
+    let allowed_by_config = invocation
+        .turn
+        .config
+        .rencrow_tool_allowlist
+        .as_deref()
+        .is_none_or(|allowlist| {
+            allowlist.iter().any(|entry| {
+                crate::tools::rencrow_tool_allowlist::parse_entry(entry) == invocation.tool_name
+            })
+        });
+    if !allowed_by_config {
+        return Err(FunctionCallError::RespondToModel(format!(
+            "common-harness v1 route is outside the configured tool allowlist: {}",
+            invocation.tool_name.name
+        )));
+    }
+    Ok(())
 }
 
 async fn notify_tool_finish_if_unclaimed(

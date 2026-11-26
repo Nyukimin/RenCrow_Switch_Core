@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-27: use real helpers and durable same-home recovery fixtures.
 // Modified by RenCrow Switch Core, 2026-11-21: initialize accepted revision history fixtures.
 // Modified by RenCrow Switch Core, 2026-09-22: handle durable compaction markers.
 #[path = "autonomous_completion_tests.rs"]
@@ -5228,8 +5229,14 @@ async fn emit_subagent_session_started_includes_fork_lineage_and_originator() {
 async fn resolved_environments_for_configuration(
     session_configuration: &SessionConfiguration,
     environment_selections: &[TurnEnvironmentSelection],
+    runtime_paths: Option<codex_exec_server::ExecServerRuntimePaths>,
 ) -> (Arc<EnvironmentManager>, TurnEnvironmentSnapshot) {
-    let environment_manager = Arc::new(EnvironmentManager::default_for_tests());
+    let environment_manager = Arc::new(match runtime_paths {
+        Some(runtime_paths) => {
+            EnvironmentManager::create_for_tests_with_local(None, runtime_paths).await
+        }
+        None => EnvironmentManager::default_for_tests(),
+    });
     let turn_environments = ThreadEnvironments::new(
         Arc::clone(&environment_manager),
         default_user_shell(),
@@ -6325,7 +6332,9 @@ async fn session_new_fails_when_zsh_fork_enabled_without_packaged_zsh() {
             codex_thread_store::LocalThreadStoreConfig::from_config(config.as_ref()),
             /*state_db*/ None,
         )),
-        codex_rollout_trace::ThreadTraceContext::disabled(),
+        SessionTraceInit::Automatic {
+            parent: codex_rollout_trace::ThreadTraceContext::disabled(),
+        },
         /*attestation_provider*/ None,
         /*external_time_provider*/ None,
         Some(config.multi_agent_version_from_features()),
@@ -6511,9 +6520,12 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
     );
 
     let state = SessionState::new(session_configuration.clone());
-    let (environment_manager, resolved_environments) =
-        resolved_environments_for_configuration(&session_configuration, &default_environments)
-            .await;
+    let (environment_manager, resolved_environments) = resolved_environments_for_configuration(
+        &session_configuration,
+        &default_environments,
+        None,
+    )
+    .await;
     let resolved_turn_environments = resolved_environments.clone();
     let turn_environments = Arc::new(ThreadEnvironments::new(
         environment_manager,
@@ -6971,7 +6983,9 @@ async fn make_session_with_config_and_rx(
             codex_thread_store::LocalThreadStoreConfig::from_config(config.as_ref()),
             /*state_db*/ None,
         )),
-        codex_rollout_trace::ThreadTraceContext::disabled(),
+        SessionTraceInit::Automatic {
+            parent: codex_rollout_trace::ThreadTraceContext::disabled(),
+        },
         /*attestation_provider*/ None,
         /*external_time_provider*/ None,
         Some(config.multi_agent_version_from_features()),
@@ -6991,6 +7005,23 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
     let codex_home = tempfile::tempdir().expect("create temp dir");
     let mut config = build_test_config(codex_home.path()).await;
     config.ephemeral = true;
+    make_session_with_history_config_and_runtime_paths(
+        initial_history,
+        session_source,
+        agent_control,
+        config,
+        None,
+    )
+    .await
+}
+
+async fn make_session_with_history_config_and_runtime_paths(
+    initial_history: InitialHistory,
+    session_source: SessionSource,
+    agent_control: LocalAgentControl,
+    config: Config,
+    runtime_paths: Option<codex_exec_server::ExecServerRuntimePaths>,
+) -> anyhow::Result<(Arc<Session>, async_channel::Receiver<Event>)> {
     let config = Arc::new(config);
     let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
     let models_manager = models_manager_with_provider(
@@ -7067,7 +7098,22 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
         config.codex_home.clone(),
         /*bundled_skills_enabled*/ true,
     ));
-    let environment_manager = Arc::new(EnvironmentManager::default_for_tests());
+    let trace_init = if runtime_paths.is_some() {
+        if !matches!(&initial_history, InitialHistory::Resumed(_)) {
+            anyhow::bail!("the persistent Common test factory requires resumed history");
+        }
+        let trace_root = config.codex_home.as_path().join("rollout-traces");
+        std::fs::create_dir_all(&trace_root)?;
+        SessionTraceInit::RootInDirectory(trace_root)
+    } else {
+        SessionTraceInit::Automatic {
+            parent: codex_rollout_trace::ThreadTraceContext::disabled(),
+        }
+    };
+    let environment_manager = Arc::new(match runtime_paths {
+        Some(paths) => EnvironmentManager::create_for_tests_with_local(None, paths).await,
+        None => EnvironmentManager::default_for_tests(),
+    });
 
     let session = Session::new(
         /*startup*/ None,
@@ -7110,7 +7156,7 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
                 .expect("state db should initialize"),
             ),
         )),
-        codex_rollout_trace::ThreadTraceContext::disabled(),
+        trace_init,
         /*attestation_provider*/ None,
         /*external_time_provider*/ None,
         Some(config.multi_agent_version_from_features()),
@@ -7120,6 +7166,94 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
     .await?;
 
     Ok((session, rx_event))
+}
+
+/// Reopen the same persisted Common task with real writer and filesystem helpers.
+pub(crate) async fn make_session_and_context_with_resumed_history_and_config(
+    codex_home: &Path,
+    cwd: &Path,
+    initial_history: InitialHistory,
+    runtime_paths: codex_exec_server::ExecServerRuntimePaths,
+    permission_profile: Option<PermissionProfile>,
+) -> anyhow::Result<(Arc<Session>, Arc<TurnContext>)> {
+    let mut config = build_test_config(codex_home).await;
+    config.ephemeral = false;
+    // This host-only cold fixture does not make model requests or prewarm a
+    // provider that belonged to the exited worker's mock server.
+    config.model_provider.supports_websockets = false;
+    config.cwd = cwd.to_path_buf().try_into()?;
+    config.rencrow_compaction = true;
+    config.rencrow_autonomous_completion = true;
+    config
+        .permissions
+        .set_permission_profile(PermissionProfile::workspace_write())?;
+    let go_cache = std::env::var_os("GOCACHE")
+        .map(PathBuf::from)
+        .filter(|path| path.is_dir())
+        .unwrap_or_else(|| codex_home.join("go-cache"));
+    std::fs::create_dir_all(&go_cache)?;
+    config
+        .permissions
+        .shell_environment_policy
+        .r#set
+        .insert("GOCACHE".into(), go_cache.to_string_lossy().into_owned());
+    let (session, _events) = make_session_with_history_config_and_runtime_paths(
+        initial_history,
+        SessionSource::Cli,
+        LocalAgentControl::default(),
+        config,
+        Some(runtime_paths),
+    )
+    .await?;
+    let mut turn = session.new_default_turn().await;
+    if let Some(permission_profile) = permission_profile {
+        // Recovery fixtures reuse the exact effective profile recorded by the
+        // original request. Runtime discovery can materialize workspace roots
+        // differently after reopening, so bind this test turn to the original
+        // typed profile while keeping the real filesystem environment alive.
+        let turn_context = Arc::get_mut(&mut turn)
+            .expect("unique cold fixture turn before it is attached to a running task");
+        let turn_config = Arc::make_mut(&mut turn_context.config);
+        turn_config.workspace_roots.clear();
+        turn_config.permissions.set_workspace_roots(Vec::new());
+        turn_config
+            .permissions
+            .set_permission_profile(permission_profile.clone())?;
+        assert_eq!(
+            turn_config.permissions.effective_permission_profile(),
+            permission_profile,
+            "cold recovery fixture must retain the original typed effective permission profile"
+        );
+    }
+    c23_compaction_cold_restore_tests::install_active_turn(&session, Arc::clone(&turn)).await;
+    session
+        .services
+        .rollout_thread_trace
+        .record_codex_turn_started(turn.sub_id.as_str());
+    Ok((session, turn))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct CommonHarnessPermissionSnapshotDiagnostics {
+    pub(crate) snapshot_ref: String,
+    pub(crate) approval_policy: String,
+    pub(crate) allow_login_shell: bool,
+    pub(crate) effective_profile_sha256: String,
+}
+
+pub(crate) fn common_harness_permission_snapshot_diagnostics_for_test(
+    config: &Config,
+) -> Result<CommonHarnessPermissionSnapshotDiagnostics, String> {
+    let effective_profile = config.permissions.effective_permission_profile();
+    let profile_bytes = serde_json::to_vec(&effective_profile)
+        .map_err(|error| format!("serialize effective permission profile for test: {error}"))?;
+    let profile_digest = <sha2::Sha256 as sha2::Digest>::digest(profile_bytes);
+    Ok(CommonHarnessPermissionSnapshotDiagnostics {
+        snapshot_ref: super::common_harness::permission_snapshot_ref(config)?,
+        approval_policy: config.permissions.approval_policy.value().to_string(),
+        allow_login_shell: config.permissions.allow_login_shell,
+        effective_profile_sha256: format!("sha256:{profile_digest:x}"),
+    })
 }
 
 #[tokio::test]
@@ -9110,6 +9244,33 @@ where
         dynamic_tools,
         codex_home.path(),
         configure_config,
+        None,
+    )
+    .await
+}
+
+/// Builds a test session with an explicitly configured local filesystem helper.
+/// Ordinary test sessions keep using `EnvironmentManager::default_for_tests`.
+pub(crate) async fn make_session_and_context_with_auth_and_config_and_rx_and_runtime_paths<F>(
+    auth: CodexAuth,
+    dynamic_tools: Vec<DynamicToolSpec>,
+    configure_config: F,
+    runtime_paths: codex_exec_server::ExecServerRuntimePaths,
+) -> (
+    Arc<Session>,
+    Arc<TurnContext>,
+    async_channel::Receiver<Event>,
+)
+where
+    F: FnOnce(&mut Config),
+{
+    let codex_home = tempfile::tempdir().expect("create temp dir");
+    make_session_and_context_with_auth_config_home_and_rx(
+        auth,
+        dynamic_tools,
+        codex_home.path(),
+        configure_config,
+        Some(runtime_paths),
     )
     .await
 }
@@ -9119,6 +9280,7 @@ async fn make_session_and_context_with_auth_config_home_and_rx<F>(
     dynamic_tools: Vec<DynamicToolSpec>,
     codex_home: &Path,
     configure_config: F,
+    runtime_paths: Option<codex_exec_server::ExecServerRuntimePaths>,
 ) -> (
     Arc<Session>,
     Arc<TurnContext>,
@@ -9134,6 +9296,7 @@ where
         dynamic_tools,
         config,
         codex_home.to_path_buf(),
+        runtime_paths,
     )
     .await
 }
@@ -9153,6 +9316,7 @@ pub(crate) async fn make_session_and_context_with_config_and_rx(
         dynamic_tools,
         config,
         codex_home,
+        None,
     )
     .await
 }
@@ -9162,6 +9326,7 @@ async fn make_session_and_context_with_config_and_auth_home_and_rx(
     dynamic_tools: Vec<DynamicToolSpec>,
     config: Config,
     auth_home: PathBuf,
+    runtime_paths: Option<codex_exec_server::ExecServerRuntimePaths>,
 ) -> (
     Arc<Session>,
     Arc<TurnContext>,
@@ -9251,8 +9416,12 @@ async fn make_session_and_context_with_config_and_auth_home_and_rx(
         &session_configuration.session_source,
     );
     let (environment_manager, resolved_turn_environments) =
-        resolved_environments_for_configuration(&session_configuration, &default_environments)
-            .await;
+        resolved_environments_for_configuration(
+            &session_configuration,
+            &default_environments,
+            runtime_paths,
+        )
+        .await;
     let turn_environments = Arc::new(ThreadEnvironments::new(
         environment_manager,
         default_user_shell(),

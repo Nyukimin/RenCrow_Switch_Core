@@ -52,13 +52,16 @@ use crate::tools::handlers::multi_agents_v2::WaitAgentHandler as WaitAgentHandle
 use crate::tools::handlers::task_context_boundary::TaskContextBoundaryHandler;
 use crate::tools::handlers::tool_search_spec::ToolSearchSourceListing;
 use crate::tools::handlers::view_image_spec::ViewImageToolOptions;
+use crate::tools::handlers::workspace_read::WorkspaceReadHandler;
 use crate::tools::hosted_spec::WebSearchToolOptions;
 use crate::tools::hosted_spec::create_web_search_tool;
 use crate::tools::multi_agent_tool::multi_agent_v2_handler;
+use crate::tools::registry::CommonHarnessToolProfile;
 #[cfg(test)]
 use crate::tools::registry::RegisteredTool;
 use crate::tools::registry::ToolExposure;
 use crate::tools::registry::ToolRegistry;
+use crate::tools::registry::common_harness_tool_name_allowed;
 use crate::tools::router::ToolRouter;
 use crate::tools::tool_namespaces_info::collect_tool_namespaces_info;
 use codex_connectors::apps_config_from_layer_stack;
@@ -129,6 +132,7 @@ pub(crate) fn build_tool_router(
     apps_enabled: bool,
     step_store: &ExtensionData,
     tool_suggest_candidates: Option<&crate::tools::router::ToolSuggestCandidates>,
+    common_harness_tool_profile: Option<CommonHarnessToolProfile>,
 ) -> CodexResult<ToolRouter> {
     let default_agent_type_description =
         crate::agent::role::spawn_tool_spec::build(&std::collections::BTreeMap::new());
@@ -172,11 +176,14 @@ pub(crate) fn build_tool_router(
         &mut registry,
     );
     append_dynamic_tool_runtimes(&turn_context.dynamic_tools, &mut registry);
-    let hosted_specs = hosted_model_tool_specs(
+    let mut hosted_specs = hosted_model_tool_specs(
         turn_context,
         model_info,
         standalone_web_search_tool.as_slice(),
     );
+    if let Some(profile) = common_harness_tool_profile {
+        prune_common_harness_tool_surface(&mut registry, &mut hosted_specs, profile);
+    }
 
     finalize_tool_router(
         turn_context,
@@ -184,7 +191,27 @@ pub(crate) fn build_tool_router(
         registry,
         hosted_specs,
         &session.services.tool_search_handler_cache,
+        common_harness_tool_profile,
     )
+}
+
+fn prune_common_harness_tool_surface(
+    registry: &mut ToolRegistry,
+    hosted_specs: &mut Vec<ToolSpec>,
+    profile: CommonHarnessToolProfile,
+) {
+    let disallowed = registry
+        .entries()
+        .filter_map(|tool| {
+            let name = tool.runtime.tool_name();
+            (!common_harness_tool_name_allowed(profile, &name)).then_some(name)
+        })
+        .collect::<Vec<_>>();
+    for name in disallowed {
+        registry.remove(&name);
+    }
+    hosted_specs
+        .retain(|spec| common_harness_tool_name_allowed(profile, &ToolName::plain(spec.name())));
 }
 
 fn apply_mcp_tool_exposure_policy(
@@ -352,8 +379,12 @@ pub(crate) fn finalize_tool_router(
     mut registry: ToolRegistry,
     mut hosted_specs: Vec<ToolSpec>,
     tool_search_handler_cache: &ToolSearchHandlerCache,
+    common_harness_tool_profile: Option<CommonHarnessToolProfile>,
 ) -> CodexResult<ToolRouter> {
     hosted_specs.retain(|spec| registry.tool_policy.allows(&ToolName::plain(spec.name())));
+    if let Some(profile) = common_harness_tool_profile {
+        prune_common_harness_tool_surface(&mut registry, &mut hosted_specs, profile);
+    }
     apply_direct_model_only_namespace_overrides(turn_context, &mut registry);
     let tool_mode = effective_tool_mode(turn_context, model_info);
     let code_mode_enabled = matches!(tool_mode, ToolMode::CodeMode | ToolMode::CodeModeOnly);
@@ -406,6 +437,10 @@ pub(crate) fn finalize_tool_router(
 
     let code_mode_tool_names =
         register_code_mode_executors(turn_context, model_info, &mut registry);
+    if let Some(profile) = common_harness_tool_profile {
+        // Code Mode's generated dispatcher must not create a second generic execution surface.
+        prune_common_harness_tool_surface(&mut registry, &mut hosted_specs, profile);
+    }
     let include_tool_namespaces_info = turn_context
         .config
         .tool_registry
@@ -468,13 +503,31 @@ pub(crate) fn finalize_tool_router(
         }
     }
 
-    let model_visible_specs = build_model_visible_specs(
+    let mut model_visible_specs = build_model_visible_specs(
         turn_context,
         model_info,
         &registry,
         &code_mode_tool_names,
         hosted_specs,
     );
+    if let Some(profile) = common_harness_tool_profile {
+        let boundary_name =
+            crate::tools::handlers::task_context_boundary_spec::TASK_CONTEXT_BOUNDARY_TOOL_NAME;
+        for spec in &mut model_visible_specs {
+            if spec.name() == boundary_name {
+                *spec = match profile {
+                    CommonHarnessToolProfile::Root => crate::tools::handlers::task_context_boundary_spec::create_common_harness_root_tool(),
+                    CommonHarnessToolProfile::ReservedBegin => crate::tools::handlers::task_context_boundary_spec::create_common_harness_reserved_begin_tool(),
+                    CommonHarnessToolProfile::StatusOnly => crate::tools::handlers::task_context_boundary_spec::create_common_harness_status_tool(),
+                    CommonHarnessToolProfile::ReviewReadOnly => crate::tools::handlers::task_context_boundary_spec::create_common_harness_status_tool(),
+                    CommonHarnessToolProfile::Legacy => continue,
+                };
+            }
+        }
+        model_visible_specs.retain(|spec| {
+            common_harness_tool_name_allowed(profile, &ToolName::plain(spec.name()))
+        });
+    }
     let tool_namespaces_info = include_tool_namespaces_info
         .then(|| {
             collect_tool_namespaces_info(&registry, &code_mode_tool_names, &model_visible_specs)
@@ -1046,6 +1099,9 @@ fn add_shell_tools(context: &CoreToolPlanContext<'_>, registry: &mut ToolRegistr
             TaskContextBoundaryHandler::new(turn_context.config.rencrow_autonomous_completion),
             ToolExposure::DirectModelOnly,
         );
+        if turn_context.config.rencrow_autonomous_completion {
+            registry.add_with_exposure(WorkspaceReadHandler, ToolExposure::DirectModelOnly);
+        }
     }
     if !environment_mode.has_environment()
         || !features.enabled(Feature::ShellTool)

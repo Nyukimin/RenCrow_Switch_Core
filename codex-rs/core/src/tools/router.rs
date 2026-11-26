@@ -107,6 +107,7 @@ impl ToolRouter {
             registry,
             hosted_specs,
             tool_search_handler_cache,
+            None,
         )
         .expect("test tool registry should not contain duplicate tools")
     }

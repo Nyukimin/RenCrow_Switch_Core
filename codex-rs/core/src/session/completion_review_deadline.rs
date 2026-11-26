@@ -975,6 +975,7 @@ mod tests {
             product_progress_at: None,
             runtime_recovery_at: None,
             activity_at: None,
+            common_harness: None,
         };
         session.state.lock().await.rencrow_completion_state = Some(("root".into(), state));
 
@@ -1200,6 +1201,7 @@ mod tests {
             product_progress_at: None,
             runtime_recovery_at: None,
             activity_at: None,
+            common_harness: None,
         };
         session.state.lock().await.rencrow_completion_state = Some(("root".into(), contract));
 

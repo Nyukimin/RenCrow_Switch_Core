@@ -14,6 +14,8 @@ pub(crate) use parent_handoff::ParentHandoffNotice;
 mod available_plugins_instructions;
 mod base_instructions;
 mod child_health_notification;
+mod common_harness_prompt;
+pub(crate) use common_harness_prompt::CommonHarnessPromptFragment;
 mod compaction_observation;
 mod compaction_results;
 mod compaction_summary;

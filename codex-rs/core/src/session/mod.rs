@@ -1,6 +1,8 @@
 // Modified by RenCrow Switch Core, 2026-09-22: intake and validated checkpoint integration.
 pub(crate) mod child_dispatch;
 mod child_monitor;
+mod trace_init;
+pub(crate) use trace_init::SessionTraceInit;
 mod rencrow_compaction;
 pub(crate) use rencrow_compaction::RenCrowCheckpoint;
 pub(crate) mod startup;
@@ -231,6 +233,16 @@ use codex_protocol::error::Result as CodexResult;
 use codex_protocol::exec_output::StreamOutput;
 
 mod code_mode_warning;
+pub(crate) mod common_harness;
+pub(crate) mod common_harness_completion;
+pub(crate) mod common_harness_deadline;
+mod common_harness_evidence_rebind;
+mod common_harness_inference;
+pub(crate) mod common_harness_iteration;
+mod common_harness_native_patch_recovery;
+mod common_harness_prompt;
+mod common_harness_task_result;
+mod common_harness_writer;
 mod completion_children;
 pub(crate) use completion_children::CompletionReviewChildGeneration;
 pub(crate) use completion_children::CompletionReviewChildIdentity;
@@ -255,6 +267,7 @@ mod mcp;
 mod mcp_prewarm;
 mod mcp_refresh;
 mod mcp_runtime;
+pub(crate) mod model_settings_receipt;
 pub(crate) mod multi_agents;
 mod plugin_selection;
 mod realtime_history;
@@ -998,7 +1011,9 @@ impl Session {
             analytics_events_client,
             image_store,
             thread_store,
-            parent_rollout_thread_trace,
+            SessionTraceInit::Automatic {
+                parent: parent_rollout_thread_trace,
+            },
             attestation_provider,
             external_time_provider,
             multi_agent_version,
@@ -4049,6 +4064,22 @@ impl Session {
         if let Some(turn_state) = turn_state {
             turn_state.lock().await.last_known_step_context = Some(Arc::clone(step_context));
         }
+    }
+
+    /// Review turns preserve their parent's SessionSource, so TaskKind is the distinguishing fact.
+    pub(crate) async fn is_read_only_review_actor_for_turn(&self, turn: &TurnContext) -> bool {
+        if turn.config.rencrow_read_only {
+            return true;
+        }
+        self.active_turn
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|active| active.task.as_ref())
+            .is_some_and(|task| {
+                task.kind == crate::state::TaskKind::Review
+                    && task.turn_context.sub_id == turn.sub_id
+            })
     }
 
     /// Captures one request-scoped view of dynamic state and retains it for the active turn.

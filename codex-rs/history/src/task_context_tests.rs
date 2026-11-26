@@ -36,6 +36,61 @@ fn candidate() -> BoundaryCandidate {
     }
 }
 
+fn common_harness_for_completion(condition_id: &str) -> CommonHarnessStateV1 {
+    CommonHarnessStateV1::queued(
+        TaskRequestV1 {
+            task_id: "task-root".into(),
+            request_revision: 1,
+            authorized_request_ref: "request:sha256:abc".into(),
+            goal: "Ship feature".into(),
+            workspace_ref: "workspace:root".into(),
+            start_target_version: "artifact-set:baseline".into(),
+            permission_snapshot_ref: "permission:sha256:def".into(),
+            constraints: vec!["Do not change auth".into()],
+            conditions: vec![ConditionSpecV1 {
+                condition_id: condition_id.into(),
+                condition_revision: 1,
+                kind: ConditionKindV1::SemanticReview,
+                comparison_scope: "CLI".into(),
+                expected: "Expected behavior is observable".into(),
+                required: true,
+                verifier_ref: None,
+                verifier_config_revision: None,
+                check: None,
+                dependency_refs: vec![],
+            }],
+            condition_set_revision: 1,
+            max_attempts: 3,
+            operation_limits_ref: "operation-limits:sha256:ghi".into(),
+            skill_refs: vec![],
+            execution_owner: ExecutionOwnerV1::StandaloneSwitch,
+        },
+        "owner-1".into(),
+        1,
+    )
+    .unwrap()
+}
+
+#[test]
+fn completion_snapshot_rejects_invalid_common_harness_extension() {
+    let mut state = review_unit_state(UnitStatus::Planned);
+    assert!(validate_completion_state_snapshot(Some(&state), &BTreeMap::new()).is_ok());
+    let mut extension = common_harness_for_completion("AC-1");
+    extension.contract_version = 99;
+    state.common_harness = Some(extension);
+    assert!(validate_completion_state_snapshot(Some(&state), &BTreeMap::new()).is_err());
+}
+
+#[test]
+fn completion_snapshot_binds_request_conditions_even_without_evidence() {
+    let mut state = review_unit_state(UnitStatus::Planned);
+    let extension = common_harness_for_completion("AC-2");
+    assert!(extension.evidence_refs.is_empty());
+    assert!(extension.validate(None).is_ok());
+    state.common_harness = Some(extension);
+    assert!(validate_completion_state_snapshot(Some(&state), &BTreeMap::new()).is_err());
+}
+
 #[test]
 fn completion_contract_round_trips_and_requires_current_host_evidence_for_satisfied() {
     let mut c = candidate();
@@ -90,6 +145,7 @@ fn completion_contract_round_trips_and_requires_current_host_evidence_for_satisf
         product_progress_at: Some(10),
         runtime_recovery_at: Some(9),
         activity_at: Some(10),
+        common_harness: None,
     });
     let mut invalid = c.completion_state.clone().unwrap();
     invalid.conditions[0].id = "http_test_common_cause".into();
@@ -118,6 +174,78 @@ fn legacy_boundary_payload_without_completion_state_remains_unknown() {
     value.as_object_mut().unwrap().remove("completion_state");
     let restored: BoundaryCandidate = serde_json::from_value(value).unwrap();
     assert_eq!(restored.completion_state, None);
+}
+
+#[test]
+fn completion_state_round_trips_common_harness_v1_extension() {
+    let mut value = serde_json::to_value(candidate()).unwrap();
+    value["completion_state"] =
+        serde_json::to_value(review_unit_state(UnitStatus::Planned)).unwrap();
+    let common_harness = serde_json::json!({
+        "contract_version": 1,
+        "request": {
+            "task_id": "task-root",
+            "request_revision": 1,
+            "authorized_request_ref": "request:sha256:abc",
+            "goal": "Fix the failing regression test",
+            "workspace_ref": "workspace:root",
+            "start_target_version": "artifact-set:baseline",
+            "permission_snapshot_ref": "permission:sha256:def",
+            "constraints": ["Do not modify files outside the task scope"],
+            "conditions": [{
+                "condition_id": "AC-1",
+                "condition_revision": 1,
+                "kind": "test_suite",
+                "comparison_scope": "task target",
+                "expected": "all selected tests pass",
+                "required": true,
+                "verifier_ref": "verifier:rust-tests",
+                "verifier_config_revision": 1,
+                "dependency_refs": []
+            }],
+            "condition_set_revision": 1,
+            "max_attempts": 3,
+            "operation_limits_ref": "operation-limits:sha256:ghi",
+            "skill_refs": [],
+            "execution_owner": "standalone_switch"
+        },
+        "run_state": {
+            "task_id": "task-root",
+            "request_revision": 1,
+            "state_version": 1,
+            "owner_id": "owner-1",
+            "owner_epoch": 1,
+            "status": "queued",
+            "phase": "plan",
+            "attempt_no": 0,
+            "target_version": "artifact-set:baseline",
+            "unmet_conditions": ["AC-1"],
+            "next_operation": "start",
+            "reason_code": null,
+            "resume_condition": null,
+            "cancel_requested": false,
+            "unsettled_operation_refs": []
+        },
+        "operation_refs": [],
+        "evidence_refs": []
+    });
+    value["completion_state"]["common_harness"] = common_harness.clone();
+
+    let restored: BoundaryCandidate = serde_json::from_value(value).unwrap();
+    let round_tripped = serde_json::to_value(restored).unwrap();
+
+    assert_eq!(
+        round_tripped["completion_state"]["common_harness"],
+        common_harness
+    );
+}
+
+#[test]
+fn legacy_completion_state_without_common_harness_remains_unchanged() {
+    let value = serde_json::to_value(review_unit_state(UnitStatus::Planned)).unwrap();
+    let restored: CompletionState = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(serde_json::to_value(restored).unwrap(), value);
+    assert!(value.get("common_harness").is_none());
 }
 
 #[test]
@@ -177,6 +305,7 @@ fn unknown_review_launch_is_typed_bounded_and_host_state_only() {
         product_progress_at: None,
         runtime_recovery_at: None,
         activity_at: None,
+        common_harness: None,
     });
     assert!(validate_boundary(candidate.clone(), &facts()).is_ok());
 
@@ -227,6 +356,7 @@ fn completion_condition_rejects_empty_result_with_field_specific_error() {
         product_progress_at: None,
         runtime_recovery_at: None,
         activity_at: None,
+        common_harness: None,
     };
 
     assert_eq!(
@@ -370,6 +500,7 @@ fn review_unit_state(status: UnitStatus) -> CompletionState {
         product_progress_at: None,
         runtime_recovery_at: None,
         activity_at: None,
+        common_harness: None,
     }
 }
 
@@ -885,6 +1016,7 @@ fn completion_units_reject_missing_refs_cycles_and_unfinished_active_dependencie
         product_progress_at: None,
         runtime_recovery_at: None,
         activity_at: None,
+        common_harness: None,
     });
     assert!(
         validate_boundary(candidate.clone(), &facts()).is_ok(),
@@ -1037,6 +1169,7 @@ fn stored_task_state_retains_only_exact_referenced_accepted_revision_history() {
         product_progress_at: None,
         runtime_recovery_at: None,
         activity_at: None,
+        common_harness: None,
     };
     candidate.completion_state = Some(state.clone());
     let stored = validate_host_boundary_checkpoint(candidate, &facts)

@@ -1755,6 +1755,11 @@ impl ModelClientSession {
             let inference_trace_attempt = inference_trace.start_attempt();
             inference_trace_attempt.add_request_headers(&mut options.extra_headers);
             inference_trace_attempt.record_started(&request);
+            record_common_harness_model_settings_receipt(
+                inference_trace,
+                &inference_trace_attempt,
+                &request,
+            );
             let client = ApiResponsesClient::new(
                 transport,
                 client_setup.api_provider,
@@ -2068,6 +2073,11 @@ impl ModelClientSession {
             if !previous_response_id_from_untraced_warmup {
                 inference_trace_attempt.record_started(&ws_request);
             }
+            record_common_harness_model_settings_receipt(
+                inference_trace,
+                &inference_trace_attempt,
+                &request,
+            );
 
             let websocket_connection =
                 self.websocket_session.connection.as_ref().ok_or_else(|| {
@@ -2348,6 +2358,29 @@ fn add_responses_lite_header(headers: &mut ApiHeaderMap, use_responses_lite: boo
 
 mod child_monitor;
 
+fn record_common_harness_model_settings_receipt(
+    inference_trace: &InferenceTraceContext,
+    attempt: &InferenceTraceAttempt,
+    request: &ResponsesApiRequest,
+) {
+    let Some(context) = inference_trace.model_settings_receipt_context() else {
+        return;
+    };
+    // This JSON was serialized from the host-owned trace context immediately
+    // before the request. It is observational only and never authorizes input.
+    let Ok(context) = serde_json::from_value::<
+        crate::session::model_settings_receipt::CommonHarnessInferenceReceiptContext,
+    >(context) else {
+        return;
+    };
+    let Ok(receipt) =
+        crate::session::model_settings_receipt::build_model_settings_receipt(&context, request)
+    else {
+        return;
+    };
+    attempt.record_model_settings_receipt(&receipt);
+}
+
 const RESPONSE_STREAM_CHANNEL_CAPACITY: usize = 1600;
 const STREAM_DROPPED_REASON: &str = "response stream dropped before provider terminal event";
 
@@ -2363,6 +2396,7 @@ fn map_response_stream(
         upstream_request_id,
         rencrow_verified_model,
     } = api_stream;
+    inference_trace_attempt.record_verified_backend_model(rencrow_verified_model.as_deref());
     if let Some(monitor) = request_monitor.as_mut() {
         monitor.headers(
             upstream_request_id.as_deref(),

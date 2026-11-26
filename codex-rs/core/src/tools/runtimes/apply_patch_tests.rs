@@ -6,6 +6,10 @@ use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::models::FileSystemPermissions;
 use codex_protocol::models::PermissionProfile;
+use codex_protocol::permissions::FileSystemAccessMode;
+use codex_protocol::permissions::FileSystemPath;
+use codex_protocol::permissions::FileSystemSandboxEntry;
+use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::EnvironmentConfig;
 use codex_protocol::protocol::EnvironmentConfigState;
@@ -352,4 +356,79 @@ async fn file_system_sandbox_context_respects_sandbox_request() {
             use_legacy_landlock: false,
         })
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn common_harness_effect_alias_projection_preserves_explicit_denials() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let physical_root = temp.path().join("physical");
+    let physical_nested = temp.path().join("physical-nested");
+    std::fs::create_dir_all(&physical_root).expect("physical root");
+    std::fs::create_dir_all(&physical_nested).expect("physical nested root");
+    let outer_alias = temp.path().join("outer-alias");
+    std::os::unix::fs::symlink(&physical_root, &outer_alias).expect("outer symlink alias");
+    let inner_alias = physical_root.join("inner-alias");
+    std::os::unix::fs::symlink(&physical_nested, &inner_alias).expect("inner symlink alias");
+    let action_path = outer_alias.join("inner-alias");
+    let effect_path = action_path.canonicalize().expect("canonical workspace");
+    let action_cwd = PathUri::from_host_native_path(&action_path).expect("action cwd URI");
+    let effect_cwd = PathUri::from_host_native_path(&effect_path).expect("effect cwd URI");
+    let denied_path = action_path.join("blocked.txt");
+    let denied_effect_path = effect_path.join("blocked.txt");
+    let policy = FileSystemSandboxPolicy::restricted(vec![
+        FileSystemSandboxEntry::new(
+            FileSystemPath::Path {
+                path: action_cwd.clone(),
+            },
+            FileSystemAccessMode::Write,
+        ),
+        FileSystemSandboxEntry::new(
+            FileSystemPath::Path {
+                path: PathUri::from_host_native_path(&denied_path).expect("denied path URI"),
+            },
+            FileSystemAccessMode::Deny,
+        ),
+    ]);
+    let permissions =
+        PermissionProfile::from_runtime_permissions(&policy, NetworkSandboxPolicy::Restricted);
+    let sandbox =
+        FileSystemSandboxContext::from_permission_profile(permissions, action_cwd.clone());
+
+    let projected =
+        ApplyPatchRuntime::align_sandbox_paths_with_effect_root(sandbox, &action_cwd, &effect_cwd)
+            .expect("project sandbox policy paths");
+    let projected_policy = projected.permissions.file_system_sandbox_policy();
+    assert!(projected_policy.can_write_local_path_with_cwd(&effect_path, &effect_path,));
+    assert!(!projected_policy.can_write_local_path_with_cwd(&denied_effect_path, &effect_path,));
+    assert_eq!(projected.cwd, effect_cwd);
+    assert_eq!(projected.workspace_roots, vec![effect_cwd]);
+}
+
+#[cfg(unix)]
+#[test]
+fn common_harness_effect_alias_projection_rejects_unprojectable_glob_denials() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let physical_root = temp.path().join("physical");
+    std::fs::create_dir_all(&physical_root).expect("physical root");
+    let alias_root = temp.path().join("alias");
+    std::os::unix::fs::symlink(&physical_root, &alias_root).expect("root symlink alias");
+    let effect_root = alias_root.canonicalize().expect("canonical workspace");
+    let action_cwd = PathUri::from_host_native_path(&alias_root).expect("action cwd URI");
+    let effect_cwd = PathUri::from_host_native_path(&effect_root).expect("effect cwd URI");
+    let policy = FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry::new(
+        FileSystemPath::GlobPattern {
+            pattern: format!("{}/**/secret", alias_root.display()),
+        },
+        FileSystemAccessMode::Deny,
+    )]);
+    let sandbox = FileSystemSandboxContext::from_permission_profile(
+        PermissionProfile::from_runtime_permissions(&policy, NetworkSandboxPolicy::Restricted),
+        action_cwd.clone(),
+    );
+
+    let error =
+        ApplyPatchRuntime::align_sandbox_paths_with_effect_root(sandbox, &action_cwd, &effect_cwd)
+            .expect_err("glob denial must fail closed across an alias");
+    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
 }

@@ -26,6 +26,200 @@ fn action_shape(action: &str, fields: &[&str], required: &[&str]) -> JsonSchema 
     )
 }
 
+fn common_harness_request_schema() -> JsonSchema {
+    let object = |properties: BTreeMap<String, JsonSchema>, required: &[&str]| {
+        JsonSchema::object(
+            properties,
+            Some(required.iter().map(|field| (*field).to_string()).collect()),
+            Some(false.into()),
+        )
+    };
+    let outcome_object =
+        |name: &str, payload: JsonSchema| object(BTreeMap::from([(name.into(), payload)]), &[name]);
+    let counts = object(
+        BTreeMap::from([
+            ("passed".into(), JsonSchema::number(None)),
+            ("failed".into(), JsonSchema::number(None)),
+            ("skipped".into(), JsonSchema::number(None)),
+        ]),
+        &["passed", "failed", "skipped"],
+    );
+    let failure = object(
+        BTreeMap::from([
+            ("test_name".into(), JsonSchema::string(None)),
+            ("reason".into(), JsonSchema::string(None)),
+        ]),
+        &["test_name", "reason"],
+    );
+    let expected_outcome = JsonSchema::one_of(
+        vec![
+            outcome_object("all_selected_tests_pass", JsonSchema::null(None)),
+            outcome_object("test_counts", counts),
+            outcome_object("failure_identity", failure.clone()),
+            outcome_object("specified_test_failure", failure),
+        ],
+        Some("Expected structured Go test result: all selected tests pass, exact counts, or a named expected failure.".into()),
+    );
+    let selection = object(
+        BTreeMap::from([
+            (
+                "selected_cases".into(),
+                JsonSchema::array(JsonSchema::string(None), None),
+            ),
+            ("expected_case_count".into(), JsonSchema::number(None)),
+        ]),
+        &["selected_cases", "expected_case_count"],
+    );
+    let skill_ref = object(
+        BTreeMap::from([("id".into(), JsonSchema::string(None))]),
+        &["id"],
+    );
+    let check = JsonSchema::object(
+        BTreeMap::from([
+            (
+                "argv".into(),
+                JsonSchema::array(
+                    JsonSchema::string(None),
+                    Some("Structured argv for the registered host Go test adapter; no shell command string.".into()),
+                ),
+            ),
+            (
+                "parser".into(),
+                JsonSchema::string_enum(vec![json!("go_test_json")], None),
+            ),
+            ("expected_outcome".into(), expected_outcome),
+            ("go_test_selection".into(), selection),
+            (
+                "cwd_binding_refs".into(),
+                JsonSchema::array(JsonSchema::string(None), None),
+            ),
+            (
+                "allowed_environment_refs".into(),
+                JsonSchema::array(JsonSchema::string(None), None),
+            ),
+            (
+                "toolchain_ref".into(),
+                JsonSchema::string(Some("Optional host-owned metadata. Omit it and the host will resolve and bind the actual Go executable and version.".into())),
+            ),
+            ("timeout_ms".into(), JsonSchema::number(None)),
+        ]),
+        Some(vec![
+            "argv".into(),
+            "parser".into(),
+            "expected_outcome".into(),
+            "go_test_selection".into(),
+            "cwd_binding_refs".into(),
+            "allowed_environment_refs".into(),
+            "timeout_ms".into(),
+        ]),
+        Some(false.into()),
+    );
+    let condition = JsonSchema::object(
+        BTreeMap::from([
+            ("condition_id".into(), JsonSchema::string(None)),
+            ("condition_revision".into(), JsonSchema::number(None)),
+            (
+                "kind".into(),
+                JsonSchema::string_enum(
+                    vec![json!("test_suite"), json!("reproduce_failure")],
+                    None,
+                ),
+            ),
+            ("comparison_scope".into(), JsonSchema::string(None)),
+            ("expected".into(), JsonSchema::string(None)),
+            ("required".into(), JsonSchema::boolean(None)),
+            (
+                "verifier_ref".into(),
+                JsonSchema::string_enum(vec![json!("codex-common-harness/go-test-json/1")], None),
+            ),
+            (
+                "verifier_config_revision".into(),
+                JsonSchema::number(Some("Registered verifier configuration revision 1.".into())),
+            ),
+            ("check".into(), check),
+            (
+                "dependency_refs".into(),
+                JsonSchema::array(JsonSchema::string(None), None),
+            ),
+        ]),
+        Some(vec![
+            "condition_id".into(),
+            "condition_revision".into(),
+            "kind".into(),
+            "comparison_scope".into(),
+            "expected".into(),
+            "required".into(),
+            "verifier_ref".into(),
+            "verifier_config_revision".into(),
+            "check".into(),
+            "dependency_refs".into(),
+        ]),
+        Some(false.into()),
+    );
+    JsonSchema::object(
+        BTreeMap::from([
+            (
+                "contract_version".into(),
+                JsonSchema::string_enum(vec![json!("common-harness/1.0")], None),
+            ),
+            ("task_id".into(), JsonSchema::string(None)),
+            ("request_revision".into(), JsonSchema::number(None)),
+            ("goal".into(), JsonSchema::string(None)),
+            (
+                "constraints".into(),
+                JsonSchema::array(JsonSchema::string(None), None),
+            ),
+            ("conditions".into(), JsonSchema::array(condition, None)),
+            ("condition_set_revision".into(), JsonSchema::number(None)),
+            ("max_attempts".into(), JsonSchema::number(None)),
+            (
+                "operation_limits_ref".into(),
+                JsonSchema::string(Some(
+                    "Optional host-owned metadata; omit it and the host will bind current limits."
+                        .into(),
+                )),
+            ),
+            (
+                "skill_refs".into(),
+                JsonSchema::array(skill_ref, Some("Requested skill identifiers only. The host binds each skill's current version, digest, and source.".into())),
+            ),
+            (
+                "execution_owner".into(),
+                JsonSchema::string_enum(vec![json!("standalone_switch")], None),
+            ),
+            (
+                "authorized_request_ref".into(),
+                JsonSchema::string(Some("Optional host-owned metadata; omit it and the host binds the current user request.".into())),
+            ),
+            (
+                "workspace_ref".into(),
+                JsonSchema::string(Some("Optional host-owned metadata; omit it and the host binds the current workspace.".into())),
+            ),
+            (
+                "start_target_version".into(),
+                JsonSchema::string(Some("Optional host-owned metadata; omit it and the host captures the current target version.".into())),
+            ),
+            (
+                "permission_snapshot_ref".into(),
+                JsonSchema::string(Some("Optional host-owned metadata; omit it and the host binds effective current permissions.".into())),
+            ),
+        ]),
+        Some(vec![
+            "contract_version".into(),
+            "task_id".into(),
+            "request_revision".into(),
+            "goal".into(),
+            "constraints".into(),
+            "conditions".into(),
+            "condition_set_revision".into(),
+            "max_attempts".into(),
+            "skill_refs".into(),
+            "execution_owner".into(),
+        ]),
+        Some(false.into()),
+    )
+}
+
 pub(crate) fn create_task_context_boundary_tool(autonomous_completion: bool) -> ToolSpec {
     let evidence_claim = JsonSchema::object(
         BTreeMap::from([
@@ -313,6 +507,10 @@ pub(crate) fn create_task_context_boundary_tool(autonomous_completion: bool) -> 
     ]);
 
     if autonomous_completion {
+        properties.insert(
+            "common_harness_request".into(),
+            common_harness_request_schema(),
+        );
         properties.insert("completion_state".into(), completion_state);
         properties.insert(
             "satisfied_conditions".into(),
@@ -401,6 +599,22 @@ pub(crate) fn create_task_context_boundary_tool(autonomous_completion: bool) -> 
                     "root_task_id",
                     "task_id",
                     "task_revision",
+                    "common_harness_request",
+                ],
+                &[
+                    "action",
+                    "root_task_id",
+                    "task_id",
+                    "task_revision",
+                    "common_harness_request",
+                ],
+            ),
+            action_shape(
+                "begin",
+                &[
+                    "root_task_id",
+                    "task_id",
+                    "task_revision",
                     "completion_state",
                 ],
                 &["action", "root_task_id", "task_id", "task_revision"],
@@ -449,7 +663,7 @@ pub(crate) fn create_task_context_boundary_tool(autonomous_completion: bool) -> 
     ToolSpec::Function(ResponsesApiTool {
         name: TASK_CONTEXT_BOUNDARY_TOOL_NAME.to_string(),
         description: if autonomous_completion {
-            "Workflow: register the root with completion_state initially and when changing the plan. For execution units only: begin the task, perform work, run checks with exec task_evidence, then accept and confirm the host checkpoint committed. For review, after an execution task is accepted, call review(target_task_id[, unit_id]); the host resolves its accepted latest revision and exact review obligation, applies the read-only reviewer route, and persists a reservation before spawning. Wait for that child result, then call adopt_review(unit_id, reason) to record whether to adopt the review. To retry an exact failed attempt, first call plan_review with review_retry containing the review unit_id and expected_attempt_id; then call review for that same unit. Use update to explicitly withdraw only a never-launched planned review that the host can validate; an attempt with a spawn or unknown outcome cannot be withdrawn. When changed artifact bytes invalidate a previously adopted review, add a new planned review with review_revalidation_of naming that exact adopted unit in the update; the host binds the relationship and the new review must be adopted before the current obligation is complete. Same-target reviews remain independent unless this exact relation is provided. Do not resend host review evidence. Use status to retrieve host facts. Once all canonical conditions and required review obligations are complete and no unresolved work or uncollected children remain, give the final report with evidence references; no additional root check or root accept is required. Receipt hashes, task board, goal, decisions, constraints, and timestamps are host-generated. Actions: begin(root_task_id, task_id, task_revision[, completion_state]); update(root_task_id, completion_state); status([root_task_id]); plan_review(root_task_id, previous_plan, revised_plan, reason[, review_retry]); accept(result[, satisfied_conditions]); review(target_task_id[, unit_id]); adopt_review(unit_id, reason)."
+            "Workflow: register the root with completion_state initially and when changing the plan. For a bounded common-harness task, call begin with common_harness_request containing the goal, constraints, acceptance conditions, a typed Go JSON test check, selected cases, and requested skill IDs. Omit host-owned references such as authorized_request_ref, workspace_ref, start_target_version, permission_snapshot_ref, and operation_limits_ref; the host binds them from the current session. For execution units only: begin the task, perform work, run checks with exec task_evidence, then accept and confirm the host checkpoint committed. For review, after an execution task is accepted, call review(target_task_id[, unit_id]); the host resolves its accepted latest revision and exact review obligation, applies the read-only reviewer route, and persists a reservation before spawning. Wait for that child result, then call adopt_review(unit_id, reason) to record whether to adopt the review. To retry an exact failed attempt, first call plan_review with review_retry containing the review unit_id and expected_attempt_id; then call review for that same unit. Use update to explicitly withdraw only a never-launched planned review that the host can validate; an attempt with a spawn or unknown outcome cannot be withdrawn. When changed artifact bytes invalidate a previously adopted review, add a new planned review with review_revalidation_of naming that exact adopted unit in the update; the host binds the relationship and the new review must be adopted before the current obligation is complete. Same-target reviews remain independent unless this exact relation is provided. Do not resend host review evidence. Use status to retrieve host facts. Once all canonical conditions and required review obligations are complete and no unresolved work or uncollected children remain, give the final report with evidence references; no additional root check or root accept is required. Receipt hashes, task board, goal, decisions, constraints, and timestamps are host-generated. Actions: begin(root_task_id, task_id, task_revision, common_harness_request); update(root_task_id, completion_state); status([root_task_id]); plan_review(root_task_id, previous_plan, revised_plan, reason[, review_retry]); accept(result[, satisfied_conditions]); review(target_task_id[, unit_id]); adopt_review(unit_id, reason)."
         } else {
             "Begin an execution scope or prepare acceptance after host verification."
         }
@@ -459,4 +673,41 @@ pub(crate) fn create_task_context_boundary_tool(autonomous_completion: bool) -> 
         parameters,
         output_schema: None,
     })
+}
+
+pub(crate) fn create_common_harness_root_tool() -> ToolSpec {
+    let ToolSpec::Function(mut tool) = create_task_context_boundary_tool(true) else {
+        unreachable!("task_context_boundary is a function tool")
+    };
+    tool.description = "Inspect bounded common-harness status or request acceptance after native host verification. Other task-board and review actions are unavailable while common-harness v1 is active.".into();
+    tool.parameters.one_of = Some(vec![
+        action_shape("status", &["root_task_id"], &["action"]),
+        action_shape("accept", &["result"], &["action", "result"]),
+    ]);
+    ToolSpec::Function(tool)
+}
+
+pub(crate) fn create_common_harness_status_tool() -> ToolSpec {
+    let ToolSpec::Function(mut tool) = create_task_context_boundary_tool(true) else {
+        unreachable!("task_context_boundary is a function tool")
+    };
+    tool.description = "Read current common-harness status. This reviewer route is read-only and supports no other task action.".into();
+    tool.parameters.one_of = Some(vec![action_shape("status", &["root_task_id"], &["action"])]);
+    ToolSpec::Function(tool)
+}
+
+pub(crate) fn create_common_harness_reserved_begin_tool() -> ToolSpec {
+    let ToolSpec::Function(mut tool) = create_task_context_boundary_tool(true) else {
+        unreachable!("task_context_boundary is a function tool")
+    };
+    tool.description = "Begin only the exact execution unit reserved by the host after a completed target changed. Omit common_harness_request and completion_state; the host validates this real Begin call against its saved reservation.".into();
+    tool.parameters.one_of = Some(vec![
+        action_shape("status", &["root_task_id"], &["action"]),
+        action_shape(
+            "begin",
+            &["root_task_id", "task_id", "task_revision"],
+            &["action", "root_task_id", "task_id", "task_revision"],
+        ),
+    ]);
+    ToolSpec::Function(tool)
 }

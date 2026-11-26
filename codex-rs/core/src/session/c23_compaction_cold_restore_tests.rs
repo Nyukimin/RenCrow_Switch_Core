@@ -253,7 +253,7 @@ async fn accept_revision(
     );
 }
 
-async fn install_active_turn(session: &Session, turn: Arc<TurnContext>) {
+pub(super) async fn install_active_turn(session: &Session, turn: Arc<TurnContext>) {
     *session.active_turn.lock().await = Some(ActiveTurn {
         task: Some(RunningTask {
             done: Arc::new(tokio::sync::Notify::new()),

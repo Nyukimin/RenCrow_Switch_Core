@@ -1138,3 +1138,101 @@ fn refuses_fifo_without_blocking_on_open() {
     assert_eq!(result, 0, "mkfifo should create a FIFO");
     assert!(hash_workspace_artifacts(temp.path(), &["artifact.pipe".into()]).is_none());
 }
+
+// Modified by RenCrow Switch Core, 2026-11-26: retain host expected-negative evidence across restore.
+#[test]
+fn expected_negative_check_survives_cold_restore_without_rewriting_raw_failure() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let artifact = std::path::PathBuf::from("regression_test.go");
+    std::fs::write(workspace.path().join(&artifact), "package regression\n")
+        .expect("baseline artifact");
+    let scope = crate::state::ActiveTaskScope {
+        root_task_id: "root-v1".into(),
+        task_id: "task-a".into(),
+        task_revision: 1,
+        begin_call_id: "begin-v1".into(),
+        start_history_cursor: 0,
+    };
+    let request = request_for(1, &artifact);
+    let execution =
+        TaskCheckExecution::new(request.clone(), workspace.path()).expect("bounded baseline");
+    let obligation = TaskCheckObligation::new(
+        scope.clone(),
+        execution.workspace_root.clone(),
+        "go test -json -count=1 -run '^TestRegression$' .",
+        vec![artifact],
+    )
+    .expect("bound obligation");
+    let command = [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^TestRegression$",
+        ".",
+    ]
+    .map(str::to_owned);
+    let output = concat!(
+        "{\"Action\":\"run\",\"Package\":\"example.test/regression\",\"Test\":\"TestRegression\"}\n",
+        "{\"Action\":\"output\",\"Package\":\"example.test/regression\",\"Test\":\"TestRegression\",\"Output\":\"expected 4, got 3\\n\"}\n",
+        "{\"Action\":\"fail\",\"Package\":\"example.test/regression\",\"Test\":\"TestRegression\"}\n",
+        "{\"Action\":\"fail\",\"Package\":\"example.test/regression\"}\n",
+    );
+    let observation = TaskCheckObservation::from_execution(
+        "baseline-call",
+        &command,
+        workspace.path(),
+        output,
+        /*exit_code*/ 1,
+        /*completed*/ true,
+        /*producer_truncated*/ false,
+    );
+    let output_sha = observation.diagnostic_sha256.clone();
+    let mut ledger = TaskCheckLedger::default();
+    ledger.begin_with_obligation(
+        "baseline-call".into(),
+        request,
+        execution.workspace_root,
+        execution.before.clone(),
+        Some(obligation.clone()),
+    );
+    ledger
+        .finish_observed(
+            "baseline-call",
+            /*exit_code*/ 1,
+            /*completed*/ true,
+            execution.before,
+            Some(observation),
+        )
+        .expect("raw failing receipt");
+    assert_eq!(ledger.unresolved_count_for_scope(&scope), 1);
+    let mut wire = serde_json::to_value(ledger.snapshot()).expect("snapshot");
+    wire[0]["expected_negative"] = serde_json::json!({
+        "binding": {
+            "source_call_id": "baseline-call",
+            "obligation": obligation,
+            "condition_id": "AC-reproduce",
+            "condition_revision": 1,
+            "condition_set_revision": 1,
+            "baseline_version": "a".repeat(64),
+            "expected_outcome_digest": "b".repeat(64),
+            "expected_failure_identity": "TestRegression: expected 4, got 3"
+        },
+        "resolution": {
+            "observed_failure_identity": "TestRegression: expected 4, got 3",
+            "evidence_ref": "host-evidence:baseline-call",
+            "raw_output_sha256": output_sha
+        }
+    });
+    let restored_snapshot = serde_json::from_value(wire)
+        .expect("host expected-negative record is part of the typed snapshot");
+    let mut restored = TaskCheckLedger::default();
+    restored
+        .restore_snapshot(restored_snapshot)
+        .expect("restore bound negative evidence");
+    assert_eq!(restored.unresolved_count_for_scope(&scope), 0);
+    let receipt = restored.get("baseline-call").expect("raw failure retained");
+    assert_eq!((receipt.exit_code, receipt.succeeded), (1, false));
+    assert!(restored.latest_for_task("task-a", 1).is_some());
+}

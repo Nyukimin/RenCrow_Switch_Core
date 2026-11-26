@@ -260,6 +260,30 @@ impl GuardState {
         }
     }
 
+    fn finish_host_projected_check(
+        &mut self,
+        key: &str,
+        stamp: u64,
+        observation: CompletedCheckObservation<'_>,
+        resolved_keys: &[String],
+    ) {
+        if observation.exit_code != 0
+            && key
+                .strip_prefix("task-evidence:")
+                .is_some_and(|key| resolved_keys.iter().any(|resolved| resolved == key))
+        {
+            self.failed_checks.remove(key);
+            return;
+        }
+        self.finish_check_observed(
+            key,
+            stamp,
+            observation.exit_code,
+            observation.output,
+            observation.output_may_be_truncated,
+        );
+    }
+
     fn finish_check_observed(
         &mut self,
         key: &str,
@@ -817,6 +841,33 @@ fn implementation_child_requires_edit(effective_requires_edit: Option<bool>) -> 
     effective_requires_edit.unwrap_or(true)
 }
 
+// Common-harness results settle by call, while legacy tasks retain command keys.
+enum TaskEvidenceKeyScope<'a> {
+    LegacyObligation,
+    CommonHarnessCall(&'a str),
+}
+
+struct CompletedCheckObservation<'a> {
+    exit_code: i64,
+    output: &'a str,
+    output_may_be_truncated: bool,
+}
+
+fn task_evidence_check_key(
+    obligation: &crate::task_check::TaskCheckObligation,
+    scope: TaskEvidenceKeyScope<'_>,
+) -> String {
+    match scope {
+        TaskEvidenceKeyScope::LegacyObligation => format!("task-evidence:{}", obligation.key()),
+        TaskEvidenceKeyScope::CommonHarnessCall(call_id) => {
+            if call_id.is_empty() {
+                return String::new();
+            }
+            format!("task-evidence:{}:call:{call_id}", obligation.key())
+        }
+    }
+}
+
 pub(crate) async fn before_tool(invocation: &ToolInvocation) -> Result<(), FunctionCallError> {
     let Some(policy) = invocation.turn.config.rencrow_execution_guard.as_ref() else {
         return Ok(());
@@ -825,14 +876,40 @@ pub(crate) async fn before_tool(invocation: &ToolInvocation) -> Result<(), Funct
         return Ok(());
     }
     let resolved_task_evidence_keys = if invocation.turn.config.rencrow_autonomous_completion {
-        invocation
-            .session
-            .resolved_task_check_launch_obligation_keys()
-            .await
+        invocation.session.resolved_task_check_guard_keys().await
     } else {
         Vec::new()
     };
     let args = arguments(invocation);
+    if invocation.tool_name.is_default_namespace() && invocation.tool_name.name == "workspace_read"
+    {
+        let key = crate::tools::handlers::workspace_read::read_budget_identity(invocation).await?;
+        let diff = invocation.tracker.lock().await.get_unified_diff();
+        let turn_state = {
+            let active = invocation.session.active_turn.lock().await;
+            active.as_ref().map(|active| active.turn_state.clone())
+        };
+        let Some(turn_state) = turn_state else {
+            return Err(FunctionCallError::RespondToModel(
+                "RENCROW_EXECUTION_GUARD: no active turn".into(),
+            ));
+        };
+        let mut turn = turn_state.lock().await;
+        turn.rencrow_execution_guard
+            .settle_proven_task_evidence_launches(&resolved_task_evidence_keys);
+        turn.rencrow_execution_guard.observe_diff(diff.as_deref());
+        if let Err(message) = turn.rencrow_execution_guard.charge_read(policy, &key) {
+            let state = &mut turn.rencrow_execution_guard;
+            let fatal = state.record_budget_rejection() && state.fatal_on_next_budget_refusal;
+            if fatal {
+                return Err(FunctionCallError::Fatal(format!(
+                    "RENCROW_READ_BUDGET_EXCEEDED: repeated host refusals stopped the turn; {message}"
+                )));
+            }
+            return Err(FunctionCallError::RespondToModel(message));
+        }
+        return Ok(());
+    }
     let task_context_status = invocation.tool_name.is_default_namespace()
         && invocation.tool_name.name
             == crate::tools::handlers::task_context_boundary_spec::TASK_CONTEXT_BOUNDARY_TOOL_NAME
@@ -932,13 +1009,23 @@ pub(crate) async fn before_tool(invocation: &ToolInvocation) -> Result<(), Funct
             } else {
                 configured_cwd.join(requested_cwd)
             };
+            let key_scope = if invocation
+                .session
+                .rencrow_completion_state(&scope.root_task_id)
+                .await
+                .is_some_and(|completion| completion.common_harness.is_some())
+            {
+                TaskEvidenceKeyScope::CommonHarnessCall(&invocation.call_id)
+            } else {
+                TaskEvidenceKeyScope::LegacyObligation
+            };
             crate::task_check::TaskCheckObligation::new(
                 scope,
                 cwd,
                 command.trim(),
                 request.artifact_paths,
             )
-            .map(|obligation| format!("task-evidence:{}", obligation.key()))
+            .map(|obligation| task_evidence_check_key(&obligation, key_scope))
             .unwrap_or_else(&fallback)
         } else {
             fallback()
@@ -1100,10 +1187,7 @@ pub(crate) async fn after_tool(invocation: &ToolInvocation, receipt: ToolReceipt
         return;
     }
     let resolved_task_evidence_keys = if invocation.turn.config.rencrow_autonomous_completion {
-        invocation
-            .session
-            .resolved_task_check_launch_obligation_keys()
-            .await
+        invocation.session.resolved_task_check_guard_keys().await
     } else {
         Vec::new()
     };
@@ -1225,7 +1309,16 @@ pub(crate) async fn after_tool(invocation: &ToolInvocation, receipt: ToolReceipt
         let output_may_be_truncated = check_output_may_be_truncated(&value);
         if let Some(exit) = value["exit_code"].as_i64() {
             if receipt.successful {
-                state.finish_check_observed(&command, stamp, exit, output, output_may_be_truncated);
+                state.finish_host_projected_check(
+                    &command,
+                    stamp,
+                    CompletedCheckObservation {
+                        exit_code: exit,
+                        output,
+                        output_may_be_truncated,
+                    },
+                    &resolved_task_evidence_keys,
+                );
             }
         } else if let Some(id) = value["session_id"].as_i64() {
             state.pending_checks.insert(id, (command, stamp));
@@ -1343,7 +1436,7 @@ pub(crate) async fn check_completion(
         return Ok(());
     }
     let resolved_task_evidence_keys = if turn.config.rencrow_autonomous_completion {
-        session.resolved_task_check_launch_obligation_keys().await
+        session.resolved_task_check_guard_keys().await
     } else {
         Vec::new()
     };

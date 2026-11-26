@@ -31,6 +31,8 @@ pub enum RawPayloadKind {
     InferenceRequest,
     /// Full upstream inference response or non-delta response stream summary.
     InferenceResponse,
+    /// Host-owned model-setting receipt attached to one inference call.
+    ModelSettingsReceipt,
     CompactionRequest,
     /// Trace-only checkpoint captured when processed replacement history is installed.
     CompactionCheckpoint,

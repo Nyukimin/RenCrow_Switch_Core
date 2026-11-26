@@ -55,6 +55,7 @@ use crate::tools::handlers::McpHandler;
 use crate::tools::handlers::ToolSearchHandlerCache;
 use crate::tools::handlers::WaitForEnvironmentHandler;
 use crate::tools::handlers::multi_agents_spec::MULTI_AGENT_V1_NAMESPACE;
+use crate::tools::registry::CommonHarnessToolProfile;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::RegisteredTool;
 use crate::tools::router::ToolRouter;
@@ -64,6 +65,115 @@ use crate::tools::spec_plan::append_source_tools;
 use crate::tools::spec_plan::build_core_tool_registry;
 
 const MULTI_AGENT_V2_NAMESPACE: &str = "collaboration";
+
+async fn common_harness_profile_specs(profile: CommonHarnessToolProfile) -> Vec<ToolSpec> {
+    let (session, mut turn) = make_session_and_context().await;
+    Arc::make_mut(&mut turn.config).rencrow_compaction = true;
+    Arc::make_mut(&mut turn.config).rencrow_autonomous_completion = true;
+    let turn = Arc::new(turn);
+    let step_context = StepContext::for_test(Arc::clone(&turn));
+    let router = super::build_tool_router(
+        &session,
+        step_context.turn.as_ref(),
+        &step_context.settings.model_info,
+        &step_context.environments,
+        &step_context.mcp,
+        /*apps_enabled*/ false,
+        &turn.extension_data,
+        /*tool_suggest_candidates*/ None,
+        Some(profile),
+    )
+    .expect("build common-harness profile router");
+    router.model_visible_specs().to_vec()
+}
+
+fn task_context_action_variants(specs: &[ToolSpec]) -> Vec<Vec<String>> {
+    let boundary = specs
+        .iter()
+        .find(|spec| spec.name() == "task_context_boundary")
+        .expect("task context boundary is advertised");
+    let ToolSpec::Function(function) = boundary else {
+        panic!("task_context_boundary is a function tool")
+    };
+    function
+        .parameters
+        .one_of
+        .as_ref()
+        .expect("common-harness action schema is a finite oneOf")
+        .iter()
+        .map(|variant| {
+            variant
+                .properties
+                .as_ref()
+                .and_then(|properties| properties.get("action"))
+                .and_then(|action| action.enum_values.as_ref())
+                .expect("each action variant has a literal action")
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn common_harness_tool_profiles_advertise_only_supported_routes() {
+    let root_specs = common_harness_profile_specs(CommonHarnessToolProfile::Root).await;
+    let root_names = root_specs
+        .iter()
+        .map(codex_tools::ToolSpec::name)
+        .collect::<Vec<_>>();
+    assert!(root_names.contains(&"workspace_read"));
+    assert!(root_names.contains(&"task_context_boundary"));
+    assert!(root_names.iter().all(|name| {
+        matches!(
+            *name,
+            "task_context_boundary" | "workspace_read" | "exec_command" | "apply_patch"
+        )
+    }));
+    let root_actions = task_context_action_variants(&root_specs);
+    assert_eq!(
+        root_actions,
+        vec![vec!["status".to_string()], vec!["accept".to_string()]]
+    );
+
+    let reviewer_specs =
+        common_harness_profile_specs(CommonHarnessToolProfile::ReviewReadOnly).await;
+    let reviewer_names = reviewer_specs
+        .iter()
+        .map(codex_tools::ToolSpec::name)
+        .collect::<Vec<_>>();
+    assert!(reviewer_names.contains(&"workspace_read"));
+    assert!(reviewer_names.contains(&"task_context_boundary"));
+    assert!(
+        reviewer_names
+            .iter()
+            .all(|name| matches!(*name, "task_context_boundary" | "workspace_read"))
+    );
+    assert_eq!(
+        task_context_action_variants(&reviewer_specs),
+        vec![vec!["status".to_string()]]
+    );
+
+    let status_only_specs =
+        common_harness_profile_specs(CommonHarnessToolProfile::StatusOnly).await;
+    let status_only_names = status_only_specs
+        .iter()
+        .map(codex_tools::ToolSpec::name)
+        .collect::<Vec<_>>();
+    assert_eq!(status_only_names, vec!["task_context_boundary"]);
+    assert_eq!(
+        task_context_action_variants(&status_only_specs),
+        vec![vec!["status".to_string()]]
+    );
+
+    let legacy_specs = common_harness_profile_specs(CommonHarnessToolProfile::Legacy).await;
+    assert!(
+        !legacy_specs
+            .iter()
+            .any(|spec| spec.name() == "workspace_read")
+    );
+}
 
 #[derive(Default)]
 struct ToolPlanInputs {
@@ -253,6 +363,48 @@ fn plan_with_model(
 
 async fn probe(configure_turn: impl FnOnce(&mut TurnContext)) -> ToolPlanProbe {
     probe_with(configure_turn, ToolPlanInputs::default()).await
+}
+
+#[tokio::test]
+async fn common_harness_plan_exposes_bounded_structured_workspace_read() {
+    let plan = probe(|turn| {
+        turn.session_source = SessionSource::Cli;
+        update_config(turn, |config| {
+            config.rencrow_compaction = true;
+            config.rencrow_autonomous_completion = true;
+        });
+    })
+    .await;
+
+    plan.assert_registered_contains(&["workspace_read"]);
+    plan.assert_visible_contains(&["workspace_read"]);
+    let schema = serde_json::to_value(plan.visible_spec("workspace_read"))
+        .expect("structured workspace read schema serializes");
+    let parameters = &schema["parameters"];
+    assert_eq!(parameters["type"], "object");
+    assert_eq!(parameters["additionalProperties"], false);
+    assert_eq!(
+        parameters["properties"]["action"]["enum"],
+        json!(["read", "search", "compare"])
+    );
+    let paths = &parameters["properties"]["paths"];
+    assert_eq!(paths["type"], "array");
+    assert!(
+        paths["description"]
+            .as_str()
+            .is_some_and(|description| description.contains("16"))
+    );
+    assert_eq!(paths["items"]["type"], "string");
+    assert_eq!(
+        parameters["properties"]["max_output_bytes"]["type"],
+        "number"
+    );
+    assert!(
+        parameters["properties"]["max_output_bytes"]["description"]
+            .as_str()
+            .is_some_and(|description| description.contains("32768"))
+    );
+    assert!(parameters["properties"].get("command").is_none());
 }
 
 fn set_feature(turn: &mut TurnContext, feature: Feature, enabled: bool) {
@@ -617,6 +769,7 @@ async fn reviewer_tool_policy_exclude_optional_core_tools() {
         /*apps_enabled*/ false,
         &turn.extension_data,
         /*tool_suggest_candidates*/ None,
+        /*common_harness_tool_profile*/ None,
     )
     .expect("build internal Guardian tool router");
 
@@ -669,6 +822,7 @@ async fn reviewer_tool_policy_respect_managed_shell_restrictions() {
             /*apps_enabled*/ false,
             &turn.extension_data,
             /*tool_suggest_candidates*/ None,
+            /*common_harness_tool_profile*/ None,
         )
         .expect("build internal Guardian tool router");
 
@@ -705,6 +859,7 @@ async fn reviewer_tool_policy_preserve_code_mode() {
         /*apps_enabled*/ false,
         &turn.extension_data,
         /*tool_suggest_candidates*/ None,
+        /*common_harness_tool_profile*/ None,
     )
     .expect("build internal Guardian tool router");
 
@@ -775,6 +930,7 @@ async fn reviewer_tool_policy_require_managed_secondary_environments() {
             /*apps_enabled*/ false,
             &turn.extension_data,
             /*tool_suggest_candidates*/ None,
+            /*common_harness_tool_profile*/ None,
         )
         .expect("build internal Guardian tool router");
 
@@ -1770,6 +1926,7 @@ async fn strict_namespace_ownership_requires_tool_namespace_inventory_opt_in() {
             registry,
             hosted_specs,
             &Default::default(),
+            None,
         );
 
         if enabled && second_exposure != ToolExposure::Hidden {
@@ -2018,6 +2175,7 @@ async fn strict_tool_collisions_reject_external_and_synthetic_duplicates() {
             registry,
             hosted_specs,
             &Default::default(),
+            None,
         )
         .err()
         .expect("strict tool collision should fail tool planning");

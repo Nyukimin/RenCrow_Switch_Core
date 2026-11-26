@@ -454,6 +454,7 @@ fn completion_state(target_artifact_ref: &str) -> CompletionState {
         product_progress_at: None,
         runtime_recovery_at: None,
         activity_at: None,
+        common_harness: None,
     }
 }
 

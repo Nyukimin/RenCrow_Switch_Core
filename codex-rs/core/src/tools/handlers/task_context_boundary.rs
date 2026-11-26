@@ -28,8 +28,12 @@ use codex_history::task_context::BoundaryMode;
 use codex_history::task_context::CompletionEvidenceRef;
 use codex_history::task_context::CompletionReviewTarget;
 use codex_history::task_context::CompletionUnitKind;
+use codex_history::task_context::ConditionSpecV1;
+use codex_history::task_context::ExecutionOwnerV1;
 use codex_history::task_context::HostBoundaryFacts;
+use codex_history::task_context::SkillRefV1;
 use codex_history::task_context::StoredTaskState;
+use codex_history::task_context::TaskRequestV1;
 use codex_history::task_context::TaskState;
 use codex_history::task_context::TaskStatus;
 use codex_history::task_context::UnitStatus;
@@ -64,6 +68,8 @@ enum TaskContextBoundaryArgs {
         task_revision: u64,
         #[serde(default)]
         completion_state: Option<serde_json::Value>,
+        #[serde(default)]
+        common_harness_request: Option<Box<CommonHarnessRequestArgs>>,
     },
     Update {
         root_task_id: String,
@@ -109,6 +115,90 @@ enum TaskContextBoundaryArgs {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct CommonHarnessRequestArgs {
+    contract_version: String,
+    task_id: String,
+    request_revision: u64,
+    #[serde(default)]
+    authorized_request_ref: String,
+    goal: String,
+    #[serde(default)]
+    workspace_ref: String,
+    #[serde(default)]
+    start_target_version: String,
+    #[serde(default)]
+    permission_snapshot_ref: String,
+    constraints: Vec<String>,
+    conditions: Vec<ConditionSpecV1>,
+    condition_set_revision: u64,
+    max_attempts: u32,
+    #[serde(default)]
+    operation_limits_ref: String,
+    skill_refs: Vec<RequestedSkillRefArgs>,
+    execution_owner: ExecutionOwnerV1,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RequestedSkillRefArgs {
+    id: String,
+    // Older clients may send model-authored metadata. It is parsed only for
+    // compatibility and discarded; Session binds the persistent SkillRefV1.
+    #[serde(default)]
+    version_ref: Option<String>,
+    #[serde(default)]
+    content_digest: Option<String>,
+    #[serde(default)]
+    source_ref: Option<String>,
+}
+
+impl CommonHarnessRequestArgs {
+    fn into_task_request(self) -> Result<TaskRequestV1, String> {
+        if self.contract_version != codex_history::task_context::COMMON_HARNESS_CONTRACT {
+            return Err(format!(
+                "unsupported common harness contract `{}`",
+                self.contract_version
+            ));
+        }
+        Ok(TaskRequestV1 {
+            task_id: self.task_id,
+            request_revision: self.request_revision,
+            authorized_request_ref: self.authorized_request_ref,
+            goal: self.goal,
+            workspace_ref: self.workspace_ref,
+            start_target_version: self.start_target_version,
+            permission_snapshot_ref: self.permission_snapshot_ref,
+            constraints: self.constraints,
+            conditions: self.conditions,
+            condition_set_revision: self.condition_set_revision,
+            max_attempts: self.max_attempts,
+            operation_limits_ref: self.operation_limits_ref,
+            skill_refs: self
+                .skill_refs
+                .into_iter()
+                .map(|skill| {
+                    let RequestedSkillRefArgs {
+                        id,
+                        version_ref,
+                        content_digest,
+                        source_ref,
+                    } = skill;
+                    let _ignored_legacy_metadata = (version_ref, content_digest, source_ref);
+                    SkillRefV1 {
+                        id,
+                        version_ref: String::new(),
+                        content_digest: String::new(),
+                        source_ref: String::new(),
+                    }
+                })
+                .collect(),
+            execution_owner: self.execution_owner,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ReviewRetryArgs {
     unit_id: String,
     expected_attempt_id: String,
@@ -119,6 +209,127 @@ fn render_completion_status(
     current_review_reason: Option<&str>,
     verification_obligations: Option<&serde_json::Value>,
 ) -> Result<String, String> {
+    if let Some(common) = state.common_harness.as_ref() {
+        let condition_summaries = common
+            .request
+            .conditions
+            .iter()
+            .take(16)
+            .map(|condition| {
+                let current_evidence = common.evidence_refs.iter().rev().find(|evidence| {
+                    evidence.condition_id == condition.condition_id
+                        && evidence.condition_revision == condition.condition_revision
+                        && evidence.condition_set_revision == common.request.condition_set_revision
+                        && evidence.request_revision == common.request.request_revision
+                        && evidence.target_version == common.run_state.target_version
+                        && evidence.lifecycle
+                            == codex_history::task_context::EvidenceLifecycleV1::Current
+                });
+                serde_json::json!({
+                    "condition_id": condition.condition_id,
+                    "revision": condition.condition_revision,
+                    "kind": condition.kind,
+                    "expected": condition.expected.chars().take(512).collect::<String>(),
+                    "required": condition.required,
+                    "unmet": common.run_state.unmet_conditions.contains(&condition.condition_id),
+                    "latest_verdict": current_evidence.map(|evidence| evidence.verdict),
+                    "evidence_id": current_evidence.map(|evidence| evidence.evidence_id.clone()),
+                    "observed": current_evidence.map(|evidence| {
+                        evidence.observed.chars().take(2048).collect::<String>()
+                    }),
+                    "log_refs": current_evidence.map(|evidence| evidence.log_refs.iter()
+                        .take(8).map(|value| value.chars().take(512).collect::<String>())
+                        .collect::<Vec<_>>()),
+                    "artifact_refs": current_evidence.map(|evidence| evidence.artifact_refs.iter()
+                        .take(16).map(|value| value.chars().take(512).collect::<String>())
+                        .collect::<Vec<_>>()),
+                })
+            })
+            .collect::<Vec<_>>();
+        let current_operation = common
+            .run_state
+            .unsettled_operation_refs
+            .first()
+            .and_then(|operation_id| {
+                common
+                    .operation_refs
+                    .iter()
+                    .find(|record| &record.intent.operation_id == operation_id)
+            })
+            .map(|record| {
+                serde_json::json!({
+                    "operation_id": record.intent.operation_id,
+                    "kind": record.intent.operation_kind,
+                    "status": record.intent.status,
+                    "claim_count": record.claims.len(),
+                    "has_raw_receipt": record.receipt.is_some(),
+                    "finalization_count": record.finalizations.len(),
+                })
+            });
+        let recent_evidence = common
+            .evidence_refs
+            .iter()
+            .rev()
+            .take(8)
+            .map(|evidence| {
+                serde_json::json!({
+                    "evidence_id": evidence.evidence_id,
+                    "condition_id": evidence.condition_id,
+                    "verdict": evidence.verdict,
+                    "lifecycle": evidence.lifecycle,
+                    "target_version": evidence.target_version,
+                })
+            })
+            .collect::<Vec<_>>();
+        let verification_obligations = verification_obligations.filter(|diagnostics| {
+            diagnostics
+                .get("count")
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|count| count > 0)
+        });
+        let mut rendered = serde_json::json!({
+            "contract_version": common.contract_version,
+            "request": {
+                "task_id": common.request.task_id,
+                "request_revision": common.request.request_revision,
+                "goal": common.request.goal.chars().take(2048).collect::<String>(),
+                "constraints": common.request.constraints.iter().take(16)
+                    .map(|value| value.chars().take(512).collect::<String>())
+                    .collect::<Vec<_>>(),
+                "conditions": condition_summaries,
+                "max_attempts": common.request.max_attempts,
+            },
+            "run_state": {
+                "state_version": common.run_state.state_version,
+                "owner_id": common.run_state.owner_id,
+                "owner_epoch": common.run_state.owner_epoch,
+                "status": common.run_state.status,
+                "phase": common.run_state.phase,
+                "attempt_no": common.run_state.attempt_no,
+                "target_version": common.run_state.target_version,
+                "unmet_conditions": common.run_state.unmet_conditions.iter().take(32).collect::<Vec<_>>(),
+                "next_operation": common.run_state.next_operation,
+                "reason_code": common.run_state.reason_code,
+                "waiting": common.run_state.waiting,
+                "current_operation": current_operation,
+            },
+            "record_counts": {
+                "operations": common.operation_refs.len(),
+                "evidence": common.evidence_refs.len(),
+            },
+            "recent_evidence": recent_evidence,
+        });
+        if let Some(verification_obligations) = verification_obligations {
+            rendered
+                .as_object_mut()
+                .ok_or_else(|| "common-harness status did not serialize as an object".to_string())?
+                .insert(
+                    "verification_obligations".into(),
+                    verification_obligations.clone(),
+                );
+        }
+        return serde_json::to_string(&rendered).map_err(|error| error.to_string());
+    }
     let reason = current_review_reason.filter(|reason| !reason.trim().is_empty());
     let verification_obligations = verification_obligations.filter(|diagnostics| {
         diagnostics
@@ -187,13 +398,77 @@ impl ToolExecutor<ToolInvocation> for TaskContextBoundaryHandler {
             };
             let raw_arguments = arguments.clone();
             let args: TaskContextBoundaryArgs = parse_arguments(arguments)?;
+            let active_common_harness = invocation
+                .session
+                .common_harness_tool_state_for_turn(&invocation.turn)
+                .await;
+            if let Some((common_root_task_id, common)) = active_common_harness {
+                let scope_matches = invocation
+                    .session
+                    .active_task_scope()
+                    .await
+                    .is_some_and(|scope| scope.root_task_id == common_root_task_id);
+                let task_is_nonterminal = !matches!(
+                    common.run_state.status,
+                    codex_history::task_context::TaskRunStatusV1::Completed
+                        | codex_history::task_context::TaskRunStatusV1::Cancelled
+                        | codex_history::task_context::TaskRunStatusV1::Exhausted
+                );
+                let review_read_only = invocation
+                    .session
+                    .is_read_only_review_actor_for_turn(&invocation.turn)
+                    .await;
+                let reserved_begin = match &args {
+                    TaskContextBoundaryArgs::Begin {
+                        root_task_id,
+                        task_id,
+                        task_revision,
+                        completion_state: None,
+                        common_harness_request: None,
+                    } => {
+                        invocation
+                            .session
+                            .common_harness_reserved_begin_matches(
+                                &invocation.turn,
+                                root_task_id,
+                                task_id,
+                                *task_revision,
+                            )
+                            .await
+                    }
+                    _ => false,
+                };
+                let supported = matches!(&args, TaskContextBoundaryArgs::Status { .. })
+                    || (!review_read_only && reserved_begin)
+                    || (scope_matches
+                        && task_is_nonterminal
+                        && !review_read_only
+                        && matches!(&args, TaskContextBoundaryArgs::Accept { .. }));
+                if !supported {
+                    return Err(FunctionCallError::RespondToModel(if review_read_only {
+                        "common-harness reviewer route permits status only".into()
+                    } else {
+                        "common-harness v1 task actions are host-routed; only status and native-gated accept are supported".into()
+                    }));
+                }
+            }
             match args {
                 TaskContextBoundaryArgs::Begin {
                     root_task_id,
                     task_id,
                     task_revision,
                     completion_state,
+                    common_harness_request,
                 } => {
+                    if completion_state.as_ref().is_some_and(|state| {
+                        state
+                            .get("common_harness")
+                            .is_some_and(|extension| !extension.is_null())
+                    }) {
+                        return Err(FunctionCallError::RespondToModel(
+                            "Begin cannot accept host-owned common-harness state; submit common_harness_request instead".into(),
+                        ));
+                    }
                     if root_task_id.trim().is_empty()
                         || task_id.trim().is_empty()
                         || task_revision == 0
@@ -203,6 +478,47 @@ impl ToolExecutor<ToolInvocation> for TaskContextBoundaryHandler {
                         ));
                     }
                     let active_scope = invocation.session.active_task_scope().await;
+                    if let Some(active) = active_scope.as_ref()
+                        && active.root_task_id == root_task_id
+                        && let Some(state) = invocation
+                            .session
+                            .rencrow_completion_state(&active.root_task_id)
+                            .await
+                        && state.common_harness.is_some()
+                    {
+                        return Err(FunctionCallError::RespondToModel(
+                            "an active common-harness v1 task cannot be restarted or downgraded through Begin".into(),
+                        ));
+                    }
+                    if completion_state.is_none()
+                        && common_harness_request.is_none()
+                        && self.autonomous_completion
+                        && invocation.turn.config.rencrow_autonomous_completion
+                        && invocation
+                            .session
+                            .common_harness_reserved_begin_matches(
+                                &invocation.turn,
+                                &root_task_id,
+                                &task_id,
+                                task_revision,
+                            )
+                            .await
+                    {
+                        invocation
+                            .session
+                            .begin_reserved_common_harness_execution(
+                                &root_task_id,
+                                &task_id,
+                                task_revision,
+                                &invocation.call_id,
+                            )
+                            .await
+                            .map_err(FunctionCallError::RespondToModel)?;
+                        return Ok(boxed_tool_output(FunctionToolOutput::from_text(
+                            "Host-reserved common-harness execution unit begun. Continue with the current task and host-bound verification obligations.".into(),
+                            Some(true),
+                        )));
+                    }
                     if let Some(active) = active_scope.as_ref()
                         && !(active.root_task_id == root_task_id
                             && active.task_id == task_id
@@ -347,32 +663,73 @@ impl ToolExecutor<ToolInvocation> for TaskContextBoundaryHandler {
                         )
                         .await
                         .map_err(FunctionCallError::RespondToModel)?;
-                    if invocation.turn.config.rencrow_autonomous_completion
-                        && let Some(completion_state) = completion_state
-                    {
+                    if let Some(common_harness_request) = common_harness_request {
+                        if completion_state.is_some() {
+                            return Err(FunctionCallError::RespondToModel(
+                                "Begin cannot combine common_harness_request with completion_state"
+                                    .into(),
+                            ));
+                        }
+                        if !self.autonomous_completion
+                            || !invocation.turn.config.rencrow_autonomous_completion
+                        {
+                            return Err(FunctionCallError::RespondToModel(
+                                "common_harness/1.0 requires autonomous completion to be enabled"
+                                    .into(),
+                            ));
+                        }
+                        let request = (*common_harness_request)
+                            .into_task_request()
+                            .map_err(FunctionCallError::RespondToModel)?;
+                        if request.task_id != task_id || request.request_revision != task_revision {
+                            return Err(FunctionCallError::RespondToModel(
+                                "common_harness_request task_id and request_revision must match Begin scope"
+                                    .into(),
+                            ));
+                        }
                         invocation
                             .session
-                            .set_rencrow_completion_state(root_task_id.clone(), completion_state)
+                            .begin_common_harness_task(
+                                root_task_id,
+                                task_id,
+                                task_revision,
+                                invocation.call_id,
+                                request,
+                                &invocation.turn,
+                            )
                             .await
                             .map_err(FunctionCallError::RespondToModel)?;
-                    }
-                    invocation
-                        .session
-                        .begin_task_scope(
-                            root_task_id,
-                            task_id,
-                            task_revision,
-                            invocation.call_id,
-                            invocation.turn.config.rencrow_autonomous_completion,
-                        )
-                        .await
-                        .map_err(FunctionCallError::RespondToModel)?;
-                    if invocation.turn.config.rencrow_autonomous_completion {
+                    } else {
+                        if invocation.turn.config.rencrow_autonomous_completion
+                            && let Some(completion_state) = completion_state
+                        {
+                            invocation
+                                .session
+                                .set_rencrow_completion_state(
+                                    root_task_id.clone(),
+                                    completion_state,
+                                )
+                                .await
+                                .map_err(FunctionCallError::RespondToModel)?;
+                        }
                         invocation
                             .session
-                            .persist_autonomous_completion_snapshot()
+                            .begin_task_scope(
+                                root_task_id,
+                                task_id,
+                                task_revision,
+                                invocation.call_id,
+                                invocation.turn.config.rencrow_autonomous_completion,
+                            )
                             .await
                             .map_err(FunctionCallError::RespondToModel)?;
+                        if invocation.turn.config.rencrow_autonomous_completion {
+                            invocation
+                                .session
+                                .persist_autonomous_completion_snapshot()
+                                .await
+                                .map_err(FunctionCallError::RespondToModel)?;
+                        }
                     }
                     Ok(boxed_tool_output(FunctionToolOutput::from_text(
                         "Task scope begun. This records a host start boundary and does not accept or complete the task."
@@ -387,6 +744,26 @@ impl ToolExecutor<ToolInvocation> for TaskContextBoundaryHandler {
                     if !invocation.turn.config.rencrow_autonomous_completion {
                         return Err(FunctionCallError::RespondToModel(
                             "autonomous completion is not enabled for this session".into(),
+                        ));
+                    }
+                    if completion_state
+                        .get("common_harness")
+                        .is_some_and(|extension| !extension.is_null())
+                    {
+                        return Err(FunctionCallError::RespondToModel(
+                            "common-harness v1 state is host-owned and cannot be supplied through Update"
+                                .into(),
+                        ));
+                    }
+                    if invocation
+                        .session
+                        .rencrow_completion_state(&root_task_id)
+                        .await
+                        .is_some_and(|state| state.common_harness.is_some())
+                    {
+                        return Err(FunctionCallError::RespondToModel(
+                            "common-harness v1 state is host-owned and cannot be changed through Update"
+                                .into(),
                         ));
                     }
                     invocation
@@ -428,27 +805,33 @@ impl ToolExecutor<ToolInvocation> for TaskContextBoundaryHandler {
                     }
                     let root_task_id = match root_task_id {
                         Some(root_task_id) => root_task_id,
-                        None => invocation
+                        None => match invocation
                             .session
-                            .latest_rencrow_task_state()
+                            .common_harness_root_for_turn(&invocation.turn)
                             .await
-                            .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?
-                            .map(|state| state.boundary.root_task_id)
-                            .ok_or_else(|| {
-                                FunctionCallError::RespondToModel(
-                                    "no host-registered completion contract is available".into(),
-                                )
-                            })?,
+                        {
+                            Some(root) => root,
+                            None => invocation
+                                .session
+                                .latest_rencrow_task_state()
+                                .await
+                                .map_err(|error| {
+                                    FunctionCallError::RespondToModel(error.to_string())
+                                })?
+                                .map(|state| state.boundary.root_task_id)
+                                .ok_or_else(|| {
+                                    FunctionCallError::RespondToModel(
+                                        "no host-registered completion contract is available"
+                                            .into(),
+                                    )
+                                })?,
+                        },
                     };
                     let state = invocation
                         .session
-                        .rencrow_completion_state(&root_task_id)
+                        .refresh_common_harness_status(&invocation.turn, &root_task_id)
                         .await
-                        .ok_or_else(|| {
-                            FunctionCallError::RespondToModel(
-                                "no host-registered completion contract is available".into(),
-                            )
-                        })?;
+                        .map_err(FunctionCallError::RespondToModel)?;
                     let current_review_reason = invocation
                         .session
                         .autonomous_completion_current_review_scope_reason()
@@ -881,12 +1264,40 @@ impl ToolExecutor<ToolInvocation> for TaskContextBoundaryHandler {
                     result,
                     satisfied_conditions,
                 } => {
+                    let active = invocation.session.active_task_scope().await;
+                    let mut common_harness_satisfied_conditions = None;
+                    if let Some(active) = active.as_ref()
+                        && let Some(state) = invocation
+                            .session
+                            .rencrow_completion_state(&active.root_task_id)
+                            .await
+                        && state.common_harness.is_some()
+                    {
+                        if satisfied_conditions.is_some() {
+                            return Err(FunctionCallError::RespondToModel(
+                                "satisfied_conditions is host-owned for common-harness v1; omit the model-supplied field".into(),
+                            ));
+                        }
+                        common_harness_satisfied_conditions = Some(
+                            invocation
+                                .session
+                                .common_harness_acceptance_conditions(&invocation.turn)
+                                .await
+                                .map_err(|error| {
+                                    FunctionCallError::RespondToModel(format!(
+                                        "common-harness v1 native acceptance gate rejected Accept: {error}"
+                                    ))
+                                })?
+                                .ok_or_else(|| FunctionCallError::RespondToModel(
+                                    "common-harness v1 native acceptance evidence is unavailable".into(),
+                                ))?,
+                        );
+                    }
                     let maybe_latest = invocation
                         .session
                         .latest_rencrow_task_state()
                         .await
                         .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
-                    let active = invocation.session.active_task_scope().await;
                     if active.as_ref().is_some_and(|active| {
                         maybe_latest
                             .as_ref()
@@ -1263,7 +1674,10 @@ impl ToolExecutor<ToolInvocation> for TaskContextBoundaryHandler {
                                 &active.task_id,
                                 active.task_revision,
                                 &evidence_ref,
-                                satisfied_conditions.as_deref().unwrap_or_default(),
+                                common_harness_satisfied_conditions
+                                    .as_deref()
+                                    .or(satisfied_conditions.as_deref())
+                                    .unwrap_or_default(),
                                 active.task_id != active.root_task_id,
                             )
                             .map_err(FunctionCallError::RespondToModel)?;

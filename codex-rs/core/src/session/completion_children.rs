@@ -2785,7 +2785,7 @@ impl Session {
     }
 }
 
-fn task_check_artifact_fingerprint(
+pub(super) fn task_check_artifact_fingerprint(
     receipt: &crate::task_check::TaskCheckReceipt,
 ) -> Result<String, String> {
     let artifact_stamp_set = receipt
@@ -2880,6 +2880,7 @@ mod tests {
             product_progress_at: None,
             runtime_recovery_at: None,
             activity_at: None,
+            common_harness: None,
         }
     }
 
@@ -3844,6 +3845,7 @@ mod tests {
                 product_progress_at: None,
                 runtime_recovery_at: None,
                 activity_at: None,
+                common_harness: None,
             },
         ));
 

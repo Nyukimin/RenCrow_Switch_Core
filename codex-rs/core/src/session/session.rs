@@ -1,8 +1,16 @@
+// Modified by RenCrow Switch Core, 2026-11-27: gate local-writer takeover with durable host proof.
 // Modified by RenCrow Switch Core, 2026-11-24: explain exact review revalidation condition scope.
 // Modified by RenCrow Switch Core, 2026-11-21: resolve exact accepted revision evidence across update and restore.
 // Modified by RenCrow Switch Core, 2026-11-20: separate caller and host checkpoint budgets.
 // Modified by RenCrow Switch Core, 2026-09-22: handle durable compaction markers; 2026-09-28: role tool allowlist.
 // Modified 2026-11-19: validate retry bindings against the host plan-review history.
+#[cfg(test)]
+pub(crate) fn trace_native_patch_wait(stage: &str) {
+    if std::env::var_os("CODEX_NATIVE_PATCH_WAIT_TRACE").is_some() {
+        tracing::debug!(stage, "native-patch-wait-stage");
+    }
+}
+
 use super::completion_review::completion_unit_obligation_is_satisfied;
 use super::input_queue::InputQueue;
 use super::mcp_refresh::McpRefresh;
@@ -58,6 +66,20 @@ use tokio::sync::Semaphore;
 
 type McpToolApprovalMetadataMap =
     HashMap<(String, String), std::sync::Weak<(Option<McpInvocation>, McpToolApprovalMetadata)>>;
+
+enum CommonHarnessHostAuthority<'a> {
+    CurrentRuntime,
+    VerifiedTakeover(&'a CommonHarnessTakeoverAuthority),
+}
+
+struct CommonHarnessTakeoverAuthority {
+    previous_owner_id: String,
+    previous_owner_epoch: u64,
+    fence: codex_history::task_context::StateFenceV1,
+    new_owner_id: String,
+    new_owner_epoch: u64,
+    proof_ref: String,
+}
 
 /// Context for an initialized model agent
 ///
@@ -961,10 +983,28 @@ impl Session {
     async fn install_rencrow_completion_state(
         &self,
         root_task_id: String,
-        mut completion_state: serde_json::Value,
+        completion_state: serde_json::Value,
         update_call_id: Option<String>,
     ) -> Result<(), String> {
-        let _review_guard = self.completion_review_owner_guard().await;
+        let review_guard = self.completion_review_owner_guard().await;
+        self.install_rencrow_completion_state_guarded(
+            root_task_id,
+            completion_state,
+            update_call_id,
+            &review_guard,
+        )
+        .await
+    }
+
+    async fn install_rencrow_completion_state_guarded(
+        &self,
+        root_task_id: String,
+        mut completion_state: serde_json::Value,
+        update_call_id: Option<String>,
+        _review_guard: &tokio::sync::OwnedMutexGuard<()>,
+    ) -> Result<(), String> {
+        #[cfg(test)]
+        trace_native_patch_wait("install:begin");
         if root_task_id.trim().is_empty() {
             return Err("completion state requires a root ID".into());
         }
@@ -1367,9 +1407,15 @@ impl Session {
             previous_contract.as_ref(),
             &mut evidence_refs,
         );
+        #[cfg(test)]
+        trace_native_patch_wait("install:after-evidence-collection");
         for (task_id, task_revision, artifact_ref, verification_ref) in evidence_refs {
+            #[cfg(test)]
+            trace_native_patch_wait("install:task-check-lookup-begin");
             let attempt = self.latest_task_check_for_scope(&task_id, task_revision).await
                 .ok_or_else(|| format!("no current host verification exists for completion evidence {task_id}@{task_revision}"))?;
+            #[cfg(test)]
+            trace_native_patch_wait("install:task-check-lookup-end");
             let receipt = match attempt.status {
                 crate::task_check::TaskCheckAttemptStatus::Finished(receipt) => receipt,
                 crate::task_check::TaskCheckAttemptStatus::Pending => {
@@ -1936,6 +1982,8 @@ impl Session {
             }
             state.rencrow_completion_state = Some((root_task_id, completion_state));
         }
+        #[cfg(test)]
+        trace_native_patch_wait("install:snapshot-persist-begin");
         if let Err(error) = self.persist_autonomous_completion_snapshot().await {
             if !withdrawals.is_empty()
                 && let Some((root, mut previous)) = previous_canonical
@@ -1947,7 +1995,379 @@ impl Session {
             }
             return Err(error);
         }
+        #[cfg(test)]
+        trace_native_patch_wait("install:snapshot-persist-end");
         Ok(())
+    }
+
+    /// Reopen an accepted task and reserve its next real execution boundary in one install.
+    pub(crate) async fn reserve_common_harness_iteration_after_target_change(
+        &self,
+        root: &str,
+        expected: &codex_history::task_context::CommonHarnessStateV1,
+        target: crate::common_harness_io::ArtifactSetV1,
+    ) -> Result<(), String> {
+        use codex_history::task_context::AcceptanceStatus;
+        use codex_history::task_context::CompletionUnit;
+        use codex_history::task_context::CompletionUnitKind;
+        use codex_history::task_context::EvidenceLifecycleV1;
+        use codex_history::task_context::HostEventV1;
+        use codex_history::task_context::TaskRunStatusV1;
+        use codex_history::task_context::UnitStatus;
+
+        let owner_guard = self.completion_owner_guard().await;
+        let mut completion = {
+            let state = self.state.lock().await;
+            if state.active_task_scope.is_some() || state.pending_task_boundary.is_some() {
+                return Err(
+                    "cannot reserve another execution while a scope or boundary is active".into(),
+                );
+            }
+            let (active_root, completion) = state
+                .rencrow_completion_state
+                .as_ref()
+                .ok_or_else(|| "common-harness reservation has no canonical state".to_string())?;
+            if active_root != root || completion.common_harness.as_ref() != Some(expected) {
+                return Err("common-harness state changed before execution reservation".into());
+            }
+            completion.clone()
+        };
+        if expected.request.execution_owner
+            != codex_history::task_context::ExecutionOwnerV1::StandaloneSwitch
+            || expected.run_state.owner_id
+                != super::common_harness::common_harness_runtime_owner_id(
+                    &self.thread_id.to_string(),
+                )
+            || expected.run_state.status != TaskRunStatusV1::Completed
+            || !expected.run_state.unsettled_operation_refs.is_empty()
+        {
+            return Err(
+                "common-harness reservation requires an accepted local task owned by this runtime"
+                    .into(),
+            );
+        }
+        if target.binding.workspace_binding_ref != expected.request.workspace_ref
+            || !target
+                .matches_workspace()
+                .map_err(|error| format!("recheck iteration target: {error}"))?
+        {
+            return Err("common-harness target changed before execution reservation".into());
+        }
+        if target.digest == expected.run_state.target_version {
+            return Ok(());
+        }
+        let accepted = self
+            .latest_rencrow_task_state()
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| {
+                "iteration reservation requires the prior accepted task boundary".to_string()
+            })?;
+        let predecessor = completion
+            .units
+            .iter()
+            .find(|unit| {
+                unit.kind == CompletionUnitKind::Execution
+                    && unit.status == UnitStatus::Done
+                    && unit.id == accepted.boundary.closed_task_id
+            })
+            .ok_or_else(|| {
+                "iteration reservation cannot identify its accepted predecessor".to_string()
+            })?;
+        if accepted.boundary.root_task_id != root
+            || accepted
+                .completed
+                .get(&predecessor.id)
+                .is_none_or(|receipt| receipt.revision != accepted.boundary.closed_task_revision)
+        {
+            return Err(
+                "iteration predecessor does not match the accepted root and revision".into(),
+            );
+        }
+        let predecessor_id = predecessor.id.clone();
+        let required_ids = expected
+            .request
+            .conditions
+            .iter()
+            .filter(|condition| condition.required)
+            .map(|condition| condition.condition_id.clone())
+            .collect::<Vec<_>>();
+        let updated = expected
+            .apply_host_event(
+                super::common_harness::common_harness_fence(expected),
+                HostEventV1::InvalidateEvidence {
+                    evidence_ids: expected
+                        .evidence_refs
+                        .iter()
+                        .filter(|evidence| evidence.lifecycle == EvidenceLifecycleV1::Current)
+                        .map(|evidence| evidence.evidence_id.clone())
+                        .collect(),
+                    new_target_version: target.digest,
+                },
+            )
+            .map_err(|error| format!("invalidate accepted common-harness target: {error:?}"))?;
+        for condition in &mut completion.conditions {
+            if required_ids.contains(&condition.id) {
+                condition.status = AcceptanceStatus::Open;
+                condition.evidence.clear();
+                condition.unmet_reason =
+                    Some("Accepted target changed; verify the current target.".into());
+            }
+        }
+        completion.current_unit = None;
+        if updated.run_state.status == TaskRunStatusV1::Queued {
+            let prefix = format!("{}-iteration-", updated.request.task_id);
+            let reserved_id = (2..=256)
+                .map(|suffix| format!("{prefix}{suffix}"))
+                .find(|id| completion.units.iter().all(|unit| unit.id != *id))
+                .ok_or_else(|| "common-harness execution reservation IDs exhausted".to_string())?;
+            completion.units.push(CompletionUnit {
+                id: reserved_id.clone(),
+                purpose: "Re-verify the changed accepted target".into(),
+                status: UnitStatus::Ready,
+                kind: CompletionUnitKind::Execution,
+                condition_refs: required_ids,
+                depends_on: vec![predecessor_id],
+                evidence: Vec::new(),
+                task_refs: Vec::new(),
+                review_target: None,
+                review_evidence: None,
+                review_launch: None,
+                review_decision_reason: None,
+                review_state: None,
+                review_revalidation_of: None,
+            });
+            completion.next_action = Some(format!(
+                "Call task_context_boundary with {}",
+                serde_json::json!({
+                    "action":"begin", "root_task_id":root, "task_id":reserved_id, "task_revision":1
+                })
+            ));
+            completion.current_unit = Some(reserved_id);
+        } else {
+            completion.next_action =
+                Some("Return the exhausted task and its unmet conditions.".into());
+        }
+        completion.contract_revision = completion
+            .contract_revision
+            .checked_add(1)
+            .ok_or_else(|| "completion contract revision exhausted".to_string())?;
+        completion.common_harness = Some(updated);
+        let value = serde_json::to_value(completion).map_err(|error| error.to_string())?;
+        let result = self
+            .install_rencrow_completion_state_guarded(root.to_owned(), value, None, &owner_guard)
+            .await;
+        if result.is_err() {
+            self.mark_completion_paused_in_memory().await;
+        }
+        result
+    }
+
+    pub(crate) async fn apply_common_harness_host_event(
+        &self,
+        root_task_id: &str,
+        fence: codex_history::task_context::StateFenceV1,
+        event: codex_history::task_context::HostEventV1,
+    ) -> Result<codex_history::task_context::CommonHarnessStateV1, String> {
+        let review_guard = self.completion_review_owner_guard().await;
+        self.apply_common_harness_host_event_guarded(root_task_id, fence, event, &review_guard)
+            .await
+    }
+
+    pub(crate) async fn completion_owner_guard(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.completion_review_owner_guard().await
+    }
+
+    pub(crate) async fn apply_common_harness_host_event_guarded(
+        &self,
+        root_task_id: &str,
+        fence: codex_history::task_context::StateFenceV1,
+        event: codex_history::task_context::HostEventV1,
+        review_guard: &tokio::sync::OwnedMutexGuard<()>,
+    ) -> Result<codex_history::task_context::CommonHarnessStateV1, String> {
+        self.apply_common_harness_host_event_guarded_inner(
+            root_task_id,
+            fence,
+            event,
+            CommonHarnessHostAuthority::CurrentRuntime,
+            review_guard,
+        )
+        .await
+    }
+
+    /// Only a freshly verified local writer can replace a restored runtime owner.
+    /// This authority applies to TakeOwnership alone; it cannot settle an old operation.
+    pub(super) async fn take_over_common_harness_local_writer(
+        &self,
+        root_task_id: &str,
+        turn: &TurnContext,
+        supplied_proof: super::common_harness_writer::VerifiedLocalWriterProof,
+    ) -> Result<codex_history::task_context::CommonHarnessStateV1, String> {
+        if !matches!(
+            &turn.session_source,
+            SessionSource::Cli | SessionSource::VSCode | SessionSource::Exec
+        ) {
+            return Err("common-harness writer takeover requires the root execution route".into());
+        }
+        let review_guard = self.completion_owner_guard().await;
+        let fresh_proof = super::common_harness_writer::verify_local_writer(self)
+            .await
+            .map_err(|error| format!("recheck common-harness local writer: {error}"))?;
+        let turn_home = turn
+            .config
+            .codex_home
+            .as_path()
+            .canonicalize()
+            .map_err(|error| format!("resolve takeover turn storage: {error}"))?;
+        if supplied_proof != fresh_proof
+            || fresh_proof.thread_id() != self.thread_id
+            || fresh_proof.codex_home() != turn_home
+        {
+            return Err("common-harness writer proof changed or belongs to another session".into());
+        }
+        let current = self.current_common_harness_state(root_task_id).await?;
+        let runtime_owner_id =
+            super::common_harness::common_harness_runtime_owner_id(&self.thread_id.to_string());
+        if current.run_state.owner_id == runtime_owner_id {
+            return Ok(current);
+        }
+        let new_owner_epoch = current
+            .run_state
+            .owner_epoch
+            .checked_add(1)
+            .ok_or_else(|| "common-harness owner epoch is exhausted".to_string())?;
+        let fence = super::common_harness::common_harness_fence(&current);
+        let proof_ref = crate::common_harness_artifacts::write_operation_artifact(
+            fresh_proof.codex_home(),
+            self.thread_id,
+            &serde_json::json!({
+                "format":"common-harness-local-writer-takeover/1",
+                "root_task_id":root_task_id,
+                "task_id":current.request.task_id,
+                "request_revision":fence.request_revision,
+                "expected_state_version":fence.expected_state_version,
+                "previous_owner_id":current.run_state.owner_id,
+                "previous_owner_epoch":fence.owner_epoch,
+                "new_owner_id":runtime_owner_id,
+                "new_owner_epoch":new_owner_epoch,
+                "attempt_no":current.run_state.attempt_no,
+                "workspace_ref":current.request.workspace_ref,
+                "permission_snapshot_ref":current.request.permission_snapshot_ref,
+                "observed_permission_snapshot_ref":super::common_harness::permission_snapshot_ref(&turn.config)?,
+                "writer":{
+                    "thread_id":fresh_proof.thread_id(),
+                    "rollout_path":fresh_proof.rollout_path(),
+                    "codex_home":fresh_proof.codex_home(),
+                },
+            }),
+        )?;
+        let authority = CommonHarnessTakeoverAuthority {
+            previous_owner_id: current.run_state.owner_id,
+            previous_owner_epoch: current.run_state.owner_epoch,
+            fence: fence.clone(),
+            new_owner_id: runtime_owner_id.clone(),
+            new_owner_epoch,
+            proof_ref: proof_ref.clone(),
+        };
+        self.apply_common_harness_host_event_guarded_inner(
+            root_task_id,
+            fence,
+            codex_history::task_context::HostEventV1::TakeOwnership {
+                new_owner_id: runtime_owner_id,
+                new_owner_epoch,
+                takeover_proof_ref: proof_ref,
+            },
+            CommonHarnessHostAuthority::VerifiedTakeover(&authority),
+            &review_guard,
+        )
+        .await
+    }
+
+    async fn apply_common_harness_host_event_guarded_inner(
+        &self,
+        root_task_id: &str,
+        fence: codex_history::task_context::StateFenceV1,
+        event: codex_history::task_context::HostEventV1,
+        authority: CommonHarnessHostAuthority<'_>,
+        review_guard: &tokio::sync::OwnedMutexGuard<()>,
+    ) -> Result<codex_history::task_context::CommonHarnessStateV1, String> {
+        #[cfg(test)]
+        let is_invalidate_event = matches!(
+            &event,
+            codex_history::task_context::HostEventV1::InvalidateEvidence { .. }
+        );
+        #[cfg(test)]
+        if is_invalidate_event {
+            trace_native_patch_wait("invalidate:guarded-inner-begin");
+        }
+        let canonical = self
+            .state
+            .lock()
+            .await
+            .rencrow_completion_state
+            .clone()
+            .filter(|(root, _)| root == root_task_id)
+            .map(|(_, state)| state)
+            .ok_or_else(|| "common-harness completion state is unavailable".to_string())?;
+        let mut completion = super::completion_review::project_completion_state(&canonical)
+            .map_err(|error| format!("project common-harness completion state: {error}"))?;
+        let current = completion
+            .common_harness
+            .as_ref()
+            .ok_or_else(|| "active completion state is not common-harness v1".to_string())?;
+        let runtime_owner_id =
+            super::common_harness::common_harness_runtime_owner_id(&self.thread_id.to_string());
+        let authorized_owner = match authority {
+            CommonHarnessHostAuthority::CurrentRuntime => {
+                current.run_state.owner_id == runtime_owner_id
+            }
+            CommonHarnessHostAuthority::VerifiedTakeover(binding) => {
+                current.run_state.owner_id == binding.previous_owner_id
+                    && current.run_state.owner_epoch == binding.previous_owner_epoch
+                    && fence == binding.fence
+                    && binding.new_owner_id == runtime_owner_id
+                    && matches!(&event,
+                        codex_history::task_context::HostEventV1::TakeOwnership {
+                            new_owner_id, new_owner_epoch, takeover_proof_ref,
+                        } if new_owner_id == &binding.new_owner_id
+                            && new_owner_epoch == &binding.new_owner_epoch
+                            && takeover_proof_ref == &binding.proof_ref)
+            }
+        };
+        if !authorized_owner {
+            return Err(
+                "common-harness host event rejected because this thread does not own the current writer epoch".into(),
+            );
+        }
+        let proposed = current
+            .apply_host_event(fence, event)
+            .map_err(|error| format!("common-harness state transition rejected: {error:?}"))?;
+        #[cfg(test)]
+        if is_invalidate_event {
+            trace_native_patch_wait("invalidate:reducer-complete");
+        }
+        completion.common_harness = Some(proposed.clone());
+        let encoded = serde_json::to_vec(&completion).map_err(|error| error.to_string())?;
+        if encoded.len() > codex_history::task_context::MAX_COMPLETION_CHECKPOINT_BYTES {
+            return Err("host common-harness state exceeds checkpoint size limit".into());
+        }
+        let value = serde_json::to_value(completion).map_err(|error| error.to_string())?;
+        #[cfg(test)]
+        if is_invalidate_event {
+            trace_native_patch_wait("invalidate:install-call");
+        }
+        self.install_rencrow_completion_state_guarded(
+            root_task_id.to_string(),
+            value,
+            None,
+            review_guard,
+        )
+        .await?;
+        #[cfg(test)]
+        if is_invalidate_event {
+            trace_native_patch_wait("invalidate:install-return");
+        }
+        Ok(proposed)
     }
 
     pub(crate) async fn rencrow_completion_state(
@@ -3470,11 +3890,19 @@ impl Session {
         before: Vec<crate::task_check::TaskArtifactStamp>,
         obligation: Option<crate::task_check::TaskCheckObligation>,
     ) {
-        self.state
-            .lock()
-            .await
-            .task_check_ledger
-            .begin_with_obligation(call_id, request, workspace_root, before, obligation);
+        {
+            let mut state = self.state.lock().await;
+            if state.task_check_ledger.attempt_for_call(&call_id).is_some() {
+                return;
+            }
+            state.task_check_ledger.begin_with_obligation(
+                call_id,
+                request,
+                workspace_root,
+                before,
+                obligation,
+            );
+        }
         if let Err(error) = self.persist_autonomous_completion_snapshot().await {
             let mut state = self.state.lock().await;
             state.rencrow_completion_paused = true;
@@ -3523,6 +3951,207 @@ impl Session {
         receipt
     }
 
+    pub(crate) async fn begin_common_harness_task_check_guarded(
+        &self,
+        _owner_guard: &tokio::sync::OwnedMutexGuard<()>,
+        call_id: &str,
+        execution: &crate::task_check::TaskCheckExecution,
+        expected_negative: Option<crate::task_check::ExpectedNegativeBindingV1>,
+    ) -> Result<(), String> {
+        if call_id.trim().is_empty() || execution.obligation.is_none() {
+            return Err(
+                "common-harness verifier requires a host-bound task-check obligation".into(),
+            );
+        }
+        {
+            let mut state = self.state.lock().await;
+            if let Some(existing) = state.task_check_ledger.attempt_for_call(call_id) {
+                if !matches!(
+                    &existing.status,
+                    crate::task_check::TaskCheckAttemptStatus::Pending
+                ) {
+                    return Err("common-harness task-check call is already terminal".into());
+                }
+            } else {
+                state.task_check_ledger.begin_with_obligation(
+                    call_id.to_string(),
+                    execution.request.clone(),
+                    execution.workspace_root.clone(),
+                    execution.before.clone(),
+                    execution.obligation.clone(),
+                );
+            }
+            if !state
+                .task_check_ledger
+                .attempt_for_call(call_id)
+                .is_some_and(|attempt| {
+                    matches!(
+                        &attempt.status,
+                        crate::task_check::TaskCheckAttemptStatus::Pending
+                    )
+                })
+            {
+                return Err("common-harness task-check did not enter Pending".into());
+            }
+            if !state
+                .task_check_ledger
+                .pending_execution_matches(call_id, execution)
+            {
+                return Err(
+                    "common-harness pending task-check binding does not match execution".into(),
+                );
+            }
+            if let Some(binding) = expected_negative {
+                state.task_check_ledger.reserve_expected_negative(binding)?;
+            }
+        }
+        self.persist_autonomous_completion_snapshot().await
+    }
+
+    /// Settle the raw TaskCheck from the same completed native result used by
+    /// the common-harness verifier. The completion-owner event may win this
+    /// race; in that case accept only its exact receipt and never rewrite it.
+    pub(crate) async fn finish_common_harness_task_check_guarded(
+        &self,
+        _owner_guard: &tokio::sync::OwnedMutexGuard<()>,
+        call_id: &str,
+        execution: &crate::task_check::TaskCheckExecution,
+        completion: crate::task_check::TaskCheckCompletion<'_>,
+    ) -> Result<Option<crate::task_check::TaskCheckReceipt>, String> {
+        let crate::task_check::TaskCheckCompletion {
+            command,
+            cwd,
+            output,
+            exit_code,
+            completed,
+            output_truncated,
+            after,
+        } = completion;
+        if call_id.trim().is_empty() || execution.obligation.is_none() {
+            return Err("common-harness raw TaskCheck requires its host-bound execution".into());
+        }
+        let canonical_cwd = std::fs::canonicalize(cwd)
+            .map_err(|error| format!("resolve completed TaskCheck cwd: {error}"))?;
+        if canonical_cwd != execution.workspace_root {
+            return Err("completed TaskCheck cwd changed from its pre-execution binding".into());
+        }
+        let mut observation = crate::task_check::TaskCheckObservation::from_execution(
+            call_id,
+            command,
+            &canonical_cwd,
+            output,
+            exit_code,
+            completed,
+            output_truncated,
+        );
+        observation.execution_environment_id = execution.execution_environment_id.clone();
+        let succeeded = completed && exit_code == 0;
+        let expected_receipt = crate::task_check::TaskCheckReceipt {
+            call_id: call_id.to_owned(),
+            task_id: execution.request.task_id.clone(),
+            task_revision: execution.request.task_revision,
+            workspace_root: execution.workspace_root.clone(),
+            artifact_before: execution.before.clone(),
+            artifact_after: after.clone(),
+            exit_code,
+            completed,
+            succeeded,
+            observation: (!succeeded).then(|| Box::new(observation.clone())),
+        };
+        let settled = {
+            let mut state = self.state.lock().await;
+            let Some(status) = state
+                .task_check_ledger
+                .attempt_for_call(call_id)
+                .map(|attempt| attempt.status.clone())
+            else {
+                return Err("common-harness raw TaskCheck attempt is unavailable".into());
+            };
+            match status {
+                crate::task_check::TaskCheckAttemptStatus::Pending => {
+                    if !state
+                        .task_check_ledger
+                        .pending_execution_matches(call_id, execution)
+                    {
+                        return Err(
+                            "common-harness pending TaskCheck no longer matches its source binding"
+                                .into(),
+                        );
+                    }
+                    state.task_check_ledger.observe_terminal_event(call_id);
+                    state.task_check_ledger.finish_observed(
+                        call_id,
+                        exit_code,
+                        completed,
+                        after,
+                        Some(observation),
+                    )
+                }
+                crate::task_check::TaskCheckAttemptStatus::Finished(receipt) => {
+                    if receipt != expected_receipt {
+                        return Err(
+                            "completion-owner TaskCheck receipt conflicts with the common-harness native result"
+                                .into(),
+                        );
+                    }
+                    Some(receipt)
+                }
+                crate::task_check::TaskCheckAttemptStatus::ChangedArtifacts => None,
+            }
+        };
+        self.persist_autonomous_completion_snapshot().await?;
+        Ok(settled)
+    }
+
+    pub(crate) async fn resolve_common_harness_expected_negative_guarded(
+        &self,
+        _owner_guard: &tokio::sync::OwnedMutexGuard<()>,
+        binding: &crate::task_check::ExpectedNegativeBindingV1,
+        observed_failure_identity: String,
+        raw_output_sha256: String,
+    ) -> Result<(crate::task_check::TaskCheckReceipt, String), String> {
+        let (receipt, evidence_ref) = {
+            let mut state = self.state.lock().await;
+            let attempt = state
+                .task_check_ledger
+                .attempt_for_call(&binding.source_call_id)
+                .ok_or_else(|| "expected-negative source call is unavailable".to_string())?;
+            let crate::task_check::TaskCheckAttemptStatus::Finished(receipt) = &attempt.status
+            else {
+                return Err("expected-negative source call has no completed raw receipt".into());
+            };
+            if receipt.exit_code != 1
+                || !receipt.completed
+                || receipt.succeeded
+                || receipt.observation.as_ref().is_none_or(|observation| {
+                    observation.launch_failure.is_some()
+                        || !observation.diagnostic_complete
+                        || observation.diagnostic_truncated
+                        || observation.diagnostic_sha256 != raw_output_sha256
+                })
+            {
+                return Err(
+                    "expected-negative source call is not a complete native failure".into(),
+                );
+            }
+            let receipt = receipt.clone();
+            let fingerprint =
+                super::completion_children::task_check_artifact_fingerprint(&receipt)?;
+            let evidence_ref = format!("task-check:{}:{fingerprint}", receipt.call_id);
+            let resolution = crate::task_check::ExpectedNegativeResolutionV1 {
+                observed_failure_identity,
+                evidence_ref: evidence_ref.clone(),
+                raw_output_sha256,
+            };
+            state
+                .task_check_ledger
+                .resolve_expected_negative(binding, resolution)?;
+            (receipt, evidence_ref)
+        };
+        self.persist_autonomous_completion_snapshot().await?;
+        Ok((receipt, evidence_ref))
+    }
+
     pub(crate) async fn observe_task_check_terminal_event(&self, call_id: &str) {
         self.state
             .lock()
@@ -3542,12 +4171,11 @@ impl Session {
             .diagnostics_for_root(root_task_id)
     }
 
-    pub(crate) async fn resolved_task_check_launch_obligation_keys(&self) -> Vec<String> {
-        self.state
-            .lock()
-            .await
-            .task_check_ledger
-            .resolved_launch_obligation_keys()
+    pub(crate) async fn resolved_task_check_guard_keys(&self) -> Vec<String> {
+        let state = self.state.lock().await;
+        let mut keys = state.task_check_ledger.resolved_launch_obligation_keys();
+        keys.extend(state.task_check_ledger.resolved_call_guard_keys());
+        keys
     }
 
     #[cfg(test)]
@@ -3740,7 +4368,7 @@ impl Session {
         analytics_events_client: Option<AnalyticsEventsClient>,
         image_store: Arc<dyn AttachmentStore>,
         thread_store: Arc<dyn ThreadStore>,
-        parent_rollout_thread_trace: ThreadTraceContext,
+        trace_init: SessionTraceInit,
         attestation_provider: Option<Arc<dyn AttestationProvider>>,
         external_time_provider: Option<Arc<dyn TimeProvider>>,
         multi_agent_version: Option<MultiAgentVersion>,
@@ -4178,16 +4806,30 @@ impl Session {
                     session_configuration.sandbox_policy(environment_selections)
                 ),
             };
-            let rollout_thread_trace = if matches!(
-                session_configuration.session_source,
-                SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. })
-            ) {
-                // Spawned child threads are part of their root rollout tree. If the
-                // parent had no trace bundle, do not create an orphan child bundle
-                // that looks like an independent rollout.
-                parent_rollout_thread_trace.start_child_thread_trace_or_disabled(trace_metadata)
-            } else {
-                ThreadTraceContext::start_root_or_disabled(trace_metadata)
+            let rollout_thread_trace = match trace_init {
+                SessionTraceInit::Automatic { parent } => {
+                    if matches!(
+                        session_configuration.session_source,
+                        SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. })
+                    ) {
+                        // Spawned children remain in their parent's trace tree;
+                        // a disabled parent cannot create an orphan child bundle.
+                        parent.start_child_thread_trace_or_disabled(trace_metadata)
+                    } else {
+                        ThreadTraceContext::start_root_or_disabled(trace_metadata)
+                    }
+                }
+                #[cfg(test)]
+                SessionTraceInit::RootInDirectory(root) => {
+                    if matches!(
+                        session_configuration.session_source,
+                        SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. })
+                    ) {
+                        anyhow::bail!("explicit root trace fixture cannot initialize a spawned child");
+                    }
+                    ThreadTraceContext::start_root_in_root_for_test(&root, trace_metadata)
+                        .map_err(|error| anyhow::anyhow!("initialize explicit root trace fixture: {error}"))?
+                }
             };
 
             let mut post_session_configured_events = Vec::<Event>::new();
