@@ -1034,9 +1034,8 @@ async fn common_harness_tool_boundary(
         .rencrow_tool_allowlist
         .as_deref()
         .is_none_or(|allowlist| {
-            allowlist.iter().any(|entry| {
-                crate::tools::rencrow_tool_allowlist::parse_entry(entry) == invocation.tool_name
-            })
+            crate::tools::rencrow_tool_allowlist::narrow_policy(&ToolPolicy::default(), allowlist)
+                .allows(&invocation.tool_name)
         });
     if !allowed_by_config {
         return Err(FunctionCallError::RespondToModel(format!(

@@ -1167,6 +1167,21 @@ async fn historical_terminal_common_state_is_not_reactivated_by_read_only_new_tu
 #[tokio::test]
 async fn common_harness_router_default_namespace_preserves_builtin_policy() {
     let (session, turn) = common_harness_policy_fixture().await;
+    let mut turn = Arc::try_unwrap(turn).expect("fixture owns its turn context");
+    let mut config = (*turn.config).clone();
+    config.rencrow_tool_allowlist = Some(
+        [
+            "task_context_boundary",
+            "workspace_read",
+            "exec_command",
+            "apply_patch",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect(),
+    );
+    turn.config = Arc::new(config);
+    let turn = Arc::new(turn);
     for namespace in [None, Some(""), Some(DEFAULT_FUNCTION_NAMESPACE)] {
         for name in [
             "task_context_boundary",
