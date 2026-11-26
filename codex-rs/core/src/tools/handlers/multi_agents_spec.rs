@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-26: advertise the delegated instruction budget.
 // Modified by RenCrow Switch Core, 2026-11-25: guide parents to provide minimal child context.
 use crate::agent::child_config::MAX_SPAWN_AGENT_MODEL_OVERRIDES;
 use crate::agent::child_config::model_supports_multi_agent_backend;
@@ -188,7 +189,7 @@ pub fn create_send_input_tool_v1() -> ToolSpec {
         (
             "message".to_string(),
             JsonSchema::string(Some(
-                "Legacy plain-text message to send to the agent. Use either message or items."
+                "Legacy plain-text message to send to the agent. Keep the complete instruction within 8000 estimated tokens including quotes and code. Reports to your parent retain their existing output contract. Use either message or items."
                     .to_string(),
             )),
         ),
@@ -228,7 +229,7 @@ pub fn create_send_message_tool() -> ToolSpec {
         (
             "message".to_string(),
             JsonSchema::string(Some(
-                "Message text to queue on the target agent.".to_string(),
+                "Message text to queue on the target agent. Instructions are limited to 8000 estimated tokens including quotes and code; shorten oversized instructions instead of splitting them across messages. Reports to your parent retain their existing output contract.".to_string(),
             ))
             .with_encrypted(),
         ),
@@ -261,7 +262,7 @@ pub fn create_followup_task_tool() -> ToolSpec {
         (
             "message".to_string(),
             JsonSchema::string(Some(
-                "Message text to send to the target agent.".to_string(),
+                "Message text to send to the target agent. Instructions are limited to 8000 estimated tokens including quotes and code; shorten oversized instructions instead of splitting them across messages. Reports to your parent retain their existing output contract.".to_string(),
             ))
             .with_encrypted(),
         ),
@@ -618,7 +619,7 @@ fn create_collab_input_items_schema() -> JsonSchema {
     ]);
 
     JsonSchema::array(JsonSchema::object(properties, /*required*/ None, Some(false.into())), Some(
-            "Structured input items. Use this to pass explicit mentions (for example app:// connector paths)."
+            "Structured input items. Combined inline text must fit within 8000 estimated tokens including quotes and code. Use this to pass explicit mentions (for example app:// connector paths)."
                 .to_string(),
         ))
 }
@@ -628,7 +629,7 @@ fn spawn_agent_common_properties_v1(agent_type_description: &str) -> BTreeMap<St
         (
             "message".to_string(),
             JsonSchema::string(Some(
-                "One small, self-contained task: include only the goal, relevant inputs and paths, permissions, acceptance condition, and needed constraints. Omit unrelated history and duplicated instructions. Use either message or items."
+                "One small, self-contained task within 8000 estimated tokens including quotes and code: include only the goal, relevant inputs and paths, permissions, acceptance condition, and needed constraints. Omit unrelated history and duplicated instructions. Use source paths for additional context. Do not split the same oversized instruction across messages. Use either message or items."
                     .to_string(),
             )),
         ),
@@ -666,7 +667,7 @@ fn spawn_agent_common_properties_v2(agent_type_description: &str) -> BTreeMap<St
         (
             "message".to_string(),
             JsonSchema::string(Some(
-                "One small, self-contained task: include only the goal, relevant inputs and paths, permissions, acceptance condition, and needed constraints. Omit unrelated history and duplicated instructions.".to_string(),
+                "One small, self-contained task within 8000 estimated tokens including quotes and code: include only the goal, relevant inputs and paths, permissions, acceptance condition, and needed constraints. Omit unrelated history and duplicated instructions. Use source paths for additional context. Do not split the same oversized instruction across messages.".to_string(),
             ))
             .with_encrypted(),
         ),

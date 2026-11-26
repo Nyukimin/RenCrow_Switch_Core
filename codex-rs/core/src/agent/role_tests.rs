@@ -767,12 +767,8 @@ async fn apply_role_preserves_catalog_and_user_instructions_for_same_provider() 
     config.model_catalog = Some(ModelsResponse { models: Vec::new() });
     config.base_instructions = Some("user-authored prompt".to_string());
     config.base_instructions_provenance = Some(BaseInstructionsProvenance::Custom);
-    let role_path = write_role_config(
-        &home,
-        "same-provider.toml",
-        "model_provider = \"openai\"",
-    )
-    .await;
+    let role_path =
+        write_role_config(&home, "same-provider.toml", "model_provider = \"openai\"").await;
     config.agent_roles.insert(
         "analyst".to_string(),
         AgentRoleConfig {
@@ -863,9 +859,8 @@ async fn apply_role_rejects_unknown_or_requirement_conflicting_provider() {
         .cloned()
         .collect();
     let requirements = config.config_layer_stack.requirements().clone();
-    config.config_layer_stack =
-        ConfigLayerStack::new(layers, requirements, requirements_toml)
-            .expect("test catalog requirement should form a valid config stack");
+    config.config_layer_stack = ConfigLayerStack::new(layers, requirements, requirements_toml)
+        .expect("test catalog requirement should form a valid config stack");
     config.model_catalog = Some(ModelsResponse { models: Vec::new() });
 
     let err = apply_role_to_config(&mut config, Some("analyst"))

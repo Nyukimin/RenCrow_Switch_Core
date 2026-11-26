@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-26: bound instructions, preserving reports to the parent.
 // Modified by RenCrow Switch Core, 2026-11-16.
 use super::*;
 use crate::agent::child_config::build_agent_resume_config;
@@ -51,6 +52,9 @@ impl Handler {
         let args: SendInputArgs = parse_arguments(&arguments)?;
         let receiver_thread_id = parse_agent_id_target(&args.target)?;
         let input_items = parse_collab_input(args.message, args.items)?;
+        if Some(receiver_thread_id) != turn.parent_thread_id {
+            validate_collab_input_budget(&input_items)?;
+        }
         let prompt = render_input_preview(&input_items);
         if session.enabled(Feature::RencrowChildMonitor) {
             let key = child_dispatch_fingerprint(

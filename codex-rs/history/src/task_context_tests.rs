@@ -91,6 +91,10 @@ fn completion_contract_round_trips_and_requires_current_host_evidence_for_satisf
         runtime_recovery_at: Some(9),
         activity_at: Some(10),
     });
+    let mut invalid = c.completion_state.clone().unwrap();
+    invalid.conditions[0].id = "http_test_common_cause".into();
+    let error = validate_completion_state(Some(&invalid), &BTreeMap::new()).unwrap_err();
+    assert!(error.contains("start with AC-"));
     let accepted = validate_boundary(c.clone(), &facts()).unwrap();
     let stored = accepted
         .into_stored_state(None, None, "nonce-1".into())

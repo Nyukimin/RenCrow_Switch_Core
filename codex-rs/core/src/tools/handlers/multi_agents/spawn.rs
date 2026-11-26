@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-26: bound the complete review instruction.
 // Modified by RenCrow Switch Core, 2026-11-25: shorten the host-assigned review prompt.
 // Modified by RenCrow Switch Core, 2026-11-16.
 use super::*;
@@ -124,12 +125,19 @@ pub(crate) async fn spawn_configured_completion_review(
     validate_completion_reviewer_depth(&turn.session_source, turn.config.agent_max_depth)
         .map_err(FunctionCallError::RespondToModel)?;
     let prompt = format!(
-        "Host-assigned read-only review. Task `{target_task_id}` revision {target_task_revision}; accepted artifact `{target_ref}`.\n{review_brief}\nUse each verified absolute path with its workspace root; do not infer paths or ownership. Use only stated criteria and host evidence. Do not edit or rerun tests. Return findings to the parent for adoption."
+        "Host-assigned read-only review. Task `{target_task_id}` revision {target_task_revision}; accepted artifact `{target_ref}`.\n{review_brief}\nInspect the verified current snapshot at each stated absolute path and compare it with the supplied acceptance criteria and host receipt. Do not edit files or rerun tests. Treat artifact_before/artifact_after equality only as evidence that host verification left the artifact unchanged, never as a pre-implementation baseline. If a criterion requires comparison with a pre-change state and no baseline is supplied, do not reconstruct one from HEAD, commits, blobs, or other Git history; report the specific missing baseline evidence as insufficient evidence. Avoid repeating facts already confirmed by the host receipt. When evidence is sufficient, return concrete findings and finish. Give a recommendation of adopt, reject, or insufficient evidence, distinguish the evidence behind it, and return it to the parent for an explicit adoption decision."
     );
     let input_items = vec![UserInput::Text {
         text: prompt.clone(),
         text_elements: Vec::new(),
     }];
+    if let Err(error) = validate_collab_input_budget(&input_items) {
+        session
+            .rollback_unstarted_completion_review(unit_id)
+            .await
+            .map_err(FunctionCallError::RespondToModel)?;
+        return Err(error);
+    }
     let call_id = invocation.call_id.clone();
     session
         .emit_turn_item_started(
@@ -422,6 +430,7 @@ async fn handle_spawn_agent(
         .map(str::trim)
         .filter(|role| !role.is_empty());
     let mut input_items = parse_collab_input(args.message, args.items)?;
+    validate_collab_input_budget(&input_items)?;
     let prompt = render_input_preview(&input_items);
     let session_source = turn.session_source.clone();
     let child_depth = next_thread_spawn_depth(&session_source);
@@ -501,6 +510,13 @@ async fn handle_spawn_agent(
             ),
             text_elements: Vec::new(),
         });
+        if let Err(error) = validate_collab_input_budget(&input_items) {
+            session
+                .rollback_unstarted_completion_review(&review.unit_id)
+                .await
+                .map_err(FunctionCallError::RespondToModel)?;
+            return Err(error);
+        }
         Some((review, role.to_string(), target_ref))
     } else {
         None

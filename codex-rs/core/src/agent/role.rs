@@ -291,9 +291,13 @@ mod role_overrides {
                     "agent role model_provider '{provider_id}' conflicts with required provider '{required_provider_id}'"
                 ));
             }
-            let provider = config.model_providers.get(provider_id).cloned().ok_or_else(|| {
-                anyhow!("agent role references unknown model provider '{provider_id}'")
-            })?;
+            let provider = config
+                .model_providers
+                .get(provider_id)
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow!("agent role references unknown model provider '{provider_id}'")
+                })?;
             let provider_changed = config.model_provider_id.as_str() != provider_id.as_str()
                 || config.model_provider != provider;
             next_config.model_provider_id = provider_id.clone();

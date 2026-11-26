@@ -701,9 +701,9 @@ async fn repeated_reads_do_not_reject_a_valid_status_in_the_same_sampling() -> R
         status.contains("Start the implementation task"),
         "status omitted the registered next action: {status}"
     );
-    assert!(calls[4].body_contains_text(
-        "Continue unfinished conditions, units, or child collection"
-    ));
+    assert!(
+        calls[4].body_contains_text("Continue unfinished conditions, units, or child collection")
+    );
     assert!(calls[4].body_contains_text("Next recorded action: Start the implementation task."));
     Ok(())
 }

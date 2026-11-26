@@ -292,6 +292,45 @@ async fn spawn_agent_rejects_empty_message() {
     );
 }
 
+// Modified by RenCrow Switch Core, 2026-11-26: reject before creating or interrupting a child.
+#[tokio::test]
+async fn delegation_budget_rejects_all_dispatch_tools_before_side_effects() {
+    let (session, turn) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    for tool in ["spawn_v1", "send_v1", "spawn_v2", "send_v2", "followup_v2"] {
+        let invocation = invocation(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            tool,
+            function_payload(match tool {
+                "spawn_v1" => json!({"message": "a".repeat(32_001)}),
+                "send_v1" => json!({
+                    "target": ThreadId::new().to_string(),
+                    "message": "a".repeat(32_001),
+                    "interrupt": true
+                }),
+                "spawn_v2" => json!({"task_name": "budget_check", "message": "a".repeat(32_001)}),
+                _ => json!({"target": ThreadId::new().to_string(), "message": "a".repeat(32_001)}),
+            }),
+        );
+        let result = match tool {
+            "spawn_v1" => SpawnAgentHandler::default().handle(invocation).await,
+            "send_v1" => SendInputHandler.handle(invocation).await,
+            "spawn_v2" => SpawnAgentHandlerV2::default().handle(invocation).await,
+            "send_v2" => SendMessageHandlerV2.handle(invocation).await,
+            _ => FollowupTaskHandlerV2.handle(invocation).await,
+        };
+        let Err(error) = result else {
+            panic!("{tool} must reject the oversized instruction");
+        };
+        assert!(
+            error.to_string().contains("Nothing was dispatched"),
+            "{tool}: {error}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn spawn_agent_rejects_when_message_and_items_are_both_set() {
     let (session, turn) = make_session_and_context().await;
@@ -1762,32 +1801,34 @@ async fn multi_agent_v2_send_message_accepts_root_target_from_child() {
         agent_role: None,
     });
 
-    SendMessageHandlerV2
-        .handle(invocation(
-            Arc::new(session),
-            Arc::new(turn),
-            "send_message",
-            function_payload(json!({
-                "target": "/root",
-                "message": "encrypted-done"
-            })),
-        ))
-        .await
-        .expect("send_message should accept the root agent path");
+    turn.parent_thread_id = Some(root.thread_id);
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    for report in ["encrypted-done".to_string(), "r".repeat(32_001)] {
+        SendMessageHandlerV2
+            .handle(invocation(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                "send_message",
+                function_payload(json!({"target": "/root", "message": report})),
+            ))
+            .await
+            .expect("reports to the parent retain their existing delivery contract");
 
-    assert!(manager.captured_ops().iter().any(|(id, op)| {
-        *id == root.thread_id
-            && matches!(
-                op,
-                Op::InterAgentCommunication { communication, .. }
-                    if communication.author == child_path
-                        && communication.recipient == AgentPath::root()
-                        && communication.other_recipients.is_empty()
-                        && communication.content.is_empty()
-                        && communication.encrypted_content.as_deref() == Some("encrypted-done")
-                        && !communication.trigger_turn
-            )
-    }));
+        assert!(manager.captured_ops().iter().any(|(id, op)| {
+            *id == root.thread_id
+                && matches!(
+                    op,
+                    Op::InterAgentCommunication { communication, .. }
+                        if communication.author == child_path
+                            && communication.recipient == AgentPath::root()
+                            && communication.other_recipients.is_empty()
+                            && communication.content.is_empty()
+                            && communication.encrypted_content.as_deref() == Some(report.as_str())
+                            && !communication.trigger_turn
+                )
+        }));
+    }
 }
 
 #[tokio::test]

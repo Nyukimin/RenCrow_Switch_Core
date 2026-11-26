@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-26: expose required acceptance condition ID syntax.
 // Modified by RenCrow Switch Core, 2026-11-24: describe exact revalidation scope and accepted execution dependency.
 // Modified by RenCrow Switch Core, 2026-11-11: describe execution and review completion separately.
 use codex_tools::JsonSchema;
@@ -47,7 +48,12 @@ pub(crate) fn create_task_context_boundary_tool(autonomous_completion: bool) -> 
                 JsonSchema::array(
                     JsonSchema::object(
                         BTreeMap::from([
-                            ("id".into(), JsonSchema::string(None)),
+                            (
+                                "id".into(),
+                                JsonSchema::string(Some(
+                                    "Unique acceptance condition ID starting with AC- (for example AC-1). Copy this exact ID into unit condition_refs.".into(),
+                                )),
+                            ),
                             ("revision".into(), JsonSchema::number(None)),
                             (
                                 "result".into(),

@@ -437,7 +437,9 @@ impl Session {
                 &contract.units[review_index].condition_refs,
             )?;
             let review_unit = &contract.units[review_index];
-            let mut brief = String::from("Accepted artifact locations:\n");
+            let mut brief = String::from(
+                "Review scope: assess the verified current snapshot against the acceptance criteria. The host receipt's before/after hashes only show that verification did not change the artifact; they are not a pre-implementation baseline.\nAccepted artifact locations:\n",
+            );
             if let Some(check) = task_check_snapshot.iter().find(|entry| {
                 entry.task_id == target_task_id && entry.task_revision == target_task_revision
             }) && let crate::task_check::TaskCheckAttemptStatus::Finished(receipt) =
@@ -448,6 +450,7 @@ impl Session {
                     let location = serde_json::json!({
                         "workspace_root": receipt.workspace_root.to_string_lossy(),
                         "absolute_path": absolute_path.to_string_lossy(),
+                        "artifact_after_sha256": artifact.sha256,
                     });
                     brief.push_str(&format!("Verified artifact location: {location}\n"));
                 }

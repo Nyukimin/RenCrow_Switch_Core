@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-26: return actionable completion identity validation errors.
 // Modified by RenCrow Switch Core, 2026-11-21: retain exact accepted task-revision evidence history.
 // Modified by RenCrow Switch Core, 2026-11-20: separate caller and host checkpoint budgets.
 //! Typed, host-verified task-boundary state and deterministic derived context.
@@ -1588,7 +1589,9 @@ fn validate_completion_state_inner(
                 .insert(condition.id.as_str(), condition)
                 .is_some()
         {
-            return Err("acceptance condition identity is invalid".into());
+            return Err(format!(
+                "acceptance condition identity is invalid: IDs must be unique, start with AC-, and be at most {MAX_TEXT_BYTES} bytes; revision must be positive"
+            ));
         }
         for (field, text) in [
             ("result", &condition.result),

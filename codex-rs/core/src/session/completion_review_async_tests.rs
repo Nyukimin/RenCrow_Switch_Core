@@ -558,6 +558,15 @@ async fn completion_review_brief_preserves_receipt_workspace_and_artifact_paths(
             .as_str()
             .expect("artifact path is a string"),
     );
+    let expected_artifact_sha256 = crate::task_check::hash_workspace_artifacts(
+        workspace_root,
+        &[std::path::PathBuf::from("review-target.txt")],
+    )
+    .expect("accepted artifact can be hashed")
+    .into_iter()
+    .next()
+    .expect("accepted artifact has a host stamp")
+    .sha256;
 
     assert!(launch.should_spawn);
     assert!(launch.review_brief.chars().count() <= 7_000);
@@ -566,6 +575,10 @@ async fn completion_review_brief_preserves_receipt_workspace_and_artifact_paths(
     assert_eq!(
         location["workspace_root"].as_str(),
         Some(workspace_root.to_string_lossy().as_ref())
+    );
+    assert_eq!(
+        location["artifact_after_sha256"].as_str(),
+        Some(expected_artifact_sha256.as_str())
     );
     assert!(artifact_path.is_absolute());
     assert_eq!(

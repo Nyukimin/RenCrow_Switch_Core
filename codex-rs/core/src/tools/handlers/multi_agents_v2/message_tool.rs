@@ -1,4 +1,5 @@
 //! Shared argument parsing and dispatch for the v2 agent messaging tools.
+// Modified by RenCrow Switch Core, 2026-11-26: validate instructions before side effects.
 //!
 //! `send_message` and `followup_task` share the same submission path and differ only in whether the
 //! resulting `InterAgentCommunication` should wake the target immediately.
@@ -58,6 +59,9 @@ pub(super) async fn handle_message_string_tool(
         ..
     } = invocation;
     let receiver_thread_id = resolve_agent_target(&session, &turn, &target).await?;
+    if Some(receiver_thread_id) != turn.parent_thread_id {
+        validate_collab_text_budget(message.len())?;
+    }
     analytics.set_receiver(receiver_thread_id);
     if mode == MessageDeliveryMode::TriggerTurn && session.enabled(Feature::RencrowChildMonitor) {
         let key = child_dispatch_fingerprint(

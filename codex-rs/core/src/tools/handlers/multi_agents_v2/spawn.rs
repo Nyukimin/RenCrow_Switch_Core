@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-26: bound the initial delegated instruction.
 use super::*;
 use crate::agent::child_config::SpawnConfigOptions;
 use crate::agent::child_config::SpawnConfigVersion;
@@ -131,6 +132,7 @@ async fn handle_spawn_agent(
     }
     let fork_mode = args.fork_mode()?;
     let message = message_content(args.message)?;
+    validate_collab_text_budget(message.len())?;
     let role_name = args
         .agent_type
         .as_deref()

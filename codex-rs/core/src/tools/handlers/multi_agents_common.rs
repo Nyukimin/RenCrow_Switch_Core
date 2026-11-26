@@ -1,3 +1,4 @@
+// Modified by RenCrow Switch Core, 2026-11-26: bound delegated instructions before dispatch.
 use crate::config::DEFAULT_MULTI_AGENT_V2_MIN_WAIT_TIMEOUT_MS;
 use crate::config::HARD_MAX_MULTI_AGENT_V2_TIMEOUT_MS;
 use crate::function_tool::FunctionCallError;
@@ -12,6 +13,7 @@ use codex_protocol::models::ResponseInputItem;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::user_input::UserInput;
+use codex_utils_output_truncation::approx_tokens_from_byte_count;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 
@@ -153,5 +155,72 @@ pub(crate) fn parse_collab_input(
             }
             Ok(items)
         }
+    }
+}
+
+/// Bound the complete inline instruction, including quoted code and all text items.
+/// Uses the same UTF-8 byte estimate as Switch tool-output budgets, not a model tokenizer.
+pub(crate) fn validate_collab_input_budget(input: &[UserInput]) -> Result<(), FunctionCallError> {
+    let bytes = input.iter().fold(0usize, |bytes, item| {
+        bytes.saturating_add(match item {
+            UserInput::Text { text, .. } => text.len(),
+            _ => 0,
+        })
+    });
+    validate_collab_text_budget(bytes)
+}
+
+pub(crate) fn validate_collab_text_budget(bytes: usize) -> Result<(), FunctionCallError> {
+    let tokens = approx_tokens_from_byte_count(bytes);
+    if tokens > 8_000 {
+        return Err(FunctionCallError::RespondToModel(format!(
+            "Delegated instruction is approximately {tokens} tokens; the limit is 8000 including all inline text, quotes, and code. Nothing was dispatched. Shorten the packet while preserving the goal, permissions, constraints, and acceptance criteria; provide source paths for additional context. Do not split the same oversized instruction across messages."
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod delegation_budget_tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+
+    fn text_input(text: String) -> UserInput {
+        UserInput::Text {
+            text,
+            text_elements: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn accepts_boundary_without_truncating_instruction() {
+        let text = "a".repeat(32_000);
+        let input = vec![text_input(text.clone())];
+        validate_collab_input_budget(&input).unwrap();
+        assert_eq!(input, vec![text_input(text)]);
+    }
+
+    #[test]
+    fn rejects_oversize_and_allows_shortened_retry() {
+        let error = validate_collab_input_budget(&[text_input("a".repeat(32_001))]).unwrap_err();
+        assert!(error.to_string().contains("8000"));
+        assert!(error.to_string().contains("Nothing was dispatched"));
+        assert!(
+            validate_collab_input_budget(&[text_input(
+                "Inspect the named function; report findings.".into()
+            )])
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn aggregates_items_and_counts_utf8_bytes() {
+        let items = vec![
+            text_input("あ".repeat(10_000)),
+            text_input("a".repeat(2_001)),
+        ];
+        assert!(validate_collab_input_budget(&items).is_err());
+        assert!(validate_collab_text_budget(32_000).is_ok());
+        assert!(validate_collab_text_budget(32_001).is_err());
     }
 }

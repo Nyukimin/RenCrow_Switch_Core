@@ -243,6 +243,7 @@ struct ActiveHandoffFixture {
     turn: Arc<TurnContext>,
     directory: tempfile::TempDir,
     _workspace: Option<tempfile::TempDir>,
+    _codex_home: Option<tempfile::TempDir>,
 }
 
 async fn active_handoff() -> anyhow::Result<ActiveHandoffFixture> {
@@ -379,6 +380,175 @@ async fn active_handoff_with_provider(
         turn,
         directory,
         _workspace: workspace,
+        _codex_home: None,
+    })
+}
+
+async fn active_handoff_with_cli_config(
+    provider_url: String,
+) -> anyhow::Result<ActiveHandoffFixture> {
+    use codex_config::config_toml::ConfigToml;
+    use codex_config::config_toml::ProjectConfig;
+    use codex_protocol::config_types::ReasoningSummary;
+    use codex_protocol::config_types::SandboxMode;
+    use codex_protocol::openai_models::ReasoningEffort;
+    use std::collections::HashMap;
+
+    let directory = tempfile::tempdir()?;
+    let workspace = tempfile::tempdir()?;
+    let codex_home = tempfile::tempdir()?;
+    let workspace_path =
+        codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(workspace.path())?;
+    let handoff_directory =
+        codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(directory.path())?;
+    let trusted_workspace = codex_config::loader::project_trust_key(workspace.path());
+    let config_toml = ConfigToml {
+        model: Some("gpt-5.5".into()),
+        model_provider: Some("openai".into()),
+        openai_base_url: Some(provider_url),
+        cli_auth_credentials_store: Some(codex_config::types::AuthCredentialsStoreMode::File),
+        projects: Some(HashMap::from([(
+            trusted_workspace.clone(),
+            ProjectConfig {
+                trust_level: Some(codex_protocol::config_types::TrustLevel::Trusted),
+            },
+        )])),
+        model_reasoning_effort: Some(ReasoningEffort::High),
+        model_reasoning_summary: Some(ReasoningSummary::None),
+        model_auto_compact_token_limit: Some(1),
+        model_auto_compact_token_limit_scope: Some(
+            codex_protocol::config_types::AutoCompactTokenLimitScope::Total,
+        ),
+        sandbox_mode: Some(SandboxMode::WorkspaceWrite),
+        rencrow_compaction: Some(true),
+        rencrow_autonomous_completion: Some(true),
+        rencrow_parent_handoff_dir: Some(handoff_directory),
+        rencrow_execution_guard: Some(codex_config::RencrowExecutionGuard {
+            task_kind: Some(codex_config::RencrowTaskKind::Orchestrate),
+            ..Default::default()
+        }),
+        analytics: Some(codex_config::types::AnalyticsConfigToml {
+            enabled: Some(false),
+        }),
+        check_for_update_on_startup: Some(false),
+        ..Default::default()
+    };
+    std::fs::write(
+        codex_home.path().join(codex_config::CONFIG_TOML_FILE),
+        toml::to_string(&config_toml)?,
+    )?;
+    let config = crate::config::ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .fallback_cwd(Some(workspace.path().to_path_buf()))
+        .build()
+        .await?;
+    anyhow::ensure!(
+        config.cwd == workspace_path,
+        "source Config did not load the isolated cwd"
+    );
+    anyhow::ensure!(
+        config.model_provider_id == "openai"
+            && config.model_provider.base_url.as_deref()
+                == Some(config_toml.openai_base_url.as_deref().unwrap()),
+        "source Config did not load the loopback OpenAI provider"
+    );
+    anyhow::ensure!(
+        config.active_project.is_trusted(),
+        "source Config did not load trust for the isolated workspace"
+    );
+    anyhow::ensure!(
+        config.cli_auth_credentials_store_mode
+            == codex_config::types::AuthCredentialsStoreMode::File,
+        "source Config did not select the isolated file auth store"
+    );
+    anyhow::ensure!(
+        config.model.as_deref() == Some("gpt-5.5")
+            && config.model_reasoning_effort == Some(ReasoningEffort::High)
+            && config.model_reasoning_summary == Some(ReasoningSummary::None)
+            && config.model_auto_compact_token_limit == Some(1)
+            && config.rencrow_compaction
+            && config.rencrow_autonomous_completion
+            && config.rencrow_parent_handoff_dir.as_ref()
+                == config_toml.rencrow_parent_handoff_dir.as_ref()
+            && config
+                .rencrow_execution_guard
+                .as_ref()
+                .and_then(|guard| guard.task_kind.as_ref())
+                == Some(&codex_config::RencrowTaskKind::Orchestrate),
+        "source Config does not match the CLI handoff model and runtime settings"
+    );
+    anyhow::ensure!(
+        runtime::runtime_contract(&config).is_ok(),
+        "loader-built C29 source Config has no valid runtime contract"
+    );
+    codex_login::login_with_api_key(
+        codex_home.path(),
+        "c29-test-only-dummy-key",
+        codex_config::types::AuthCredentialsStoreMode::File,
+        codex_login::AuthKeyringBackendKind::default(),
+    )?;
+    let (session, turn, _) = crate::session::tests::make_session_and_context_with_config_and_rx(
+        codex_login::CodexAuth::from_api_key("test"),
+        Vec::new(),
+        config,
+    )
+    .await;
+    let mut session = Arc::try_unwrap(session)
+        .unwrap_or_else(|_| panic!("loader-built source session fixture has a unique owner"));
+    let turn = Arc::try_unwrap(turn)
+        .unwrap_or_else(|_| panic!("loader-built source turn fixture has a unique owner"));
+    let config = session.get_config().await;
+    let live_thread = codex_thread_store::LiveThread::create(
+        Arc::clone(&session.services.thread_store),
+        codex_thread_store::CreateThreadParams {
+            creator_user_id: None,
+            creator_account_id: None,
+            session_id: session.thread_id().into(),
+            thread_id: session.thread_id(),
+            extra_config: None,
+            forked_from_id: None,
+            parent_thread_id: None,
+            source: codex_protocol::protocol::SessionSource::Cli,
+            thread_source: None,
+            originator: "test_originator".into(),
+            base_instructions: codex_protocol::models::BaseInstructions::default(),
+            dynamic_tools: Vec::new(),
+            selected_capability_roots: Vec::new(),
+            multi_agent_version: None,
+            history_mode: Default::default(),
+            subagent_history_start_ordinal: None,
+            history_base: None,
+            initial_window_id: uuid::Uuid::now_v7().to_string(),
+            runtime_workspace_roots: None,
+            metadata: codex_thread_store::ThreadPersistenceMetadata {
+                cwd: Some(config.cwd.to_path_buf()),
+                model_provider: config.model_provider_id.clone(),
+                memory_mode: codex_protocol::protocol::ThreadMemoryMode::Disabled,
+            },
+        },
+    )
+    .await?;
+    session.services.live_thread = Some(live_thread);
+    session
+        .ensure_rollout_materialized(codex_thread_store::PersistContext::Standard)
+        .await;
+    session.flush_rollout().await?;
+    session.state.lock().await.rencrow_completion_state = Some(("root".into(), open_state(false)));
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    session
+        .spawn_task(Arc::clone(&turn), Vec::new(), PendingBoundaryTask)
+        .await;
+    session
+        .persist_autonomous_completion_snapshot()
+        .await
+        .map_err(anyhow::Error::msg)?;
+    Ok(ActiveHandoffFixture {
+        session,
+        turn,
+        directory,
+        _workspace: Some(workspace),
+        _codex_home: Some(codex_home),
     })
 }
 
@@ -386,8 +556,28 @@ async fn active_handoff_with_provider(
 async fn actual_capacity_compaction_failure_seals_and_cold_restores_parent_handoff()
 -> anyhow::Result<()> {
     let server = wiremock::MockServer::start().await;
-    let fixture =
-        active_handoff_with_loopback_provider(Some(1), format!("{}/v1", server.uri())).await?;
+    let bridge_enabled = std::env::var_os("RENCROW_C29_HARNESS").is_some();
+    let provider_url = format!("{}/v1", server.uri());
+    let fixture = if bridge_enabled {
+        active_handoff_with_cli_config(provider_url).await?
+    } else {
+        active_handoff_with_loopback_provider(Some(1), provider_url).await?
+    };
+    if bridge_enabled {
+        let response_sse = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"c29-resp\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"c29-resp\"}}\n\n",
+        );
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/responses"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(response_sse),
+            )
+            .mount(&server)
+            .await;
+    }
     assert_eq!(fixture.turn.config.model_auto_compact_token_limit, Some(1));
     assert_eq!(
         fixture.turn.model_info().auto_compact_token_limit(),
@@ -479,6 +669,13 @@ async fn actual_capacity_compaction_failure_seals_and_cold_restores_parent_hando
     assert!(raw["failed_proof"].is_object());
     assert!(raw["reason"].as_str().is_some());
     let (record, capsule, _) = runtime::load_verified(&path).map_err(anyhow::Error::msg)?;
+    if bridge_enabled {
+        assert_eq!(
+            capsule.settings.reasoning_summary,
+            Some(codex_protocol::config_types::ReasoningSummary::None),
+            "C29 CLI source Config and sealed capsule must retain TUI's explicit summary default"
+        );
+    }
     assert_eq!(record.phase, "failed");
     assert!(record.failed_proof.is_some());
     let source_generation = capsule.original_snapshot["resume_generation"]
@@ -512,12 +709,19 @@ async fn actual_capacity_compaction_failure_seals_and_cold_restores_parent_hando
     if std::env::var_os("RENCROW_C29_HARNESS").is_some() {
         run_c29_python_owner_harness(&fixture, &path, &record, &capsule).await?;
         let server_requests = server.received_requests().await.unwrap_or_default();
-        anyhow::ensure!(
-            !server_requests.iter().any(|request| {
+        let continuation_requests = server_requests
+            .iter()
+            .filter(|request| {
                 request.method == wiremock::http::Method::POST
                     && request.url.path().ends_with("/responses")
-            }),
-            "isolated C29 bridge must not send a model request"
+                    && serde_json::from_slice::<Value>(&request.body).is_ok_and(|body| {
+                        body.to_string().contains("Hostの自動引継ぎが完了しました")
+                    })
+            })
+            .count();
+        anyhow::ensure!(
+            continuation_requests == 1,
+            "expected exactly one continuation request at the isolated loopback Responses endpoint; observed {continuation_requests}"
         );
         fixture
             .session
@@ -625,15 +829,83 @@ async fn run_c29_python_owner_harness(
     record: &runtime::HandoffRecord,
     capsule: &ParentHandoffCapsule,
 ) -> anyhow::Result<()> {
+    use sha2::Digest;
     use std::io::Write;
+    let test_process_group_id = c29_test_process_group_id()?;
 
     let harness = std::env::var_os("RENCROW_C29_HARNESS")
         .ok_or_else(|| anyhow::anyhow!("RENCROW_C29_HARNESS is required"))?;
     let tools_root = std::env::var_os("RENCROW_TOOLS_ROOT")
         .ok_or_else(|| anyhow::anyhow!("RENCROW_TOOLS_ROOT archive is required"))?;
+    let tools_root_path = std::path::PathBuf::from(&tools_root);
     let tools_commit = std::env::var("RENCROW_TOOLS_COMMIT")?;
     let parent_handoff_sha256 = std::env::var("RENCROW_PARENT_HANDOFF_SHA256")?;
+    let cli_binary =
+        std::path::PathBuf::from(std::env::var_os("RENCROW_C29_CLI_BIN").ok_or_else(|| {
+            anyhow::anyhow!("RENCROW_C29_CLI_BIN is required for the real CLI bridge")
+        })?);
+    let cli_source_commit = std::env::var("RENCROW_C29_CLI_COMMIT")?;
+    let expected_cli_sha256 = std::env::var("RENCROW_C29_CLI_SHA256")?;
+    let cli_manifest_path =
+        std::path::PathBuf::from(std::env::var_os("RENCROW_C29_CLI_MANIFEST").ok_or_else(
+            || anyhow::anyhow!("RENCROW_C29_CLI_MANIFEST is required for paired binary evidence"),
+        )?);
+    let cli_manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&cli_manifest_path)?)?;
+    anyhow::ensure!(
+        cli_manifest["source_commit"] == cli_source_commit
+            && cli_manifest["source_clean_after_build"] == true
+            && cli_manifest["artifacts"]["codex"]["path"] == cli_binary.to_string_lossy().as_ref()
+            && cli_manifest["artifacts"]["codex"]["sha256"] == expected_cli_sha256,
+        "paired CLI manifest does not bind the provided path, source commit, and SHA-256"
+    );
+    let cli_binary_bytes = std::fs::read(&cli_binary)?;
+    let actual_cli_sha256 = format!("{:x}", sha2::Sha256::digest(&cli_binary_bytes));
+    anyhow::ensure!(
+        actual_cli_sha256 == expected_cli_sha256,
+        "test-owned CLI binary hash mismatch at {}",
+        cli_binary.display()
+    );
+    let test_source_head = std::process::Command::new("git")
+        .arg("-C")
+        .arg(env!("CARGO_MANIFEST_DIR"))
+        .args(["rev-parse", "HEAD"])
+        .output()?;
+    anyhow::ensure!(
+        test_source_head.status.success(),
+        "could not read test source HEAD"
+    );
+    let test_source_head = String::from_utf8(test_source_head.stdout)?
+        .trim()
+        .to_owned();
+    let cli_source_commit_matches_test_head = cli_source_commit == test_source_head;
+    let source_diff = std::process::Command::new("git")
+        .arg("-C")
+        .arg(env!("CARGO_MANIFEST_DIR"))
+        .args([
+            "diff",
+            "--name-only",
+            &format!("{cli_source_commit}..{test_source_head}"),
+        ])
+        .output()?;
+    anyhow::ensure!(
+        source_diff.status.success(),
+        "could not compare paired CLI and test source"
+    );
+    let paired_to_test_changes = String::from_utf8(source_diff.stdout)?
+        .lines()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        paired_to_test_changes.iter().all(|path| {
+            path.starts_with("codex-rs/core/src/session/") && path.ends_with("_tests.rs")
+                || path.starts_with("codex-rs/core/tests/fixtures/")
+                || path.starts_with("codex-rs/core/tests/suite/")
+        }),
+        "paired CLI source differs from test HEAD outside test/fixture paths: {paired_to_test_changes:?}"
+    );
     let workspace = fixture.turn.config.cwd.to_path_buf();
+    let trusted_workspace_key = codex_config::loader::project_trust_key(&workspace);
     let codex_home = fixture.turn.config.codex_home.to_path_buf();
     let source_rollout = capsule.source_rollout.clone();
     anyhow::ensure!(
@@ -654,6 +926,11 @@ async fn run_c29_python_owner_harness(
     let record_sha256 =
         codex_history::archive_reference::content_sha256(std::str::from_utf8(&record_bytes)?);
     let config_path = base.join("harness-input.json");
+    let target_effort = capsule
+        .settings
+        .reasoning_effort
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("sealed capsule omits reasoning effort"))?;
     let config = serde_json::json!({
         "base": base,
         "home": codex_home,
@@ -670,7 +947,23 @@ async fn run_c29_python_owner_harness(
         "handoff_directory": record_path.parent().and_then(std::path::Path::parent)
             .ok_or_else(|| anyhow::anyhow!("handoff directory is missing"))?,
         "provider_url": provider_url,
+        "tools_root": tools_root_path,
         "test_binary": std::env::current_exe()?,
+        "cli_binary": cli_binary,
+        "cli_binary_sha256": actual_cli_sha256,
+        "cli_binary_manifest_source_clean": cli_manifest["source_clean_after_build"],
+        "cli_source_commit": cli_source_commit,
+        "cli_manifest_path": cli_manifest_path,
+        "paired_to_test_source_changes": paired_to_test_changes,
+        "test_source_head": test_source_head,
+        "cli_source_commit_matches_test_head": cli_source_commit_matches_test_head,
+        "source_runtime_contract_sha256": runtime::runtime_contract(&fixture.turn.config)
+            .map_err(anyhow::Error::msg)?,
+        "target_model": capsule.settings.model,
+        "target_effort": serde_json::to_value(target_effort)?,
+        "cli_config_file": codex_home.join(codex_config::CONFIG_TOML_FILE),
+        "trusted_workspace_key": trusted_workspace_key,
+        "test_process_group_id": test_process_group_id,
     });
     let mut config_file = std::fs::File::create(&config_path)?;
     config_file.write_all(&serde_json::to_vec_pretty(&config)?)?;
@@ -688,7 +981,11 @@ async fn run_c29_python_owner_harness(
         .env("PYTHONDONTWRITEBYTECODE", "1")
         .env("RENCROW_TOOLS_ROOT", tools_root)
         .env("RENCROW_TOOLS_COMMIT", &tools_commit)
-        .env("RENCROW_PARENT_HANDOFF_SHA256", &parent_handoff_sha256);
+        .env("RENCROW_PARENT_HANDOFF_SHA256", &parent_handoff_sha256)
+        .env("RENCROW_C29_CLI_BIN", &cli_binary)
+        .env("RENCROW_C29_CLI_SHA256", &expected_cli_sha256)
+        .env("RENCROW_C29_CLI_COMMIT", &cli_source_commit);
+    command.env("RENCROW_C29_CLI_MANIFEST", &cli_manifest_path);
     if let Some(value) = std::env::var_os("RUST_MIN_STACK") {
         command.env("RUST_MIN_STACK", value);
     }
@@ -697,29 +994,54 @@ async fn run_c29_python_owner_harness(
         command.env("DYLD_LIBRARY_PATH", value);
     }
     let output = command.output()?;
-    let child_log_path = base.join("native-child.log");
+    let child_log_path = base.join("successor-cli-pty.log");
     let child_log_diagnostic = match std::fs::read_to_string(&child_log_path) {
         Ok(contents) => format!(
-            "native-child.log ({}):\n{contents}",
+            "successor-cli-pty.log ({}):\n{contents}",
             child_log_path.display()
         ),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            format!("native-child.log is absent: {}", child_log_path.display())
+            format!(
+                "successor-cli-pty.log is absent: {}",
+                child_log_path.display()
+            )
         }
         Err(error) => format!(
-            "native-child.log could not be read at {}: {error}",
+            "successor-cli-pty.log could not be read at {}: {error}",
             child_log_path.display()
         ),
     };
+    let failure_evidence = if output.status.success() {
+        None
+    } else if let Some(evidence_root) = std::env::var_os("RENCROW_C29_EVIDENCE_DIR") {
+        match preserve_c29_failure_evidence(
+            std::path::Path::new(&evidence_root),
+            &base,
+            record_path,
+            &record.capsule_file,
+            &output,
+            &child_log_path,
+            record,
+        ) {
+            Ok(path) => Some(format!("failure evidence saved at {}", path.display())),
+            Err(error) => Some(format!("failure evidence save failed: {error:#}")),
+        }
+    } else {
+        None
+    };
     anyhow::ensure!(
         output.status.success(),
-        "test-owned Python Supervisor bridge failed (status {}): {}\n{}",
+        "test-owned Python Supervisor bridge failed (status {}): {}\n{}\n{}",
         output.status,
         String::from_utf8_lossy(&output.stderr),
-        child_log_diagnostic
+        child_log_diagnostic,
+        failure_evidence
+            .as_deref()
+            .unwrap_or("failure evidence was not requested")
     );
     let result_path = base.join("result.json");
     let result: serde_json::Value = serde_json::from_slice(&std::fs::read(&result_path)?)?;
+    let paired_to_test_changes_json = serde_json::to_value(&paired_to_test_changes)?;
     anyhow::ensure!(
         result["record_file"] == record_path.to_string_lossy().as_ref()
             && result["record_id"] == record.capsule_sha256
@@ -728,31 +1050,126 @@ async fn run_c29_python_owner_harness(
             && result["successor_thread"] == record.successor_thread_id.to_string()
             && result["launch_count"] == 1
             && result["continuation_count"] == 1
+            && result["continuation_submit_count"] == 1
+            && result["input_delivery_sequence"]
+                == serde_json::json!([
+                    "bracketed-paste",
+                    "cold-owner-readonly-resume",
+                    "same-process-continuing-reobserve",
+                    "enter"
+                ])
+            && result["source_exit_keys"]
+                == serde_json::json!(["Escape", "C-u", "C-c", "C-c", "C-u"])
             && result["child_returncode_after_cleanup"] == 0
             && result["successor_rollout_copy_bytes_equal"] == true
             && result["successor_rollout_sha256"].as_str().is_some()
             && result["cold_resume_tested"] == false
             && result["cold_owner_status"] == "parent_handoff_continuing"
+            && result["cold_owner_returncode"] == 0
             && result["cold_owner_pid"].as_u64().is_some()
             && result["cold_owner_pid"] != result["child_pid"]
+            && result["cold_owner_process_pid"].as_u64().is_some()
+            && result["cold_owner_process_pid"] == result["cold_owner_pid"]
+            && result["cold_owner_process_group_id"] == test_process_group_id
+            && result["cold_owner_process_reaped"] == true
             && result["cold_owner_send_count"] == 0
             && result["cold_owner_ledger_sha256"].as_str().is_some()
             && result["real_supervisor_restart_tested"] == false
+            && result["successor_cli_started"] == true
+            && result["cli_auth_file_store"] == true
+            && result["cli_auth_dummy_key_only"] == true
+            && result["cli_api_key_environment_absent"] == true
+            && result["cli_workspace_trusted"] == true
+            && result["successor_cli_returncode_after_cleanup"] == 0
+            && result["test_process_group_id"] == test_process_group_id
+            && result["test_process_id"] == test_process_group_id
+            && result["python_process_id"]
+                .as_i64()
+                .is_some_and(|pid| pid != test_process_group_id as i64)
+            && result["python_process_group_id"] == test_process_group_id
+            && result["source_process_group_id"] == test_process_group_id
+            && result["duplicate_start_process_group_id"] == test_process_group_id
+            && result["successor_cli_process_group_id"] == test_process_group_id
+            && result["successor_cli_inherited_test_group"] == true
+            && result["successor_cli_reaped"] == true
+            && result["duplicate_start_reaped"] == true
+            && result["source_process_reaped"] == true
+            && result["cleanup_signal_scope"] == "owned-popen-pids-only"
+            && result["process_group_isolated_by_nextest"] == true
+            && result["cleanup_signal_targets"]
+                .as_array()
+                .is_some_and(|targets| {
+                    targets.contains(&result["source_process_pid"])
+                        && targets.iter().all(|pid| {
+                            pid == &result["source_process_pid"]
+                                || pid == &result["child_pid"]
+                                || pid == &result["duplicate_start_process_pid"]
+                        })
+                })
+            && result["duplicate_native_start_rejected"] == true
+            && result["duplicate_start_child_pid"].as_u64().is_some()
+            && result["duplicate_start_child_pid"] != result["child_pid"]
+            && result["duplicate_start_returncode"] == 0
+            && result["owner_final_status"] == "parent_handoff_adopted"
+            && result["cli_binary_sha256"] == actual_cli_sha256
+            && result["cli_binary_manifest_source_clean"] == true
+            && result["cli_source_commit"] == cli_source_commit
+            && result["paired_to_test_source_changes"] == paired_to_test_changes_json
+            && result["cli_argv_observed"] == true
+            && result["task_started_delta"] == 1
+            && result["cli_manifest_path"] == cli_manifest_path.to_string_lossy().as_ref()
+            && result["test_source_head"] == test_source_head
+            && result["cli_source_commit_matches_test_head"] == cli_source_commit_matches_test_head
             && result["parent_handoff_source_sha256"] == parent_handoff_sha256
+            && result["tools_root"] == tools_root_path.to_string_lossy().as_ref()
+            && result["parent_handoff_source"]
+                == tools_root_path
+                    .join("tools/observability/ren2_supervisor/parent_handoff.py")
+                    .to_string_lossy()
+                    .as_ref()
             && result["tools_commit"] == tools_commit,
         "C29 bridge result did not preserve the one-record/one-child contract: {result}"
     );
     if let Some(evidence_root) = std::env::var_os("RENCROW_C29_EVIDENCE_DIR") {
+        let cli_config_path = codex_home.join(codex_config::CONFIG_TOML_FILE);
+        let cli_evidence_sources = C29CliEvidenceSources {
+            config: &cli_config_path,
+            manifest: &cli_manifest_path,
+            tools_root: &tools_root_path,
+        };
         preserve_c29_evidence(
             std::path::Path::new(&evidence_root),
             &base,
             record_path,
             &record.capsule_file,
             &capsule.source_rollout,
+            &cli_evidence_sources,
             record,
         )?;
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn c29_test_process_group_id() -> anyhow::Result<i32> {
+    let process_id = unsafe { libc::getpid() };
+    let process_group_id = unsafe { libc::getpgrp() };
+    anyhow::ensure!(
+        process_id == process_group_id,
+        "C29 requires the nextest-owned test process to lead its isolated process group; pid={process_id}, pgid={process_group_id}"
+    );
+    Ok(process_id)
+}
+
+#[cfg(not(unix))]
+fn c29_test_process_group_id() -> anyhow::Result<i32> {
+    anyhow::bail!("C29 process-group acceptance requires Unix nextest semantics")
+}
+
+struct C29CliEvidenceSources<'a> {
+    config: &'a std::path::Path,
+    manifest: &'a std::path::Path,
+    tools_root: &'a std::path::Path,
 }
 
 fn preserve_c29_evidence(
@@ -761,6 +1178,7 @@ fn preserve_c29_evidence(
     record_path: &std::path::Path,
     capsule_path: &std::path::Path,
     source_rollout: &std::path::Path,
+    cli_sources: &C29CliEvidenceSources<'_>,
     record: &runtime::HandoffRecord,
 ) -> anyhow::Result<()> {
     let destination = evidence_root.join(format!("c29-{}", record.successor_thread_id));
@@ -774,6 +1192,23 @@ fn preserve_c29_evidence(
         ("sealed-handoff.json", record_path.to_path_buf()),
         ("handoff-capsule.json", capsule_path.to_path_buf()),
         ("source-rollout.jsonl", source_rollout.to_path_buf()),
+        ("cli-config.toml", cli_sources.config.to_path_buf()),
+        (
+            "cli-build-manifest.json",
+            cli_sources.manifest.to_path_buf(),
+        ),
+        (
+            "parent-handoff-source.py",
+            cli_sources
+                .tools_root
+                .join("tools/observability/ren2_supervisor/parent_handoff.py"),
+        ),
+        (
+            "supervise-source.py",
+            cli_sources
+                .tools_root
+                .join("tools/observability/ren2_supervisor/supervise.py"),
+        ),
         (
             "native-successor-rollout.jsonl",
             run_directory.join("native-successor-rollout.jsonl"),
@@ -791,14 +1226,21 @@ fn preserve_c29_evidence(
             run_directory.join("cold-owner-result.json"),
         ),
         (
-            "native-child-proof.json",
-            run_directory.join("child-ready.json"),
+            "duplicate-start-proof.json",
+            run_directory.join("duplicate-start-proof.json"),
         ),
         (
-            "native-child-done.json",
-            run_directory.join("child-done.json"),
+            "cli-process-proof.json",
+            run_directory.join("cli-process-proof.json"),
         ),
-        ("native-child.log", run_directory.join("native-child.log")),
+        (
+            "successor-cli-pty.log",
+            run_directory.join("successor-cli-pty.log"),
+        ),
+        (
+            "duplicate-start.log",
+            run_directory.join("duplicate-start.log"),
+        ),
         (
             "supervisor-ledger.json",
             run_directory.join("escalation-ledger.json"),
@@ -813,24 +1255,7 @@ fn preserve_c29_evidence(
             run_directory.join("executor-policy.json"),
         ),
     ];
-    let mut hashes = serde_json::Map::new();
-    for (name, source) in artifacts {
-        let bytes = std::fs::read(&source)
-            .map_err(|error| anyhow::anyhow!("read C29 evidence {}: {error}", source.display()))?;
-        let copied_path = destination.join(name);
-        std::fs::copy(&source, &copied_path)?;
-        let copied = std::fs::read(&copied_path)?;
-        anyhow::ensure!(
-            bytes == copied,
-            "C29 evidence copy changed bytes for {name}"
-        );
-        let text = std::str::from_utf8(&copied)
-            .map_err(|error| anyhow::anyhow!("C29 evidence {name} is not UTF-8: {error}"))?;
-        hashes.insert(
-            name.to_string(),
-            serde_json::Value::String(codex_history::archive_reference::content_sha256(text)),
-        );
-    }
+    let hashes = copy_c29_evidence_artifacts(&destination, &artifacts)?;
     std::fs::write(
         destination.join("artifact-hashes.json"),
         serde_json::to_vec_pretty(&serde_json::json!({
@@ -842,6 +1267,96 @@ fn preserve_c29_evidence(
         }))?,
     )?;
     Ok(())
+}
+
+fn preserve_c29_failure_evidence(
+    evidence_root: &std::path::Path,
+    run_directory: &std::path::Path,
+    record_path: &std::path::Path,
+    capsule_path: &std::path::Path,
+    output: &std::process::Output,
+    child_log_path: &std::path::Path,
+    record: &runtime::HandoffRecord,
+) -> anyhow::Result<std::path::PathBuf> {
+    std::fs::create_dir_all(evidence_root)?;
+    let destination = evidence_root.join(format!(
+        "c29-failure-{}-{}",
+        record.successor_thread_id, record.capsule_sha256
+    ));
+    std::fs::create_dir(&destination).map_err(|error| {
+        anyhow::anyhow!(
+            "create new C29 failure evidence directory {} (existing evidence is never overwritten): {error}",
+            destination.display()
+        )
+    })?;
+
+    let stdout_path = run_directory.join("python-bridge.stdout.bin");
+    let stderr_path = run_directory.join("python-bridge.stderr.bin");
+    std::fs::write(&stdout_path, &output.stdout)?;
+    std::fs::write(&stderr_path, &output.stderr)?;
+    let absent_log_path = run_directory.join("successor-cli-pty.log.absent.txt");
+    let preserved_log_path = if child_log_path.exists() {
+        child_log_path.to_path_buf()
+    } else {
+        std::fs::write(
+            &absent_log_path,
+            format!("CLI PTY log was absent at {}\n", child_log_path.display()),
+        )?;
+        absent_log_path
+    };
+    let mut artifacts = vec![
+        ("sealed-handoff.json", record_path.to_path_buf()),
+        ("handoff-capsule.json", capsule_path.to_path_buf()),
+        (
+            "harness-input.json",
+            run_directory.join("harness-input.json"),
+        ),
+        ("python-bridge.stdout.bin", stdout_path),
+        ("python-bridge.stderr.bin", stderr_path),
+        ("successor-cli-diagnostic.log", preserved_log_path),
+    ];
+    let python_diagnostic = run_directory.join("failure-diagnostic.json");
+    if python_diagnostic.exists() {
+        artifacts.push(("python-failure-diagnostic.json", python_diagnostic));
+    }
+    let hashes = copy_c29_evidence_artifacts(&destination, &artifacts)?;
+    std::fs::write(
+        destination.join("failure-artifact-manifest.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "bridge_exit_status": output.status.to_string(),
+            "record_id": record.capsule_sha256,
+            "source_thread": record.source_thread_id.to_string(),
+            "successor_thread": record.successor_thread_id.to_string(),
+            "auth_material_saved": false,
+            "artifacts": hashes,
+        }))?,
+    )?;
+    Ok(destination)
+}
+
+fn copy_c29_evidence_artifacts(
+    destination: &std::path::Path,
+    artifacts: &[(&str, std::path::PathBuf)],
+) -> anyhow::Result<serde_json::Map<String, serde_json::Value>> {
+    use sha2::Digest;
+
+    let mut hashes = serde_json::Map::new();
+    for (name, source) in artifacts {
+        let bytes = std::fs::read(source)
+            .map_err(|error| anyhow::anyhow!("read C29 evidence {}: {error}", source.display()))?;
+        let copied_path = destination.join(name);
+        std::fs::copy(source, &copied_path)?;
+        let copied = std::fs::read(&copied_path)?;
+        anyhow::ensure!(
+            bytes == copied,
+            "C29 evidence copy changed bytes for {name}"
+        );
+        hashes.insert(
+            (*name).to_string(),
+            serde_json::Value::String(format!("{:x}", sha2::Sha256::digest(&copied))),
+        );
+    }
+    Ok(hashes)
 }
 
 /// Explicit subprocess-only native import helper. The parent test supplies a real sealed record.
@@ -960,6 +1475,55 @@ async fn parent_handoff_os_child_imports_same_record() -> anyhow::Result<()> {
     );
     successor.thread.shutdown_and_wait().await?;
     std::fs::write(&done_file, serde_json::to_vec(&proof)?)?;
+    Ok(())
+}
+
+/// Explicit subprocess-only duplicate-start proof while the real CLI owns the record.
+#[tokio::test]
+#[ignore = "spawned only by the isolated C29 Python owner harness"]
+async fn parent_handoff_os_child_rejects_claimed_record() -> anyhow::Result<()> {
+    use crate::config::ConfigBuilder;
+    let record_path = std::path::PathBuf::from(std::env::var("C29_HANDOFF_PATH")?);
+    let workspace = std::path::PathBuf::from(std::env::var("C29_WORKSPACE")?);
+    let codex_home = std::path::PathBuf::from(std::env::var("C29_CODEX_HOME")?);
+    let proof_path = std::path::PathBuf::from(std::env::var("C29_DUPLICATE_PROOF")?);
+    let duplicate_config = ConfigBuilder::default()
+        .codex_home(codex_home)
+        .fallback_cwd(Some(workspace))
+        .cli_overrides(vec![(
+            "rencrow_parent_handoff_file".to_string(),
+            toml::Value::String(record_path.to_string_lossy().into_owned()),
+        )])
+        .build()
+        .await?;
+    let manager = crate::ThreadManager::with_models_provider_and_home_for_tests(
+        codex_login::CodexAuth::from_api_key("test"),
+        duplicate_config.model_provider.clone(),
+        duplicate_config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    );
+    let mut options = crate::StartThreadOptions::new(duplicate_config);
+    options.session_source = Some(codex_protocol::protocol::SessionSource::Cli);
+    let error = match manager.start_thread(options).await {
+        Ok(started) => {
+            started.thread.shutdown_and_wait().await?;
+            anyhow::bail!("a second process started the CLI-owned handoff");
+        }
+        Err(error) => error,
+    };
+    anyhow::ensure!(
+        error.to_string().contains("claimed or unavailable"),
+        "duplicate start failed for an unexpected reason: {error}"
+    );
+    std::fs::write(
+        &proof_path,
+        serde_json::to_vec(&serde_json::json!({
+            "record_file": record_path,
+            "duplicate_start_child_pid": std::process::id(),
+            "duplicate_start_rejected": true,
+            "reason": error.to_string(),
+        }))?,
+    )?;
     Ok(())
 }
 

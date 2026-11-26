@@ -9127,13 +9127,51 @@ async fn make_session_and_context_with_auth_config_home_and_rx<F>(
 where
     F: FnOnce(&mut Config),
 {
-    let (tx_event, rx_event) = async_channel::unbounded();
     let mut config = build_test_config(codex_home).await;
     configure_config(&mut config);
+    make_session_and_context_with_config_and_auth_home_and_rx(
+        auth,
+        dynamic_tools,
+        config,
+        codex_home.to_path_buf(),
+    )
+    .await
+}
+
+pub(crate) async fn make_session_and_context_with_config_and_rx(
+    auth: CodexAuth,
+    dynamic_tools: Vec<DynamicToolSpec>,
+    config: Config,
+) -> (
+    Arc<Session>,
+    Arc<TurnContext>,
+    async_channel::Receiver<Event>,
+) {
+    let codex_home = config.codex_home.to_path_buf();
+    make_session_and_context_with_config_and_auth_home_and_rx(
+        auth,
+        dynamic_tools,
+        config,
+        codex_home,
+    )
+    .await
+}
+
+async fn make_session_and_context_with_config_and_auth_home_and_rx(
+    auth: CodexAuth,
+    dynamic_tools: Vec<DynamicToolSpec>,
+    config: Config,
+    auth_home: PathBuf,
+) -> (
+    Arc<Session>,
+    Arc<TurnContext>,
+    async_channel::Receiver<Event>,
+) {
+    let (tx_event, rx_event) = async_channel::unbounded();
     let state_db = None;
     let config = Arc::new(config);
     let thread_id = ThreadId::default();
-    let auth_manager = AuthManager::from_auth_for_testing_with_home(auth, codex_home.to_path_buf());
+    let auth_manager = AuthManager::from_auth_for_testing_with_home(auth, auth_home);
     let models_manager = models_manager_with_provider(
         config.codex_home.to_path_buf(),
         auth_manager.clone(),
