@@ -318,6 +318,15 @@ impl ExecCommandHandler {
                 )));
             }
         }
+        if args.login.is_none()
+            && let Some(scope) = session.active_task_scope().await
+            && session
+                .rencrow_completion_state(&scope.root_task_id)
+                .await
+                .is_some_and(|completion| completion.common_harness.is_some())
+        {
+            args.login = Some(false);
+        }
         let resolved_command = get_command(
             &args,
             shell,
@@ -330,7 +339,9 @@ impl ExecCommandHandler {
         let verifier_direct_shell =
             matches!(&shell_mode, codex_tools::UnifiedExecShellMode::Direct)
                 && args.shell.is_none()
-                && args.login != Some(true);
+                && !args
+                    .login
+                    .unwrap_or(turn_environment.config().allow_login_shell);
         let ExecCommandArgs {
             mut tty,
             yield_time_ms,

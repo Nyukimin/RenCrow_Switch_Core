@@ -96,6 +96,7 @@ async fn common_task_in_store(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CommonTaskFixtureVariant {
     Default,
+    LoginShellEnabled,
     SuiteExcludesBaselineFailure,
     InconsistentSuiteExpectedCounts,
     FrameworkErrorAtBaseline,
@@ -275,6 +276,9 @@ async fn common_task_in_store_variant_with_provider(
             .permissions
             .set_permission_profile(codex_protocol::models::PermissionProfile::workspace_write())
             .expect("fixture Go compilation requires the standard workspace-write profile");
+        if variant == CommonTaskFixtureVariant::LoginShellEnabled {
+            config.permissions.allow_login_shell = true;
+        }
         config
             .permissions
             .shell_environment_policy
@@ -424,7 +428,7 @@ async fn common_task_in_store_variant_with_provider(
         request["constraints"] = json!(vec!["x".repeat(4096); 9]);
     }
     match variant {
-        CommonTaskFixtureVariant::Default => {}
+        CommonTaskFixtureVariant::Default | CommonTaskFixtureVariant::LoginShellEnabled => {}
         CommonTaskFixtureVariant::SuiteExcludesBaselineFailure => {
             request["conditions"][1]["comparison_scope"] = json!("TestOther");
             request["conditions"][1]["expected"] = json!("one unrelated regression passes");

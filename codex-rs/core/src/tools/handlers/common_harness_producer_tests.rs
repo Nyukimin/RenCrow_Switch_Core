@@ -111,7 +111,13 @@ pub(super) async fn run_registered_check(
 
 #[tokio::test]
 async fn registered_baseline_failure_records_partial_fail_evidence_and_keeps_raw_failure() {
-    let (workspace, session, turn) = common_task().await;
+    let (workspace, session, turn) = super::common_task_in_store_variant(
+        /*reproduce_failure*/ true,
+        /*local_writer*/ false,
+        super::CommonTaskFixtureVariant::LoginShellEnabled,
+    )
+    .await;
+    assert!(turn.config.permissions.allow_login_shell);
     let initial = session
         .current_common_harness_state("harness-root")
         .await
@@ -235,6 +241,15 @@ async fn registered_baseline_failure_records_partial_fail_evidence_and_keeps_raw
         "the failed check did not modify its registered inputs"
     );
     let failure_observation = raw_task_check.observation.as_ref();
+    assert_eq!(
+        failure_observation
+            .expect("native verifier records its actual command")
+            .command,
+        session
+            .user_shell()
+            .derive_exec_args(&command, /*use_login_shell*/ false),
+        "Common verification must not inherit login startup from the host configuration"
+    );
     let diagnostic_excerpt = failure_observation.map(|observation| {
         observation
             .diagnostic_excerpt

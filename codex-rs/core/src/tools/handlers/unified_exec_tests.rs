@@ -75,8 +75,10 @@ fn test_get_command_uses_default_shell_when_unspecified() -> anyhow::Result<()> 
     .map_err(anyhow::Error::msg)?;
     let command = resolved.command;
 
-    assert_eq!(command.len(), 3);
-    assert_eq!(command[2], "echo hello");
+    assert_eq!(
+        command,
+        default_user_shell().derive_exec_args("echo hello", /*use_login_shell*/ true)
+    );
     Ok(())
 }
 
